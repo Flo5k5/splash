@@ -312,6 +312,9 @@ private:
   // The scratch of every tile a decode plan of the workload may take, the
   // register tile's where it takes the projection's formats.
   [[nodiscard]] LinearScratchSize ggufDecodeScratchSize(LinearWorkload workload, bool registerFormats) const;
+  // The scratch of every plan a prefill workload of a projection may take,
+  // whatever its formats.
+  [[nodiscard]] LinearScratchSize ggufPrefillScratchSize(LinearWorkload workload) const;
   void addGguf(metal::CommandGraph &graph, const LinearBuffers &buffers,
                const Projection &projection, const LinearPlan &plan,
                const Projection *gate) const;
@@ -326,6 +329,9 @@ private:
   void addGgufFloatSegments(metal::CommandGraph &graph, const LinearBuffers &buffers,
                             const Projection &projection, const LinearPlan &plan) const;
   GpuFamilyClass family_;
+  // Apple GPU family 11 (M6), whose staged tile also splits K by the
+  // projection's formats (LinearGguf.cpp).
+  bool apple11_ = false;
   uint32_t gpuCores_ = 0;
 };
 

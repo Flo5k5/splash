@@ -2566,7 +2566,8 @@ one lane 3.3-3.6% faster on a 12-core M6). Split plans take more time on it, as 
 (`LinearTile::GgufPrefill`), and the staged tile for chunks of up to 32 rows. Every projection
 splits its K across threadgroups by one rule (`decodeSplits`: each tile's tiers of threadgroups
 per core, inputs per partition and partitions, from measured occupancy, Apple9's staged tile taking
-the register tile's of eight partitions) that does not depend on the batch width. Partitions stop
+the register tile's of eight partitions; Apple11's adds a long-reduction tier in the low-bit
+formats and a lower tier in Q4_K to Q6_K) that does not depend on the batch width. Partitions stop
 at eight, but the register tile splits a grid that eight leave below three threadgroups per core
 into sixteen while partitions keep 512 inputs (Qwen3.8-Flash-Next's hyper-connection down
 projection, 320 columns over 10240 inputs; measured on Apple10). The MoE experts
