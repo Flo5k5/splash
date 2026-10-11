@@ -261,6 +261,9 @@ public:
   void discardState(uint64_t block, const CompositeState *state) {
     states_.discardState(block, state);
   }
+  // The state at this block, in either tier, matches nothing any more and
+  // leaves once nothing uses it.
+  void invalidateState(uint64_t block) noexcept { states_.invalidate(block); }
   void beginRequest(uint64_t requestId);
   void endRequest(uint64_t requestId);
 

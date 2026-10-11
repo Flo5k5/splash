@@ -797,7 +797,9 @@ void Engine::completeAdmission(Request &active, CacheLookup &lookup,
   if (resuming)
     scheduler_.resumeFromResources(active.request.id, resumeBoundary, active.replayTokens);
   active.latestCheckpoint = {};
+  active.unprovenState.reset();
   if (lookup.state) {
+    active.unprovenState = lookup.state->kvBlock();
     active.latestCheckpoint = cache_.checkpointState(lookup.state->kvBlock());
     // A restored replay point of the prompt already has the ordinary state
     // we need, in whichever tier holds it: a promotion that found no cache
@@ -1584,25 +1586,25 @@ void Engine::apply(const BatchPlan &plan,
       throw std::logic_error("model result order changed");
     }
     Request &active = request(result.requestId);
-    if (!result.failure.empty() && !active.pendingEnd) {
-      // The model rejected this lane's own numerical result. An earlier
-      // cancellation or deadline of the same lane still stands.
-      active.pendingEnd = LaneEnd{LaneOutcome::ModelResultInvalid, result.failure};
-    }
-    if (!active.pendingEnd) {
+    // The model rejected this lane's own numerical result. A model that emits
+    // a token outside the vocabulary without reporting it fails the lane the
+    // same way (the Qwen runtime reports its non-finite rows itself).
+    std::string invalid = result.failure;
+    if (invalid.empty()) {
       const auto outOfVocabulary = std::find_if(
           result.outputTokens.begin(), result.outputTokens.end(),
           [&](uint32_t token) { return token >= config_.vocabularySize; });
-      if (outOfVocabulary != result.outputTokens.end()) {
-        // A model that emits a token outside the vocabulary without reporting
-        // it fails this lane the same way (the Qwen runtime reports its
-        // non-finite rows itself).
-        active.pendingEnd =
-            LaneEnd{LaneOutcome::ModelResultInvalid,
-                    "model emitted out-of-vocabulary token " +
-                        std::to_string(*outOfVocabulary)};
-      }
+      if (outOfVocabulary != result.outputTokens.end())
+        invalid = "model emitted out-of-vocabulary token " + std::to_string(*outOfVocabulary);
     }
+    // A damaged state is one way to such a result: the state the request
+    // restored goes, unless an earlier step computed from it was finite.
+    if (!invalid.empty() && active.unprovenState)
+      cache_.invalidateState(*active.unprovenState);
+    active.unprovenState.reset();
+    // An earlier cancellation or deadline of the same lane still stands.
+    if (!invalid.empty() && !active.pendingEnd)
+      active.pendingEnd = LaneEnd{LaneOutcome::ModelResultInvalid, std::move(invalid)};
     if (active.pendingEnd) {
       // An in-flight Metal command cannot be revoked safely. Its provisional
       // writes remain invisible, but a cancelled, deadline-expired or
