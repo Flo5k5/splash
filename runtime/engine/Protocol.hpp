@@ -131,9 +131,10 @@ validateLimits(const ProtocolLimits &limits);
 //   74 u32 score token count
 //   78 u32 generationPromptTokens
 //   82 u32 flags
+//   86 u64 cacheSalt.lo, u64 cacheSalt.hi
 // then the prompt tokens, the 32-byte image spans, the image pixels and the
 // score tokens.
-inline constexpr uint64_t kRequestFixedBytes = 86;
+inline constexpr uint64_t kRequestFixedBytes = 102;
 
 // The request flags word holds the RequestFlag bits and this one, which asks
 // for PromptProgressEvents while the prompt prefills.
@@ -170,6 +171,8 @@ struct RequestFrame {
   uint32_t generationPromptTokens = 0;
   // RequestFlag bits and kReturnProgressFlag.
   uint32_t flags = 0;
+  // The request's cache_salt as the server hashed it; zero without one.
+  engine::CacheSalt cacheSalt;
 
   bool operator==(const RequestFrame &) const = default;
 };

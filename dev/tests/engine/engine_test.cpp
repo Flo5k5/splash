@@ -193,6 +193,46 @@ void testColdRequestReportsTheBlocksItReadFromTheCache() {
           "a cold request did not report the cached blocks it read");
 }
 
+// Requests of different cache salts share nothing: concurrent ones each
+// compute their prefix instead of waiting for another's state, and a later
+// one restores only a state of its own salt and swaps no other salt's
+// block in.
+void testCacheSaltsShareNothing() {
+  test::TestKvStorage storage(64, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor model;
+  Events events;
+  engine::Engine engine(test::engineConfig(), cache, model, events);
+  guardReleases(storage, engine);
+  const auto salted = [](uint64_t id, const std::vector<uint32_t> &prompt, uint64_t salt) {
+    EngineRequest value = request(id, prompt);
+    value.cacheSalt = {salt, 0};
+    return value;
+  };
+  for (uint32_t id = 1; id <= 4; ++id) {
+    std::vector<uint32_t> prompt(193, 7);
+    std::fill(prompt.begin() + 160, prompt.end(), id + 10);
+    engine.submit(salted(id, prompt, id));
+  }
+  static_cast<void>(engine.tick(0));
+  require(model.requests.size() == 4, "requests of different salts waited for another's prefix");
+  runUntilIdle(engine);
+  require(model.prefillRows == 4 * 193 && model.restored == 0 && events.completedCount == 4,
+          "concurrent requests of different salts shared a prefix");
+  const uint32_t computed = model.prefillRows;
+  std::vector<uint32_t> prompt(193, 7);
+  std::fill(prompt.begin() + 160, prompt.end(), 30);
+  engine.submit(salted(5, prompt, 99));
+  runUntilIdle(engine);
+  require(events.starts.back() == 0 && events.deduplicatedTokens.at(5) == 0 &&
+              model.prefillRows - computed == 193,
+          "a request read another salt's cached blocks");
+  engine.submit(salted(6, prompt, 99));
+  runUntilIdle(engine);
+  require(events.starts.back() > 0, "a request missed its own salt's cached prefix");
+}
+
 // A request whose last command fills blocks found cached never reads their
 // pages, so it reports none of them.
 void testBlocksFoundCachedAfterTheLastCommandAreNotReported() {
@@ -9129,6 +9169,7 @@ int main() {
     testConcurrentColdPrefixesComputeOnce();
     testColdRequestReportsTheBlocksItReadFromTheCache();
     testBlocksFoundCachedAfterTheLastCommandAreNotReported();
+    testCacheSaltsShareNothing();
     testSharedPrefillRebuildsTheMissingJunctionOnce();
     testSharedPrefillReleasesDifferentJunctionsIndependently();
     testSharedPrefillEvictedPublicationFallsBack();

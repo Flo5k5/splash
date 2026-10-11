@@ -677,7 +677,8 @@ ProtocolResult<ClientMessage> decodeRequest(std::vector<uint8_t> &&payload,
       !reader.f32(request.sampling.minP) ||
       !reader.u64(request.sampling.seed) || !reader.u32(scoreCount) ||
       !reader.u32(request.generationPromptTokens) ||
-      !reader.u32(request.flags)) {
+      !reader.u32(request.flags) || !reader.u64(request.cacheSalt.lo) ||
+      !reader.u64(request.cacheSalt.hi)) {
     return failure<ClientMessage>(
         makeIssue(FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength,
                   0, "request fixed payload is truncated"));

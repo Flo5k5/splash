@@ -19,6 +19,13 @@
 
 namespace splash::engine {
 
+// What a prompt's KV blocks are cached under beside its tokens: the images
+// its rows depend on and its request's cache salt (blockIdentity).
+struct PromptIdentity final {
+  std::span<const ImageSpan> images;
+  CacheSalt salt;
+};
+
 struct CacheLookup final {
   uint32_t kvBoundary = 0;
   std::optional<CompositeStateLease> state;
@@ -38,8 +45,8 @@ struct CacheLookup final {
 
 class Cache;
 
-// A scheduling probe of one prompt and its images: refresh() and lookup()
-// take the same spans it was made from.
+// A scheduling probe of one prompt: refresh() and lookup() take the same
+// identity it was made from.
 class CacheProbe final {
 public:
   [[nodiscard]] uint32_t cachedTokens() const noexcept { return cachedTokens_; }
@@ -269,13 +276,12 @@ public:
 
   // Scheduling probe only: does not pin, touch recency, or count a hit.
   [[nodiscard]] CacheProbe
-  probe(std::span<const uint32_t> prompt,
-        std::span<const ImageSpan> images);
+  probe(std::span<const uint32_t> prompt, PromptIdentity identity);
   // Brings a probe this cache made up to date: after a change of the KV
   // graph its chain is cut at the first block that no longer matches and
   // matched on from there; its cached tokens follow the states either way.
   void refresh(CacheProbe &probe, std::span<const uint32_t> prompt,
-               std::span<const ImageSpan> images);
+               PromptIdentity identity);
 
   // Pin the usable prefix before potentially evicting for active allocations.
   // Accounting is separate: failed admission retries are not extra samples.
@@ -283,7 +289,7 @@ public:
   // matched chain; otherwise the prompt is matched again.
   [[nodiscard]] CacheLookup lookup(
       std::span<const uint32_t> prompt,
-      std::span<const ImageSpan> images,
+      PromptIdentity identity,
       const CacheProbe *probe = nullptr);
   void recordLookup(const CacheLookup &lookup);
   void promoteState(const CacheLookup &lookup, StateRestore &transfer);
@@ -309,7 +315,7 @@ public:
   [[nodiscard]] PageTableView pageTable(uint64_t requestId) const;
 
   // Canonicalizes every newly complete Page32 block. A block whose parent,
-  // tokens and images match a cached one swaps the request to that block's
+  // tokens and identity match a cached one swaps the request to that block's
   // immutable page after the writer command has completed; no active command
   // ever aliases a writable page. The cached page holds KV another command
   // computed, which can differ from the request's own in the last bits, and
@@ -318,7 +324,7 @@ public:
   uint32_t publishCommittedBlocks(uint64_t requestId,
                                   std::span<const uint32_t> exactTokens,
                                   uint32_t committedTokens,
-                                  std::span<const ImageSpan> images);
+                                  PromptIdentity identity);
   [[nodiscard]] uint64_t blockAt(uint64_t requestId, uint32_t boundary) const;
   [[nodiscard]] bool reuseCompositeState(uint64_t kvBlock, bool checkpoint);
   // Reuses the state at this block in either tier, as reuseCompositeState()
@@ -453,7 +459,7 @@ private:
   // Matches the prompt's pages on from blocks.back() (from the root when
   // empty) and appends each block found; returns the pages it hashed.
   size_t extendMatch(std::vector<uint64_t> &blocks, std::span<const uint32_t> prompt,
-                     std::span<const ImageSpan> images) const;
+                     PromptIdentity identity) const;
   // The tokens up to the deepest of these blocks that holds a state.
   [[nodiscard]] uint32_t stateTokens(std::span<const uint64_t> blocks) const;
 

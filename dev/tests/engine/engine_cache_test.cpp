@@ -402,13 +402,55 @@ void testProbeBindsImageIdentity() {
   const std::span<const ImageSpan> images(&image, 1);
   cache.beginRequest(1);
   require(admitTokens(cache, 1, 32).granted(), "image KV page was not acquired");
-  const uint64_t block = test::publishBlocks(cache, 1, prompt, 32, images);
+  const uint64_t block = test::publishBlocks(cache, 1, prompt, 32, {images, {}});
   cache.publishCompositeState(block, std::make_shared<TestState>(100), false);
   cache.endRequest(1);
-  const CacheProbe probe = cache.probe(prompt, images);
-  const auto valid = cache.lookup(prompt, images, &probe);
+  const CacheProbe probe = cache.probe(prompt, {images, {}});
+  const auto valid = cache.lookup(prompt, {images, {}}, &probe);
   require(valid.kvBoundary == 32 && valid.resumeBoundary() == 32,
           "matching image probe lost its cached prefix");
+}
+
+// A cache salt goes into the first block's identity alone: a prompt cached
+// under one salt matches only lookups with that salt, and an unsalted
+// prompt only unsalted ones.
+void testCacheSaltSeparatesPrompts() {
+  const CacheSalt red{0x1111, 0x2222}, blue{0x3333, 0x4444};
+  require(blockIdentity(0, 32, {}, {}) == BlockIdentity{} &&
+              blockIdentity(0, 32, {}, red) != BlockIdentity{} &&
+              blockIdentity(0, 32, {}, red) != blockIdentity(0, 32, {}, blue) &&
+              blockIdentity(32, 32, {}, red) == BlockIdentity{},
+          "a salt did not key the first block alone");
+  test::TestKvStorage storage{8, 100, 1};
+  KvPool pool{storage, 8};
+  engine::Cache cache{pool, nullptr, nullptr};
+  std::vector<uint32_t> prompt(65, 77);
+  const auto publish = [&](uint64_t id, CacheSalt salt) {
+    cache.beginRequest(id);
+    require(admitTokens(cache, id, 64).granted(), "KV pages were not acquired");
+    const uint64_t block = test::publishBlocks(cache, id, prompt, 64, {{}, salt});
+    cache.publishCompositeState(block, std::make_shared<TestState>(100), false);
+    cache.endRequest(id);
+  };
+  const auto cached = [&](CacheSalt salt) {
+    return cache.lookup(prompt, {{}, salt}).resumeBoundary();
+  };
+  // Probes taken before the prompt is cached match it, once refreshed, only
+  // under its salt, and a lookup takes the refreshed chain.
+  CacheProbe probe = cache.probe(prompt, {{}, red});
+  CacheProbe other = cache.probe(prompt, {{}, blue});
+  publish(1, red);
+  require(cached(red) == 64 && cached(blue) == 0 && cached({}) == 0,
+          "a prompt cached under a salt matched another salt or none");
+  cache.refresh(probe, prompt, {{}, red});
+  cache.refresh(other, prompt, {{}, blue});
+  require(probe.cachedTokens() == 64 && other.cachedTokens() == 0 &&
+              cache.lookup(prompt, {{}, red}, &probe).resumeBoundary() == 64,
+          "a refreshed probe matched across salts or lost its own");
+  publish(3, blue);
+  publish(2, {});
+  require(cached({}) == 64 && cached(red) == 64 && cached(blue) == 64,
+          "an unsalted prompt did not part from the salted ones");
 }
 
 void testProbeCannotCrossCaches() {
@@ -4216,6 +4258,7 @@ int main() {
     testProbeRechecksStateChanges();
     testProbeFallsBackWhenKvChanges();
     testProbeBindsImageIdentity();
+    testCacheSaltSeparatesPrompts();
     testProbeCannotCrossCaches();
     testPageTableReportsWhatChanged();
     testNewPagesTheWorkDoesNotFillComeCleared();

@@ -34,6 +34,8 @@ REQUEST_FIELDS = (
     "score_count",
     "generation_prompt_tokens",
     "flags",
+    "cache_salt_lo",
+    "cache_salt_hi",
 )
 assert len(REQUEST_FIELDS) == len(p._REQUEST.format) - 1
 OFFSET = dict(
@@ -65,6 +67,7 @@ def example_request():
         seed=0xFEDCBA9876543210,
         constraint=p.ConstraintMode.TOKEN_MASK,
         generation_prompt_tokens=2,
+        cache_salt=0x00112233445566778899AABBCCDDEEFF,
     )
 
 
@@ -417,6 +420,8 @@ class ProtocolPythonTests(unittest.TestCase):
                 len(request.score_tokens),
                 request.generation_prompt_tokens,
                 int(request.flags),
+                request.cache_salt & 0xFFFFFFFFFFFFFFFF,
+                request.cache_salt >> 64,
             )
             + struct.pack(f"<{len(request.prompt_tokens)}I", *request.prompt_tokens)
             + struct.pack(p._IMAGE_SPAN.format, *astuple(span))

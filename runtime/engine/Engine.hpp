@@ -290,7 +290,8 @@ private:
     // The blocks it restored or published in any residency end at this
     // token. A replay after a suspension finds them cached as its own, so
     // it counts none of them, though one evicted meanwhile may hold KV
-    // another request computed again.
+    // another request computed again; nor does it count blocks past them
+    // that a state another request published there lets it restore.
     uint32_t publishedTokens = 0;
     // Tokens of blocks it computed and then found cached
     // (Cache::publishCommittedBlocks), whose pages its next command reads,
@@ -317,8 +318,8 @@ private:
     // (ModelStepResult::firstToken) and until the first decode cycle commits
     // it: that cycle emits it first, and its event leaves it out.
     std::optional<uint32_t> sentFirstToken;
-    // Made from exactTokens and request.images, which do not change while
-    // the request waits; refreshed each pass and dropped once it starts or
+    // Made from exactTokens and the request's prompt identity, which do not
+    // change while the request waits; refreshed each pass and dropped once it starts or
     // skips the cache.
     std::optional<CacheProbe> admissionProbe;
     std::vector<StateBoundary> stateBoundaries;

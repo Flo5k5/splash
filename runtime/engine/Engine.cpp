@@ -21,6 +21,11 @@ constexpr int kMaskWaitLimitMilliseconds = 5000;
 // draft-context rows; a later request must save at least that much prefill.
 constexpr uint32_t kMinimumJunctionGain = model::ExecutionLimits::draftContextTokens;
 
+// What the request's KV blocks are cached under beside its tokens.
+PromptIdentity promptIdentity(const EngineRequest &request) noexcept {
+  return {request.images, request.cacheSalt};
+}
+
 // A refusal for memory, which reclaim or the host's recovery may end.
 bool memoryDenied(const StateAdmission &admission) noexcept {
   return admission.failure == StateFailure::MemoryPressure;
@@ -268,7 +273,10 @@ bool Engine::tick(double now) {
         throw std::logic_error("model returned an empty command ticket");
       }
       scheduler_.commit(*plan, excluded);
-      // The command reads the cached pages its lanes' blocks were swapped for.
+      // The command reads the cached pages its lanes' blocks were swapped
+      // for. Selecting a constrained request's first token reads none, but
+      // the cycle after it does; only a first token that stops the request
+      // counts pages nothing read.
       for (const BatchItem &item : plan->items) {
         Request &lane = request(item.requestId);
         lane.deduplicatedKvTokens += lane.unreadDeduplicatedKvTokens;
@@ -466,9 +474,9 @@ bool Engine::admitQueued(double now) {
     if (active.skipCache)
       return 0;
     if (active.admissionProbe)
-      cache_.refresh(*active.admissionProbe, active.exactTokens, active.request.images);
+      cache_.refresh(*active.admissionProbe, active.exactTokens, promptIdentity(active.request));
     else
-      active.admissionProbe = cache_.probe(active.exactTokens, active.request.images);
+      active.admissionProbe = cache_.probe(active.exactTokens, promptIdentity(active.request));
     return active.admissionProbe->cachedTokens();
   };
   // A request starts only in a free lane. While every lane is resident,
@@ -612,6 +620,9 @@ uint32_t Engine::promptReplayBoundary(const Request &active) noexcept {
 
 uint32_t Engine::sharedPrefillBoundary(const Request &left,
                                        const Request &right) {
+  // Requests of different cache salts share no block.
+  if (left.request.cacheSalt != right.request.cacheSalt)
+    return 0;
   const auto a = std::span<const uint32_t>(left.exactTokens).first(left.promptTokens);
   const auto b = std::span<const uint32_t>(right.exactTokens).first(right.promptTokens);
   const auto end = std::mismatch(a.begin(), a.end(), b.begin(), b.end()).first;
@@ -671,7 +682,7 @@ bool Engine::admit(Request &active, double now) {
   CacheLookup lookup =
       active.skipCache
           ? CacheLookup{}
-          : cache_.lookup(modelRequest.prompt, active.request.images,
+          : cache_.lookup(modelRequest.prompt, promptIdentity(active.request),
                           active.admissionProbe ? &*active.admissionProbe
                                                 : nullptr);
   // Only unstarted requests wait for a resident producer. Recheck planned
@@ -730,7 +741,7 @@ bool Engine::admit(Request &active, double now) {
   active.lane = *state.admission.lane;
   active.admission = ++admissions_;
   if (droppedLease)
-    lookup = cache_.lookup(modelRequest.prompt, active.request.images);
+    lookup = cache_.lookup(modelRequest.prompt, promptIdentity(active.request));
   const uint32_t resumeBoundary = lookup.resumeBoundary();
   const uint64_t requestId = active.request.id;
   // The matched chain first, then the first work's pages for a lane that
@@ -1054,9 +1065,9 @@ void Engine::publishCommittedBlocks(Request &active, uint32_t committedTokens) {
   // before as its own; only those past them can be another request's.
   const uint32_t replayed = std::min(committedTokens, active.publishedTokens);
   cache_.publishCommittedBlocks(active.request.id, active.exactTokens, replayed,
-                                active.request.images);
+                                promptIdentity(active.request));
   active.unreadDeduplicatedKvTokens += cache_.publishCommittedBlocks(
-      active.request.id, active.exactTokens, committedTokens, active.request.images);
+      active.request.id, active.exactTokens, committedTokens, promptIdentity(active.request));
   active.publishedTokens = std::max(active.publishedTokens, committedTokens);
 }
 

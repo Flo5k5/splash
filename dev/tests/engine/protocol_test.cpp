@@ -68,7 +68,8 @@ constexpr size_t seed = minP + 4;
 constexpr size_t scoreCount = seed + 8;
 constexpr size_t generationPrompt = scoreCount + 4;
 constexpr size_t flags = generationPrompt + 4;
-static_assert(flags + 4 == kRequestFixedBytes);
+constexpr size_t cacheSalt = flags + 4;
+static_assert(cacheSalt + 16 == kRequestFixedBytes);
 } // namespace request_offset
 
 uint32_t loadU32(const std::vector<uint8_t> &bytes, size_t offset) {
@@ -172,6 +173,7 @@ RequestFrame exampleRequest() {
   request.sampling.seed = 0xfedcba9876543210ULL;
   request.constraint = ConstraintMode::TokenMask;
   request.generationPromptTokens = 2;
+  request.cacheSalt = {0x8899aabbccddeeffULL, 0x0011223344556677ULL};
   return request;
 }
 
