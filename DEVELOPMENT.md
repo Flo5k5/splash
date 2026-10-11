@@ -402,7 +402,8 @@ checkout's `install/`, which `git status` lists as untracked.
 
 Splash 1.1 kept prepared copies of the weights in
 `~/Library/Caches/Splash/weights` (or the directory `SPLASH_WEIGHT_CACHE`
-named), which nothing reads now and which can be deleted.
+named), which nothing reads now and which can be deleted. While the default
+directory remains, the native runtime says so when it starts, with its size.
 
 ## API
 
