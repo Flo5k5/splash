@@ -885,12 +885,29 @@ void poisonRecurrentState(const metal::MetalBackend &backend,
   std::memset(recurrent.contents(), 0xFF, recurrent.sizeBytes());
 }
 
-// Zeroes the pages: a lane computing from a NaN state writes NaN keys and
-// values there, which the checks that follow must not find.
-void clearPages(const kv::PageStorage &pages, std::span<const uint32_t> ids) {
-  for (const uint32_t page : ids)
-    for (const std::span<std::byte> bytes : pages.spans(page))
-      std::ranges::fill(bytes, std::byte{0});
+
+// Whether a lane's draft rings hold a BF16 value that is not finite, or
+// hold nothing but zero bytes.
+bool ringsHoldNonFinite(const model::QwenStateStorage &states, uint32_t lane) {
+  for (const model::DFlashDraftRingLayer &layer : states.draft(lane))
+    for (const metal::MetalBuffer *tensor : {&layer.keys, &layer.values}) {
+      const auto *bits = static_cast<const uint16_t *>(tensor->contents());
+      for (uint64_t index = 0; index < tensor->sizeBytes() / sizeof(uint16_t); ++index)
+        if ((bits[index] & 0x7F80) == 0x7F80)
+          return true;
+    }
+  return false;
+}
+
+bool ringsAreClear(const model::QwenStateStorage &states, uint32_t lane) {
+  for (const model::DFlashDraftRingLayer &layer : states.draft(lane))
+    for (const metal::MetalBuffer *tensor : {&layer.keys, &layer.values}) {
+      const auto *bytes = static_cast<const std::byte *>(tensor->contents());
+      if (std::any_of(bytes, bytes + tensor->sizeBytes(),
+                      [](std::byte value) { return value != std::byte{0}; }))
+        return false;
+    }
+  return true;
 }
 
 // A request whose own state is non-finite fails its lane instead of throwing:
@@ -899,9 +916,10 @@ void clearPages(const kv::PageStorage &pages, std::span<const uint32_t> ids) {
 // or not, and a constrained prompt's last chunk among them, its last row is
 // not finite. The failed lanes emit nothing and the backend stays healthy. The
 // GDN cells they return to the pool are cleared or overwritten before a lane
-// reads them again.
+// reads them again, and their draft rings, where the failed cycle left rows
+// that are not finite, come back cleared.
 void requireNonFiniteRowFailsOnlyItsLane(model::Runtime &executor,
-                                         const kv::PageStorage &pages,
+                                         kv::PageStorage &pages,
                                          const model::QwenStateStorage &states,
                                          const metal::MetalBackend &backend,
                                          std::span<const uint32_t> chat,
@@ -939,14 +957,21 @@ void requireNonFiniteRowFailsOnlyItsLane(model::Runtime &executor,
   require(decoded[1].failure.empty() && !decoded[1].outputTokens.empty() &&
               !decoded[1].finished && inVocabulary(decoded[1]),
           "a non-finite lane disturbed its healthy neighbour");
+  require(ringsHoldNonFinite(states, 0),
+          "the failed decode left no row that is not finite in its draft rings");
   executor.end(201);
+  // The next start takes the rings the failed lane returned last.
+  beginCold(executor, makeRequest(210, prompt40, 16), 0);
+  require(ringsAreClear(states, 0),
+          "the failed lane's draft rings came back with what it left in them");
+  executor.end(210);
   const ModelStepResult continued =
       decodeOne(executor, 202, 40 + decoded[1].outputTokens.size(), pagesB);
   require(continued.failure.empty() && !continued.outputTokens.empty() &&
               inVocabulary(continued),
           "the healthy lane did not keep decoding after its neighbour failed");
   executor.end(202);
-  clearPages(pages, pagesA);
+  pages.clearPages(pagesA);
 
   beginCold(executor, makeRequest(203, prompt80, 16), 0);
   prefillChunk(executor, 203, 0, std::span(prompt80).first(64), pagesC);
@@ -956,7 +981,7 @@ void requireNonFiniteRowFailsOnlyItsLane(model::Runtime &executor,
   require(!prefilled.failure.empty() && prefilled.outputTokens.empty(),
           "a prefill from a non-finite state did not fail its lane");
   executor.end(203);
-  clearPages(pages, pagesC);
+  pages.clearPages(pagesC);
 
   // A chunk inside the prompt computes no logits; its last row finds the
   // state that is not finite all the same.
@@ -967,7 +992,7 @@ void requireNonFiniteRowFailsOnlyItsLane(model::Runtime &executor,
                .failure.empty(),
           "a prefill chunk inside the prompt from a non-finite state did not fail its lane");
   executor.end(205);
-  clearPages(pages, pagesC);
+  pages.clearPages(pagesC);
 
   EngineRequest constrained = makeRequest(204, prompt80, 16);
   constrained.constraint = ConstraintMode::TokenMask;
@@ -980,7 +1005,7 @@ void requireNonFiniteRowFailsOnlyItsLane(model::Runtime &executor,
               constrainedEnd.nextDecodeStage != DecodeStage::ApplyInitialMask,
           "a constrained prompt's last chunk from a non-finite state asked for its first mask");
   executor.end(204);
-  clearPages(pages, pagesC);
+  pages.clearPages(pagesC);
   require(backend.healthy(), "a non-finite lane made the backend unhealthy");
   std::cout << "non_finite_rows=PASS\n";
 }
@@ -1049,7 +1074,7 @@ void requireConcurrentRequestsShareOneEncode(model::Runtime &executor,
 // command encodes the image again. Rows a finite lane of the same command
 // injected stay encoded, and the next request with the image reuses them.
 void requireNonFiniteChunkLeavesItsImageToEncode(model::Runtime &executor,
-                                                 const kv::PageStorage &pages,
+                                                 kv::PageStorage &pages,
                                                  const model::QwenStateStorage &states,
                                                  const metal::MetalBackend &backend) {
   // Each part has an image of its own: the first leaves its image cached.
@@ -1071,12 +1096,12 @@ void requireNonFiniteChunkLeavesItsImageToEncode(model::Runtime &executor,
                 executor.telemetry().imageEncodes == encodes + 1,
             "the chunk that encoded the image did not fail its lane");
     executor.end(130);
-    clearPages(pages, tableA);
+    pages.clearPages(tableA);
     require(prefillChunk(executor, 131, 0, sharing.prompt, tableB).failure.empty() &&
                 executor.telemetry().imageEncodes == encodes + 2,
             "a request sharing the image a failed chunk encoded did not encode it again");
     executor.end(131);
-    clearPages(pages, tableB);
+    pages.clearPages(tableB);
   }
   {
     const EngineRequest failing = imageRequest(132, other);
@@ -1106,14 +1131,14 @@ void requireNonFiniteChunkLeavesItsImageToEncode(model::Runtime &executor,
             "one command did not encode the image once and fail the poisoned lane alone");
     executor.end(132);
     executor.end(133);
-    clearPages(pages, tableA);
-    clearPages(pages, tableB);
+    pages.clearPages(tableA);
+    pages.clearPages(tableB);
     beginCold(executor, next, 0);
     require(prefillChunk(executor, 134, 0, next.prompt, tableA).failure.empty() &&
                 executor.telemetry().imageEncodes == encodes + 1,
             "the image a finite lane injected beside a failed one was encoded again");
     executor.end(134);
-    clearPages(pages, tableA);
+    pages.clearPages(tableA);
   }
   std::cout << "non_finite_chunk_leaves_its_image_to_encode=PASS\n";
 }

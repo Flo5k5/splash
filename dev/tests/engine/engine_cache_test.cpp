@@ -493,6 +493,39 @@ void testPageTableReportsWhatChanged() {
   cache.endRequest(3);
 }
 
+// A request's work writes its rows below writtenTokens, every row up to its
+// KV target unless said otherwise: a new page with a row the work does not
+// write comes cleared, and the pages it writes in full keep what they held.
+void testNewPagesTheWorkDoesNotFillComeCleared() {
+  test::TestKvStorage storage{16, 4096, 4};
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  std::fill(storage.content.begin(), storage.content.end(), 7);
+  cache.beginRequest(1);
+  require(cache.ensureTokens(1, 64).granted() && storage.cleared.empty(),
+          "a target at a page boundary cleared a page");
+  require(cache.ensureTokens(1, 70).granted(), "the tail page was not admitted");
+  const PageTableView table = cache.pageTable(1);
+  require(table.pages.size() == 3 &&
+              storage.cleared == std::vector<uint32_t>{table.pages[2]} &&
+              storage.content[table.pages[2]] == 0 &&
+              storage.content[table.pages[0]] == 7 && storage.content[table.pages[1]] == 7,
+          "the new tail page was not cleared, or a page written in full was");
+  require(cache.ensureTokens(1, 90).granted() && storage.cleared.size() == 1,
+          "a target inside the tail page cleared it again");
+  // A resumed lane takes back pages past where its replay ends.
+  cache.beginRequest(2);
+  require(cache.ensureTokens(2, 160, 70).granted(), "the resumed pages were not admitted");
+  const PageTableView resumed = cache.pageTable(2);
+  require(resumed.pages.size() == 5 &&
+              storage.cleared == std::vector<uint32_t>{table.pages[2], resumed.pages[2],
+                                                       resumed.pages[3], resumed.pages[4]} &&
+              storage.content[resumed.pages[1]] == 7,
+          "a page the replay does not write in full was not cleared, or one it does was");
+  cache.endRequest(2);
+  cache.endRequest(1);
+}
+
 void testCacheLookupAndOneTokenReplay() {
   CacheFixture fixture;
   fixture.publish(0);
@@ -4185,6 +4218,7 @@ int main() {
     testProbeBindsImageIdentity();
     testProbeCannotCrossCaches();
     testPageTableReportsWhatChanged();
+    testNewPagesTheWorkDoesNotFillComeCleared();
     testCacheLookupAndOneTokenReplay();
     testPage31Page32Page33Backoff();
     testLazyJunctionMaterialization();

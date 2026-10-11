@@ -280,6 +280,10 @@ struct Runtime::Impl {
     // What its activation took from a cached state: the images that end
     // there were left out (ModelRequest::restoredTokens).
     uint32_t restoredTokens = 0;
+    // A step of it found a row that is not finite (ModelStepResult::failure):
+    // its lane's draft rings may hold such rows, so the lane returns them
+    // cleared (QwenStateStorage::clearDraftRings).
+    bool resultInvalid = false;
   };
 
   struct DecodeLaneResult final {
@@ -537,6 +541,14 @@ struct Runtime::Impl {
     embeddingCache.erase(entry);
     embeddingCacheBytes -= bytes;
     return bytes;
+  }
+
+  // A resident request returns its lane's buffers to the pool.
+  void releaseLane(Request &entry) {
+    if (entry.resultInvalid)
+      states.clearDraftRings(entry.stateLane);
+    states.releaseLane(entry.stateLane, entry.id);
+    pageTableBindings[entry.stateLane] = {};
   }
 
   // A request lets go of its images; the encoded ones stay in the cache.
@@ -1038,8 +1050,10 @@ struct Runtime::Impl {
         // A failed selection leaves no anchor: the engine ends the request
         // before any output, and the other lanes go on.
         result.failure = invalidSelection({&token, 1});
-        if (!result.failure.empty())
+        if (!result.failure.empty()) {
+          entry.resultInvalid = true;
           continue;
+        }
         commitSelected(entry, {&token, 1});
         entry.maskWords.clear();
         entry.finalTargetHidden.clear();
@@ -1688,6 +1702,7 @@ struct Runtime::Impl {
       if (!laneResult.failure.empty()) {
         // The cycle's state and tokens are not committed; the engine ends
         // the request.
+        entry.resultInvalid = true;
         entry.maskWords.clear();
         entry.verifyMaskInFlight = false;
         results.push_back({.requestId = entry.id,
@@ -1952,8 +1967,7 @@ void Runtime::suspend(uint64_t requestId) {
   if (!entry.resident || entry.verifyMaskInFlight) {
     throw std::logic_error("Qwen request cannot be suspended");
   }
-  impl_->states.releaseLane(entry.stateLane, requestId);
-  impl_->pageTableBindings[entry.stateLane] = {};
+  impl_->releaseLane(entry);
   impl_->releaseImages(entry);
   entry.draftContextPlan.reset();
   entry.draftRebuild.reset();
@@ -2205,6 +2219,7 @@ Runtime::prefillAsync(const BatchPlan &plan,
       const uint64_t nextLength = item.logicalPosition + item.tokenCount;
       if (!finite[lane]) {
         // The chunk's state is not committed; the engine ends the request.
+        entry.resultInvalid = true;
         results.push_back({.requestId = entry.id,
                            .consumedPromptTokens = item.tokenCount,
                            .failure = "target prefill row is not finite"});
@@ -2219,6 +2234,7 @@ Runtime::prefillAsync(const BatchPlan &plan,
             !failure.empty()) {
           // The chunk's state is not committed; the engine ends the
           // request.
+          entry.resultInvalid = true;
           results.push_back({.requestId = entry.id,
                              .consumedPromptTokens = item.tokenCount,
                              .failure = std::move(failure)});
@@ -2264,6 +2280,7 @@ Runtime::prefillAsync(const BatchPlan &plan,
               // before cache publication or output and the batch survives.
               result.scoreLogits.clear();
               result.failure = "score logit is not finite";
+              entry.resultInvalid = true;
               break;
             }
             result.scoreLogits.push_back(logit);
@@ -2486,10 +2503,8 @@ void Runtime::end(uint64_t requestId) {
   if (found == impl_->requests.end())
     return;
   impl_->releaseImages(found->second);
-  if (found->second.resident) {
-    impl_->states.releaseLane(found->second.stateLane, requestId);
-    impl_->pageTableBindings[found->second.stateLane] = {};
-  }
+  if (found->second.resident)
+    impl_->releaseLane(found->second);
   impl_->requests.erase(found);
 }
 

@@ -675,6 +675,18 @@ void run(const std::string &metallib) {
                 word(storage.current(0).recurrentLayers[0]) == 0 &&
                 word(storage.current(0).stateBase, tailWord) == 0,
             "a cold start left readable state in the current cell");
+    // A lane whose request found a row that is not finite clears every
+    // layer's ring keys and values before its release.
+    const model::DFlashDraftRingLayer &lastRing = storage.draft(0).back();
+    const uint64_t ringTail = lastRing.values.sizeBytes() - sizeof(uint32_t);
+    word(storage.draft(0)[0].keys) = 0xe1e1e1e1;
+    word(storage.draft(0)[0].values) = 0xe2e2e2e2;
+    word(lastRing.keys) = 0xe3e3e3e3;
+    word(lastRing.values, ringTail) = 0xe4e4e4e4;
+    storage.clearDraftRings(0);
+    require(word(storage.draft(0)[0].keys) == 0 && word(storage.draft(0)[0].values) == 0 &&
+                word(lastRing.keys) == 0 && word(lastRing.values, ringTail) == 0,
+            "the lane's draft rings were not cleared");
 
     // Rejected publications fail before any cache slot is taken or admitted.
     const uint64_t beforeRejected = storage.actualAllocatedBytes();

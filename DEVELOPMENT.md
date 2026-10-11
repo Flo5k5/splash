@@ -2101,8 +2101,12 @@ score request as a score logit. The engine reports `model_result_invalid` for
 that request alone, before it publishes the failing step's cache state or any
 output, and the rest of the batch finishes normally. Since every step that
 publishes was checked, what earlier steps published stays, as it does for a
-cancelled request. GPU faults and broken engine invariants stay fatal and still
-mark the runtime unhealthy.
+cancelled request. Such values cannot reach the next holder of a request's
+memory either: a page a request takes comes with zeros in the rows its work
+does not write, and the lane of a request that found one returns its draft
+rings cleared, since attention weighs rows past a request's end by zero and a
+BF16 value is read as stored (0 × NaN is NaN). GPU faults and broken engine
+invariants stay fatal and still mark the runtime unhealthy.
 
 Request logs omit bodies; full crash traces require explicit
 `SPLASH_CRASH_TRACE=1` and can contain private conversation data. With it, a

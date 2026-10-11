@@ -378,7 +378,8 @@ bool Cache::retireCheckpointState(StateCheckpoint checkpoint) noexcept {
 // the governor admits one. Making room is the caller's reclaim; a page that
 // must be written first comes back when its copy lands.
 
-TokenAdmission Cache::ensureTokens(uint64_t requestId, uint64_t tokenCount) {
+TokenAdmission Cache::ensureTokens(uint64_t requestId, uint64_t tokenCount,
+                                   uint64_t writtenTokens) {
   Request &active = request(requestId);
   const uint64_t needed64 =
       (tokenCount + KvCache::pageTokens - 1) / KvCache::pageTokens;
@@ -392,6 +393,10 @@ TokenAdmission Cache::ensureTokens(uint64_t requestId, uint64_t tokenCount) {
   if (const TokenAdmission admission = admitPages(needed - previousSize, acquired);
       !admission.granted())
     return admission;
+  const uint64_t written = std::min(writtenTokens, tokenCount);
+  for (uint32_t index = 0; index < acquired.size(); ++index)
+    if (uint64_t{previousSize + index + 1} * KvCache::pageTokens > written)
+      pool_.clearPage(acquired[index]);
   active.pages.insert(active.pages.end(), acquired.begin(), acquired.end());
   pagesChanged(active, previousSize);
   return {};

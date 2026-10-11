@@ -5509,6 +5509,57 @@ void testFirstTokenSentBeforeASuspensionIsNotSentAgain() {
           "the resumed lane replayed its first token or sent it again");
 }
 
+// A lane suspended in its decode takes new pages past the chain it restores
+// when it resumes, which its replay writes in chunks that may end inside any
+// of them: they all come cleared, so rows not yet written read zero whoever
+// held them before.
+void testResumedLaneClearsThePagesPastItsRestoredChain() {
+  test::TestKvStorage storage(512, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, nullptr, nullptr);
+  Executor executor;
+  executor.firstTokens = true;
+  executor.decodeFinishes = false;
+  executor.decodeTokens = 4;
+  executor.beginGrowthBlocked = [&] {
+    return executor.lastBeginId == 2 && executor.requests.at(1).resident;
+  };
+  Events events;
+  engine::Engine engine(test::engineConfig(), resources, executor, events);
+  guardReleases(storage, engine);
+
+  auto background = request(1, std::vector<uint32_t>(40, 1));
+  background.priority = RequestPriority::Background;
+  background.maxNewTokens = 80;
+  engine.submit(std::move(background));
+  double now = 1;
+  tickUntil(engine, now,
+            [&] { return events.outputs.contains(1) && events.outputs.at(1).size() >= 41; },
+            "the lane did not decode");
+  auto normal = request(2, std::vector<uint32_t>(9, 2));
+  normal.maxNewTokens = 4;
+  engine.submit(std::move(normal));
+  tickUntil(engine, now, [&] { return !executor.requests.at(1).resident; },
+            "the Background lane was not suspended");
+  const size_t cleared = storage.cleared.size();
+  tickUntil(engine, now, [&] { return executor.requests.at(1).resident; },
+            "the Background lane did not resume");
+  const auto replayEnd = static_cast<uint32_t>(executor.resumedPrompts.at(0).size());
+  const PageTableView table = resources.pageTable(1);
+  const std::vector<uint32_t> pages(table.pages.begin(), table.pages.end());
+  const uint32_t restored = executor.lastRestoredTokens / KvCache::pageTokens;
+  require(replayEnd % KvCache::pageTokens && replayEnd / KvCache::pageTokens < pages.size() &&
+              restored + 1 < pages.size() && restored <= replayEnd / KvCache::pageTokens,
+          "fixture did not take pages past its restored chain");
+  for (size_t page = restored; page < pages.size(); ++page)
+    require(std::find(storage.cleared.begin() + cleared, storage.cleared.end(), pages[page]) !=
+                storage.cleared.end(),
+            "a page past the resumed lane's restored chain was not cleared");
+  tickUntil(engine, now, [&] { return idle(engine); }, "the requests did not end");
+  require(events.completedCount == 2 && events.failedCount == 0,
+          "the resumed lane did not complete");
+}
+
 void testPrefillCanCompleteTheRequest() {
   for (bool stop : {false, true}) {
     test::TestKvStorage storage(8, 4096, 4);
@@ -9059,6 +9110,7 @@ int main() {
     testPrefillCanCompleteTheRequest();
     testFirstTokenIsSentAtPrefill();
     testFirstTokenSentBeforeASuspensionIsNotSentAgain();
+    testResumedLaneClearsThePagesPastItsRestoredChain();
     testOutOfVocabularyOutputFailsLaneOnly();
     std::cout << "engine tests passed\n";
     return EXIT_SUCCESS;

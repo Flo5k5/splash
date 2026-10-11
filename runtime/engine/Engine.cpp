@@ -738,9 +738,14 @@ bool Engine::admit(Request &active, double now) {
       lookup.state && (!lookup.state->state()->residentBytes() ||
                        cache_.kvRestoreStatus(requestId) == KvRestoreStatus::Pending);
   if (kv.admission.granted() && (resuming || restoring)) {
+    // A lane that resumes holds the chain it restored and takes new pages
+    // past it, which its replay writes in chunks that may end inside any
+    // of them: they all come cleared.
     const uint64_t workEnd =
         resuming ? active.resumeKvTargetTokens : uint64_t{resumeBoundary} + 1;
-    kv = allocate([&] { return cache_.ensureTokens(requestId, workEnd); }, inService, upTo);
+    const uint64_t written = resuming ? uint64_t{resumeBoundary} : workEnd;
+    kv = allocate([&] { return cache_.ensureTokens(requestId, workEnd, written); }, inService,
+                  upTo);
   }
   if (!kv.admission.granted()) {
     // The host continuation survives this failed admission. No recurrent
