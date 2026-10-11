@@ -212,6 +212,22 @@ class NativeBackendContractTests(unittest.TestCase):
         with self.assertRaises(api_errors.ConstraintError):
             generation_constraints.TokenConstraint(None, None).masks(tuple(range(9)))
 
+    def test_release_weights_asks_the_engine_and_returns_its_status(self):
+        transport, runtime = self.make_transport()
+        snapshot = transport.release_weights()
+        self.assertEqual(runtime.release_calls, 1)
+        self.assertIs(snapshot["weights"]["released"], True)
+        runtime.release_event = native_peer.status_event(
+            weights={"released": False, "restores": 0, "restore_failures": 0}
+        )
+        # A busy engine leaves the weights loaded: the status says so.
+        self.assertIs(transport.release_weights()["weights"]["released"], False)
+        transport.closing = True
+        with self.assertRaises(api_errors.APIError) as raised:
+            transport.release_weights()
+        self.assertEqual(raised.exception.status, 503)
+        self.assertEqual(runtime.release_calls, 2)
+
     def test_http_fields_reach_native_generation_request(self):
         transport, runtime = self.make_transport()
         app = make_frontend(

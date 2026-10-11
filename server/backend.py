@@ -610,6 +610,36 @@ class NativeBackend:
             frame, job.deadline, self._mask_provider(job), job.image_owner
         )
 
+    def release_weights(self, timeout=5.0):
+        """Asks the engine to give its weights back now; returns its status.
+
+        It releases only while no request is in service and no restore is
+        under way; `weights.released` in the returned snapshot says whether it
+        did. The next request restores the weights as after the idle release.
+        """
+        with self.lock:
+            if self.closing:
+                raise APIError(503, "server is shutting down", "server_shutdown")
+        restarts = self.runtime.restart_count
+        try:
+            event = self.runtime.release_weights(timeout=timeout)
+        except TimeoutError:
+            # The engine answers between commands: it is running a long one.
+            raise APIError(
+                503,
+                f"the engine did not answer within {timeout:g} s; retry shortly",
+                "engine_busy",
+            ) from None
+        except (
+            engine_runtime.EngineUnhealthy,
+            engine_runtime.ProtocolFatal,
+            engine_runtime.RuntimeClosed,
+        ) as error:
+            raise self.refusal() or self._api_error(error) from None
+        snapshot = self._decode_status_event(event)
+        self._cache_status(snapshot, restarts)
+        return snapshot
+
     def submit(self, job):
         state = None
 

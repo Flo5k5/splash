@@ -153,6 +153,7 @@ private:
   bool handleCancel(const protocol::CancelFrame &cancel);
   bool handleMask(const protocol::MaskResponseFrame &mask);
   bool handleStatus(const protocol::StatusRequestFrame &status);
+  bool handleRelease(const protocol::ReleaseRequestFrame &release);
   bool handleMaskIssue(protocol::ProtocolIssue issue);
   bool handleIssue(protocol::ProtocolIssue issue);
   void requestError(uint64_t requestId, std::string code, std::string message,

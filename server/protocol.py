@@ -15,7 +15,7 @@ from dataclasses import dataclass, fields
 from enum import IntEnum, IntFlag
 from typing import TypeAlias
 
-PROTOCOL_VERSION = 8
+PROTOCOL_VERSION = 9
 # A frame is its header, the magic, the protocol version, the frame type and
 # the payload length, then the payload.
 FRAME_HEADER_BYTES = 16
@@ -49,6 +49,7 @@ _IMAGE_SPAN = struct.Struct("<IIIIQQ")
 _CANCEL = struct.Struct("<Q")
 _MASK_RESPONSE = struct.Struct("<QQI")
 _STATUS_REQUEST = struct.Struct("<Q")
+_RELEASE_REQUEST = struct.Struct("<Q")
 _READY = struct.Struct("<IIB")
 _START = struct.Struct("<QII")
 _PROMPT_PROGRESS = struct.Struct("<QIQ")
@@ -81,6 +82,7 @@ class FrameType(IntEnum):
     CANCEL = 0x0002
     MASK_RESPONSE = 0x0003
     STATUS_REQUEST = 0x0004
+    RELEASE_REQUEST = 0x0005
 
     READY = 0x0100
     START = 0x0101
@@ -279,6 +281,14 @@ class StatusRequestFrame:
 
 
 @dataclass(slots=True, frozen=True)
+class ReleaseRequestFrame:
+    """Give the weights back now when the engine holds no request; answered
+    by a status JSON with the same correlation id."""
+
+    correlation_id: int
+
+
+@dataclass(slots=True, frozen=True)
 class ReadyEvent:
     max_concurrent_requests: int
     max_context_tokens: int
@@ -364,7 +374,11 @@ class StatusJsonEvent:
 
 
 ClientMessage: TypeAlias = (
-    RequestFrame | CancelFrame | MaskResponseFrame | StatusRequestFrame
+    RequestFrame
+    | CancelFrame
+    | MaskResponseFrame
+    | StatusRequestFrame
+    | ReleaseRequestFrame
 )
 EngineEvent: TypeAlias = (
     ReadyEvent
@@ -513,6 +527,8 @@ def _payload_bounds(frame_type: FrameType) -> tuple[int, int]:
             bounds = (_MASK_RESPONSE.size, _MASK_RESPONSE.size + MAX_MASK_WORDS * 4)
         case FrameType.STATUS_REQUEST:
             bounds = (_STATUS_REQUEST.size, _STATUS_REQUEST.size)
+        case FrameType.RELEASE_REQUEST:
+            bounds = (_RELEASE_REQUEST.size, _RELEASE_REQUEST.size)
         case FrameType.READY:
             bounds = (_READY.size, _READY.size)
         case FrameType.PROMPT_PROGRESS:
@@ -813,6 +829,16 @@ def _status_request_frame(request: StatusRequestFrame) -> bytearray:
     return frame
 
 
+def _release_request_frame(request: ReleaseRequestFrame) -> bytearray:
+    try:
+        correlation_id = _u64(request.correlation_id, "release correlation id")
+    except ValueError as error:
+        _fail_request(IssueCode.INTEGER_OVERFLOW, str(error))
+    frame = _frame(FrameType.RELEASE_REQUEST, _RELEASE_REQUEST.size)
+    _RELEASE_REQUEST.pack_into(frame, FRAME_HEADER_BYTES, correlation_id)
+    return frame
+
+
 def serialize_message(message: ClientMessage) -> bytearray:
     """Validate and serialize one client message as a whole frame, built in
     one buffer: a request's image pixels are copied once."""
@@ -825,6 +851,8 @@ def serialize_message(message: ClientMessage) -> bytearray:
             return _mask_response_frame(message)
         if isinstance(message, StatusRequestFrame):
             return _status_request_frame(message)
+        if isinstance(message, ReleaseRequestFrame):
+            return _release_request_frame(message)
     except MemoryError as error:
         raise ProtocolError(
             _allocation_issue("allocation failed while serializing a client frame")

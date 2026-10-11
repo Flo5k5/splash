@@ -190,6 +190,9 @@ class PostRoute:
     # engine's state refuses none of its requests, which hold slots of the
     # token-count gate instead of the request gate.
     prompt_only: bool = False
+    # Whether it takes no fields: a request carries no body or an empty JSON
+    # object.
+    fieldless: bool = False
 
 
 POST_ROUTES = {
@@ -206,6 +209,9 @@ POST_ROUTES = {
     ),
     "/v1/judgments": PostRoute("_post_judgments", OPENAI_ERRORS),
     "/v1/systemone": PostRoute("_post_systemone", SYSTEMONE_ERRORS),
+    "/v1/memory/release": PostRoute(
+        "_post_memory_release", OPENAI_ERRORS, fieldless=True
+    ),
 }
 
 
@@ -672,8 +678,13 @@ class FrontendHandler(BaseHTTPRequestHandler):
         """Read the request and serve it: answer it, or prepare the
         generation it asks for and return its job and the method that answers
         with the job's output."""
-        with self.app.latencies.measure("upload"):
-            body = self._read_json_body(started_at + self.app.request_timeout)
+        if route.fieldless and not self._unread_body:
+            body = {}
+        else:
+            with self.app.latencies.measure("upload"):
+                body = self._read_json_body(started_at + self.app.request_timeout)
+            if route.fieldless and body:
+                raise APIError(400, "this endpoint takes no fields")
         serve = getattr(self, route.method)
         return serve(body, self.app.request_deadline(body, started_at))
 
@@ -771,6 +782,17 @@ class FrontendHandler(BaseHTTPRequestHandler):
             200,
             judgments.judgment_response(self.app.response_model, row, job, result),
         )
+
+    def _post_memory_release(self, body, deadline):
+        weights = self.app.backend.release_weights().get("weights") or {}
+        if weights.get("released") is not True:
+            raise APIError(
+                409,
+                "the engine is serving requests or restoring its weights; "
+                "the weights stay loaded",
+                "engine_busy",
+            )
+        self._json(200, {"released": True, "weights": weights})
 
     def _post_systemone(self, body, deadline):
         answers = {}

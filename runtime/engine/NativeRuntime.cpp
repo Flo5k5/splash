@@ -260,6 +260,8 @@ bool NativeRuntime::handle(protocol::ClientMessage &message) {
           return handleCancel(typed);
         } else if constexpr (std::is_same_v<T, protocol::MaskResponseFrame>) {
           return handleMask(typed);
+        } else if constexpr (std::is_same_v<T, protocol::ReleaseRequestFrame>) {
+          return handleRelease(typed);
         } else {
           return handleStatus(typed);
         }
@@ -356,6 +358,18 @@ bool NativeRuntime::handleStatus(const protocol::StatusRequestFrame &status) {
   if (json.empty())
     throw std::runtime_error("empty status document");
   return send(protocol::StatusJsonEvent{status.correlationId, std::move(json)});
+}
+
+// The weights go back now, as at the end of the idle release, when the engine
+// holds no request and no restore is under way; otherwise nothing changes. The
+// answer is the status document either way: its `weights.released` tells
+// the caller which.
+bool NativeRuntime::handleRelease(const protocol::ReleaseRequestFrame &release) {
+  if (!config_.weights->released() && !restoreStarted_ && core_.idle()) {
+    config_.weights->release();
+    logLine("Weights released on request; the next request restores them");
+  }
+  return handleStatus(protocol::StatusRequestFrame{release.correlationId});
 }
 
 bool NativeRuntime::handleMaskIssue(protocol::ProtocolIssue issue) {
