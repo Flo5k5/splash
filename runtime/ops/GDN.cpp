@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -151,11 +152,18 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
   // step's; no step's tape may overlap a tape another lane, or the step's own
   // lane, reads or writes.
   const uint64_t tapeBytes = gdnTapeLayerBytes(shape);
+  // Validate the complete layer extent before adding the slot offset. An
+  // overflowing offset could otherwise wrap past both the overlap and
+  // buffer-extent checks below.
+  const uint64_t layerOffset = uint64_t{layer} * tapeBytes;
+  const uint64_t lastSlot = std::numeric_limits<uint64_t>::max() - layerOffset - tapeBytes;
   const auto overlaps = [&](uint64_t a, uint64_t b) { return a < b + tapeBytes && b < a + tapeBytes; };
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     const GdnTapeLane &tape = buffers.tapeLanes[lane];
-    params.pending_tape[lane] = tape.pendingSlot + uint64_t{layer} * tapeBytes;
-    params.step_tape[lane] = tape.stepSlot + uint64_t{layer} * tapeBytes;
+    if (tape.pendingSlot > lastSlot || tape.stepSlot > lastSlot)
+      throw std::invalid_argument("invalid GDN decode tape");
+    params.pending_tape[lane] = tape.pendingSlot + layerOffset;
+    params.step_tape[lane] = tape.stepSlot + layerOffset;
     params.pending_rows[lane] = tape.pendingRows;
     if (tape.pendingRows > SPLASH_TARGET_VERIFY_ROWS || params.pending_tape[lane] % 16 ||
         params.step_tape[lane] % 16)

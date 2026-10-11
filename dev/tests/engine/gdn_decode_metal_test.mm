@@ -10,7 +10,8 @@
 // k/v and gates on the tape; the hidden rows from the recurrent rows read
 // from that state with the reference q and rounded to bf16. The decode
 // gate's hidden rows are also checked bit for bit against the prefill gate's
-// from the same recurrent rows.
+// from the same recurrent rows. Changing multi-step batches are compared
+// bit for bit with independent lanes, with rejected tape rows poisoned.
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
 #include "metal/MetalBackend.hpp"
@@ -31,6 +32,8 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -655,6 +658,119 @@ std::string caseName(const char *test, const GdnShape &shape, uint32_t lanes, Li
          (layout == LinearInput::Plain ? " plain" : " Table16");
 }
 
+// A lane's result depends on its retained prefix, not its position in a
+// batch or whether other lanes ran while it was idle. Compare ten changing
+// batches against one-lane submissions, including repeated partial/full
+// acceptance and both tape parities. Each storage lane keeps its own cells
+// and slots while the batch shrinks, reorders and later rejoins it.
+void replayAcrossBatches(MetalBackend &backend, const GdnShape &shape, bool float32,
+                         GdnHeadOrder order, LinearInput layout) {
+  Fixture batched(backend, shape, kMaxLanes, float32);
+  Fixture individual(backend, shape, kMaxLanes, float32);
+  const uint32_t width = shape.valueHeads * shape.headDimension;
+  const uint64_t hiddenBytes = uint64_t{kRows} * width * 2;
+  const std::string what = caseName("replay across batches", shape, kMaxLanes, layout) +
+                           (float32 ? " f32 norm" : " bf16 norm") +
+                           (order == GdnHeadOrder::Tiled ? " tiled" : " grouped");
+  constexpr std::array widths{4U, 2U, 3U, 1U, 4U};
+  // No rows are pending initially. Later, poison only the rejected suffix
+  // of each step's tape; reading beyond its retained prefix must fail.
+  std::memset(batched.tape.contents(), 0xFF, batched.tape.sizeBytes());
+  for (uint32_t cycle = 0; cycle < 10; ++cycle) {
+    const uint32_t lanes = widths[cycle % widths.size()];
+    const std::string where = what + " cycle " + std::to_string(cycle);
+    batched.fillPacked();
+    individual.fillPacked();
+    std::array<uint32_t, kMaxLanes> storage{};
+    std::array<MetalBuffer, kMaxLanes> current, next;
+    std::array<GdnTapeLane, kMaxLanes> tapes{};
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+      const uint32_t stateLane = storage[lane] = (lane + cycle) % kMaxLanes;
+      current[lane] = batched.current[stateLane];
+      next[lane] = batched.next[stateLane];
+      tapes[lane] = batched.tapeLanes[stateLane];
+      for (uint32_t layer = 0; layer < kLayers; ++layer)
+        std::memcpy(static_cast<uint16_t *>(batched.packedLayer[layer].contents()) + lane * batched.packedStride,
+                    individual.packedRow(layer, stateLane, 0), batched.packedStride * 2);
+    }
+    for (uint32_t lane = lanes; lane < kMaxLanes; ++lane) {
+      current[lane] = current[0];
+      next[lane] = next[0];
+    }
+    std::optional<PreparedTables> tables;
+    if (layout != LinearInput::Plain)
+      tables.emplace(backend, layout, width, lanes);
+    CommandGraph batchGraph, individualGraph;
+    PreparedInput prepared;
+    for (uint32_t layer = 0; layer < kLayers; ++layer) {
+      auto buffers = batched.decodeBuffers(layer);
+      buffers.currentStates = current;
+      buffers.nextStates = next;
+      buffers.tapeLanes = std::span(tapes).first(lanes);
+      if (tables)
+        buffers.linearScratch = tables->scratch();
+      prepared = GDN::addDecode(batchGraph, buffers, shape, lanes, layer, batched.cell.strides(), order, layout);
+      for (uint32_t lane = 0; lane < lanes; ++lane) {
+        const uint32_t stateLane = storage[lane];
+        auto single = individual.decodeBuffers(layer);
+        std::array<MetalBuffer, kMaxLanes> singleCurrent, singleNext;
+        singleCurrent.fill(individual.current[stateLane]);
+        singleNext.fill(individual.next[stateLane]);
+        const std::array singleTape{individual.tapeLanes[stateLane]};
+        single.packed = backend.view(individual.packedLayer[layer], stateLane * individual.packedStride * 2,
+                                     individual.packedStride * 2);
+        single.hidden = backend.view(individual.hidden, stateLane * hiddenBytes, hiddenBytes);
+        single.currentStates = singleCurrent;
+        single.nextStates = singleNext;
+        single.tapeLanes = singleTape;
+        (void)GDN::addDecode(individualGraph, single, shape, 1, layer, individual.cell.strides(), order,
+                             LinearInput::Plain);
+      }
+    }
+    if (tables)
+      tables->addReference(batchGraph, batched.hidden);
+    (void)backend.submitCommandAsync(batchGraph.dispatches()).wait();
+    (void)backend.submitCommandAsync(individualGraph.dispatches()).wait();
+    if (tables)
+      tables->requireWritten(prepared, batched.hidden, where);
+    else
+      require(prepared.layout == LinearInput::Plain, where + ": plain GDN claimed a table");
+    for (uint32_t stateLane = 0; stateLane < kMaxLanes; ++stateLane) {
+      // Includes idle lanes: neither parity may change when a lane is omitted.
+      require(!std::memcmp(batched.current[stateLane].contents(), individual.current[stateLane].contents(),
+                           batched.cell.bytes), where + ": incoming cell mismatch");
+      require(!std::memcmp(batched.next[stateLane].contents(), individual.next[stateLane].contents(),
+                           batched.cell.bytes), where + ": folded cell mismatch");
+    }
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+      const uint32_t stateLane = storage[lane];
+      require(!std::memcmp(batched.hiddenRow(lane, 0, 0), individual.hiddenRow(stateLane, 0, 0), hiddenBytes),
+              where + ": hidden rows changed with batching");
+      const uint32_t retained = 1 + (cycle + stateLane) % kRows;
+      for (uint32_t layer = 0; layer < kLayers; ++layer) {
+        const uint64_t slot = batched.tapeLanes[stateLane].stepSlot;
+        require(!std::memcmp(batched.tapeLayer(slot, layer), individual.tapeLayer(slot, layer), batched.tapeBytes),
+                where + ": step tape changed with batching");
+        auto *tape = static_cast<uint8_t *>(batched.tape.contents()) + slot + layer * batched.tapeBytes;
+        for (const auto &[offset, rowBytes] :
+             {std::pair{uint64_t{0}, uint64_t{shape.convolutionDimension} * 2},
+              std::pair{gdn_tape_kv_offset(shape.convolutionDimension), batched.kvWidth * 2},
+              std::pair{gdn_tape_decay_offset(shape.convolutionDimension, batched.kvWidth),
+                        uint64_t{shape.valueHeads} * 4},
+              std::pair{gdn_tape_beta_offset(shape.convolutionDimension, batched.kvWidth, shape.valueHeads),
+                        uint64_t{shape.valueHeads} * 2}})
+          std::memset(tape + offset + retained * rowBytes, 0xFF, (kRows - retained) * rowBytes);
+      }
+      for (Fixture *fixture : {&batched, &individual}) {
+        std::swap(fixture->current[stateLane], fixture->next[stateLane]);
+        auto &tape = fixture->tapeLanes[stateLane];
+        std::swap(tape.pendingSlot, tape.stepSlot);
+        tape.pendingRows = retained;
+      }
+    }
+  }
+}
+
 void fusedPreparation(MetalBackend &backend, const GdnShape &shape, uint32_t lanes, LinearInput layout,
                       bool float32) {
   const std::string what = caseName(float32 ? "fused GDN, F32 norms," : "fused GDN, bf16 norms,", shape, lanes, layout);
@@ -968,6 +1084,23 @@ void rejectsInvalid(MetalBackend &backend) {
                          LinearInput::Plain);
         },
         "invalid GDN decode tape", "a GDN decode took more pending rows than a step's or overlapping tapes");
+  // Offset arithmetic must not wrap either when selecting a layer or when
+  // reaching the end of its tape. Otherwise the extent/overlap checks can
+  // accept an offset far outside the buffer without submitting it here.
+  const uint64_t nearEnd = std::numeric_limits<uint64_t>::max() - 15;
+  for (const bool pending : {false, true})
+    for (const auto &[slot, layer] :
+         {std::pair{nearEnd, 0U}, std::pair{uint64_t{0} - tape, 1U}})
+      rejects(
+          [&] {
+            auto tapeLanes = fixture.tapeLanes;
+            (pending ? tapeLanes[0].pendingSlot : tapeLanes[0].stepSlot) = slot;
+            auto buffers = fixture.decodeBuffers(layer);
+            buffers.tapeLanes = tapeLanes;
+            GDN::addDecode(graph, buffers, shape, 1, layer, fixture.cell.strides(),
+                           GdnHeadOrder::Grouped, LinearInput::Plain);
+          },
+          "invalid GDN decode tape", "a GDN decode accepted an overflowing tape offset");
   rejects(
       [&] {
         auto buffers = fixture.decodeBuffers(0);
@@ -1020,6 +1153,11 @@ int main(int argc, char **argv) {
       for (const GdnShape &shape : kShapes)
         for (GdnHeadOrder order : {GdnHeadOrder::Grouped, GdnHeadOrder::Tiled})
           gateMatchesPrefill(backend, shape, float32, order);
+    for (const GdnShape &shape : kShapes)
+      for (bool float32 : {false, true})
+        for (GdnHeadOrder order : {GdnHeadOrder::Grouped, GdnHeadOrder::Tiled})
+          for (LinearInput layout : {LinearInput::Plain, LinearInput::Table16})
+            replayAcrossBatches(backend, shape, float32, order, layout);
     std::cout << "gdn_decode_metal_test: PASS\n";
     return 0;
   } catch (const std::exception &error) {
