@@ -11,9 +11,12 @@
 // is element dim as bf16. Every format's value keeps the source order of its
 // float operations (reassociate(off)), as the GGUF GEMMs do.
 
-// The little-endian half at byte `at` of a block.
+// The little-endian ushort at byte `at` of a block, and the half it holds.
+inline ushort gguf_u16(device const uchar *block, uint at) {
+  return ushort(block[at] | (block[at + 1] << 8));
+}
 inline half gguf_half(device const uchar *block, uint at) {
-  return as_type<half>(ushort(block[at] | (block[at + 1] << 8)));
+  return as_type<half>(gguf_u16(block, at));
 }
 
 // block_q4_K: half d | half dmin | uchar scales[12] | uchar qs[128], eight
@@ -150,6 +153,26 @@ struct GgufEmbedIQ3S {
     const uint s = (block[Scales + j / 2] >> (4 * (j % 2))) & 15;
     const float sign = (block[Signs + 4 * j + l / 8] >> (l % 8)) & 1 ? -1.0f : 1.0f;
     return bfloat(float(gguf_half(block, D)) * float(1 + 2 * s) * float(magnitude) * sign);
+  }
+};
+// block_iq1_m: uchar qs[32] | uchar qh[16] | ushort scales[4], eight 32-weight groups of four 8-weight IQ1_S grid
+// entries: entry e of group j is kIQ1SGrid[qs[4 j + e] | (h & 7) << 8] for h nibble e % 2 of qh[2 j + e / 2], whose
+// bit 3 makes its delta -1/8 (else +1/8); element k is nibble k / 4 of the entry's byte k % 4, less 1. Entries e and
+// e + 1 (e even) scale by 1 + 2 s, s the three bits at 6 (j % 2) + 3 (e / 2) of scales[j / 2], times the half d whose
+// nibble w is the top nibble of scales[w]; value = d (1 + 2 s) (grid + delta), llama.cpp's operation order.
+struct GgufEmbedIQ1M {
+  enum : uint { Weights = 256, Bytes = 56, Codes = 0, High = 32, Scales = 48 };
+  __attribute__((always_inline)) static bfloat value(device const uchar *block, uint dim) {
+#pragma clang fp reassociate(off)
+    const uint j = (dim % Weights) / 32, e = (dim % 32) / 8, k = dim % 8;
+    const ushort d = (gguf_u16(block, Scales) >> 12) | ((gguf_u16(block, Scales + 2) >> 8) & 0x00F0) |
+                     ((gguf_u16(block, Scales + 4) >> 4) & 0x0F00) | (gguf_u16(block, Scales + 6) & 0xF000);
+    const uint s = (gguf_u16(block, Scales + 2 * (j / 2)) >> (6 * (j % 2) + 3 * (e / 2))) & 7;
+    const uint h = block[High + 2 * j + e / 2] >> (4 * (e % 2));
+    const uint entry = kIQ1SGrid[block[Codes + 4 * j + e] | ((h & 7) << 8)];
+    const int grid = int((entry >> (8 * (k % 4) + 4 * (k / 4))) & 15) - 1;
+    const float delta = h & 8 ? -0.125f : 0.125f;
+    return bfloat(float(as_type<half>(d)) * float(1 + 2 * s) * (float(grid) + delta));
   }
 };
 // block_mxfp4: uchar e | uchar qs[16], element l in nibble l / 16 of qs[l % 16], an E2M1 code; value =
