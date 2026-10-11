@@ -18,7 +18,7 @@
 // pins the bytes both sides agree on.
 namespace splash::protocol {
 
-inline constexpr uint16_t kProtocolVersion = 8;
+inline constexpr uint16_t kProtocolVersion = 9;
 // A frame is its header, the magic "SPLH", the u16 protocol version, the
 // u16 FrameType and the u64 payload length, then the payload.
 inline constexpr size_t kFrameHeaderBytes = 16;
@@ -35,6 +35,7 @@ enum class FrameType : uint16_t {
   Cancel = 0x0002,
   MaskResponse = 0x0003,
   StatusRequest = 0x0004,
+  ReleaseRequest = 0x0005,
 
   Ready = 0x0100,
   Start = 0x0101,
@@ -178,6 +179,7 @@ struct RequestFrame {
 //   Cancel         u64 requestId
 //   MaskResponse   u64 requestId, u64 maskRequestId, u32 count, u32 words
 //   StatusRequest  u64 correlationId
+//   ReleaseRequest u64 correlationId
 //   Ready          u32 maxConcurrentRequests, u32 maxContextTokens, u8 vision
 //   Start          u64 requestId, u32 lane, u32 matchedPromptTokens
 //   PromptProgress u64 requestId, u32 processedTokens, u64 elapsedMicros
@@ -208,6 +210,15 @@ struct StatusRequestFrame {
   uint64_t correlationId = 0;
 
   bool operator==(const StatusRequestFrame &) const = default;
+};
+
+// Asks the engine to give its weights back now, as the idle release does, when
+// it holds no request. The answer is a StatusJson with the same correlationId,
+// whose `weights.released` says whether the weights are released.
+struct ReleaseRequestFrame {
+  uint64_t correlationId = 0;
+
+  bool operator==(const ReleaseRequestFrame &) const = default;
 };
 
 struct ReadyEvent {
@@ -293,7 +304,7 @@ struct StatusJsonEvent {
 };
 
 using ClientMessage = std::variant<RequestFrame, CancelFrame, MaskResponseFrame,
-                                   StatusRequestFrame>;
+                                   StatusRequestFrame, ReleaseRequestFrame>;
 using EngineEvent =
     std::variant<ReadyEvent, StartEvent, PromptProgressEvent, TokensEvent,
                  MaskRequestEvent, DoneEvent, ErrorEvent, StatusJsonEvent>;

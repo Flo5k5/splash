@@ -206,6 +206,7 @@ POST_ROUTES = {
     ),
     "/v1/judgments": PostRoute("_post_judgments", OPENAI_ERRORS),
     "/v1/systemone": PostRoute("_post_systemone", SYSTEMONE_ERRORS),
+    "/v1/memory/release": PostRoute("_post_memory_release", OPENAI_ERRORS),
 }
 
 
@@ -771,6 +772,18 @@ class FrontendHandler(BaseHTTPRequestHandler):
             200,
             judgments.judgment_response(self.app.response_model, row, job, result),
         )
+
+    def _post_memory_release(self, body, deadline):
+        if body:
+            raise APIError(400, "the release request takes no fields")
+        weights = self.app.backend.release_weights().get("weights") or {}
+        if weights.get("released") is not True:
+            raise APIError(
+                409,
+                "requests are in service; the weights stay loaded",
+                "engine_busy",
+            )
+        self._json(200, {"released": True, "weights": weights})
 
     def _post_systemone(self, body, deadline):
         answers = {}

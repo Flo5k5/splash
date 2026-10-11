@@ -1686,6 +1686,54 @@ void testIdleReleaseOffKeepsTheWeights() {
   }
 }
 
+// A release request gives the weights back now, with the idle release off, when the
+// engine holds no request and no restore is under way; the answer is the status
+// document either way. The next request restores them as after the idle release.
+void testReleaseRequestGivesTheWeightsBackWhenIdle() {
+  Weights weights;
+  ReleasableMemory memory(weights, std::nullopt);
+  engine::NativeLoopConfig config;
+  config.engine.maxContext = 1024;
+  config.weights = &memory;
+  LoopFixture fixture(config, {}, {}, std::numeric_limits<double>::infinity());
+  engine::NativeRuntime &loop = fixture.loop;
+  loop.announceReady();
+  require(!weights.released(), "the weights were released before any release request");
+
+  require(loop.receive(protocol::peer::serialize(protocol::ReleaseRequestFrame{5})) &&
+              answeredStatus(fixture, 5),
+          "a release request was not answered with a status document");
+  require(weights.released() && loop.weightsSnapshot().released &&
+              loop.weightsSnapshot().restores == 0,
+          "an idle engine did not release its weights on request");
+  // A second request changes nothing and is answered again.
+  require(loop.receive(protocol::peer::serialize(protocol::ReleaseRequestFrame{6})) &&
+              answeredStatus(fixture, 6) && weights.released(),
+          "releasing released weights again failed");
+
+  // A request restores them, an image per tick.
+  require(loop.receive(protocol::peer::serialize(request(1))) && loop.tick() &&
+              weights.released(),
+          "the request did not start the restore");
+  // A release request during the restore leaves it alone.
+  require(loop.receive(protocol::peer::serialize(protocol::ReleaseRequestFrame{7})) &&
+              answeredStatus(fixture, 7),
+          "a release request during the restore was not answered");
+  while (weights.released())
+    require(loop.tick(), "a tick did not write back an image");
+  require(weights.restores == Weights::kImages, "the restore was disturbed by a release request");
+
+  // With a request in service the weights stay.
+  require(loop.receive(protocol::peer::serialize(request(2))) &&
+              loop.receive(protocol::peer::serialize(protocol::ReleaseRequestFrame{8})) &&
+              answeredStatus(fixture, 8) && !weights.released(),
+          "the weights were released under a request");
+  runUntilIdle(loop);
+  require(loop.receive(protocol::peer::serialize(protocol::ReleaseRequestFrame{9})) &&
+              weights.released(),
+          "the engine did not release once its request ended");
+}
+
 // The loop reports that it holds requests from the first it takes to the end
 // of its last, the span the process keeps the Mac from idle sleep for.
 void testHoldingRequestsSpansFirstToLastRequest() {
@@ -1785,6 +1833,7 @@ int main() {
     testIdleReleaseRestoresTheSplitLast();
     testRefusedRestoreWaitsForMemory();
     testIdleReleaseOffKeepsTheWeights();
+    testReleaseRequestGivesTheWeightsBackWhenIdle();
     testHoldingRequestsSpansFirstToLastRequest();
     testMemoryStatusReporterLogsTransitionsOnly();
     std::cout << "native engine loop tests passed\n";

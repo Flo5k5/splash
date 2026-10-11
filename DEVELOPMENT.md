@@ -429,6 +429,7 @@ Responses requests that omit it get the served model; Messages requires it.
 | `GET /v1/models`, `/v1/models/{id}` | The served model and its aliases, with the context limit |
 | `POST /tokenize`, `/apply-template` | A text's tokens, or a conversation's rendered prompt, without inference |
 | `POST /v1/judgments`, `/v1/systemone` | Scores over fixed answers ([judgment contracts](#judgment-contracts)) |
+| `POST /v1/memory/release` | Gives the weights back now, as the idle release does, when no request is in service; the next request restores them ([explicit release](#explicit-weights-release)). `200` with `{"released": true, "weights": …}`, or `409 engine_busy` while a request is in service; the body must be empty |
 | `GET /status`, `/metrics` | JSON status and Prometheus metrics ([status](#status-readiness-and-metrics)) |
 | `GET /health` | 200 while the server answers; public |
 | `GET /ready` | 200 while the engine is ready, else 503; public |
@@ -1495,6 +1496,19 @@ place) stops the engine, which the server starts again. With the [Neural Engine
 split](#neural-engine-prefill), the release unloads its program after the
 images, and the restore loads it again in one tick more, after the last image
 (`ReleasableMemory`).
+
+#### Explicit weights release
+
+`POST /v1/memory/release` asks the engine for the same release without waiting
+for the timer: the server sends a `ReleaseRequest` frame (protocol 9), and the
+engine, between commands, releases the weights when it holds no request and no
+restore is under way, then answers with its status document, whose
+`weights.released` tells whether it did (`NativeRuntime::handleRelease`). Nothing
+else changes: the next request restores the weights as after the idle release
+(`Weights restored in N s`), the prefix cache and the other caches stay as they
+are, and `--idle-release off` does not stop it, so a host that shares the Mac
+with other memory-heavy work can take the weights' memory back on demand instead
+of on a timer. A busy engine answers `409 engine_busy` and keeps its weights.
 
 `loadQwenTarget` (`QwenTargetLoader.hpp`) reads a target's images
 (`QwenTargetFiles`: the images `SafetensorsTargetLoader` or `GgufTargetLoader` plans)

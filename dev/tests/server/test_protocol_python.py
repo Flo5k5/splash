@@ -113,6 +113,7 @@ def client_messages():
             91, 7, struct.pack("<3I", 0xFFFFFFFF, 0, 0xA5A5A5A5)
         ),
         "status_request": p.StatusRequestFrame(808),
+        "release_request": p.ReleaseRequestFrame(808),
     }
 
 

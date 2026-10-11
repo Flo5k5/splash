@@ -913,6 +913,25 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(status.json, READY_STATUS)
         self.assertTrue(runtime.ready)
 
+    def test_release_weights_is_answered_by_the_correlated_status(self):
+        def handler(process, message):
+            if isinstance(message, wire.ReleaseRequestFrame):
+                answer_status(process, message)
+
+        factory = FakeFactory(handler)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, eager_start=True
+        )
+        self.addCleanup(runtime.close)
+        process = factory.processes[0]
+
+        status = runtime.release_weights(timeout=1.0)
+        sent = process.stdin.messages(wire.ReleaseRequestFrame)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(status.correlation_id, sent[0].correlation_id)
+        self.assertEqual(status.json, READY_STATUS)
+        self.assertEqual(process.stdin.messages(wire.StatusRequestFrame), [])
+
     @fast_liveness_probe
     def test_liveness_probe_fails_a_generation_whose_loop_stops_answering(self):
         alive = threading.Event()

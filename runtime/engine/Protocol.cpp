@@ -27,6 +27,7 @@ constexpr std::array<uint8_t, 4> kMagic{'S', 'P', 'L', 'H'};
 constexpr uint64_t kCancelFixedBytes = 8;
 constexpr uint64_t kMaskResponseFixedBytes = 20;
 constexpr uint64_t kStatusRequestFixedBytes = 8;
+constexpr uint64_t kReleaseRequestFixedBytes = 8;
 constexpr uint64_t kReadyFixedBytes = 9;
 constexpr uint64_t kStartFixedBytes = 16;
 constexpr uint64_t kPromptProgressFixedBytes = 20;
@@ -87,6 +88,8 @@ std::optional<PayloadBounds> payloadBounds(FrameType type,
     return bounded(kMaskResponseFixedBytes, maximum);
   case FrameType::StatusRequest:
     return bounded(kStatusRequestFixedBytes, kStatusRequestFixedBytes);
+  case FrameType::ReleaseRequest:
+    return bounded(kReleaseRequestFixedBytes, kReleaseRequestFixedBytes);
   default:
     // The engine never receives an event.
     return std::nullopt;
@@ -125,6 +128,7 @@ bool clientFrameType(uint16_t raw, FrameType &type) {
   case FrameType::Cancel:
   case FrameType::MaskResponse:
   case FrameType::StatusRequest:
+  case FrameType::ReleaseRequest:
     type = static_cast<FrameType>(raw);
     return true;
   default:
@@ -790,6 +794,17 @@ ProtocolResult<ClientMessage> decodeStatusRequest(const Frame &frame) {
   return success(ClientMessage{request});
 }
 
+ProtocolResult<ClientMessage> decodeReleaseRequest(const Frame &frame) {
+  Reader reader(frame.payload);
+  ReleaseRequestFrame request;
+  if (!reader.u64(request.correlationId) || reader.remaining()) {
+    return failure<ClientMessage>(
+        makeIssue(FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength,
+                  0, "release request payload has an invalid length"));
+  }
+  return success(ClientMessage{request});
+}
+
 std::string_view frameTypeName(FrameType type) {
   switch (type) {
   case FrameType::Request:
@@ -800,6 +815,8 @@ std::string_view frameTypeName(FrameType type) {
     return "mask_response";
   case FrameType::StatusRequest:
     return "status_request";
+  case FrameType::ReleaseRequest:
+    return "release_request";
   case FrameType::Ready:
     return "ready";
   case FrameType::PromptProgress:
@@ -931,6 +948,8 @@ ProtocolResult<ClientMessage> decodeFrame(Frame &&frame,
       return decodeMaskResponse(frame, limits);
     case FrameType::StatusRequest:
       return decodeStatusRequest(frame);
+    case FrameType::ReleaseRequest:
+      return decodeReleaseRequest(frame);
     default:
       break;
     }

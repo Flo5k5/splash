@@ -131,6 +131,11 @@ FrameType write(Writer &out, const StatusRequestFrame &request) {
   return FrameType::StatusRequest;
 }
 
+FrameType write(Writer &out, const ReleaseRequestFrame &request) {
+  out.u64(request.correlationId);
+  return FrameType::ReleaseRequest;
+}
+
 struct Header {
   FrameType type;
   uint64_t payloadBytes;
