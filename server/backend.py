@@ -621,9 +621,22 @@ class NativeBackend:
             if self.closing:
                 raise APIError(503, "server is shutting down", "server_shutdown")
         restarts = self.runtime.restart_count
-        snapshot = self._decode_status_event(
-            self.runtime.release_weights(timeout=timeout)
-        )
+        try:
+            event = self.runtime.release_weights(timeout=timeout)
+        except TimeoutError:
+            # The engine answers between commands: it is running a long one.
+            raise APIError(
+                503,
+                f"the engine did not answer within {timeout:g} s; retry shortly",
+                "engine_busy",
+            ) from None
+        except (
+            engine_runtime.EngineUnhealthy,
+            engine_runtime.ProtocolFatal,
+            engine_runtime.RuntimeClosed,
+        ) as error:
+            raise self.refusal() or self._api_error(error) from None
+        snapshot = self._decode_status_event(event)
         self._cache_status(snapshot, restarts)
         return snapshot
 

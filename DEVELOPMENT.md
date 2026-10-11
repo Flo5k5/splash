@@ -429,7 +429,7 @@ Responses requests that omit it get the served model; Messages requires it.
 | `GET /v1/models`, `/v1/models/{id}` | The served model and its aliases, with the context limit |
 | `POST /tokenize`, `/apply-template` | A text's tokens, or a conversation's rendered prompt, without inference |
 | `POST /v1/judgments`, `/v1/systemone` | Scores over fixed answers ([judgment contracts](#judgment-contracts)) |
-| `POST /v1/memory/release` | Gives the weights back now, as the idle release does, when no request is in service; the next request restores them ([explicit release](#explicit-weights-release)). `200` with `{"released": true, "weights": …}`, or `409 engine_busy` while a request is in service; the body must be empty |
+| `POST /v1/memory/release` | Gives the weights back now, as the idle release does, when no request is in service; the next request restores them ([explicit release](#explicit-weights-release)). It takes no body (or `{}`); `200` with `{"released": true, "weights": …}`, or `409 engine_busy` while the engine serves a request or restores its weights |
 | `GET /status`, `/metrics` | JSON status and Prometheus metrics ([status](#status-readiness-and-metrics)) |
 | `GET /health` | 200 while the server answers; public |
 | `GET /ready` | 200 while the engine is ready, else 503; public |
@@ -1508,7 +1508,12 @@ else changes: the next request restores the weights as after the idle release
 (`Weights restored in N s`), the prefix cache and the other caches stay as they
 are, and `--idle-release off` does not stop it, so a host that shares the Mac
 with other memory-heavy work can take the weights' memory back on demand instead
-of on a timer. A busy engine answers `409 engine_busy` and keeps its weights.
+of on a timer. A busy engine, serving a request or restoring its weights, answers
+`409 engine_busy` and keeps them. The request takes no body:
+
+```sh
+curl -X POST http://127.0.0.1:8000/v1/memory/release
+```
 
 `loadQwenTarget` (`QwenTargetLoader.hpp`) reads a target's images
 (`QwenTargetFiles`: the images `SafetensorsTargetLoader` or `GgufTargetLoader` plans)
