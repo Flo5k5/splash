@@ -536,7 +536,8 @@ test-real: preflight $(TARGET) $(TEST_MODEL_RUNTIME_ORACLE) \
 	benchmark-decode-profile benchmark-attention-sweep \
 	benchmark-gguf-projection benchmark-gguf-moe
 # decode-profile replays the installed model's prefill and decode commands as
-# separate dispatches; DECODE_PROFILE_ARGS passes --prompt-tokens/--cycles.
+# separate dispatches; DECODE_PROFILE_ARGS passes --prompt-tokens/--cycles,
+# or --images HxW[,HxW...] for the vision encoder on synthetic images.
 benchmark-decode-profile: preflight $(TARGET) $(TEST_DECODE_PROFILE) $(LIB)
 	$(TEST_DECODE_PROFILE) $(LIB) "$(MODEL_ROOT)" $(DECODE_PROFILE_ARGS)
 
