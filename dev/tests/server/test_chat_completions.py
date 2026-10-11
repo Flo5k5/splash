@@ -52,7 +52,12 @@ class ChatCompletionTests(HarnessTestCase):
         self.assertNotIn("batch", response["metrics"])
         self.assertEqual(
             response["metrics"]["cache"],
-            {"status": "hit", "matched_tokens": 1, "lane": 0},
+            {
+                "status": "hit",
+                "matched_tokens": 1,
+                "lane": 0,
+                "deduplicated_tokens": 0,
+            },
         )
         self.assertNotIn("queue_ms", response["metrics"])
         self.assertEqual(runtime.requests[0].frame.seed, 7)

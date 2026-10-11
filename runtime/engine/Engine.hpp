@@ -151,6 +151,8 @@ struct EngineSnapshot final {
   uint64_t cacheHits = 0;
   uint64_t coldMisses = 0;
   uint64_t reusedTokens = 0;
+  // Tokens requests computed and then read from cached blocks' pages.
+  uint64_t deduplicatedKvTokens = 0;
   uint64_t replayStatePublications = 0;
   uint64_t deduplicatedStatePublications = 0;
   // Publications completed after reclaiming a cached state.
@@ -285,6 +287,16 @@ private:
     uint32_t promptTokens = 0;
     uint32_t reportedPromptTokens = 0;
     uint32_t replayTokens = 0;
+    // The blocks it restored or published in any residency end at this
+    // token. A replay after a suspension finds them cached as its own, so
+    // it counts none of them, though one evicted meanwhile may hold KV
+    // another request computed again.
+    uint32_t publishedTokens = 0;
+    // Tokens of blocks it computed and then found cached
+    // (Cache::publishCommittedBlocks), whose pages its next command reads,
+    // and of those its commands read, which it reports when it completes.
+    uint32_t unreadDeduplicatedKvTokens = 0;
+    uint32_t deduplicatedKvTokens = 0;
     // A failed dispatch must fit before replay can consume any model work.
     uint64_t resumeKvTargetTokens = 0;
     ResourceWait resourceWait;
@@ -404,6 +416,9 @@ private:
   // Another unfinished lane holds this lane's recovery point as its own.
   [[nodiscard]] bool checkpointShared(const Request &request) const;
   [[nodiscard]] bool retireCheckpoint(Request &request);
+  // Publishes the request's complete blocks up to committedTokens and keeps
+  // the tokens of those found cached for its next command to read.
+  void publishCommittedBlocks(Request &request, uint32_t committedTokens);
   void publishReachedStateBoundaries(Request &request,
                                      uint32_t promptProcessed, double nowMilliseconds);
   [[nodiscard]] Prepared prepare(BatchPlan &plan,

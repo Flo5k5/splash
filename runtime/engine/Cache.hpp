@@ -308,13 +308,17 @@ public:
   // firstChanged on.
   [[nodiscard]] PageTableView pageTable(uint64_t requestId) const;
 
-  // Canonicalizes every newly complete Page32 block. Duplicate content swaps
-  // the request to the existing immutable page after the writer command has
-  // completed; no active command ever aliases a writable page.
-  void publishCommittedBlocks(uint64_t requestId,
-                              std::span<const uint32_t> exactTokens,
-                              uint32_t committedTokens,
-                              std::span<const ImageSpan> images);
+  // Canonicalizes every newly complete Page32 block. A block whose parent,
+  // tokens and images match a cached one swaps the request to that block's
+  // immutable page after the writer command has completed; no active command
+  // ever aliases a writable page. The cached page holds KV another command
+  // computed, which can differ from the request's own in the last bits, and
+  // the request's later commands read it. Returns the tokens of the swapped
+  // blocks.
+  uint32_t publishCommittedBlocks(uint64_t requestId,
+                                  std::span<const uint32_t> exactTokens,
+                                  uint32_t committedTokens,
+                                  std::span<const ImageSpan> images);
   [[nodiscard]] uint64_t blockAt(uint64_t requestId, uint32_t boundary) const;
   [[nodiscard]] bool reuseCompositeState(uint64_t kvBlock, bool checkpoint);
   // Reuses the state at this block in either tier, as reuseCompositeState()

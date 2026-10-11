@@ -119,8 +119,11 @@ public:
   virtual void tokens(uint64_t requestId, std::span<const uint32_t> tokens) = 0;
   virtual void maskRequested(uint64_t requestId,
                              std::span<const uint32_t> simulationTokens) = 0;
+  // deduplicatedTokens: of the tokens the request computed, those whose KV it
+  // then read from a cached block's page.
   virtual void completed(uint64_t requestId, EngineFinishReason reason,
                          uint32_t promptTokens, uint32_t completionTokens,
+                         uint32_t deduplicatedTokens,
                          std::span<const float> optionLogits) = 0;
   virtual void failed(uint64_t requestId, LaneOutcome outcome,
                       std::string message) = 0;

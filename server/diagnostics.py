@@ -51,12 +51,17 @@ def print_request(record):
         return
     metrics = record.get("metrics", {})
     latency = metrics.get("request_latency", {})
+    cache = metrics.get("cache", {})
     parts = [
         "Cancelled" if outcome == "cancelled" else "Done",
         f"input {record['prompt_tokens']:,}",
-        f"cached {metrics.get('cache', {}).get('matched_tokens', 0):,}",
-        f"output {record.get('completion_tokens', 0):,}",
+        f"cached {cache.get('matched_tokens', 0):,}",
     ]
+    # Tokens the request computed and then read from cached blocks: its
+    # later work used KV another command computed.
+    if cache.get("deduplicated_tokens"):
+        parts.append(f"deduplicated {cache['deduplicated_tokens']:,}")
+    parts.append(f"output {record.get('completion_tokens', 0):,}")
     tools = record.get("tools")
     if isinstance(tools, dict) and tools.get("count"):
         parts.append(f"tools {tools['count']}·{tools.get('signature', '')}")

@@ -52,9 +52,11 @@ public:
         requestId, std::vector<uint32_t>(simulation.begin(), simulation.end()));
   }
   void completed(uint64_t id, EngineFinishReason, uint32_t prompt,
-                 uint32_t completion, std::span<const float>) override {
+                 uint32_t completion, uint32_t deduplicated,
+                 std::span<const float>) override {
     ++completedCount;
     usage[id] = {prompt, completion};
+    deduplicatedTokens[id] = deduplicated;
   }
   void failed(uint64_t, LaneOutcome outcome, std::string message) override {
     ++failedCount;
@@ -71,6 +73,7 @@ public:
   std::vector<uint64_t> startIds;
   std::unordered_map<uint64_t, std::vector<uint32_t>> outputs;
   std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> usage;
+  std::unordered_map<uint64_t, uint32_t> deduplicatedTokens;
   std::vector<std::string> failures;
   std::vector<std::pair<std::string, bool>> failureDetails;
   uint32_t emitted = 0;
@@ -157,6 +160,70 @@ void testConcurrentColdPrefixesComputeOnce() {
   require(events.completedCount == 4 && events.failedCount == 0 &&
               events.emitted == 4,
           "shared prefill lost independent completions");
+}
+
+// A cold request whose first blocks match cached ones computes them, then
+// reads the cached blocks' pages in its later commands: it reports those
+// tokens when it completes, though it restored nothing.
+void testColdRequestReportsTheBlocksItReadFromTheCache() {
+  test::TestKvStorage storage(64, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor model;
+  Events events;
+  engine::Engine engine(test::engineConfig(), cache, model, events);
+  guardReleases(storage, engine);
+  std::vector<uint32_t> first(100);
+  std::iota(first.begin(), first.end(), 1);
+  engine.submit(request(1, first));
+  runUntilIdle(engine);
+  // Two full blocks in common and no state where the prompts part.
+  std::vector<uint32_t> second = first;
+  std::fill(second.begin() + 2 * KvCache::pageTokens + 5, second.end(), 7);
+  require(cache.lookup(second, {}).kvBoundary == 2 * KvCache::pageTokens &&
+              cache.lookup(second, {}).resumeBoundary() == 0,
+          "fixture did not share KV without a state");
+  engine.submit(request(2, second));
+  runUntilIdle(engine);
+  require(events.starts == std::vector<uint32_t>{0, 0} && events.completedCount == 2,
+          "the second request did not start cold");
+  require(events.deduplicatedTokens.at(1) == 0 &&
+              events.deduplicatedTokens.at(2) == 2 * KvCache::pageTokens &&
+              engine.snapshot().deduplicatedKvTokens == 2 * KvCache::pageTokens,
+          "a cold request did not report the cached blocks it read");
+}
+
+// A request whose last command fills blocks found cached never reads their
+// pages, so it reports none of them.
+void testBlocksFoundCachedAfterTheLastCommandAreNotReported() {
+  test::TestKvStorage storage(64, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor model;
+  Events events;
+  engine::Engine engine(test::engineConfig(), cache, model, events);
+  guardReleases(storage, engine);
+  std::vector<uint32_t> first(100);
+  std::iota(first.begin(), first.end(), 1);
+  engine.submit(request(1, first));
+  runUntilIdle(engine);
+  // A generation prompt that starts in the first block leaves the second
+  // request no state boundary, and its prompt's command selects its only
+  // token: that command is its last.
+  const std::vector<uint32_t> second(first.begin(), first.begin() + 70);
+  EngineRequest last = request(2, second);
+  last.generationPromptTokens = 40;
+  require(cache.lookup(second, {}).kvBoundary == 2 * KvCache::pageTokens &&
+              cache.lookup(second, {}).resumeBoundary() == 0,
+          "fixture did not share KV without a state");
+  model.prefillAnchor = true;
+  engine.submit(std::move(last));
+  runUntilIdle(engine);
+  require(events.starts == std::vector<uint32_t>{0, 0} && events.completedCount == 2 &&
+              model.prefillChunks.at(2) == 1 && events.outputs.at(2) == std::vector<uint32_t>{42},
+          "the second request did not end with the command of its prompt");
+  require(events.deduplicatedTokens.at(2) == 0 && engine.snapshot().deduplicatedKvTokens == 0,
+          "a request reported cached blocks no command of it read");
 }
 
 void testSharedPrefillRebuildsTheMissingJunctionOnce() {
@@ -5560,6 +5627,51 @@ void testResumedLaneClearsThePagesPastItsRestoredChain() {
           "the resumed lane did not complete");
 }
 
+// A lane suspended after it published a block past its latest state replays
+// that block when it resumes and finds it cached: its own, not counted as KV
+// another command computed.
+void testReplayFindsItsOwnBlocks() {
+  test::TestKvStorage storage(512, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, nullptr, nullptr);
+  Executor executor;
+  executor.firstTokens = true;
+  executor.decodeFinishes = false;
+  executor.decodeTokens = 4;
+  executor.beginGrowthBlocked = [&] {
+    return executor.lastBeginId == 2 && executor.requests.at(1).resident;
+  };
+  Events events;
+  engine::Engine engine(test::engineConfig(), resources, executor, events);
+  guardReleases(storage, engine);
+
+  const std::vector<uint32_t> prompt(40, 1);
+  auto background = request(1, prompt);
+  background.priority = RequestPriority::Background;
+  background.maxNewTokens = 40;
+  engine.submit(std::move(background));
+  double now = 1;
+  // Its KV reaches past the second block; its latest state is at the first.
+  tickUntil(engine, now,
+            [&] { return events.outputs.contains(1) && events.outputs.at(1).size() >= 28; },
+            "the lane did not decode past its second block");
+  auto normal = request(2, std::vector<uint32_t>(9, 2));
+  normal.maxNewTokens = 4;
+  engine.submit(std::move(normal));
+  tickUntil(engine, now, [&] { return !executor.requests.at(1).resident; },
+            "the Background lane was not suspended");
+  tickUntil(engine, now, [&] { return idle(engine); }, "the requests did not end");
+  require(executor.lastRestoredTokens == KvCache::pageTokens &&
+              executor.resumedPrompts.size() == 1 &&
+              executor.resumedPrompts.front().size() > 2 * KvCache::pageTokens,
+          "the lane did not replay its second block");
+  require(events.completedCount == 2 && events.failedCount == 0 &&
+              events.usage.at(1) == std::pair<uint32_t, uint32_t>{40, 40},
+          "the resumed lane did not complete");
+  require(events.deduplicatedTokens.at(1) == 0 && engine.snapshot().deduplicatedKvTokens == 0,
+          "a replay counted the request's own block as another's");
+}
+
 void testPrefillCanCompleteTheRequest() {
   for (bool stop : {false, true}) {
     test::TestKvStorage storage(8, 4096, 4);
@@ -9015,6 +9127,8 @@ int main() {
     testEveryEndReleasesTheReplayPoint();
     testWaitingEndsReleaseTheReplayPoint();
     testConcurrentColdPrefixesComputeOnce();
+    testColdRequestReportsTheBlocksItReadFromTheCache();
+    testBlocksFoundCachedAfterTheLastCommandAreNotReported();
     testSharedPrefillRebuildsTheMissingJunctionOnce();
     testSharedPrefillReleasesDifferentJunctionsIndependently();
     testSharedPrefillEvictedPublicationFallsBack();
@@ -9208,6 +9322,7 @@ int main() {
     testFirstTokenIsSentAtPrefill();
     testFirstTokenSentBeforeASuspensionIsNotSentAgain();
     testResumedLaneClearsThePagesPastItsRestoredChain();
+    testReplayFindsItsOwnBlocks();
     testOutOfVocabularyOutputFailsLaneOnly();
     testNonFiniteFirstStepAfterARestoreInvalidatesTheState();
     testNonFiniteLaterStepKeepsTheRestoredState();

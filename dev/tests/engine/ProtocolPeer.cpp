@@ -200,6 +200,7 @@ EngineEvent decodeEvent(FrameType type, Reader &in) {
     event.prefillMicros = in.u64();
     event.decodeMicros = in.u64();
     event.wallMicros = in.u64();
+    event.deduplicatedTokens = in.u32();
     event.optionLogits.resize(in.u32());
     for (float &logit : event.optionLogits)
       logit = in.f32();

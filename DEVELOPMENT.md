@@ -608,7 +608,14 @@ is chunked. Concurrent requests change both, and chunk boundaries also come from
 the cached boundary a request resumes from and from the junctions and
 checkpoints earlier requests left. So a greedy or seeded request repeats its
 output when it runs alone with the same cached prefixes; alongside other
-requests, or with other prefixes cached, it can differ.
+requests, or with other prefixes cached, it can differ. A request that restores
+nothing can still read cached KV: once a command completes, each block it
+filled whose prefix, tokens and images match a cached block is swapped for
+that block's page, which another command computed, and its later commands read
+it. The Done line of the request log counts those tokens, as does
+`metrics.cache.deduplicated_tokens` in Chat Completions and text completions
+responses (in a stream, its usage chunk), and `/status` sums them in
+`cache.deduplicated_kv_tokens`.
 
 ### Output limits and streaming
 

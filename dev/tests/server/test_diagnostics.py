@@ -103,6 +103,25 @@ class DiagnosticsTests(HarnessTestCase):
             " · TTFT 0.8s · 85.0 tok/s\n",
         )
 
+    def test_console_names_tokens_read_from_cached_blocks(self):
+        # A cold request whose first blocks matched cached ones read those
+        # blocks' KV in its later chunks: cached 0 alone would hide it.
+        record = {
+            "outcome": "stop",
+            "prompt_tokens": 168,
+            "completion_tokens": 0,
+            "metrics": {"cache": {"matched_tokens": 0, "deduplicated_tokens": 64}},
+        }
+        with (
+            mock.patch.object(api.time, "strftime", return_value="08:02:27"),
+            mock.patch("sys.stdout", new_callable=io.StringIO) as output,
+        ):
+            diagnostics.print_request(record)
+        self.assertEqual(
+            output.getvalue(),
+            "08:02:27 Done · input 168 · cached 0 · deduplicated 64 · output 0\n",
+        )
+
     def test_console_request_start(self):
         with (
             mock.patch.object(api.time, "strftime", return_value="19:03:32"),

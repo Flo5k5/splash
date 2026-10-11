@@ -268,6 +268,12 @@ bool Engine::tick(double now) {
         throw std::logic_error("model returned an empty command ticket");
       }
       scheduler_.commit(*plan, excluded);
+      // The command reads the cached pages its lanes' blocks were swapped for.
+      for (const BatchItem &item : plan->items) {
+        Request &lane = request(item.requestId);
+        lane.deduplicatedKvTokens += lane.unreadDeduplicatedKvTokens;
+        counters_.deduplicatedKvTokens += std::exchange(lane.unreadDeduplicatedKvTokens, 0);
+      }
       pending_ = Pending{std::move(*plan), std::move(ticket),
                          busySinceMilliseconds_.value_or(now)};
       return true;
@@ -794,6 +800,8 @@ void Engine::completeAdmission(Request &active, CacheLookup &lookup,
   active.skipCache = false;
   active.admissionProbe.reset();
   const uint32_t resumeBoundary = lookup.resumeBoundary();
+  // The restored chain is the request's from the start of this residency.
+  active.publishedTokens = std::max(active.publishedTokens, resumeBoundary);
   if (resuming)
     scheduler_.resumeFromResources(active.request.id, resumeBoundary, active.replayTokens);
   active.latestCheckpoint = {};
@@ -1039,6 +1047,17 @@ bool Engine::retireCheckpoint(Request &active) {
     return false;
   active.latestCheckpoint = {};
   return true;
+}
+
+void Engine::publishCommittedBlocks(Request &active, uint32_t committedTokens) {
+  // A replay after a suspension finds the blocks the request published
+  // before as its own; only those past them can be another request's.
+  const uint32_t replayed = std::min(committedTokens, active.publishedTokens);
+  cache_.publishCommittedBlocks(active.request.id, active.exactTokens, replayed,
+                                active.request.images);
+  active.unreadDeduplicatedKvTokens += cache_.publishCommittedBlocks(
+      active.request.id, active.exactTokens, committedTokens, active.request.images);
+  active.publishedTokens = std::max(active.publishedTokens, committedTokens);
 }
 
 void Engine::publishReachedStateBoundaries(Request &active,
@@ -1626,8 +1645,7 @@ void Engine::apply(const BatchPlan &plan,
         counters_.resourceReplayTokens += result.consumedPromptTokens;
       if (promptProcessed == active.replayTokens)
         active.replaying = false;
-      cache_.publishCommittedBlocks(active.request.id, active.exactTokens,
-                                    promptProcessed, active.request.images);
+      publishCommittedBlocks(active, promptProcessed);
       publishReachedStateBoundaries(active, promptProcessed, now);
       // Recovery may replay an already reported prefix, including generated
       // history.
@@ -1669,8 +1687,7 @@ void Engine::apply(const BatchPlan &plan,
       const uint32_t storedTokens =
           static_cast<uint32_t>(active.exactTokens.size()) -
           result.outputTokensWithoutKv;
-      cache_.publishCommittedBlocks(active.request.id, active.exactTokens,
-                                    storedTokens, active.request.images);
+      publishCommittedBlocks(active, storedTokens);
     }
     const uint64_t completionTokens =
         active.exactTokens.size() - active.promptTokens;
@@ -1773,7 +1790,7 @@ void Engine::finish(Request &active, EngineFinishReason reason,
   active.finalized = true;
   const uint32_t completionTokens = generatedTokens(active);
   events_.completed(active.request.id, reason, active.promptTokens,
-                    completionTokens, optionLogits);
+                    completionTokens, active.deduplicatedKvTokens, optionLogits);
   if (reason == EngineFinishReason::Cancelled) {
     ++counters_.cancelled;
   } else {

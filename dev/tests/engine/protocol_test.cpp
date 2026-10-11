@@ -236,9 +236,9 @@ const std::vector<std::pair<std::string, EngineEvent>> &engineEvents() {
       {"mask_request_initial", MaskRequestEvent{91, 6, 4, {}}},
       {"mask_request_verify", MaskRequestEvent{91, 7, 4, {101, 102, 103}}},
       {"done", DoneEvent{91, EngineFinishReason::Stop, 4096, 512, 1000, 2000,
-                         3500, {}}},
+                         3500, {}, 64}},
       {"done_scored", DoneEvent{91, EngineFinishReason::Stop, 4096, 0, 1000, 0,
-                                3500, {1.5f, -2.25f, 0.5f}}},
+                                3500, {1.5f, -2.25f, 0.5f}, 32}},
       {"error_request",
        ErrorEvent{FailureClass::RequestError, 91, true, "deadline_exceeded",
                   "request deadline expired"}},
@@ -387,13 +387,14 @@ void testScoreRequestAndDoneLogits() {
   expectRequestIssue(test, topP, IssueCode::InvalidSampling);
 
   DoneEvent scored{91, EngineFinishReason::Stop, 4096, 0, 1000, 0, 3500,
-                   {1.5f, -2.0f, 0.25f}};
+                   {1.5f, -2.0f, 0.25f}, 96};
   CHECK(test, roundTripEvent(scored) == scored);
   auto encodedDone = serializeEvent(scored, kLimits);
   CHECK(test, encodedDone);
   if (encodedDone) {
-    CHECK(test, encodedDone.value->size() == kFrameHeaderBytes + 45 + 12);
-    CHECK(test, loadU32(*encodedDone.value, kFrameHeaderBytes + 41) == 3);
+    CHECK(test, encodedDone.value->size() == kFrameHeaderBytes + 49 + 12);
+    CHECK(test, loadU32(*encodedDone.value, kFrameHeaderBytes + 41) == 96);
+    CHECK(test, loadU32(*encodedDone.value, kFrameHeaderBytes + 45) == 3);
   }
 
   DoneEvent generation{91, EngineFinishReason::Length, 10, 4, 1, 2, 3, {}};

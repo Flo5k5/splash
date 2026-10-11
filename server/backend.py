@@ -5,7 +5,7 @@ import functools
 import queue
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from tokenizers.decoders import DecodeStream
 
@@ -52,6 +52,9 @@ class CacheInfo:
     status: str = "unknown"
     matched_tokens: int = 0
     lane: int = -1
+    # Of the tokens the request computed, those whose KV it then read from a
+    # cached block's page; known once it is done.
+    deduplicated_tokens: int = 0
 
 
 @dataclass
@@ -831,7 +834,7 @@ class NativeBackend:
                 first_token_to_done_ms=done.decode_micros / 1000.0,
                 request_wall_ms=done.wall_micros / 1000.0,
                 prefill_tokens=max(0, done.prompt_tokens - job.cache.matched_tokens),
-                cache=job.cache,
+                cache=replace(job.cache, deduplicated_tokens=done.deduplicated_tokens),
                 stop_sequence=stop_sequence,
                 first_token_batch_tokens=state.first_token_batch_tokens,
             )

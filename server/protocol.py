@@ -55,7 +55,7 @@ _START = struct.Struct("<QII")
 _PROMPT_PROGRESS = struct.Struct("<QIQ")
 _TOKENS = struct.Struct("<QII")
 _MASK_REQUEST = struct.Struct("<QQII")
-_DONE = struct.Struct("<QBIIQQQI")
+_DONE = struct.Struct("<QBIIQQQII")
 _ERROR = struct.Struct("<BBQII")
 _STATUS_JSON = struct.Struct("<Q")
 
@@ -69,7 +69,7 @@ assert _REQUEST.size == 86
 assert _IMAGE_SPAN.size == 32
 assert _READY.size == 9
 assert _START.size == 16
-assert _DONE.size == 45
+assert _DONE.size == 49
 assert _ERROR.size == 18
 assert _STATUS_JSON.size == 8
 
@@ -354,6 +354,9 @@ class DoneEvent:
     # Raw final-position logits for a score-only request, in requested token
     # order; empty for generation and for cancelled or failed scoring.
     option_logits: tuple[float, ...]
+    # Of the tokens the request computed, those whose KV it then read from a
+    # cached block's page.
+    deduplicated_tokens: int = 0
 
 
 @dataclass(slots=True, frozen=True)
@@ -1010,7 +1013,9 @@ def _decode_event(frame: Frame) -> EngineEvent:
             )
         return MaskRequestEvent(request_id, mask_request_id, words_per_mask, tokens)
     if frame_type is FrameType.DONE:
-        request_id, reason, *counts, logit_count = _DONE.unpack_from(payload)
+        request_id, reason, *counts, deduplicated, logit_count = _DONE.unpack_from(
+            payload
+        )
         logits = _tail(
             payload, _DONE.size, logit_count, "f", "option logit", request_id
         )
@@ -1026,7 +1031,7 @@ def _decode_event(frame: Frame) -> EngineEvent:
             _fatal(
                 IssueCode.INVALID_REQUEST_ID, "done event request id must be non-zero"
             )
-        event = DoneEvent(request_id, reason, *counts, logits)
+        event = DoneEvent(request_id, reason, *counts, logits, deduplicated)
         if logits and (
             len(logits) < MIN_SCORE_TOKENS
             or not all(map(math.isfinite, logits))
