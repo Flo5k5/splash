@@ -353,7 +353,8 @@ struct Runtime::Impl {
   explicit Impl(RuntimeContext value)
       : backend(value.backend),
         model(value.model),
-        geometry(RuntimeGeometry::from(value.model, value.kvPages.layout().format)),
+        geometry(RuntimeGeometry::from(value.model, value.kvPages.layout().format,
+                                       value.stateStorage.layout().target.format)),
         operators(value.operators),
         kvPages(value.kvPages),
         states(value.stateStorage),
@@ -366,7 +367,7 @@ struct Runtime::Impl {
                         value.model.target)),
         draftModel(value.model.draft, value.backend, operators),
         aneFfn(value.aneFfn) {
-    if (states.layout() != model.stateLayout() ||
+    if (states.layout() != model.stateLayout(states.layout().target.format) ||
         kvPages.layout() != model.targetKvLayout(kvPages.layout().format)) {
       throw std::invalid_argument(
           "model runtime resources do not match the loaded model");
@@ -2785,17 +2786,20 @@ std::vector<ops::SwiGluProjections> aneFfnLayers(const LoadedModel &model) {
 void withPrefillArena(
     MetalBackend &backend, const LoadedModel &model, const ops::ExecutionPlans &operators, kv::Format format,
     const std::function<void(const ops::PrefillFfnBuffers &, const std::array<MetalBuffer, 2> &)> &use) {
-  const PrefillArena arena(backend, RuntimeGeometry::from(model, format), operators);
+  // A prefill arena holds no state cell, so either state format sizes it.
+  const PrefillArena arena(backend, RuntimeGeometry::from(model, format, ops::GdnStateFormat::Float32),
+                           operators);
   const QwenTargetPrefillBuffers buffers = prefillBuffers(arena);
   use(buffers.ffn(), buffers.hidden);
 }
 
 ModelMemoryPlan plannedRuntimeMemory(const LoadedModel &model,
                                      const ops::ExecutionPlans &operators,
-                                     kv::Format format) {
+                                     kv::Format kvFormat,
+                                     ops::GdnStateFormat stateFormat) {
   requireCompatibleModel(model);
-  const RuntimeGeometry geometry = RuntimeGeometry::from(model, format);
-  return {model.stateLayout().laneBytes(),
+  const RuntimeGeometry geometry = RuntimeGeometry::from(model, kvFormat, stateFormat);
+  return {model.stateLayout(stateFormat).laneBytes(),
           plannedPrefillBytes(geometry, operators),
           plannedDecodeBytes(geometry, operators)};
 }

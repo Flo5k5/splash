@@ -119,6 +119,14 @@ void testLayoutFormulas() {
           "four-lane byte formula is wrong");
   require(kStateLayout.cachedBytes() == 160'038'912,
           "prefix byte formula is wrong");
+  // A bf16 recurrent state takes half the bytes; the convolution rows keep
+  // theirs.
+  model::CompositeStateLayout bfloat = kStateLayout;
+  bfloat.target.format = ops::GdnStateFormat::BFloat16;
+  require(bfloat.target.recurrentLayerBytes() == 1'572'864 &&
+              bfloat.target.convolutionBytes() == 3'145'728 &&
+              bfloat.laneBytes() == 205'127'680 && bfloat.cachedBytes() == 84'541'440,
+          "bf16 state byte formula is wrong");
 }
 
 void testOffloadAllocationFailure(metal::MetalBackend &backend) {

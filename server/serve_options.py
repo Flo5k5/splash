@@ -393,6 +393,16 @@ SERVE_OPTIONS = (
         ),
     ),
     ServeOption(
+        "--state-format",
+        "memory",
+        dict(
+            choices=("fp32", "bf16"),
+            default="fp32",
+            help="recurrent state storage (default: fp32); bf16 halves each "
+            "state, so memory and the SSD cache hold about twice as many",
+        ),
+    ),
+    ServeOption(
         "--idle-release",
         "memory",
         dict(

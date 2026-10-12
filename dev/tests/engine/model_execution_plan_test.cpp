@@ -79,7 +79,7 @@ void checkGateUpLayers() {
     device.appleGpuFamily = family;
     device.gpuCoreCount = 16;
     ops::ExecutionPlans plans(device);
-    const auto geometry = model::RuntimeGeometry::from(dense, kv::Format::Int8);
+    const auto geometry = model::RuntimeGeometry::from(dense, kv::Format::Int8, ops::GdnStateFormat::Float32);
     const auto head = target.logitsProjection.shape();
     const auto containsHead = [&](const auto &shapes) {
       return std::find(shapes.begin(), shapes.end(), head) != shapes.end();
@@ -113,7 +113,7 @@ void checkGateUpLayers() {
 // grow with its rows. The arena must hold every lane's plan of every target
 // and draft projection at the measured core counts.
 void checkLaneScratch(const model::LoadedModel &loaded) {
-  const auto geometry = model::RuntimeGeometry::from(loaded, kv::Format::Int8);
+  const auto geometry = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32);
   const auto &d = geometry.draft;
   std::vector<ops::LinearMatrix> matrices{
       {d.dynamicSize, d.hiddenSize}, {d.qkvSize, d.hiddenSize}, {d.contextKvSize(), d.hiddenSize},
@@ -146,8 +146,9 @@ void checkLaneScratch(const model::LoadedModel &loaded) {
 void checkUnsizedProjection() {
   auto broken = loadedModel<model::Qwen3_8Weights>();
   std::get<model::Qwen3_8Weights>(broken.target).layers.back().downProjection = ops::Projection();
-  rejects([&] { static_cast<void>(model::RuntimeGeometry::from(broken, kv::Format::Int8)); },
-          "invalid model runtime geometry", "a target projection without sizes reached arena sizing");
+  rejects([&] {
+    static_cast<void>(model::RuntimeGeometry::from(broken, kv::Format::Int8, ops::GdnStateFormat::Float32));
+  }, "invalid model runtime geometry", "a target projection without sizes reached arena sizing");
 }
 
 // The GDN value rows are sized with attentionWidth, so a layout whose value
@@ -159,7 +160,7 @@ void checkGdnWidths() {
   const auto sizeArenas = [&](const model::Qwen3_6MoeLayout &layout) {
     auto candidate = sparse;
     std::get<model::Qwen3_6MoeWeights>(candidate.target).layout = layout;
-    static_cast<void>(model::RuntimeGeometry::from(candidate, kv::Format::Int8));
+    static_cast<void>(model::RuntimeGeometry::from(candidate, kv::Format::Int8, ops::GdnStateFormat::Float32));
   };
   // The shipped sparse layout passes both checks.
   const model::Qwen3_6MoeLayout shipped;

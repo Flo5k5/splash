@@ -372,8 +372,8 @@ void provideMask(model::Runtime &executor, uint64_t requestId,
                          rejected.value_or(""));
 }
 
-// The convolution and recurrent halves of a GDN cell, which hold BF16 and
-// FP32 values.
+// The convolution and recurrent halves of a GDN cell, which hold BF16 values
+// and the recurrent state's format (FP32 or BF16).
 metal::MetalBuffer convolutionHalf(const metal::MetalBackend &backend,
                                    const model::GdnParityBuffers &gdn,
                                    const model::GdnStateLayout &layout) {
@@ -411,10 +411,11 @@ StateSamples sampleCommittedState(const metal::MetalBackend &backend,
   };
   const auto &gdn = states.current(lane);
   const auto &target = states.layout().target;
+  const bool bfloatState = target.format == ops::GdnStateFormat::BFloat16;
   add("convolution", convolutionHalf(backend, gdn, target), true);
-  add("recurrent", recurrentHalf(backend, gdn, target), false);
+  add("recurrent", recurrentHalf(backend, gdn, target), bfloatState);
   add("first_convolution", gdn.convolutionLayers.front(), true);
-  add("first_recurrent", gdn.recurrentLayers.front(), false);
+  add("first_recurrent", gdn.recurrentLayers.front(), bfloatState);
   const auto &lengths = states.metadata(lane).lengths;
   const auto layout = states.layout().draft;
   constexpr uint32_t window = model::ExecutionLimits::draftContextTokens;
@@ -501,6 +502,7 @@ struct AllocationFault final {
 
 void requireAtomicImageAdmission(model::Runtime &executor,
                                  metal::MetalBackend &backend,
+                                 const model::QwenStateStorage &states,
                                  const model::LoadedModel &model,
                                  AllocationFault &fault) {
   const uint64_t originalBytes = backend.memoryStats().allocatedBytes;
@@ -521,7 +523,7 @@ void requireAtomicImageAdmission(model::Runtime &executor,
         span.pixelBytes() +
         uint64_t{ops::Vision::embeddingRows({span.gridHeight, span.gridWidth})} *
             model.vision.tensors.layout.outputHiddenSize * sizeof(uint16_t) +
-        model.stateLayout().laneBytes();
+        states.layout().laneBytes();
     fault.remainingBytes = attemptBytes - 1;
     const StateAdmission denied = executor.begin(image.modelView());
     const uint64_t unspent = fault.remainingBytes;
@@ -685,7 +687,7 @@ void requireImageRowsAfterReclaim(model::Runtime &executor,
   // must fit a fresh lane's state without recreating the reclaimed encoder.
   while (states.releaseOneIdle(false)) {
   }
-  const uint64_t stateBytes = model.stateLayout().laneBytes();
+  const uint64_t stateBytes = states.layout().laneBytes();
   const uint64_t beforeReuse = backend.memoryStats().allocatedBytes;
   request.id = 96;
   fault.remainingBytes = stateBytes;
@@ -874,8 +876,8 @@ void requireFullWindowRestore(model::Runtime &executor,
   std::cout << "full_window_restore=PASS\n";
 }
 
-// Fills every byte of a lane's GDN recurrent state, the FP32 half of the cell
-// its next transition reads, with 0xFF: NaN, which the recurrence carries into
+// Fills every byte of a lane's GDN recurrent state, the half of the cell its
+// next transition reads, with 0xFF: NaN in either format, which the recurrence carries into
 // every row the lane computes. Non-finite KV would not do: the paged-attention
 // tile of some GPU families gives non-finite keys and values zero weight.
 void poisonRecurrentState(const metal::MetalBackend &backend,
@@ -1211,7 +1213,7 @@ void requireInjectedRowsBecomeReclaimable(model::Runtime &executor,
 // refused; one at it continues past the image without encoding it.
 void requireCoveredImagesAreNotStaged(model::Runtime &executor,
                                       metal::MetalBackend &backend,
-                                      const model::LoadedModel &model) {
+                                      const model::QwenStateStorage &states) {
   while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
   }
   const uint64_t originalBytes = backend.memoryStats().allocatedBytes;
@@ -1251,7 +1253,7 @@ void requireCoveredImagesAreNotStaged(model::Runtime &executor,
     require(admission.granted() && !started.imageRowsBytes && !started.visionArenaBytes &&
                 started.imageEmbeddingReuses == reuses &&
                 backend.memoryStats().allocatedBytes ==
-                    before + model.stateLayout().laneBytes(),
+                    before + states.layout().laneBytes(),
             "a start staged an image its restored prefix covers");
     if (id == 115) {
       rejects([&] { static_cast<void>(executor.beginRestore(id, 32, beforeImage, true, {})); },
@@ -1283,12 +1285,13 @@ void requireCoveredImagesAreNotStaged(model::Runtime &executor,
 // the refused attempt did.
 void requireRefusedStartKeepsItsRows(model::Runtime &executor,
                                      metal::MetalBackend &backend,
+                                     const model::QwenStateStorage &states,
                                      const model::LoadedModel &model,
                                      AllocationFault &fault) {
   while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
   }
   const uint64_t originalBytes = backend.memoryStats().allocatedBytes;
-  const uint64_t laneBytes = model.stateLayout().laneBytes();
+  const uint64_t laneBytes = states.layout().laneBytes();
   const auto imageBytes = [&](const ImageSpan &span) {
     return span.pixelBytes() +
            uint64_t{ops::Vision::embeddingRows({span.gridHeight, span.gridWidth})} *
@@ -1600,13 +1603,14 @@ int main(int argc, char **argv) {
   try {
     bool imagesOnly = false, warmupEosOnly = false;
     kv::Format format = kv::Format::Int8;
+    ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
     std::optional<double> givenAneFfnShare;
     // The evaluation of the split's program that fails, counted from 1 as
     // ane::ProgramInstrumentation counts them; 0 for none.
     uint64_t aneFfnFault = 0;
     if (argc < 3)
-      fail("usage: model-runtime-oracle METALLIB MODEL_ROOT [--kv-format int8|bf16] [--ane-ffn-share SHARE] "
-           "[--ane-ffn-fault EVALUATION]");
+      fail("usage: model-runtime-oracle METALLIB MODEL_ROOT [--kv-format int8|bf16] [--state-format fp32|bf16] "
+           "[--ane-ffn-share SHARE] [--ane-ffn-fault EVALUATION]");
     for (int i = 3; i < argc; ++i) {
       const std::string_view option(argv[i]);
       if (option == "--images-only") imagesOnly = true;
@@ -1615,6 +1619,10 @@ int main(int argc, char **argv) {
         const std::string_view value(argv[++i]);
         if (value != "int8" && value != "bf16") fail("invalid KV format");
         format = value == "int8" ? kv::Format::Int8 : kv::Format::BFloat16;
+      } else if (option == "--state-format" && i + 1 < argc) {
+        const std::string_view value(argv[++i]);
+        if (value != "fp32" && value != "bf16") fail("invalid state format");
+        stateFormat = value == "fp32" ? ops::GdnStateFormat::Float32 : ops::GdnStateFormat::BFloat16;
       } else if (option == "--ane-ffn-share" && i + 1 < argc) {
         const char *value = argv[++i];
         char *end = nullptr;
@@ -1653,7 +1661,7 @@ int main(int argc, char **argv) {
         model::loadModel(backend, modelRoot, descriptor);
     ops::ExecutionPlans operators(backend.capabilities());
     model::ModelMemoryPlan executorPlan =
-        model::plannedRuntimeMemory(model, operators, format);
+        model::plannedRuntimeMemory(model, operators, format, stateFormat);
     // The memory plan with `aneFfnBytes` set aside for the prefill FFN's
     // Neural Engine split.
     const auto planMemory = [&](uint64_t aneFfnBytes) {
@@ -1664,7 +1672,7 @@ int main(int argc, char **argv) {
           executorPlan, 0, aneFfnBytes};
       ModelMemoryProfile profile{
           model.name(), model.maximumContextTokens(),
-          model.targetKvLayout(format), footprint};
+          model.targetKvLayout(format), footprint, stateFormat};
       return evaluateEngineMemoryPlan(backend.capabilities(), profile, 0);
     };
 
@@ -1770,7 +1778,7 @@ int main(int argc, char **argv) {
               "oracle KV extent is unavailable");
     model::QwenStateStorage states(backend,
                                     admission,
-                                    model.stateLayout(), nullptr);
+                                    model.stateLayout(stateFormat), nullptr);
     model::RuntimeContext context{backend, model, pages, states, operators, aneFfn.get()};
     require(executorPlan.sharedDecodePlannedAllocatedBytes <=
                 std::numeric_limits<uint64_t>::max() -
@@ -1815,15 +1823,15 @@ int main(int argc, char **argv) {
     // The engine refuses image requests to a model without vision before they
     // reach the runtime, which treats one as a broken invariant.
     if (model.descriptor.hasVision()) {
-      requireAtomicImageAdmission(executor, backend, model, allocationFault);
+      requireAtomicImageAdmission(executor, backend, states, model, allocationFault);
       requireImageRowsAfterReclaim(executor, backend, states, model, allocationFault);
       requireRepeatedImagePlacements(executor, backend, states, allocationFault);
       requireConcurrentRequestsShareOneEncode(executor, backend);
       requireNonFiniteChunkLeavesItsImageToEncode(executor, pages, states, backend);
       requireSuspendedLaneKeepsItsRows(executor, backend);
       requireInjectedRowsBecomeReclaimable(executor, backend);
-      requireCoveredImagesAreNotStaged(executor, backend, model);
-      requireRefusedStartKeepsItsRows(executor, backend, model, allocationFault);
+      requireCoveredImagesAreNotStaged(executor, backend, states);
+      requireRefusedStartKeepsItsRows(executor, backend, states, model, allocationFault);
       requireReclaimTakesOneCacheUnit(executor, backend, model);
       requireEncoderFitsItsImages(executor, backend, model, allocationFault);
       requireReplayPointKeepsItsImageRows(executor, backend);
@@ -1864,7 +1872,7 @@ int main(int argc, char **argv) {
             "prefill state length mismatch");
 
     const uint64_t predictedPromptSnapshotBytes =
-        model.stateLayout().cachedBytes();
+        states.layout().cachedBytes();
     std::shared_ptr<const CompositeState> promptSnapshot =
         executor.snapshot(1);
     require(promptSnapshot != nullptr,
@@ -1955,7 +1963,11 @@ int main(int argc, char **argv) {
 
     // Compare the active GDN state from one 16-row chunk and two M8 commits
     // within the numerical tolerance below. Their next-token decisions are
-    // diagnostic because the command partitions round differently.
+    // diagnostic because the command partitions round differently. A BF16
+    // state is also rounded where the first commit stores it, which the rows
+    // after it carry through the model, and a mixture of experts amplifies
+    // (convolution cosine 0.998 on the 35B): its bound is looser, and the FP32
+    // run holds the partition itself to the tight one.
     const std::vector<uint32_t> prompt16{
         248045, 8678, 198,   24342, 286,  4879, 369,   716,
         310,    830,  11553, 13,    5044, 1683, 15060, 1472};
@@ -1981,12 +1993,14 @@ int main(int argc, char **argv) {
                 baselineMetadata.lengths.targetTokens == prompt16.size(),
             "partitioned prefill logical state diverged");
     const model::GdnStateLayout &gdnLayout = states.layout().target;
+    const bool bfloatState = gdnLayout.format == ops::GdnStateFormat::BFloat16;
     const Similarity convolution =
         compareBfloat(convolutionHalf(backend, states.current(2), gdnLayout),
                       convolutionHalf(backend, states.current(3), gdnLayout));
-    const Similarity recurrent =
-        compareFloat(recurrentHalf(backend, states.current(2), gdnLayout),
-                     recurrentHalf(backend, states.current(3), gdnLayout));
+    const metal::MetalBuffer baselineRecurrent = recurrentHalf(backend, states.current(2), gdnLayout),
+                             partitionedRecurrent = recurrentHalf(backend, states.current(3), gdnLayout);
+    const Similarity recurrent = bfloatState ? compareBfloat(baselineRecurrent, partitionedRecurrent)
+                                             : compareFloat(baselineRecurrent, partitionedRecurrent);
     std::cout
         << "partition_equivalence conv_cos=" << convolution.cosine
         << " parity=" << baselineMetadata.activeParity << '/'
@@ -1999,7 +2013,8 @@ int main(int argc, char **argv) {
         << " recurrent_cos=" << recurrent.cosine
         << " recurrent_norms=" << recurrent.leftNorm << '/'
         << recurrent.rightNorm << '\n';
-    require(convolution.cosine > 0.999 && recurrent.cosine > 0.999,
+    const double bound = bfloatState ? 0.99 : 0.999;
+    require(convolution.cosine > bound && recurrent.cosine > bound,
             "partitioned prefill numerical state diverged");
 
     ModelStepResult baselinePending =

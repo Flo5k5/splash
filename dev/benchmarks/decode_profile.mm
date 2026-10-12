@@ -1,6 +1,7 @@
 // Per-kernel GPU time attribution for the production executor.
 //
 //   decode-profile METALLIB MODEL_ROOT [--prompt-tokens N] [--cycles K] [--kv-format int8|bf16]
+//                  [--state-format fp32|bf16]
 //   decode-profile METALLIB MODEL_ROOT --images HxW[,HxW...] [--cycles K]
 //
 // Drives the real model runtime with Metal dispatch profiling enabled, so
@@ -293,7 +294,8 @@ int main(int argc, char **argv) {
     try {
       if (argc < 3) {
         std::cerr << "usage: decode-profile METALLIB MODEL_ROOT "
-                     "[--prompt-tokens N] [--cycles K] [--kv-format int8|bf16]\n"
+                     "[--prompt-tokens N] [--cycles K] [--kv-format int8|bf16] "
+                     "[--state-format fp32|bf16]\n"
                      "       decode-profile METALLIB MODEL_ROOT "
                      "--images HxW[,HxW...] [--cycles K]\n";
         return 2;
@@ -301,6 +303,7 @@ int main(int argc, char **argv) {
       uint32_t promptTokens = 512;
       uint32_t cycles = 4;
       kv::Format format = kv::Format::Int8;
+      ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
       std::vector<ops::ImageGrid> grids;
       bool textOptions = false;
       for (int index = 3; index < argc; index += 2) {
@@ -317,6 +320,12 @@ int main(int argc, char **argv) {
           if (value != "int8" && value != "bf16")
             throw std::invalid_argument("--kv-format takes int8 or bf16");
           format = value == "int8" ? kv::Format::Int8 : kv::Format::BFloat16;
+          textOptions = true;
+        } else if (option == "--state-format") {
+          const std::string_view value(argv[index + 1]);
+          if (value != "fp32" && value != "bf16")
+            throw std::invalid_argument("--state-format takes fp32 or bf16");
+          stateFormat = value == "fp32" ? ops::GdnStateFormat::Float32 : ops::GdnStateFormat::BFloat16;
           textOptions = true;
         } else if (option == "--images")
           grids = parseGrids(argv[index + 1]);
@@ -360,13 +369,13 @@ int main(int argc, char **argv) {
       }
       model::QwenStateStorage states(backend,
                                       governor.allocationAdmission(),
-                                      model.stateLayout(), nullptr);
+                                      model.stateLayout(stateFormat), nullptr);
       model::RuntimeContext context{backend, model, pages, states, operators};
       model::Runtime executor(context);
 
-      std::printf("device %s, %u prompt tokens, %u cycles per width\n",
+      std::printf("device %s, %u prompt tokens, %u cycles per width, %s state\n",
                   backend.capabilities().deviceName.c_str(), promptTokens,
-                  cycles);
+                  cycles, std::string(ops::formatName(stateFormat)).c_str());
 
       std::array<Lane, 4> lanes;
       for (uint32_t index = 0; index < lanes.size(); ++index) {

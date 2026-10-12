@@ -222,7 +222,10 @@ std::string persistentCacheNamespace(const RuntimeCacheIdentity &identity,
             << kv.headDimension << ' ' << kv::formatName(kv.format) << '\n'
             << "gdn " << gdn.layers << ' ' << gdn.convolutionHistory << ' '
             << gdn.convolutionChannels << ' ' << gdn.recurrentGroups << ' ' << gdn.recurrentRows
-            << ' ' << gdn.recurrentColumns << '\n'
+            << ' ' << gdn.recurrentColumns
+            // fp32 states keep the line they had before states had a format,
+            // so the caches they wrote stay valid.
+            << (gdn.format == ops::GdnStateFormat::BFloat16 ? " bf16" : "") << '\n'
             << "draft " << draft.layers << ' ' << draft.kvHeads << ' ' << draft.headDimension << ' '
             << SPLASH_DRAFT_SLIDING_WINDOW << '\n'
             << "context " << draft.contextWidth << " q4 " << SPLASH_DRAFT_CONTEXT_GROUP << '\n';
@@ -265,14 +268,14 @@ std::unique_ptr<RuntimeResources>
 RuntimeResources::create(const RuntimeResourcesConfig &config,
                          uint32_t requestedContextTokens) {
   if (config.metallibPath.empty() || config.modelRoot.empty() ||
-      !kv::validFormat(config.kvFormat) ||
+      !kv::validFormat(config.kvFormat) || !ops::validFormat(config.stateFormat) ||
       !config.model.valid() || !config.hostAvailableMemory ||
       config.buildId.empty() || !config.maximumImagePatches ||
       config.maximumImagePatches % 4 ||
       config.maximumImagePatches > ops::kMaximumImagePatches) {
     throw RuntimeResourcesError(
         RuntimeResourceStage::Configuration,
-        "metallib path, model root, a valid model layout and KV format, a "
+        "metallib path, model root, a valid model layout, KV and state format, a "
         "host memory probe, build id, and a merge-aligned image patch limit no "
         "larger than the protocol's are required");
   }
@@ -324,7 +327,9 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   // no state's write needs the staging buffer the plan would set aside.
   std::shared_ptr<model::DiskBudget> diskBudget;
   std::shared_ptr<model::SlotFile> stateFile;
-  const uint64_t stateBytes = config.model.stateLayout.cachedBytes();
+  model::CompositeStateLayout stateLayout = config.model.stateLayout;
+  stateLayout.target.format = config.stateFormat;
+  const uint64_t stateBytes = stateLayout.cachedBytes();
   if (config.maximumCacheDiskBytes) {
     diskBudget = std::make_shared<model::DiskBudget>(config.maximumCacheDiskBytes);
     try {
@@ -358,7 +363,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         fixedBytes = std::numeric_limits<uint64_t>::max();
     }
     const uint64_t requiredBytes =
-        minimumRequiredBytes(fixedBytes, config.model.stateLayout.laneBytes(),
+        minimumRequiredBytes(fixedBytes, stateLayout.laneBytes(),
                              kvLayout)
             .value_or(std::numeric_limits<uint64_t>::max());
     if (requiredBytes > hardBudgetBytes) {
@@ -407,7 +412,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   ops::ExecutionPlans operators(device);
   model::ModelMemoryPlan modelMemoryPlan;
   try {
-    modelMemoryPlan = model::plannedRuntimeMemory(loaded, operators, config.kvFormat);
+    modelMemoryPlan = model::plannedRuntimeMemory(loaded, operators, config.kvFormat,
+                                                  config.stateFormat);
   } catch (const std::exception &error) {
     throw RuntimeResourcesError(
         RuntimeResourceStage::MemoryPlanning,
@@ -426,7 +432,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     };
     ModelMemoryProfile modelProfile{
         loaded.name(), loaded.maximumContextTokens(),
-        loaded.targetKvLayout(config.kvFormat), footprint};
+        loaded.targetKvLayout(config.kvFormat), footprint, config.stateFormat};
     return evaluateEngineMemoryPlan(device, modelProfile, config.maximumMemoryBytes);
   };
   EngineMemoryPlanResult planResult = planMemory(0);
@@ -487,14 +493,14 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     if (stateFile && !config.persistentCacheRoot.empty()) {
       persistentCache = openPersistentCache(
           config.persistentCacheRoot,
-          persistentCacheNamespace(cacheIdentity, loaded.stateLayout()),
+          persistentCacheNamespace(cacheIdentity, loaded.stateLayout(config.stateFormat)),
           model::SlotFile::slotBytesFor(kvPages->bytesPerPage()), stateFile->slotBytes(),
           diskBudget, config.cancelled);
       if (persistentCache.directory)
         stateFile = persistentCache.states;
     }
     auto stateStorage = std::make_unique<model::QwenStateStorage>(
-        *backend, memoryGovernor->allocationAdmission(), loaded.stateLayout(),
+        *backend, memoryGovernor->allocationAdmission(), loaded.stateLayout(config.stateFormat),
         stateFile);
     std::unique_ptr<KvPageTier> kvTier;
     if (diskBudget) {
