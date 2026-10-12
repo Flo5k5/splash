@@ -96,6 +96,7 @@ window. To set your own limits or cache options, add these to `splash serve`:
 | `--max-context 100K` | Set the context limit. |
 | `--language-only` | Skip vision; serve text only. |
 | `--kv-format bf16` | Use BF16 KV cache. Default: 8-bit (INT8). |
+| `--state-format bf16` | Keep recurrent states in BF16: nearly twice as many cached prompts per GB. Default: FP32. |
 | `--disable-ane` | Prefill on the GPU alone. Default: the 27B also uses the Neural Engine. |
 | `--max-cache-disk 16G` | Keep cached prompts on SSD when memory runs short. Off by default. |
 | `--persistent-cache` | Keep the SSD cache across restarts; needs `--max-cache-disk`. Off by default. |

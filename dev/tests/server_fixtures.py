@@ -797,6 +797,7 @@ def main_args(**overrides):
             "port": 0,
             "binary": "splash",
             "kv_format": "int8",
+            "state_format": "fp32",
             **overrides,
         }
     )

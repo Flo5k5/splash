@@ -135,14 +135,16 @@ void testPersistentCacheNamespace() {
   require(persistentCacheNamespace(identity('a', "another build", kv::Format::Int8),
                                    model.stateLayout) == name,
           "the build changed the cache namespace");
-  model::CompositeStateLayout states = model.stateLayout;
+  model::CompositeStateLayout states = model.stateLayout, bfloatStates = model.stateLayout;
   ++states.draft.layers;
+  bfloatStates.target.format = ops::GdnStateFormat::BFloat16;
   require(persistentCacheNamespace(identity('c', "build", kv::Format::Int8), model.stateLayout) !=
                   name &&
               persistentCacheNamespace(identity('a', "build", kv::Format::BFloat16),
                                        model.stateLayout) != name &&
-              persistentCacheNamespace(identity('a', "build", kv::Format::Int8), states) != name,
-          "other models or layouts shared a cache namespace");
+              persistentCacheNamespace(identity('a', "build", kv::Format::Int8), states) != name &&
+              persistentCacheNamespace(identity('a', "build", kv::Format::Int8), bfloatStates) != name,
+          "other models, layouts or state formats shared a cache namespace");
 }
 
 void testWeightBudgetBeforeLoading(const char *metallibPath) {

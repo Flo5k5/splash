@@ -91,6 +91,7 @@ access.
 | `--max-memory` | Auto | Lower the ceiling on Metal allocations, e.g. `28G`; not combined process RSS. See [memory and context](#memory-and-context). |
 | `--max-context` | Auto | Set the context limit, e.g. `100K`. See [memory and context](#memory-and-context). |
 | `--kv-format` | `int8` | Target KV storage: `int8` or `bf16`. See [KV cache precision](#kv-cache-precision). |
+| `--state-format` | `fp32` | Recurrent state storage: `fp32` or `bf16`. See [state precision](#state-precision). |
 | `--idle-release` | `10m` | Time without a request before the engine unwires its memory and frees the weights; the next request restores them. `off` keeps both. See [weight loading](#weight-loading). |
 | `--max-cache-disk` | `0` (off) | SSD quota for cached KV pages and states, e.g. `16G`; kept for the session, or across restarts with `--persistent-cache`. See [SSD cache](#ssd-cache). |
 | `--persistent-cache` | Off | Keep the SSD cache across restarts; needs `--max-cache-disk`. See [persistent cache](#persistent-cache). |
@@ -203,6 +204,26 @@ memory, and can be slower at long contexts. Model weights are unchanged. Restart
 to switch formats. Omit `--kv-format` or use `--kv-format int8` for the default.
 The [SSD cache](#ssd-cache) supports both formats, preserving their stored
 bytes without further quantization.
+
+### State precision
+
+The linear-attention (GDN) layers of the targets carry a recurrent state,
+which every lane holds and every cached state keeps, in memory and on the SSD.
+Select its storage when starting the server:
+
+```bash
+splash serve --model mlx-community/Qwen3.8-27B-4bit --state-format bf16
+```
+
+BF16 halves the recurrent state, most of a cached state's bytes, so memory and
+the [SSD cache](#ssd-cache) hold nearly twice as many cached states, and a
+decode step reads and writes half the state. The kernels compute in FP32
+either way and round the state to BF16 where they store it, at the end of each
+prefill chunk and each decode step, so where a prompt's chunks end also
+changes its state in the last bits ([sampling](#sampling)). Restart to switch
+formats; the SSD cache keeps each format's states apart. Omit `--state-format`
+or use `--state-format fp32` for the default, the precision the models'
+configurations ask for.
 
 ### SSD cache
 
@@ -1827,9 +1848,10 @@ client's failures, limits, unload and load, and cache files on a small program.
 `handoff` runs the event handoff against an agent the CPU plays in each way it
 can fail, and `ane-program-faults` checks that an Objective-C exception and a
 changed method signature fail as `std::runtime_error`. `make test-real` runs
-the model runtime oracle with the GPU alone and with the split as a start makes
-it, which must not be unavailable, and whose automatic context must be what the
-plan holds with the split it runs.
+the model runtime oracle with the GPU alone, with the GPU alone over a BF16
+state (`--state-format bf16`), and with the split as a start makes it, which
+must not be unavailable, and whose automatic context must be what the plan
+holds with the split it runs.
 
 ### Residency and KV extents
 
