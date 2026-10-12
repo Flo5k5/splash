@@ -2042,39 +2042,58 @@ int main(int argc, char **argv) {
     require(partitionedSamplingSnapshot != nullptr,
             "partitioned sampling snapshot allocation failed");
     executor.end(54);
+    // The restore copies the target state exactly, so after the replayed
+    // token the restored lane and a cold lane hold the same GDN cell and
+    // select the same anchor. Their draft rings differ: a cached state keeps
+    // the 4-bit context window, from which the restore computes them again,
+    // and a sampled cycle draws a rejected proposal's correction from the
+    // target's distribution less the draft's, so the cycle's later tokens
+    // may differ.
     EngineRequest restoredMicroSampling =
         makeRequest(55, policyReplayPrompt, 2);
     restoredMicroSampling.sampling = partitionedSampling.sampling;
     beginCold(executor, restoredMicroSampling, 0);
     restoreActivePrefix(executor, 55, policyReplayPrompt.size(),
                         promptAligned.size(), partitionedSamplingSnapshot);
-    ModelStepResult restoredMicroSample = firstStep(
-        executor,
-        prefillChunk(executor, 55, promptAligned.size(),
-                     std::span<const uint32_t>(policyReplayPrompt).subspan(128,
-                                                                          1),
-                     policyPages),
-        55, policyReplayPrompt.size(), policyPages);
-    executor.end(55);
+    ModelStepResult restoredReplay = prefillChunk(
+        executor, 55, promptAligned.size(),
+        std::span<const uint32_t>(policyReplayPrompt).subspan(128, 1),
+        policyPages);
     const std::vector<uint32_t> coldPolicyPages = pageRange(15, 5);
     EngineRequest coldMicroSampling = restoredMicroSampling;
     coldMicroSampling.id = 57;
-    beginCold(executor, coldMicroSampling, 0);
+    beginCold(executor, coldMicroSampling, 1);
     prefillChunk(executor, 57, 0,
                  std::span<const uint32_t>(policyReplayPrompt).first(120),
                  coldPolicyPages);
     prefillChunk(executor, 57, 120,
                  std::span<const uint32_t>(policyReplayPrompt).subspan(120, 8),
                  coldPolicyPages);
-    ModelStepResult coldMicroSample = firstStep(
-        executor,
-        prefillChunk(executor, 57, 128,
-                     std::span<const uint32_t>(policyReplayPrompt).subspan(128,
-                                                                          1),
-                     coldPolicyPages),
-        57, policyReplayPrompt.size(), coldPolicyPages);
-    require(restoredMicroSample.outputTokens == coldMicroSample.outputTokens,
-            "one-token recurrent restore replay diverged from cold prefill");
+    ModelStepResult coldReplay = prefillChunk(
+        executor, 57, 128,
+        std::span<const uint32_t>(policyReplayPrompt).subspan(128, 1),
+        coldPolicyPages);
+    const metal::MetalBuffer &restoredCell = states.current(0).stateBase;
+    const metal::MetalBuffer &coldCell = states.current(1).stateBase;
+    require(restoredCell.sizeBytes() == coldCell.sizeBytes() &&
+                restoredCell.contents() && coldCell.contents() &&
+                std::memcmp(restoredCell.contents(), coldCell.contents(),
+                            restoredCell.sizeBytes()) == 0,
+            "one-token recurrent restore replay left another GDN state than "
+            "cold prefill");
+    const ModelStepResult restoredMicroSample = firstStep(
+        executor, std::move(restoredReplay), 55, policyReplayPrompt.size(),
+        policyPages);
+    const ModelStepResult coldMicroSample = firstStep(
+        executor, std::move(coldReplay), 57, policyReplayPrompt.size(),
+        coldPolicyPages);
+    require(!restoredMicroSample.outputTokens.empty() &&
+                !coldMicroSample.outputTokens.empty() &&
+                restoredMicroSample.outputTokens.front() ==
+                    coldMicroSample.outputTokens.front(),
+            "one-token recurrent restore replay selected another anchor than "
+            "cold prefill");
+    executor.end(55);
     executor.end(57);
     partitionedSamplingSnapshot.reset();
 
