@@ -105,11 +105,16 @@ TIME = {"name": "time", "input_schema": {"type": "object"}}
 
 
 def tool_addition(definition):
-    """A system content block announcing a tool that became available mid-session."""
+    """A system message's block defining a tool that became available."""
     return {
         "type": "tool_addition",
         "tool": {"type": "tool_definition", "definition": copy.deepcopy(definition)},
     }
+
+
+def tool_by_name(kind, name):
+    """A system message's tool_addition or tool_removal block naming a tool."""
+    return {"type": kind, "tool": {"type": "tool_reference", "name": name}}
 
 
 def stream_events(payload):
@@ -500,36 +505,40 @@ class AnthropicAdapterTest(unittest.TestCase):
         with self.assertRaisesRegex(APIError, "require user/assistant/system roles"):
             anthropic_to_chat_body(body, thinking_resolver=no_signed_thinking)
 
-    def test_tool_additions_join_the_request_tools(self):
+    def test_tool_changes_join_the_request_tools(self):
         body = request_body(
-            system=[{"type": "text", "text": "Session start."}, tool_addition(WEATHER)],
+            system=[{"type": "text", "text": "Session start."}],
             messages=[
                 {"role": "user", "content": "hi"},
-                {"role": "assistant", "content": "hello"},
                 {
                     "role": "system",
                     "content": [
                         {"type": "text", "text": "Environment update"},
-                        tool_addition(TIME),
+                        tool_addition(WEATHER),
                     ],
                 },
+                {"role": "assistant", "content": "hello"},
                 {"role": "user", "content": "say ok"},
+                {"role": "system", "content": [tool_by_name("tool_removal", "time")]},
             ],
-            tools=[{"name": "ToolSearch", "input_schema": {"type": "object"}}],
+            tools=[
+                {"name": "ToolSearch", "input_schema": {"type": "object"}},
+                {**TIME, "defer_loading": True},
+            ],
         )
         original = copy.deepcopy(body)
         chat = anthropic_to_chat_prompt(body, thinking_resolver=no_signed_thinking)
+        # A system message keeps its text where it is.
         self.assertEqual(
             chat["messages"],
             [
                 {"role": "system", "content": "Session start."},
                 {"role": "user", "content": "hi"},
-                {"role": "assistant", "content": "hello"},
                 {"role": "system", "content": "Environment update"},
+                {"role": "assistant", "content": "hello"},
                 {"role": "user", "content": "say ok"},
             ],
         )
-        # Declared tools come first, then announcements in document order.
         self.assertEqual(
             chat["tools"],
             [
@@ -548,93 +557,162 @@ class AnthropicAdapterTest(unittest.TestCase):
                         "parameters": WEATHER["input_schema"],
                     },
                 },
-                {
-                    "type": "function",
-                    "function": {"name": "time", "parameters": {"type": "object"}},
-                },
             ],
         )
         self.assertEqual(body, original)
 
-    def test_declared_tools_and_later_additions_decide_a_repeated_name(self):
+    def test_tool_changes_apply_in_conversation_order(self):
+        first = {**WEATHER, "description": "first"}
+        second = {**WEATHER, "description": "second"}
+        query = {"name": "query", "input_schema": {"type": "object"}}
+        cases = [
+            # A definition replaces the tool of its name where it is listed.
+            (
+                [tool_addition(first), tool_addition(second)],
+                [("time", None), ("weather", "second")],
+            ),
+            ([tool_by_name("tool_removal", "weather")], [("time", None)]),
+            # A removed tool comes back by name or by a new definition.
+            (
+                [
+                    tool_by_name("tool_removal", "time"),
+                    tool_by_name("tool_addition", "time"),
+                ],
+                [("time", None), ("weather", WEATHER["description"])],
+            ),
+            (
+                [tool_by_name("tool_removal", "weather"), tool_addition(second)],
+                [("time", None), ("weather", "second")],
+            ),
+            # A tool a message defines can be named by a later one.
+            (
+                [
+                    tool_addition(query),
+                    tool_by_name("tool_removal", "query"),
+                    tool_by_name("tool_addition", "query"),
+                ],
+                [("time", None), ("weather", WEATHER["description"]), ("query", None)],
+            ),
+        ]
+        for changes, expected in cases:
+            messages = [{"role": "user", "content": "hi"}]
+            for change in changes:
+                messages += [
+                    {"role": "system", "content": [change]},
+                    {"role": "assistant", "content": "ok"},
+                    {"role": "user", "content": "go on"},
+                ]
+            body = request_body(messages=messages, tools=[TIME, WEATHER])
+            with self.subTest(changes=changes):
+                chat = anthropic_to_chat_prompt(
+                    body, thinking_resolver=no_signed_thinking
+                )
+                self.assertEqual(
+                    [
+                        (tool["function"]["name"], tool["function"].get("description"))
+                        for tool in chat["tools"]
+                    ],
+                    expected,
+                )
+
+        # tool_choice is checked against the tools offered at the end.
         body = request_body(
             messages=[
                 {"role": "user", "content": "hi"},
                 {
                     "role": "system",
-                    "content": [tool_addition({**WEATHER, "description": "first"})],
+                    "content": [tool_by_name("tool_removal", "weather")],
                 },
-                {"role": "assistant", "content": "hello"},
-                {
-                    "role": "system",
-                    "content": [
-                        tool_addition({**WEATHER, "description": "second"}),
-                        tool_addition({"name": "time", "description": "added"}),
-                    ],
-                },
-                {"role": "user", "content": "say ok"},
             ],
-            tools=[
-                {
-                    "name": "time",
-                    "description": "declared",
-                    "input_schema": {"type": "object"},
-                }
-            ],
+            tools=[TIME, WEATHER],
             tool_choice={"type": "tool", "name": "weather"},
         )
         chat = anthropic_to_chat_prompt(body, thinking_resolver=no_signed_thinking)
-        self.assertEqual(
-            [
-                (tool["function"]["name"], tool["function"]["description"])
-                for tool in chat["tools"]
-            ],
-            [("time", "declared"), ("weather", "second")],
-        )
-        # The merged tools are what a request's tool choice is checked against.
-        _, policy = normalize_tools(
-            chat["tools"], chat["tool_choice"], chat["parallel_tool_calls"]
-        )
-        self.assertEqual(set(policy.schemas), {"weather"})
+        with self.assertRaisesRegex(APIError, "invalid named tool_choice"):
+            normalize_tools(
+                chat["tools"], chat["tool_choice"], chat["parallel_tool_calls"]
+            )
 
-    def test_tool_additions_must_announce_a_tool_definition(self):
-        invalid = [
-            {"type": "tool_addition"},
-            {"type": "tool_addition", "tool": {"type": "tool_reference"}},
-            {"type": "tool_addition", "tool": {"type": "tool_definition"}},
-            {
-                "type": "tool_addition",
-                "tool": {
-                    "type": "tool_definition",
-                    "definition": {"description": "no name"},
+    def test_tool_changes_require_valid_blocks_in_system_messages(self):
+        invalid = {
+            "tool_addition.tool must be": [
+                {"type": "tool_addition"},
+                {"type": "tool_addition", "tool": {"type": "tool_reference"}},
+                {
+                    "type": "tool_addition",
+                    "tool": {
+                        "type": "mcp_tool_reference",
+                        "server_name": "files",
+                        "name": "read",
+                    },
                 },
-            },
-            {
-                "type": "tool_addition",
-                "tool": {
-                    "type": "tool_definition",
-                    "definition": {"name": "web", "type": "web_search_20250305"},
-                },
-            },
-            {"type": "image"},
-        ]
-        for block in invalid:
-            placements = {
-                "system": request_body(system=[block]),
-                "system message": request_body(
+            ],
+            "tool_removal.tool must be": [
+                {
+                    "type": "tool_removal",
+                    "tool": {"type": "tool_definition", "definition": WEATHER},
+                }
+            ],
+            "which is not declared": [
+                tool_by_name("tool_addition", "weather"),
+                tool_by_name("tool_removal", "weather"),
+            ],
+            "invalid Anthropic tool": [
+                {"type": "tool_addition", "tool": {"type": "tool_definition"}},
+                tool_addition({"description": "no name"}),
+            ],
+            "only custom function tools": [
+                tool_addition({"name": "web", "type": "web_search_20250305"})
+            ],
+            "unsupported content": [{"type": "image"}],
+        }
+        for error, blocks in invalid.items():
+            for block in blocks:
+                body = request_body(
                     messages=[
-                        {"role": "system", "content": [block]},
                         {"role": "user", "content": "hi"},
-                    ]
-                ),
-            }
-            for placement, body in placements.items():
+                        {"role": "system", "content": [block]},
+                    ],
+                    tools=[TIME],
+                )
                 with (
-                    self.subTest(block=block, placement=placement),
-                    self.assertRaises(APIError) as caught,
+                    self.subTest(block=block),
+                    self.assertRaisesRegex(APIError, error) as caught,
                 ):
                     anthropic_to_chat_prompt(body, thinking_resolver=no_signed_thinking)
                 self.assertEqual(caught.exception.status, 400)
+
+        # Only a system message changes tools.
+        change = tool_addition(WEATHER)
+        placements = {
+            "system": request_body(system=[change]),
+            "user": request_body(messages=[{"role": "user", "content": [change]}]),
+            "assistant": request_body(
+                messages=[
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": [change]},
+                    {"role": "user", "content": "go on"},
+                ]
+            ),
+        }
+        for placement, body in placements.items():
+            with (
+                self.subTest(placement=placement),
+                self.assertRaisesRegex(APIError, "unsupported") as caught,
+            ):
+                anthropic_to_chat_prompt(body, thinking_resolver=no_signed_thinking)
+            self.assertEqual(caught.exception.status, 400)
+
+        # A repeated tool name is rejected with tool changes as without them.
+        body = request_body(
+            messages=[
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": [tool_addition(WEATHER)]},
+            ],
+            tools=[TIME, TIME],
+        )
+        with self.assertRaisesRegex(APIError, "duplicate tool name: time"):
+            anthropic_to_chat_prompt(body, thinking_resolver=no_signed_thinking)
 
     def test_anthropic_thinking_off_is_not_reenabled_by_effort(self):
         tokenizer = TemplateTokenizer(reasoning_template())
