@@ -516,7 +516,10 @@ edits return 400.
 Messages takes `max_tokens`, `system`, `messages`, custom `tools` (every one
 declared in the prompt, `defer_loading` ones too, so a `tool_result`'s
 `tool_reference` blocks from a tool search render as text naming the tools
-found), `tool_choice` (`auto`, `any`, `tool` or `none`, with
+found; a system message's `tool_addition` and `tool_removal` blocks change
+them in order: a `tool_definition` adds a tool or replaces the one of its name,
+and a removed tool is left out until a later block adds it again),
+`tool_choice` (`auto`, `any`, `tool` or `none`, with
 `disable_parallel_tool_use`), `stop_sequences`, `temperature`, `top_p`, `top_k`,
 `thinking` and `output_config`. A request reasons only when `thinking` sets it:
 `{"type": "enabled"}` and `{"type": "adaptive"}` reason at

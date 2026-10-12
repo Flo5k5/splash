@@ -787,12 +787,11 @@ def _anthropic_chat(body, thinking_resolver):
     chat = {
         "model": body["model"],
         "messages": translated,
+        "tools": _anthropic_offered_tools(body.get("tools"), messages),
         "response_format": response_format,
         "preserve_thinking": preserve_thinking,
         "reasoning_effort": reasoning_effort,
     }
-    if body.get("tools") is not None:
-        chat["tools"] = _anthropic_tools(body["tools"])
     if body.get("tool_choice") is not None:
         chat.update(_anthropic_tool_choice(body["tool_choice"]))
     chat = {key: value for key, value in chat.items() if value is not None}
@@ -827,6 +826,9 @@ def _anthropic_message(message, thinking_resolver):
     if role not in ("user", "assistant", "system"):
         raise APIError(400, "Anthropic messages require user/assistant/system roles")
     if role == "system":
+        if isinstance(content, list):
+            # Its tool changes apply to the request's tools.
+            content = [block for block in content if not _is_tool_change(block)]
         text = _anthropic_system_text(content, "system message")
         return [{"role": "system", "content": text}] if text else []
     if isinstance(content, str):
@@ -975,6 +977,71 @@ def _anthropic_tools(tools):
             function["strict"] = tool["strict"]
         functions.append({"type": "function", "function": function})
     return functions
+
+
+_TOOL_CHANGES = ("tool_addition", "tool_removal")
+
+
+def _is_tool_change(block):
+    return isinstance(block, dict) and block.get("type") in _TOOL_CHANGES
+
+
+def _anthropic_offered_tools(tools, messages):
+    """A Messages request's tools as Chat function tools, changed in order by
+    the tool_addition and tool_removal blocks of its system messages. A chat
+    template declares one tool list, so a tool a message defines joins it,
+    replacing a tool of its name, and a removed tool leaves it until added
+    again. None without tools."""
+    declared = None if tools is None else _anthropic_tools(tools)
+    changes = [
+        block
+        for message in messages
+        if message["role"] == "system" and isinstance(message["content"], list)
+        for block in message["content"]
+        if _is_tool_change(block)
+    ]
+    if not changes:
+        return declared
+    offered = {}
+    for tool in declared or []:
+        name = tool["function"]["name"]
+        # Keyed by name, the tools would hide a repeated one from
+        # normalize_tools.
+        if name in offered:
+            raise APIError(400, f"duplicate tool name: {name}")
+        offered[name] = tool
+    removed = set()
+    for block in changes:
+        name, definition = _tool_change(block)
+        if definition is not None:
+            offered[name] = definition
+        elif name not in offered:
+            raise APIError(
+                400, f"{block['type']} names tool {name!r}, which is not declared"
+            )
+        if block["type"] == "tool_removal":
+            removed.add(name)
+        else:
+            removed.discard(name)
+    return [tool for name, tool in offered.items() if name not in removed]
+
+
+def _tool_change(block):
+    """The name of the tool a tool_addition or tool_removal block changes, and
+    the Chat tool it defines; None when it names the tool."""
+    tool = block.get("tool")
+    form = tool.get("type") if isinstance(tool, dict) else None
+    if block["type"] == "tool_addition" and form == "tool_definition":
+        (definition,) = _anthropic_tools([tool.get("definition")])
+        return definition["function"]["name"], definition
+    if form != "tool_reference" or not isinstance(tool.get("name"), str):
+        forms = (
+            "a named tool_reference or a tool_definition"
+            if block["type"] == "tool_addition"
+            else "a named tool_reference"
+        )
+        raise APIError(400, f"{block['type']}.tool must be {forms}")
+    return tool["name"], None
 
 
 def _anthropic_tool_choice(choice):
