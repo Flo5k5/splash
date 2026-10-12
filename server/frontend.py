@@ -237,6 +237,7 @@ class GenerationOptions:
     ignore_eos: bool
     seed: int
     priority: wire.RequestPriority
+    cache_salt: int
 
 
 class Frontend:
@@ -589,8 +590,29 @@ class Frontend:
             raise APIError(400, "priority must be foreground, normal, or background")
         return _PRIORITIES[priority_name]
 
+    @staticmethod
+    def _cache_salt(body):
+        """The request's cache_salt as the engine keys its cache: 128 bits of
+        its hash, zero without one. A request shares cached prompts only with
+        requests of the same salt."""
+        salt = body.get("cache_salt")
+        if salt is None:
+            return 0
+        if not isinstance(salt, str) or not salt:
+            raise APIError(400, "cache_salt must be a non-empty string")
+        digest = hashlib.blake2b(
+            salt.encode("utf-8", "surrogatepass"), digest_size=16, person=b"splash-salt"
+        ).digest()
+        return int.from_bytes(digest, "little")
+
     def _score_job(
-        self, prompt_tokens, slot_ids, deadline, priority, prompt_sha256=None
+        self,
+        prompt_tokens,
+        slot_ids,
+        deadline,
+        priority,
+        prompt_sha256,
+        cache_salt,
     ):
         return Job(
             request_id=next(self.ids),
@@ -603,6 +625,7 @@ class Frontend:
             score_tokens=tuple(slot_ids),
             public_id=secrets.token_hex(16),
             prompt_sha256=prompt_sha256,
+            cache_salt=cache_salt,
         )
 
     def _encode_score_prompt(self, messages, labels, admit, checkpoint, what):
@@ -628,7 +651,16 @@ class Frontend:
     def prepare_judgment(self, body, *, deadline, disconnected):
         unknown = sorted(
             set(body)
-            - {"id", "state", "question", "options", "model", "timeout", "priority"}
+            - {
+                "id",
+                "state",
+                "question",
+                "options",
+                "model",
+                "timeout",
+                "priority",
+                "cache_salt",
+            }
         )
         if unknown:
             raise APIError(400, f"unsupported fields: {', '.join(unknown)}")
@@ -639,6 +671,7 @@ class Frontend:
         except ValueError as error:
             raise APIError(400, str(error)) from error
         priority = self._priority(body)
+        cache_salt = self._cache_salt(body)
         checkpoint = _preparation_checkpoint(deadline, disconnected)
         with self._preparation(deadline):
 
@@ -656,7 +689,12 @@ class Frontend:
             )
             checkpoint()
             job = self._score_job(
-                tokens, slots, deadline, priority, judgments.digest(prompt)
+                tokens,
+                slots,
+                deadline,
+                priority,
+                judgments.digest(prompt),
+                cache_salt,
             )
         return job, body
 
@@ -675,6 +713,10 @@ class Frontend:
             priority = self._priority(body)
         except APIError as error:
             details.append(field_error(["priority"], error.message))
+        try:
+            cache_salt = self._cache_salt(body)
+        except APIError as error:
+            details.append(field_error(["cache_salt"], error.message))
         if details:
             raise RequestValidationError(details)
         jobs = []
@@ -724,7 +766,13 @@ class Frontend:
                 checkpoint()
                 total_tokens += len(tokens)
                 jobs.append(
-                    (qid, spec, self._score_job(tokens, slot_ids, deadline, priority))
+                    (
+                        qid,
+                        spec,
+                        self._score_job(
+                            tokens, slot_ids, deadline, priority, None, cache_salt
+                        ),
+                    )
                 )
         return jobs
 
@@ -1090,6 +1138,7 @@ class Frontend:
             ignore_eos,
             seed,
             self._priority(body),
+            self._cache_salt(body),
         )
 
     def _output_budget(self, requested, prompt_tokens, field, clamp=False):
@@ -1125,6 +1174,7 @@ class Frontend:
             sampling=options.sampling,
             deadline=deadline,
             priority=options.priority,
+            cache_salt=options.cache_salt,
             stop_sequences=options.stop_sequences,
             flags=(
                 wire.RequestFlag.IGNORE_END_OF_SEQUENCE

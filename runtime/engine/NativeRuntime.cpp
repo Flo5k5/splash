@@ -306,6 +306,7 @@ bool NativeRuntime::handleRequest(protocol::RequestFrame &request) {
     engineRequest.sampling = request.sampling;
     engineRequest.constraint = request.constraint;
     engineRequest.flags = request.flags & kRequestFlagBits;
+    engineRequest.cacheSalt = request.cacheSalt;
     engineRequest.returnProgress =
         request.flags & protocol::kReturnProgressFlag;
     engineRequest.deadlineMilliseconds =
@@ -536,6 +537,7 @@ void NativeRuntime::maskRequested(uint64_t requestId,
 
 void NativeRuntime::completed(uint64_t requestId, EngineFinishReason reason,
                               uint32_t promptTokens, uint32_t completionTokens,
+                              uint32_t deduplicatedTokens,
                               std::span<const float> optionLogits) {
   RequestTelemetry &telemetry = telemetry_.at(requestId);
   double now = config_.monotonicMilliseconds();
@@ -548,7 +550,8 @@ void NativeRuntime::completed(uint64_t requestId, EngineFinishReason reason,
       durationMicros(started, first),
       telemetry.firstTokenMilliseconds ? durationMicros(first, now) : 0,
       durationMicros(telemetry.arrivedMilliseconds, now),
-      std::vector<float>(optionLogits.begin(), optionLogits.end())});
+      std::vector<float>(optionLogits.begin(), optionLogits.end()),
+      deduplicatedTokens});
   ended(requestId, now);
 }
 

@@ -68,7 +68,8 @@ constexpr size_t seed = minP + 4;
 constexpr size_t scoreCount = seed + 8;
 constexpr size_t generationPrompt = scoreCount + 4;
 constexpr size_t flags = generationPrompt + 4;
-static_assert(flags + 4 == kRequestFixedBytes);
+constexpr size_t cacheSalt = flags + 4;
+static_assert(cacheSalt + 16 == kRequestFixedBytes);
 } // namespace request_offset
 
 uint32_t loadU32(const std::vector<uint8_t> &bytes, size_t offset) {
@@ -172,6 +173,7 @@ RequestFrame exampleRequest() {
   request.sampling.seed = 0xfedcba9876543210ULL;
   request.constraint = ConstraintMode::TokenMask;
   request.generationPromptTokens = 2;
+  request.cacheSalt = {0x8899aabbccddeeffULL, 0x0011223344556677ULL};
   return request;
 }
 
@@ -236,9 +238,9 @@ const std::vector<std::pair<std::string, EngineEvent>> &engineEvents() {
       {"mask_request_initial", MaskRequestEvent{91, 6, 4, {}}},
       {"mask_request_verify", MaskRequestEvent{91, 7, 4, {101, 102, 103}}},
       {"done", DoneEvent{91, EngineFinishReason::Stop, 4096, 512, 1000, 2000,
-                         3500, {}}},
+                         3500, {}, 64}},
       {"done_scored", DoneEvent{91, EngineFinishReason::Stop, 4096, 0, 1000, 0,
-                                3500, {1.5f, -2.25f, 0.5f}}},
+                                3500, {1.5f, -2.25f, 0.5f}, 32}},
       {"error_request",
        ErrorEvent{FailureClass::RequestError, 91, true, "deadline_exceeded",
                   "request deadline expired"}},
@@ -387,13 +389,14 @@ void testScoreRequestAndDoneLogits() {
   expectRequestIssue(test, topP, IssueCode::InvalidSampling);
 
   DoneEvent scored{91, EngineFinishReason::Stop, 4096, 0, 1000, 0, 3500,
-                   {1.5f, -2.0f, 0.25f}};
+                   {1.5f, -2.0f, 0.25f}, 96};
   CHECK(test, roundTripEvent(scored) == scored);
   auto encodedDone = serializeEvent(scored, kLimits);
   CHECK(test, encodedDone);
   if (encodedDone) {
-    CHECK(test, encodedDone.value->size() == kFrameHeaderBytes + 45 + 12);
-    CHECK(test, loadU32(*encodedDone.value, kFrameHeaderBytes + 41) == 3);
+    CHECK(test, encodedDone.value->size() == kFrameHeaderBytes + 49 + 12);
+    CHECK(test, loadU32(*encodedDone.value, kFrameHeaderBytes + 41) == 96);
+    CHECK(test, loadU32(*encodedDone.value, kFrameHeaderBytes + 45) == 3);
   }
 
   DoneEvent generation{91, EngineFinishReason::Length, 10, 4, 1, 2, 3, {}};

@@ -5,7 +5,7 @@ import functools
 import queue
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from tokenizers.decoders import DecodeStream
 
@@ -52,6 +52,9 @@ class CacheInfo:
     status: str = "unknown"
     matched_tokens: int = 0
     lane: int = -1
+    # Of the tokens the request computed, those whose KV it then read from a
+    # cached block's page; known once it is done.
+    deduplicated_tokens: int = 0
 
 
 @dataclass
@@ -119,6 +122,8 @@ class Job:
     output_clamped_to_context: bool = False
     # The digest of a judgment's rendered prompt, which its response reports.
     prompt_sha256: str | None = None
+    # The request's cache_salt hashed to 128 bits; zero without one.
+    cache_salt: int = 0
     latency: RequestLatency | None = None
 
     @property
@@ -605,6 +610,7 @@ class NativeBackend:
             score_tokens=job.score_tokens,
             generation_prompt_tokens=job.generation_prompt_tokens,
             flags=job.flags,
+            cache_salt=job.cache_salt,
         )
         return engine_runtime.GenerationRequest(
             frame, job.deadline, self._mask_provider(job), job.image_owner
@@ -831,7 +837,7 @@ class NativeBackend:
                 first_token_to_done_ms=done.decode_micros / 1000.0,
                 request_wall_ms=done.wall_micros / 1000.0,
                 prefill_tokens=max(0, done.prompt_tokens - job.cache.matched_tokens),
-                cache=job.cache,
+                cache=replace(job.cache, deduplicated_tokens=done.deduplicated_tokens),
                 stop_sequence=stop_sequence,
                 first_token_batch_tokens=state.first_token_batch_tokens,
             )

@@ -44,7 +44,7 @@ _MAGIC = b"SPLH"
 _HEADER = struct.Struct("<4sHHQ")
 # Replay can update the integer deadlines without decoding sampling floats.
 _REQUEST_HEAD = struct.Struct("<QBBQQ")
-_REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIffIffffQIII")
+_REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIffIffffQIIIQQ")
 _IMAGE_SPAN = struct.Struct("<IIIIQQ")
 _CANCEL = struct.Struct("<Q")
 _MASK_RESPONSE = struct.Struct("<QQI")
@@ -55,7 +55,7 @@ _START = struct.Struct("<QII")
 _PROMPT_PROGRESS = struct.Struct("<QIQ")
 _TOKENS = struct.Struct("<QII")
 _MASK_REQUEST = struct.Struct("<QQII")
-_DONE = struct.Struct("<QBIIQQQI")
+_DONE = struct.Struct("<QBIIQQQII")
 _ERROR = struct.Struct("<BBQII")
 _STATUS_JSON = struct.Struct("<Q")
 
@@ -65,11 +65,11 @@ assert (
     and sys.byteorder == "little"
 )
 assert _HEADER.size == FRAME_HEADER_BYTES
-assert _REQUEST.size == 86
+assert _REQUEST.size == 102
 assert _IMAGE_SPAN.size == 32
 assert _READY.size == 9
 assert _START.size == 16
-assert _DONE.size == 45
+assert _DONE.size == 49
 assert _ERROR.size == 18
 assert _STATUS_JSON.size == 8
 
@@ -260,6 +260,9 @@ class RequestFrame:
     # when unknown. It must leave at least one prompt token.
     generation_prompt_tokens: int
     flags: RequestFlag
+    # The request's cache_salt hashed to 128 bits (Frontend._cache_salt);
+    # zero without one.
+    cache_salt: int
 
 
 @dataclass(slots=True, frozen=True)
@@ -354,6 +357,9 @@ class DoneEvent:
     # Raw final-position logits for a score-only request, in requested token
     # order; empty for generation and for cancelled or failed scoring.
     option_logits: tuple[float, ...]
+    # Of the tokens the request computed, those whose KV it then read from a
+    # cached block's page.
+    deduplicated_tokens: int = 0
 
 
 @dataclass(slots=True, frozen=True)
@@ -715,6 +721,7 @@ def _validated_request(
         )
     try:
         _u64(request.seed, "seed")
+        _integer(request.cache_salt, 0, (1 << 128) - 1, "cache salt")
     except ValueError as error:
         _fail_request(IssueCode.INTEGER_OVERFLOW, str(error), request_id)
     return prompt, scores, sampling
@@ -765,6 +772,8 @@ def _request_frame(request: RequestFrame) -> bytearray:
         len(request.score_tokens),
         request.generation_prompt_tokens,
         request.flags,
+        request.cache_salt & 0xFFFFFFFFFFFFFFFF,
+        request.cache_salt >> 64,
     )
     for index, span in enumerate(request.image_spans):
         _IMAGE_SPAN.pack_into(
@@ -1010,7 +1019,9 @@ def _decode_event(frame: Frame) -> EngineEvent:
             )
         return MaskRequestEvent(request_id, mask_request_id, words_per_mask, tokens)
     if frame_type is FrameType.DONE:
-        request_id, reason, *counts, logit_count = _DONE.unpack_from(payload)
+        request_id, reason, *counts, deduplicated, logit_count = _DONE.unpack_from(
+            payload
+        )
         logits = _tail(
             payload, _DONE.size, logit_count, "f", "option logit", request_id
         )
@@ -1026,7 +1037,7 @@ def _decode_event(frame: Frame) -> EngineEvent:
             _fatal(
                 IssueCode.INVALID_REQUEST_ID, "done event request id must be non-zero"
             )
-        event = DoneEvent(request_id, reason, *counts, logits)
+        event = DoneEvent(request_id, reason, *counts, logits, deduplicated)
         if logits and (
             len(logits) < MIN_SCORE_TOKENS
             or not all(map(math.isfinite, logits))

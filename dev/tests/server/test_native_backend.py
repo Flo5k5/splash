@@ -147,9 +147,9 @@ class DrivenRuntime(FakeRuntime):
         super().close()
 
 
-def success_result(call, *, reason=wire.FinishReason.STOP, tokens=()):
+def success_result(call, *, reason=wire.FinishReason.STOP, tokens=(), deduplicated=0):
     return wire.DoneEvent(
-        call.request_id, reason, 4, len(tokens), 1_250, 2_500, 4_000, ()
+        call.request_id, reason, 4, len(tokens), 1_250, 2_500, 4_000, (), deduplicated
     )
 
 
@@ -414,7 +414,7 @@ class NativeBackendContractTests(unittest.TestCase):
 
         call.emit(wire.StartEvent(call.request_id, 2, 2))
         call.emit(wire.TokensEvent(call.request_id, 0, (7, 8)))
-        call.complete(result=success_result(call, tokens=(7, 8)))
+        call.complete(result=success_result(call, tokens=(7, 8), deduplicated=64))
 
         self.assertEqual(job.events.get(timeout=1.0), ("start", None))
         self.assertEqual(job.events.get(timeout=1.0), ("text", "7"))
@@ -423,6 +423,8 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertEqual(kind, "done")
         self.assertEqual(result.reason, "stop")
         self.assertEqual(result.cache.status, "hit")
+        self.assertEqual(result.cache.deduplicated_tokens, 64)
+        self.assertEqual(result.metrics["cache"]["deduplicated_tokens"], 64)
         self.assertEqual(result.prefill_tokens, 2)
         self.assertEqual(result.start_to_first_token_ms, 1.25)
         self.assertEqual(result.first_token_to_done_ms, 2.5)

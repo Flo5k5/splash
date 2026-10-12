@@ -77,6 +77,7 @@ void testCleanRuntimeStatus(const char *goldenPath) {
   engine.cacheHits = 1;
   engine.coldMisses = 2;
   engine.reusedTokens = 64;
+  engine.deduplicatedKvTokens = 96;
   engine.junctionMaterializations = 1;
   engine.checkpointPublications = 3;
   engine.checkpointPublicationFailures = 1;

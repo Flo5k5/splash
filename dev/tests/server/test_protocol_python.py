@@ -34,6 +34,8 @@ REQUEST_FIELDS = (
     "score_count",
     "generation_prompt_tokens",
     "flags",
+    "cache_salt_lo",
+    "cache_salt_hi",
 )
 assert len(REQUEST_FIELDS) == len(p._REQUEST.format) - 1
 OFFSET = dict(
@@ -65,6 +67,7 @@ def example_request():
         seed=0xFEDCBA9876543210,
         constraint=p.ConstraintMode.TOKEN_MASK,
         generation_prompt_tokens=2,
+        cache_salt=0x00112233445566778899AABBCCDDEEFF,
     )
 
 
@@ -126,9 +129,11 @@ def engine_events():
         "tokens": p.TokensEvent(91, 17, (10, 11, 12)),
         "mask_request_initial": p.MaskRequestEvent(91, 6, 4, ()),
         "mask_request_verify": p.MaskRequestEvent(91, 7, 4, (101, 102, 103)),
-        "done": p.DoneEvent(91, p.FinishReason.STOP, 4096, 512, 1000, 2000, 3500, ()),
+        "done": p.DoneEvent(
+            91, p.FinishReason.STOP, 4096, 512, 1000, 2000, 3500, (), 64
+        ),
         "done_scored": p.DoneEvent(
-            91, p.FinishReason.STOP, 4096, 0, 1000, 0, 3500, (1.5, -2.25, 0.5)
+            91, p.FinishReason.STOP, 4096, 0, 1000, 0, 3500, (1.5, -2.25, 0.5), 32
         ),
         "error_request": p.ErrorEvent(
             p.FailureClass.REQUEST_ERROR,
@@ -415,6 +420,8 @@ class ProtocolPythonTests(unittest.TestCase):
                 len(request.score_tokens),
                 request.generation_prompt_tokens,
                 int(request.flags),
+                request.cache_salt & 0xFFFFFFFFFFFFFFFF,
+                request.cache_salt >> 64,
             )
             + struct.pack(f"<{len(request.prompt_tokens)}I", *request.prompt_tokens)
             + struct.pack(p._IMAGE_SPAN.format, *astuple(span))
@@ -488,19 +495,22 @@ class ProtocolPythonTests(unittest.TestCase):
 
     def test_done_option_logits_wire_layout_and_roundtrip(self):
         done = p.DoneEvent(
-            91, p.FinishReason.STOP, 4096, 0, 1000, 0, 3500, (1.5, -2.25, 0.5)
+            91, p.FinishReason.STOP, 4096, 0, 1000, 0, 3500, (1.5, -2.25, 0.5), 96
         )
         wire = native_peer.serialize_event(done)
         self.assertEqual(decode_event(wire), done)
+        self.assertEqual(
+            struct.unpack_from("<I", wire, p.FRAME_HEADER_BYTES + 41), (96,)
+        )
         # A wrong logit count must fail closed, not truncate.
         self.assert_protocol_error(
             p.FailureClass.PROTOCOL_FATAL,
             p.IssueCode.INVALID_PAYLOAD_LENGTH,
-            lambda: decode_event(mutate_u32(wire, p.FRAME_HEADER_BYTES + 41, 2)),
+            lambda: decode_event(mutate_u32(wire, p.FRAME_HEADER_BYTES + 45, 2)),
         )
-        # A Done payload without its option-logit count (41 bytes) is below
+        # A Done payload without its option-logit count (45 bytes) is below
         # the minimum.
-        short = mutate_u64(wire[: p.FRAME_HEADER_BYTES + 41], 8, 41)
+        short = mutate_u64(wire[: p.FRAME_HEADER_BYTES + 45], 8, 45)
         self.assertEqual(parser_issue(short).code, p.IssueCode.INVALID_PAYLOAD_LENGTH)
 
     def test_done_option_logits_validation(self):

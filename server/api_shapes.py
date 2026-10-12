@@ -594,6 +594,7 @@ def responses_to_chat_body(body, items):
         "seed",
         "timeout",
         "priority",
+        "cache_salt",
         "stop",
         "max_output_tokens",
     ):
@@ -685,6 +686,7 @@ def anthropic_to_chat_body(body, *, thinking_resolver):
         seed=body.get("seed"),
         timeout=body.get("timeout"),
         priority=body.get("priority"),
+        cache_salt=body.get("cache_salt"),
     )
     chat = {key: value for key, value in chat.items() if value is not None}
     return chat, thinking_display

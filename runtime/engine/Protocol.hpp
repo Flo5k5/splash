@@ -131,9 +131,10 @@ validateLimits(const ProtocolLimits &limits);
 //   74 u32 score token count
 //   78 u32 generationPromptTokens
 //   82 u32 flags
+//   86 u64 cacheSalt.lo, u64 cacheSalt.hi
 // then the prompt tokens, the 32-byte image spans, the image pixels and the
 // score tokens.
-inline constexpr uint64_t kRequestFixedBytes = 86;
+inline constexpr uint64_t kRequestFixedBytes = 102;
 
 // The request flags word holds the RequestFlag bits and this one, which asks
 // for PromptProgressEvents while the prompt prefills.
@@ -170,6 +171,8 @@ struct RequestFrame {
   uint32_t generationPromptTokens = 0;
   // RequestFlag bits and kReturnProgressFlag.
   uint32_t flags = 0;
+  // The request's cache_salt as the server hashed it; zero without one.
+  engine::CacheSalt cacheSalt;
 
   bool operator==(const RequestFrame &) const = default;
 };
@@ -188,7 +191,8 @@ struct RequestFrame {
 //                  u32 count, u32 simulation tokens
 //   Done           u64 requestId, u8 reason, u32 promptTokens,
 //                  u32 completionTokens, u64 prefillMicros, u64 decodeMicros,
-//                  u64 wallMicros, u32 count, f32 option logits
+//                  u64 wallMicros, u32 deduplicatedTokens, u32 count,
+//                  f32 option logits
 //   Error          u8 failureClass, u8 retryable, u64 requestId, u32 code
 //                  bytes, u32 message bytes, the code, the message
 //   StatusJson     u64 correlationId, the JSON
@@ -279,6 +283,9 @@ struct DoneEvent {
   // Raw final-prompt-position logits at the request's scoreTokens, in
   // requested order. Empty for generation and for cancelled/failed scoring.
   std::vector<float> optionLogits{};
+  // Of the tokens the request computed, those whose KV it then read from a
+  // cached block's page (engine::Cache::publishCommittedBlocks).
+  uint32_t deduplicatedTokens = 0;
 
   bool operator==(const DoneEvent &) const = default;
 };

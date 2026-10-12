@@ -31,6 +31,16 @@ enum class EngineFinishReason : uint8_t {
   Cancelled = 2,
 };
 
+// A request's cache salt: its API's cache_salt, which the server hashes to
+// 128 bits. Requests share cached KV and states only with requests of the
+// same salt; zero for a request without one.
+struct CacheSalt final {
+  uint64_t lo = 0;
+  uint64_t hi = 0;
+
+  bool operator==(const CacheSalt &) const = default;
+};
+
 struct EngineRequest final {
   uint64_t id = 0;
   RequestPriority priority = RequestPriority::Normal;
@@ -53,6 +63,7 @@ struct EngineRequest final {
   std::vector<uint32_t> scoreTokens{};
   // RequestFlag bits.
   uint32_t flags = 0;
+  CacheSalt cacheSalt;
 
   [[nodiscard]] ModelRequest modelView() const noexcept {
     return {id,       prompt,     images,      imagePixels, maxNewTokens,
@@ -119,8 +130,11 @@ public:
   virtual void tokens(uint64_t requestId, std::span<const uint32_t> tokens) = 0;
   virtual void maskRequested(uint64_t requestId,
                              std::span<const uint32_t> simulationTokens) = 0;
+  // deduplicatedTokens: of the tokens the request computed, those whose KV it
+  // then read from a cached block's page.
   virtual void completed(uint64_t requestId, EngineFinishReason reason,
                          uint32_t promptTokens, uint32_t completionTokens,
+                         uint32_t deduplicatedTokens,
                          std::span<const float> optionLogits) = 0;
   virtual void failed(uint64_t requestId, LaneOutcome outcome,
                       std::string message) = 0;

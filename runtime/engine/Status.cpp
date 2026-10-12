@@ -232,6 +232,7 @@ std::string runtimeStatusJson(
       << ",\"kv_disk_hit_tokens\":" << resources.kvTier.restores * kv::kPageTokens
       << ",\"lost_state_misses\":" << lookup.lostStateMisses
       << ",\"reused_tokens\":" << core.reusedTokens
+      << ",\"deduplicated_kv_tokens\":" << core.deduplicatedKvTokens
       << ",\"replay_state_publications\":" << core.replayStatePublications
       << ",\"deduplicated_state_publications\":"
       << core.deduplicatedStatePublications

@@ -342,6 +342,54 @@ void testGenerationPromptBoundsTheReplayState() {
           "the replay state did not end before the generation prompt");
 }
 
+// A request's cache salt reaches the engine: the same prompt under another
+// salt starts cold and under its own salt resumes. A Done event reports the
+// tokens a request read from blocks another request computed, and a salt no
+// other request uses reads none.
+void testCacheSaltAndDeduplicationCrossTheWire() {
+  engine::NativeLoopConfig config;
+  config.engine.maxContext = 1024;
+  LoopFixture fixture(config);
+  engine::NativeRuntime &loop = fixture.loop;
+  fixture.clockStep = 0.25;
+  loop.announceReady();
+  const auto send = [&](protocol::RequestFrame input) {
+    require(loop.receive(protocol::peer::serialize(input)), "salted request wire failed");
+    runUntilIdle(loop);
+  };
+  for (const auto &[id, salt] : {std::pair<uint64_t, uint64_t>{1, 7}, {2, 8}, {3, 7}}) {
+    auto input = request(id);
+    input.cacheSalt = {salt, 0};
+    send(input);
+  }
+  // An unsalted longer prompt, then two with its first three blocks' tokens
+  // and no state there: one unsalted, one under a salt no other request uses.
+  auto longer = request(4, 8);
+  longer.promptTokens.resize(129);
+  for (uint32_t i = 0; i < longer.promptTokens.size(); ++i)
+    longer.promptTokens[i] = 1000 + i;
+  send(longer);
+  for (const auto &[id, salt] : {std::pair<uint64_t, uint64_t>{5, 0}, {6, 99}}) {
+    auto branch = longer;
+    branch.requestId = id;
+    branch.cacheSalt = {salt, 0};
+    std::fill(branch.promptTokens.begin() + 100, branch.promptTokens.end(), 7);
+    send(branch);
+  }
+  std::unordered_map<uint64_t, uint32_t> matched, deduplicated;
+  for (const auto &message : fixture.events()) {
+    if (const auto *start = std::get_if<protocol::StartEvent>(&message))
+      matched[start->requestId] = start->matchedPromptTokens;
+    if (const auto *done = std::get_if<protocol::DoneEvent>(&message))
+      deduplicated[done->requestId] = done->deduplicatedTokens;
+  }
+  require(matched.at(1) == 0 && matched.at(2) == 0 && matched.at(3) > 0,
+          "a request's cache salt did not reach the engine");
+  require(matched.at(5) == 0 && deduplicated.at(5) > 0 && matched.at(6) == 0 &&
+              deduplicated.at(6) == 0,
+          "a Done event did not carry the tokens read from another request's blocks");
+}
+
 // A request's flags reach the model with the rest of its request.
 void testRequestFlagsReachTheModel() {
   engine::NativeLoopConfig config;
@@ -1864,6 +1912,7 @@ int main() {
     testWireLifecycleAndCacheHit();
     testSnapshotReportsLiveRequests();
     testGenerationPromptBoundsTheReplayState();
+    testCacheSaltAndDeduplicationCrossTheWire();
     testRequestFlagsReachTheModel();
     testSamplingReachesTheModel();
     testPromptProgress();
