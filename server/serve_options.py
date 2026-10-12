@@ -25,8 +25,6 @@ DEFAULT_QUEUE_SIZE = 32
 # The port both commands serve on unless --port names another, or for the
 # launcher SPLASH_PORT does.
 DEFAULT_PORT = 8000
-# Where --persistent-cache keeps its files unless --cache-dir says otherwise.
-DEFAULT_CACHE_DIR = Path.home() / "Library/Caches/Splash/prefix-cache"
 _SIZE_UNITS = {
     unit + suffix: 1024**power
     for power, unit in enumerate(("K", "M", "G"), 1)

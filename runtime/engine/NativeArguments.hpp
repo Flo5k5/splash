@@ -26,9 +26,12 @@ struct NativeArguments final {
   uint32_t maxContext = 0;
   uint64_t maxMemoryBytes = 0;
   uint64_t maxCacheDiskBytes = 0;
-  // --cache-dir: where the cache tier keeps its files for the next process;
-  // empty for temporary ones.
-  std::filesystem::path persistentCacheRoot;
+  // --persistent-cache on|off: whether the cache tier keeps its files for the
+  // next process, instead of temporary ones.
+  bool persistentCache = false;
+  // --cache-dir: where persistent caches live; empty for the default,
+  // ~/Library/Caches/Splash/prefix-cache.
+  std::filesystem::path cacheRoot;
   kv::Format kvFormat = kv::Format::Int8;
   ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
   double decodeShare = EngineConfig{}.decodeShare;

@@ -382,14 +382,6 @@ class ServeOptionsTests(unittest.TestCase):
                     api._native_command(api.parse_args([*required, *options])),
                     [args.binary, "serve-native", args.model_root, *arguments],
                 )
-        # A persistent cache names its directory; the server picks the default.
-        persistent_args = api.parse_args(
-            [*required, "--max-cache-disk", "5G", "--persistent-cache"]
-        )
-        self.assertEqual(
-            api._native_command(persistent_args)[-2:],
-            ["--cache-dir", str(serve_options.DEFAULT_CACHE_DIR)],
-        )
 
 
 if __name__ == "__main__":

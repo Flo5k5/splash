@@ -90,10 +90,13 @@ struct RuntimeResourcesConfig {
   uint64_t maximumMemoryBytes = 0;
   // Disk quota shared by cached KV pages and states; zero disables the tier.
   uint64_t maximumCacheDiskBytes = 0;
-  // Where the tier keeps its files for the next process to take back
-  // (--cache-dir): one directory per persistentCacheNamespace(). Empty for
-  // temporary files that go with the process.
-  std::filesystem::path persistentCacheRoot;
+  // Where persistent caches live, one directory per persistentCacheNamespace():
+  // every start removes those nobody used for two weeks. Empty for none.
+  std::filesystem::path cacheRoot;
+  // The tier keeps its files under cacheRoot for the next process to take
+  // back (--persistent-cache), instead of temporary files that go with the
+  // process.
+  bool persistentCache = false;
   // Patches per image, from --max-image-patches: the engine admits images up
   // to it when the model loaded vision and none otherwise. The wire parser
   // keeps the protocol ceiling.

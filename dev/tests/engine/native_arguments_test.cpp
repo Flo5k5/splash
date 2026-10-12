@@ -112,7 +112,13 @@ void testServerCommandLines(const char *path) {
       {"persistent",
        [](NativeArguments &read) {
          read.maxCacheDiskBytes = 5 * kGiB;
-         read.persistentCacheRoot = "/srv/cache";
+         read.persistentCache = true;
+       }},
+      {"persistent_dir",
+       [](NativeArguments &read) {
+         read.maxCacheDiskBytes = 5 * kGiB;
+         read.persistentCache = true;
+         read.cacheRoot = "/srv/cache";
        }},
       {"bf16", [](NativeArguments &read) { read.kvFormat = kv::Format::BFloat16; }},
       {"disk_bf16",
@@ -147,7 +153,7 @@ void testServerCommandLines(const char *path) {
     return read.modelRoot == meant.modelRoot && read.maxContext == meant.maxContext &&
            read.maxMemoryBytes == meant.maxMemoryBytes &&
            read.maxCacheDiskBytes == meant.maxCacheDiskBytes &&
-           read.persistentCacheRoot == meant.persistentCacheRoot &&
+           read.persistentCache == meant.persistentCache && read.cacheRoot == meant.cacheRoot &&
            read.kvFormat == meant.kvFormat && read.stateFormat == meant.stateFormat &&
            read.decodeShare == meant.decodeShare &&
            read.maxImagePatches == meant.maxImagePatches &&
@@ -207,9 +213,12 @@ void testRefusals() {
   refuses({"auto", "auto", "--idle-sleep", "never"},
           "--idle-sleep requires prevent or allow");
   refuses({"auto", "auto", "--ane", "gpu"}, "--ane requires on or off");
-  refuses({"auto", "auto", "--cache-dir", "/srv/cache"},
-          "--cache-dir requires a MAX_CACHE_DISK_BYTES quota");
-  refuses({"auto", "auto", "5368709120", "--cache-dir", ""},
+  refuses({"auto", "auto", "--persistent-cache", "yes"}, "--persistent-cache requires on or off");
+  refuses({"auto", "auto", "--persistent-cache", "on"},
+          "--persistent-cache requires a MAX_CACHE_DISK_BYTES quota");
+  refuses({"auto", "auto", "5368709120", "--cache-dir", "/srv/cache"},
+          "--cache-dir requires --persistent-cache on");
+  refuses({"auto", "auto", "5368709120", "--persistent-cache", "on", "--cache-dir", ""},
           "--cache-dir requires a directory");
   refuses({"auto", "auto", "5G"},
           "MAX_CACHE_DISK_BYTES must be a nonnegative integer");

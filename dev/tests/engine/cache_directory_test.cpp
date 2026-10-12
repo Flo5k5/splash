@@ -45,7 +45,7 @@ public:
   [[nodiscard]] const std::filesystem::path &path() const noexcept { return path_; }
   [[nodiscard]] std::unique_ptr<CacheDirectory> open(const char *cacheNamespace = "0123abcd",
                                                      std::chrono::milliseconds wait = 0ms) const {
-    return CacheDirectory::open(path_, cacheNamespace, wait, std::chrono::hours(24 * 14));
+    return CacheDirectory::open(path_, cacheNamespace, wait);
   }
 
 private:
@@ -72,8 +72,8 @@ void testOneProcessAtATime() {
   require(std::chrono::steady_clock::now() - started >= 300ms,
           "a second opener gave up before its wait");
   bool asked = false;
-  require(!CacheDirectory::open(root.path(), "0123abcd", 10s, std::chrono::hours(1),
-                                [&] { return asked = true; }) && asked,
+  require(!CacheDirectory::open(root.path(), "0123abcd", 10s, [&] { return asked = true; }) &&
+              asked,
           "a cancelled wait for the lock did not stop");
   first.reset();
   require(root.open() != nullptr, "a released cache directory could not be opened");
@@ -123,9 +123,9 @@ void testMarksFollowTheLastEnd() {
           "a failure after probation emptied the cache");
 }
 
-// Opening one namespace removes another nobody opened or wrote for the
-// stale period, by its known files, unless its lock is held or it holds
-// something else.
+// Cleanup removes a namespace nobody opened or wrote for the stale period,
+// by its known files, unless its lock is held, by this process too, or it
+// holds something else. A missing root has nothing to remove.
 void testStaleNamespacesGo() {
   Root root;
   const auto age = [&](const char *cacheNamespace, std::initializer_list<const char *> files) {
@@ -146,7 +146,7 @@ void testStaleNamespacesGo() {
   age("eeee", {"lock"});
   auto held = root.open("cccc");
   age("cccc", {"lock"});
-  auto opened = root.open("ffff");
+  CacheDirectory::removeStale(root.path(), std::chrono::hours(24 * 14));
   require(!std::filesystem::exists(root.path() / "aaaa") &&
               std::filesystem::exists(root.path() / "bbbb" / "kv.slots") &&
               std::filesystem::exists(root.path() / "cccc" / "kv.slots") &&
@@ -154,6 +154,7 @@ void testStaleNamespacesGo() {
               !std::filesystem::exists(root.path() / "dddd" / "kv.slots") &&
               std::filesystem::exists(root.path() / "eeee" / "kv.slots"),
           "stale namespaces were not removed exactly by their known files");
+  CacheDirectory::removeStale(root.path() / "missing", std::chrono::hours(24 * 14));
 }
 
 // Stale cleanup can remove a namespace's lock while another process waits
@@ -167,7 +168,7 @@ void testRemovedLockGivesNoOwnership() {
   auto waited = waiting.get_future();
   bool signalled = false;
   auto second = std::async(std::launch::async, [&] {
-    return CacheDirectory::open(root.path(), "0123abcd", 10s, std::chrono::hours(24 * 14), [&] {
+    return CacheDirectory::open(root.path(), "0123abcd", 10s, [&] {
       if (!std::exchange(signalled, true))
         waiting.set_value();
       return false;

@@ -114,10 +114,14 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
       result.decodeShare = parseDecodeShare(value);
     } else if (option == "--max-image-patches") {
       result.maxImagePatches = parseMaxImagePatches(value);
+    } else if (option == "--persistent-cache") {
+      if (value != "on" && value != "off")
+        throw UsageError("--persistent-cache requires on or off");
+      result.persistentCache = value == "on";
     } else if (option == "--cache-dir") {
       if (value.empty())
         throw UsageError("--cache-dir requires a directory");
-      result.persistentCacheRoot = std::filesystem::absolute(std::filesystem::path(value));
+      result.cacheRoot = std::filesystem::absolute(std::filesystem::path(value));
     } else if (option == "--idle-release") {
       result.idleReleaseSeconds = parseIdleRelease(value);
     } else if (option == "--idle-sleep") {
@@ -132,8 +136,10 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
       throw UsageError("unexpected argument " + std::string(option));
     }
   }
-  if (!result.persistentCacheRoot.empty() && !result.maxCacheDiskBytes)
-    throw UsageError("--cache-dir requires a MAX_CACHE_DISK_BYTES quota");
+  if (result.persistentCache && !result.maxCacheDiskBytes)
+    throw UsageError("--persistent-cache requires a MAX_CACHE_DISK_BYTES quota");
+  if (!result.cacheRoot.empty() && !result.persistentCache)
+    throw UsageError("--cache-dir requires --persistent-cache on");
   result.modelRoot = requireModelRoot(argv[2]);
   result.model = model::inspectModelRoot(result.modelRoot);
   result.maxContext = parseMaxContext(argv[3], result.model.capabilities);

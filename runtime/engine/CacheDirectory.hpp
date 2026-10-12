@@ -14,8 +14,8 @@ namespace splash::engine {
 // models, the KV and state layouts, and the cache's own format), so caches
 // of several models stay side by side and none is reused for anything else.
 // A lock in each directory gives it to one process at a time. A namespace
-// nobody has opened or written for a while is removed when another one
-// opens, by its known files only.
+// nobody has opened or written for a while is removed (removeStale()), by
+// its known files only.
 //
 // Two marks say how the last process ended. A serving process is marked
 // until it closes cleanly, so a start that finds the mark follows an
@@ -27,16 +27,18 @@ class CacheDirectory final {
 public:
   // Opens root/cacheNamespace (made 0700 when missing) and takes its lock,
   // trying every 200 ms while another process holds it: null when one still
-  // does after lockWait, or once cancelled(). Other namespaces' directories
-  // nobody opened or wrote for staleAfter, and whose lock is free, are
-  // removed.
+  // does after lockWait, or once cancelled().
   // Throws std::invalid_argument for a namespace that is not a plain name,
   // and std::system_error when the directory cannot be used or belongs to
   // another user or others may write to it.
   [[nodiscard]] static std::unique_ptr<CacheDirectory>
   open(const std::filesystem::path &root, std::string_view cacheNamespace,
-       std::chrono::milliseconds lockWait, std::chrono::hours staleAfter,
-       const std::function<bool()> &cancelled = {});
+       std::chrono::milliseconds lockWait, const std::function<bool()> &cancelled = {});
+  // Removes the namespaces under root that nobody opened or wrote for
+  // staleAfter, by their known files only. One whose lock is held stays,
+  // this process's own included. Housekeeping: nothing it meets is reported.
+  static void removeStale(const std::filesystem::path &root,
+                          std::chrono::hours staleAfter) noexcept;
   ~CacheDirectory();
   CacheDirectory(const CacheDirectory &) = delete;
   CacheDirectory &operator=(const CacheDirectory &) = delete;

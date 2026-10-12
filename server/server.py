@@ -1653,9 +1653,9 @@ def _native_command(args):
     if args.max_cache_disk:
         command.append(str(args.max_cache_disk))
     if args.persistent_cache:
-        command.extend(
-            ("--cache-dir", str(args.cache_dir or serve_options.DEFAULT_CACHE_DIR))
-        )
+        command.extend(("--persistent-cache", "on"))
+    if args.cache_dir is not None:
+        command.extend(("--cache-dir", str(args.cache_dir)))
     if args.kv_format != "int8":
         command.extend(("--kv-format", args.kv_format))
     if args.state_format != "fp32":

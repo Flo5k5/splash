@@ -83,7 +83,8 @@ constexpr uint32_t kPersistentCacheFormat = 2;
 // that is closing has finished its flush, or been stopped by the server, by
 // then (server/runtime.py `_shutdown_grace_seconds`).
 constexpr std::chrono::seconds kCacheLockWait{20};
-// Another model's cache nobody opened for this long is removed.
+// A cache nobody opened or wrote for this long is removed at the next start,
+// whether or not that start keeps a cache itself.
 constexpr std::chrono::hours kStaleCache{24 * 14};
 // How long a start that follows an unclean end serves on probation: the
 // server counts a failure within that time toward a crash loop
@@ -99,9 +100,10 @@ PersistentCacheFiles openPersistentCache(const std::filesystem::path &root,
                                          const std::shared_ptr<model::DiskBudget> &budget,
                                          const std::function<bool()> &cancelled) {
   try {
+    if (root.empty())
+      throw std::runtime_error("no home directory to keep it in");
     PersistentCacheFiles files;
-    files.directory = CacheDirectory::open(root, cacheNamespace, kCacheLockWait,
-                                           kStaleCache, cancelled);
+    files.directory = CacheDirectory::open(root, cacheNamespace, kCacheLockWait, cancelled);
     if (!files.directory) {
       if (!cancelled || !cancelled())
         logLine("Persistent cache ", (root / cacheNamespace).string(),
@@ -490,15 +492,18 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     // When another process holds it or it cannot be used, the tier keeps
     // temporary files, as without one.
     PersistentCacheFiles persistentCache;
-    if (stateFile && !config.persistentCacheRoot.empty()) {
+    if (stateFile && config.persistentCache) {
       persistentCache = openPersistentCache(
-          config.persistentCacheRoot,
+          config.cacheRoot,
           persistentCacheNamespace(cacheIdentity, loaded.stateLayout(config.stateFormat)),
           model::SlotFile::slotBytesFor(kvPages->bytesPerPage()), stateFile->slotBytes(),
           diskBudget, config.cancelled);
       if (persistentCache.directory)
         stateFile = persistentCache.states;
     }
+    // After the open, which holds this start's own cache: a held one stays.
+    if (!config.cacheRoot.empty())
+      CacheDirectory::removeStale(config.cacheRoot, kStaleCache);
     auto stateStorage = std::make_unique<model::QwenStateStorage>(
         *backend, memoryGovernor->allocationAdmission(), loaded.stateLayout(config.stateFormat),
         stateFile);

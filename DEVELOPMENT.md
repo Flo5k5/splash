@@ -260,7 +260,9 @@ Files live in `~/Library/Caches/Splash/prefix-cache/<namespace>/` (mode 0700;
 `--cache-dir` sets the root). The namespace digests the model manifests, the KV
 and state layouts and the cache format, so no model reads another's cache. One
 engine holds a directory at a time; another waits 20 s, then uses temporary
-files. A namespace unused for 14 days is removed.
+files. Every start, with `--persistent-cache` or without it, removes the
+namespaces under its root (`--cache-dir`, else the default) that nobody used
+for 14 days, so a cache left behind when it is turned off goes too.
 
 Each conversation's newest restore point at least 2048 tokens deep is written
 10 s after publication, unless the conversation has gone past it; its RAM copy
@@ -322,7 +324,7 @@ are not moved.
 | --- | --- |
 | `~/Library/Application Support/Splash` | The data directory of a packaged install: `models/`, the installed models' links into the Hugging Face cache and the metadata derived from GGUFs; `runtime/`, the locks of running servers; and `thinking.key`, which encrypts the Messages reasoning a response hides. A source checkout keeps the first two in `install/models` and `build/runtime`. |
 | Hugging Face cache (`HF_HUB_CACHE`, by default `~/.cache/huggingface/hub`) | Model and draft downloads, with Splash's pins under `refs/splash` ([revisions](#revisions)). |
-| `~/Library/Caches/Splash/prefix-cache` (`--cache-dir`) | The [persistent cache](#persistent-cache), with `--persistent-cache` only. |
+| `~/Library/Caches/Splash/prefix-cache` (`--cache-dir`) | The [persistent cache](#persistent-cache), with `--persistent-cache` only. Every start removes the caches there that nobody used for 14 days. |
 | `$TMPDIR/splash-cache-*` | The [SSD cache](#ssd-cache)'s files without `--persistent-cache`, or when another process holds the persistent cache's directory or it cannot be used: one of KV pages and one of states, together at most about `--max-cache-disk`. Each is unlinked as it is created, so no directory lists it, and its space returns when the engine exits, even after a crash. `--cache-dir` does not move them; they follow `TMPDIR`. |
 | `~/Library/Logs/Splash/crash` | [Crash traces](#failures-and-crash-traces), with `SPLASH_CRASH_TRACE=1` only. |
 | Pi's `models.json` (`~/.pi/agent`, or `PI_CODING_AGENT_DIR`) and the Hermes profile (`~/.hermes/profiles/splash`, or `splash-<port>`) | The settings `splash pi` and `splash hermes` write ([agent launchers](#agent-launchers)). Every agent keeps its sessions in its own home; `splash claude`, `codex` and `opencode` pass their settings at launch and write none. |

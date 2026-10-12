@@ -90,10 +90,11 @@ bool named(const std::filesystem::path &path, int lock) noexcept {
          held.st_dev == current.st_dev && held.st_ino == current.st_ino;
 }
 
-// Removes another namespace's cache that nobody has used for staleAfter,
-// once it holds its lock. A cache is used when it opens (its lock's time) and
-// while it serves (its files' times). Anything in the way leaves it as it is.
-void removeStale(const std::filesystem::path &path, std::chrono::hours staleAfter) noexcept {
+// Removes a namespace's cache that nobody has used for staleAfter, once it
+// holds its lock. A cache is used when it opens (its lock's time) and while
+// it serves (its files' times). Anything in the way leaves it as it is.
+void removeStaleNamespace(const std::filesystem::path &path,
+                          std::chrono::hours staleAfter) noexcept {
   Descriptor directory(::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
   if (directory.get() < 0 || !owned(directory.get()))
     return;
@@ -123,8 +124,7 @@ void removeStale(const std::filesystem::path &path, std::chrono::hours staleAfte
 
 std::unique_ptr<CacheDirectory>
 CacheDirectory::open(const std::filesystem::path &root, std::string_view cacheNamespace,
-                     std::chrono::milliseconds lockWait, std::chrono::hours staleAfter,
-                     const std::function<bool()> &cancelled) {
+                     std::chrono::milliseconds lockWait, const std::function<bool()> &cancelled) {
   if (!plainName(cacheNamespace))
     throw std::invalid_argument("a cache namespace is a name of lowercase hex digits");
   if (root.has_parent_path())
@@ -173,14 +173,20 @@ CacheDirectory::open(const std::filesystem::path &root, std::string_view cacheNa
     result->unmark(kProbation);
     result->coldReason_ = "the last start failed within its probation";
   }
-  // Removing stale caches is housekeeping: nothing it meets stops the open.
-  std::error_code ignored;
-  for (const auto &entry : std::filesystem::directory_iterator(root, ignored)) {
-    const std::string name = entry.path().filename().string();
-    if (name != cacheNamespace && plainName(name) && entry.is_directory(ignored))
-      removeStale(entry.path(), staleAfter);
-  }
   return result;
+}
+
+void CacheDirectory::removeStale(const std::filesystem::path &root,
+                                 std::chrono::hours staleAfter) noexcept {
+  try {
+    std::error_code ignored;
+    for (const auto &entry : std::filesystem::directory_iterator(root, ignored)) {
+      if (plainName(entry.path().filename().string()) && entry.is_directory(ignored))
+        removeStaleNamespace(entry.path(), staleAfter);
+    }
+  } catch (...) {
+    // Housekeeping: nothing it meets stops a start.
+  }
 }
 
 CacheDirectory::CacheDirectory(std::filesystem::path path, int directory, int lock)
