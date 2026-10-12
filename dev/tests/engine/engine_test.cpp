@@ -30,9 +30,12 @@ namespace {
 
 class Events final : public EngineEventSink {
 public:
-  void batchCompleted(WorkKind kind, uint32_t, uint32_t, uint32_t, uint32_t,
-                      uint32_t, double, double cycleMilliseconds) override {
+  void batchCompleted(WorkKind kind, uint32_t, uint32_t, uint32_t,
+                      uint32_t drafted, uint32_t accepted, double,
+                      double cycleMilliseconds) override {
     cycles.emplace_back(kind, cycleMilliseconds);
+    draftedTokens += drafted;
+    acceptedDraftTokens += accepted;
   }
   void started(uint64_t requestId, uint32_t matched, uint32_t) override {
     startIds.push_back(requestId);
@@ -53,10 +56,11 @@ public:
   }
   void completed(uint64_t id, EngineFinishReason, uint32_t prompt,
                  uint32_t completion, uint32_t deduplicated,
-                 std::span<const float>) override {
+                 std::span<const float>, const SpeculativeCounts &speculation) override {
     ++completedCount;
     usage[id] = {prompt, completion};
     deduplicatedTokens[id] = deduplicated;
+    speculativeCounts[id] = speculation;
   }
   void failed(uint64_t, LaneOutcome outcome, std::string message) override {
     ++failedCount;
@@ -74,6 +78,7 @@ public:
   std::unordered_map<uint64_t, std::vector<uint32_t>> outputs;
   std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> usage;
   std::unordered_map<uint64_t, uint32_t> deduplicatedTokens;
+  std::unordered_map<uint64_t, SpeculativeCounts> speculativeCounts;
   std::vector<std::string> failures;
   std::vector<std::pair<std::string, bool>> failureDetails;
   uint32_t emitted = 0;
@@ -83,6 +88,9 @@ public:
   std::vector<std::pair<uint64_t, std::vector<uint32_t>>> maskRequests;
   // Each completed command's kind and engine cycle.
   std::vector<std::pair<WorkKind, double>> cycles;
+  // The draft tokens of every completed command, as /status sums them.
+  uint32_t draftedTokens = 0;
+  uint32_t acceptedDraftTokens = 0;
 };
 
 using splash::test::rejects;
@@ -3692,6 +3700,9 @@ void testLongDecodePreemptionPlansTheCurrentReplayBoundary() {
   guardReleases(storage, engine);
 
   constexpr uint64_t id = 255;
+  // Each decode step drafts one token and accepts none: one token a step,
+  // as without a draft.
+  executor.speculativeCounts = {{id, {1, 0}}};
   const std::vector<uint32_t> prompt(4097, 5);
   auto value = request(id, prompt);
   value.maxNewTokens = 10'000;
@@ -3708,6 +3719,7 @@ void testLongDecodePreemptionPlansTheCurrentReplayBoundary() {
   }
   require(executor.suspensions == 1 && !engine.commandInFlight(),
           "long decode did not suspend at KV growth pressure");
+  const uint32_t draftedBeforeSuspension = events.draftedTokens;
   const std::vector<uint32_t> emitted = events.outputs.at(id);
   std::vector<uint32_t> history = prompt;
   history.insert(history.end(), emitted.begin(), emitted.end());
@@ -3759,6 +3771,13 @@ void testLongDecodePreemptionPlansTheCurrentReplayBoundary() {
                                          prompt.size(), expectedOutput.size()} &&
               events.startIds == std::vector<uint64_t>{id},
           "long replay repeated output or changed original request usage");
+  // The request reports the decode steps before its suspension and after,
+  // as /status counts them; the replay drafts nothing.
+  require(draftedBeforeSuspension > 0 &&
+              events.draftedTokens > draftedBeforeSuspension &&
+              events.speculativeCounts.at(id) ==
+                  SpeculativeCounts{events.draftedTokens, 0, events.draftedTokens},
+          "suspension lost the request's speculative counts");
   require(executor.requests.empty() &&
               resources.snapshot().pool.pagesActive == 0 &&
               resources.snapshot().activeRequests == 0,
@@ -9152,8 +9171,62 @@ void testWaitingEndsReleaseTheReplayPoint() {
   }
 }
 
+void testSpeculativeCountsStayWithEachConcurrentRequest() {
+  test::TestKvStorage storage(128, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor executor;
+  executor.decodeFinishes = false;
+  executor.speculativeCounts = {{1, {7, 2}}, {2, {7, 6}}};
+  Events events;
+  engine::Engine engine(test::engineConfig(), cache, executor, events);
+  guardReleases(storage, engine);
+  auto prose = request(1, std::vector<uint32_t>(65, 11));
+  prose.maxNewTokens = 6;
+  auto arithmetic = request(2, std::vector<uint32_t>(65, 12));
+  arithmetic.maxNewTokens = 21;
+  engine.submit(std::move(prose));
+  engine.submit(std::move(arithmetic));
+  runUntilIdle(engine);
+  require(events.speculativeCounts.at(1) == SpeculativeCounts{14, 4, 2} &&
+              events.speculativeCounts.at(2) == SpeculativeCounts{21, 18, 3} &&
+              events.draftedTokens == 14 + 21 &&
+              events.acceptedDraftTokens == 4 + 18 &&
+              events.outputs.at(1).size() == 6 && events.outputs.at(2).size() == 21,
+          "concurrent requests mixed or dropped their speculative counts");
+  auto score = request(3, std::vector<uint32_t>(65, 13));
+  score.maxNewTokens = 0;
+  score.scoreTokens = {1, 2};
+  engine.submit(std::move(score));
+  runUntilIdle(engine);
+  require(events.speculativeCounts.at(3) == SpeculativeCounts{},
+          "score-only request inherited speculative generation activity");
+}
+
+void testImpossibleSpeculativeCountsFailOnlyTheirOwnLane() {
+  test::TestKvStorage storage(128, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor executor;
+  executor.speculativeCounts = {{1, {7, 9}}, {2, {7, 1}}};
+  Events events;
+  engine::Engine engine(test::engineConfig(), cache, executor, events);
+  guardReleases(storage, engine);
+  engine.submit(request(1, std::vector<uint32_t>(65, 11)));
+  auto healthy = request(2, std::vector<uint32_t>(65, 12));
+  healthy.maxNewTokens = 2;
+  engine.submit(std::move(healthy));
+  runUntilIdle(engine);
+  require(events.failedCount == 1 && events.completedCount == 1 &&
+              !events.speculativeCounts.contains(1) &&
+              events.speculativeCounts.at(2) == SpeculativeCounts{7, 1, 1},
+          "invalid speculative counts poisoned another request's completion");
+}
+
 int main() {
   try {
+    testSpeculativeCountsStayWithEachConcurrentRequest();
+    testImpossibleSpeculativeCountsFailOnlyTheirOwnLane();
     testRunningRequestKeepsItsReplayPoint();
     testSuspendedRequestKeepsItsReplayPoint();
     testResumedLaneKeepsThePromptReplayPoint();

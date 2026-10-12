@@ -71,6 +71,9 @@ class NativeResult:
     first_token_batch_tokens: int = 0
     # Raw option logits for score-only jobs, in requested token order.
     option_logits: tuple = ()
+    drafted_tokens: int = 0
+    accepted_draft_tokens: int = 0
+    draft_cycles: int = 0
 
     @functools.cached_property
     def metrics(self):
@@ -840,6 +843,9 @@ class NativeBackend:
                 cache=replace(job.cache, deduplicated_tokens=done.deduplicated_tokens),
                 stop_sequence=stop_sequence,
                 first_token_batch_tokens=state.first_token_batch_tokens,
+                drafted_tokens=done.drafted_tokens,
+                accepted_draft_tokens=done.accepted_draft_tokens,
+                draft_cycles=done.draft_cycles,
             )
             if job.latency is not None:
                 latency = result.metrics["request_latency"]

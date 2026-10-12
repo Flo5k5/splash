@@ -177,7 +177,8 @@ private:
   void completed(uint64_t requestId, EngineFinishReason reason,
                  uint32_t promptTokens, uint32_t completionTokens,
                  uint32_t deduplicatedTokens,
-                 std::span<const float> optionLogits) override;
+                 std::span<const float> optionLogits,
+                 const SpeculativeCounts &speculation) override;
   void failed(uint64_t requestId, LaneOutcome outcome,
               std::string message) override;
 

@@ -691,8 +691,12 @@ are not isolated GPU timings. `prompt_per_second` uses only uncached prompt
 tokens; `predicted_per_second` excludes the entire first emission (which can
 contain multiple speculative tokens). Thus rates use tokens processed in the
 measured interval, not the full counts. An unavailable rate is zero, including
-responses completed in one emission. Per-request draft counters are omitted
-because the native runtime only reports them at batch level.
+responses completed in one emission. A request that drafted adds
+llama-server's `draft_n` and `draft_n_accepted`: the tokens its draft proposed
+and those verification accepted, including any a stop or the output limit then
+cut. They count that request alone, so they hold under concurrency.
+`metrics.speculation` carries them with the request's speculative `cycles`, and
+the Done line shows the tokens each cycle yielded, `1 + accepted / cycles`.
 
 ### Tool calls
 

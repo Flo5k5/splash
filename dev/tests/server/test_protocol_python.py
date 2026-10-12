@@ -130,7 +130,7 @@ def engine_events():
         "mask_request_initial": p.MaskRequestEvent(91, 6, 4, ()),
         "mask_request_verify": p.MaskRequestEvent(91, 7, 4, (101, 102, 103)),
         "done": p.DoneEvent(
-            91, p.FinishReason.STOP, 4096, 512, 1000, 2000, 3500, (), 64
+            91, p.FinishReason.STOP, 4096, 512, 1000, 2000, 3500, (), 64, 350, 280, 50
         ),
         "done_scored": p.DoneEvent(
             91, p.FinishReason.STOP, 4096, 0, 1000, 0, 3500, (1.5, -2.25, 0.5), 32
@@ -506,12 +506,43 @@ class ProtocolPythonTests(unittest.TestCase):
         self.assert_protocol_error(
             p.FailureClass.PROTOCOL_FATAL,
             p.IssueCode.INVALID_PAYLOAD_LENGTH,
-            lambda: decode_event(mutate_u32(wire, p.FRAME_HEADER_BYTES + 45, 2)),
+            lambda: decode_event(
+                mutate_u32(wire, p.FRAME_HEADER_BYTES + p._DONE.size - 4, 2)
+            ),
         )
-        # A Done payload without its option-logit count (45 bytes) is below
-        # the minimum.
-        short = mutate_u64(wire[: p.FRAME_HEADER_BYTES + 45], 8, 45)
+        # A Done payload without its option-logit count is below the minimum.
+        size = p._DONE.size - 4
+        short = mutate_u64(wire[: p.FRAME_HEADER_BYTES + size], 8, size)
         self.assertEqual(parser_issue(short).code, p.IssueCode.INVALID_PAYLOAD_LENGTH)
+
+    def test_done_speculative_counts_round_trip_and_reject_inconsistent_totals(self):
+        done = p.DoneEvent(
+            91,
+            p.FinishReason.LENGTH,
+            20,
+            100,
+            1,
+            2,
+            3,
+            (),
+            drafted_tokens=210,
+            accepted_draft_tokens=70,
+            draft_cycles=30,
+        )
+        self.assertEqual(decode_event(native_peer.serialize_event(done)), done)
+        for counts in ((7, 8, 1), (7, 0, 0), (0, 0, 1), (7, 0, 8)):
+            with self.subTest(counts=counts):
+                bad = replace(
+                    done,
+                    drafted_tokens=counts[0],
+                    accepted_draft_tokens=counts[1],
+                    draft_cycles=counts[2],
+                )
+                self.assert_protocol_error(
+                    p.FailureClass.PROTOCOL_FATAL,
+                    p.IssueCode.INVALID_COUNT,
+                    lambda: decode_event(native_peer.serialize_event(bad)),
+                )
 
     def test_done_option_logits_validation(self):
         base = dict(

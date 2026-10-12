@@ -538,7 +538,8 @@ void NativeRuntime::maskRequested(uint64_t requestId,
 void NativeRuntime::completed(uint64_t requestId, EngineFinishReason reason,
                               uint32_t promptTokens, uint32_t completionTokens,
                               uint32_t deduplicatedTokens,
-                              std::span<const float> optionLogits) {
+                              std::span<const float> optionLogits,
+                              const SpeculativeCounts &speculation) {
   RequestTelemetry &telemetry = telemetry_.at(requestId);
   double now = config_.monotonicMilliseconds();
   // A request that ends before it starts counts from its arrival.
@@ -551,7 +552,7 @@ void NativeRuntime::completed(uint64_t requestId, EngineFinishReason reason,
       telemetry.firstTokenMilliseconds ? durationMicros(first, now) : 0,
       durationMicros(telemetry.arrivedMilliseconds, now),
       std::vector<float>(optionLogits.begin(), optionLogits.end()),
-      deduplicatedTokens});
+      deduplicatedTokens, speculation});
   ended(requestId, now);
 }
 

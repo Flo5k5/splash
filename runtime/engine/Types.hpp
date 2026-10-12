@@ -31,6 +31,16 @@ enum class EngineFinishReason : uint8_t {
   Cancelled = 2,
 };
 
+// A request's speculative decoding: the tokens its draft proposed, those
+// verification accepted, and the decode steps that verified a draft.
+struct SpeculativeCounts final {
+  uint32_t draftedTokens = 0;
+  uint32_t acceptedDraftTokens = 0;
+  uint32_t cycles = 0;
+
+  bool operator==(const SpeculativeCounts &) const = default;
+};
+
 // A request's cache salt: its API's cache_salt, which the server hashes to
 // 128 bits. Requests share cached KV and states only with requests of the
 // same salt; zero for a request without one.
@@ -135,7 +145,8 @@ public:
   virtual void completed(uint64_t requestId, EngineFinishReason reason,
                          uint32_t promptTokens, uint32_t completionTokens,
                          uint32_t deduplicatedTokens,
-                         std::span<const float> optionLogits) = 0;
+                         std::span<const float> optionLogits,
+                         const SpeculativeCounts &speculation) = 0;
   virtual void failed(uint64_t requestId, LaneOutcome outcome,
                       std::string message) = 0;
 };
