@@ -28,6 +28,7 @@ from server.api_shapes import (
     normalize_messages,
 )
 from server.errors import APIError
+from server.tool_schema import normalize_tools
 
 SCHEMA = {
     "type": "object",
@@ -89,6 +90,26 @@ def tool_search_body(content, **fields):
         ],
         **fields,
     )
+
+
+WEATHER = {
+    "name": "weather",
+    "description": "Get the weather for a city.",
+    "input_schema": {
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+        "required": ["city"],
+    },
+}
+TIME = {"name": "time", "input_schema": {"type": "object"}}
+
+
+def tool_addition(definition):
+    """A system content block announcing a tool that became available mid-session."""
+    return {
+        "type": "tool_addition",
+        "tool": {"type": "tool_definition", "definition": copy.deepcopy(definition)},
+    }
 
 
 def stream_events(payload):
@@ -479,6 +500,142 @@ class AnthropicAdapterTest(unittest.TestCase):
         with self.assertRaisesRegex(APIError, "require user/assistant/system roles"):
             anthropic_to_chat_body(body, thinking_resolver=no_signed_thinking)
 
+    def test_tool_additions_join_the_request_tools(self):
+        body = request_body(
+            system=[{"type": "text", "text": "Session start."}, tool_addition(WEATHER)],
+            messages=[
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+                {
+                    "role": "system",
+                    "content": [
+                        {"type": "text", "text": "Environment update"},
+                        tool_addition(TIME),
+                    ],
+                },
+                {"role": "user", "content": "say ok"},
+            ],
+            tools=[{"name": "ToolSearch", "input_schema": {"type": "object"}}],
+        )
+        original = copy.deepcopy(body)
+        chat = anthropic_to_chat_prompt(body, thinking_resolver=no_signed_thinking)
+        self.assertEqual(
+            chat["messages"],
+            [
+                {"role": "system", "content": "Session start."},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+                {"role": "system", "content": "Environment update"},
+                {"role": "user", "content": "say ok"},
+            ],
+        )
+        # Declared tools come first, then announcements in document order.
+        self.assertEqual(
+            chat["tools"],
+            [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "ToolSearch",
+                        "parameters": {"type": "object"},
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "weather",
+                        "description": "Get the weather for a city.",
+                        "parameters": WEATHER["input_schema"],
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {"name": "time", "parameters": {"type": "object"}},
+                },
+            ],
+        )
+        self.assertEqual(body, original)
+
+    def test_declared_tools_and_later_additions_decide_a_repeated_name(self):
+        body = request_body(
+            messages=[
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "system",
+                    "content": [tool_addition({**WEATHER, "description": "first"})],
+                },
+                {"role": "assistant", "content": "hello"},
+                {
+                    "role": "system",
+                    "content": [
+                        tool_addition({**WEATHER, "description": "second"}),
+                        tool_addition({"name": "time", "description": "added"}),
+                    ],
+                },
+                {"role": "user", "content": "say ok"},
+            ],
+            tools=[
+                {
+                    "name": "time",
+                    "description": "declared",
+                    "input_schema": {"type": "object"},
+                }
+            ],
+            tool_choice={"type": "tool", "name": "weather"},
+        )
+        chat = anthropic_to_chat_prompt(body, thinking_resolver=no_signed_thinking)
+        self.assertEqual(
+            [
+                (tool["function"]["name"], tool["function"]["description"])
+                for tool in chat["tools"]
+            ],
+            [("time", "declared"), ("weather", "second")],
+        )
+        # The merged tools are what a request's tool choice is checked against.
+        _, policy = normalize_tools(
+            chat["tools"], chat["tool_choice"], chat["parallel_tool_calls"]
+        )
+        self.assertEqual(set(policy.schemas), {"weather"})
+
+    def test_tool_additions_must_announce_a_tool_definition(self):
+        invalid = [
+            {"type": "tool_addition"},
+            {"type": "tool_addition", "tool": {"type": "tool_reference"}},
+            {"type": "tool_addition", "tool": {"type": "tool_definition"}},
+            {
+                "type": "tool_addition",
+                "tool": {
+                    "type": "tool_definition",
+                    "definition": {"description": "no name"},
+                },
+            },
+            {
+                "type": "tool_addition",
+                "tool": {
+                    "type": "tool_definition",
+                    "definition": {"name": "web", "type": "web_search_20250305"},
+                },
+            },
+            {"type": "image"},
+        ]
+        for block in invalid:
+            placements = {
+                "system": request_body(system=[block]),
+                "system message": request_body(
+                    messages=[
+                        {"role": "system", "content": [block]},
+                        {"role": "user", "content": "hi"},
+                    ]
+                ),
+            }
+            for placement, body in placements.items():
+                with (
+                    self.subTest(block=block, placement=placement),
+                    self.assertRaises(APIError) as caught,
+                ):
+                    anthropic_to_chat_prompt(body, thinking_resolver=no_signed_thinking)
+                self.assertEqual(caught.exception.status, 400)
+
     def test_anthropic_thinking_off_is_not_reenabled_by_effort(self):
         tokenizer = TemplateTokenizer(reasoning_template())
         app = make_frontend(tokenizer, None, "test-model", 128, 1, 2, vision=True)
@@ -535,6 +692,69 @@ class AnthropicHTTPContractTest(HarnessTestCase):
             if tool["function"]["name"] == "weather"
         )
         self.assertEqual(weather["parameters"], body["tools"][1]["input_schema"])
+        self.assertEqual(runtime.requests, [])
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                status, _, payload = harness.request(
+                    "POST", "/v1/messages", {**body, "stream": stream}
+                )
+                self.assertEqual(status, 200, payload)
+                self.assertEqual(tokenizer.templates[-1], counted)
+                if stream:
+                    events = stream_events(payload)
+                    usage = events[0]["message"]["usage"]
+                    call = next(
+                        event["content_block"]
+                        for event in events
+                        if event["type"] == "content_block_start"
+                        and event["content_block"]["type"] == "tool_use"
+                    )
+                else:
+                    response = json.loads(payload)
+                    usage = response["usage"]
+                    call = response["content"][0]
+                    self.assertEqual(call["input"], {"city": "Paris"})
+                self.assertEqual(call["name"], "weather")
+                self.assertEqual(
+                    count, usage["input_tokens"] + usage["cache_read_input_tokens"]
+                )
+        self.assertEqual(len(runtime.requests), 2)
+
+    def test_tool_additions_count_and_generation_allow_added_tool_calls(self):
+        runtime = FakeRuntime(Plan([[5]]), Plan([[5]]))
+        # Unlike FakeTokenizer's, this template renders a later system message in
+        # place, so the startup probe serves the request.
+        tokenizer = TemplateTokenizer(reasoning_template())
+        harness = self.harness(runtime, tokenizer=tokenizer)
+        body = request_body(
+            messages=[
+                {"role": "user", "content": "Check Paris."},
+                {"role": "assistant", "content": "Checking."},
+                {
+                    "role": "system",
+                    "content": [
+                        {"type": "text", "text": "Environment update"},
+                        tool_addition(WEATHER),
+                    ],
+                },
+                {"role": "user", "content": "Check Paris again."},
+            ],
+            tools=[TIME],
+        )
+        status, _, payload = harness.request("POST", "/v1/messages/count_tokens", body)
+        self.assertEqual(status, 200, payload)
+        count = json.loads(payload)["input_tokens"]
+        counted = copy.deepcopy(tokenizer.templates[-1])
+        messages, kwargs = counted
+        self.assertEqual(
+            messages[2], {"role": "system", "content": "Environment update"}
+        )
+        weather = next(
+            tool["function"]
+            for tool in kwargs["tools"]
+            if tool["function"]["name"] == "weather"
+        )
+        self.assertEqual(weather["parameters"], WEATHER["input_schema"])
         self.assertEqual(runtime.requests, [])
         for stream in (False, True):
             with self.subTest(stream=stream):
