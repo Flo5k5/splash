@@ -316,6 +316,15 @@ void QwenStateStorage::clearForColdStart(uint32_t index) {
   clear(current(index).stateBase, "cold-start GDN state");
 }
 
+void QwenStateStorage::clearDraftRings(uint32_t index) {
+  const Lane &target = lane(index);
+  requireAssigned(target);
+  for (const DFlashDraftRingLayer &layer : target.cells.draft->layers()) {
+    clear(layer.keys, "draft ring keys");
+    clear(layer.values, "draft ring values");
+  }
+}
+
 uint64_t QwenStateStorage::releaseOneIdle(bool keepLane) noexcept {
   const uint64_t before = backend_.memoryStats().allocatedBytes;
   const uint32_t kept = keepLane ? 1 : 0;

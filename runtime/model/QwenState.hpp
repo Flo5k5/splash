@@ -209,6 +209,14 @@ public:
   // A lane that starts at length zero without a restore reads zero recurrent
   // state; its first transition overwrites the other parity.
   void clearForColdStart(uint32_t lane);
+  // A lane whose request found a row that is not finite may hold such rows in
+  // its draft rings. Draft attention weighs the ring positions a request has
+  // not written by zero, so one would reach the lane's next request as
+  // 0 x NaN: the rings are cleared before the lane is released. Its GDN cells
+  // and context window need no such care: a start clears or overwrites the
+  // cell it reads, a transition writes the other cell before reading it, and
+  // rings are computed only from window rows their request wrote.
+  void clearDraftRings(uint32_t lane);
 
   // Returns one pooled buffer to macOS, a cell before draft rings and rings
   // before a window, keeping one lane's buffers when keepLane: what a

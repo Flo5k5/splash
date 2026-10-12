@@ -316,6 +316,9 @@ private:
     // next turn resumes: its state is in use from the moment the request
     // reaches, reuses or restores it until the request ends, suspended or not.
     StateUse replayPoint;
+    // The block of the state it restored in this residency, until a step of
+    // it computed from that state reports a finite result.
+    std::optional<uint64_t> unprovenState;
     // The scheduler owns the terminal phase; this flag records that the
     // corresponding event was emitted and model/resource ownership ended.
     bool finalized = false;

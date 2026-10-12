@@ -310,6 +310,13 @@ public:
         }
       }
       Request &state = requests.at(item.requestId);
+      if (nonFinitePrefills.contains(item.requestId)) {
+        // The chunk commits nothing; the engine ends the request.
+        result.push_back({.requestId = item.requestId,
+                          .consumedPromptTokens = item.tokenCount,
+                          .failure = "target prefill row is not finite"});
+        continue;
+      }
       state.position += item.tokenCount;
       prefillRows += item.tokenCount;
       ++prefillChunks[item.requestId];
@@ -635,6 +642,8 @@ public:
   std::function<void()> submitObserver;
   // Score requests whose final prompt step reports a non-finite logit.
   std::unordered_set<uint64_t> invalidScores;
+  // Requests whose prefill steps report a row that is not finite.
+  std::unordered_set<uint64_t> nonFinitePrefills;
   // The flags and sampling each request began with.
   std::unordered_map<uint64_t, uint32_t> beganFlags;
   std::unordered_map<uint64_t, SamplingParameters> beganSampling;

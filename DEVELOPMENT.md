@@ -2092,13 +2092,26 @@ carry no logits.
 
 ### Failures and crash traces
 
-A non-finite logit row is a per-request failure, not an engine fault: a score
-logit, or a token the sampling kernels could only select outside the
-vocabulary. The engine reports `model_result_invalid` for that request alone,
-before it publishes the failing step's cache state or any output, and the rest
-of the batch finishes normally. Prompt chunks that already succeeded keep the
-blocks they committed, exactly as they do for a cancelled request. GPU faults
-and broken engine invariants stay fatal and still mark the runtime unhealthy.
+A row that is not finite is a per-request failure, not an engine fault. Every
+prefill chunk checks the last row of each lane's final hidden, which a value
+that is not finite anywhere in the chunk, or in the state it computed from,
+reaches through the recurrent state, and through attention on a GPU whose tile
+weighs non-finite keys and values (some families' tiles give them zero weight,
+for every reader); a decode finds one as
+a token the sampling kernels could only select outside the vocabulary, and a
+score request as a score logit. The engine reports `model_result_invalid` for
+that request alone, before it publishes the failing step's cache state or any
+output, and the rest of the batch finishes normally. Since every step that
+publishes was checked, what earlier steps published stays, as it does for a
+cancelled request. A damaged state is one way to such a result: a request
+whose first step from the state it restored is not finite takes that state out
+of the cache, and the next request with the prompt computes it again. Values
+that are not finite cannot reach the next holder of a request's memory either:
+a page a request takes comes with zeros in the rows its work does not write,
+and the lane of a request that found one returns its draft rings cleared, since
+attention weighs rows past a request's end by zero and a BF16 value is read as
+stored (0 × NaN is NaN). GPU faults and broken engine invariants stay fatal and
+still mark the runtime unhealthy.
 
 Request logs omit bodies; full crash traces require explicit
 `SPLASH_CRASH_TRACE=1` and can contain private conversation data. With it, a

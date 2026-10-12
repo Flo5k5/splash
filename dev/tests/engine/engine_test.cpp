@@ -5509,6 +5509,57 @@ void testFirstTokenSentBeforeASuspensionIsNotSentAgain() {
           "the resumed lane replayed its first token or sent it again");
 }
 
+// A lane suspended in its decode takes new pages past the chain it restores
+// when it resumes, which its replay writes in chunks that may end inside any
+// of them: they all come cleared, so rows not yet written read zero whoever
+// held them before.
+void testResumedLaneClearsThePagesPastItsRestoredChain() {
+  test::TestKvStorage storage(512, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, nullptr, nullptr);
+  Executor executor;
+  executor.firstTokens = true;
+  executor.decodeFinishes = false;
+  executor.decodeTokens = 4;
+  executor.beginGrowthBlocked = [&] {
+    return executor.lastBeginId == 2 && executor.requests.at(1).resident;
+  };
+  Events events;
+  engine::Engine engine(test::engineConfig(), resources, executor, events);
+  guardReleases(storage, engine);
+
+  auto background = request(1, std::vector<uint32_t>(40, 1));
+  background.priority = RequestPriority::Background;
+  background.maxNewTokens = 80;
+  engine.submit(std::move(background));
+  double now = 1;
+  tickUntil(engine, now,
+            [&] { return events.outputs.contains(1) && events.outputs.at(1).size() >= 41; },
+            "the lane did not decode");
+  auto normal = request(2, std::vector<uint32_t>(9, 2));
+  normal.maxNewTokens = 4;
+  engine.submit(std::move(normal));
+  tickUntil(engine, now, [&] { return !executor.requests.at(1).resident; },
+            "the Background lane was not suspended");
+  const size_t cleared = storage.cleared.size();
+  tickUntil(engine, now, [&] { return executor.requests.at(1).resident; },
+            "the Background lane did not resume");
+  const auto replayEnd = static_cast<uint32_t>(executor.resumedPrompts.at(0).size());
+  const PageTableView table = resources.pageTable(1);
+  const std::vector<uint32_t> pages(table.pages.begin(), table.pages.end());
+  const uint32_t restored = executor.lastRestoredTokens / KvCache::pageTokens;
+  require(replayEnd % KvCache::pageTokens && replayEnd / KvCache::pageTokens < pages.size() &&
+              restored + 1 < pages.size() && restored <= replayEnd / KvCache::pageTokens,
+          "fixture did not take pages past its restored chain");
+  for (size_t page = restored; page < pages.size(); ++page)
+    require(std::find(storage.cleared.begin() + cleared, storage.cleared.end(), pages[page]) !=
+                storage.cleared.end(),
+            "a page past the resumed lane's restored chain was not cleared");
+  tickUntil(engine, now, [&] { return idle(engine); }, "the requests did not end");
+  require(events.completedCount == 2 && events.failedCount == 0,
+          "the resumed lane did not complete");
+}
+
 void testPrefillCanCompleteTheRequest() {
   for (bool stop : {false, true}) {
     test::TestKvStorage storage(8, 4096, 4);
@@ -5562,6 +5613,103 @@ void testOutOfVocabularyOutputFailsLaneOnly() {
           "out-of-vocabulary token reached the event sink");
   require(events.usage.count(2) == 1,
           "clean peer request did not complete");
+}
+
+// A damaged state is one way to a result that is not finite: a request whose
+// first step from the state it restored is not finite takes the state out of
+// the cache, and the next request with the prompt computes it again. The KV
+// blocks below it and what the step published before stay.
+void testNonFiniteFirstStepAfterARestoreInvalidatesTheState() {
+  test::TestKvStorage storage(32, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor model;
+  Events events;
+  engine::Engine engine(test::engineConfig(), cache, model, events);
+  guardReleases(storage, engine);
+  std::vector<uint32_t> prompt(129);
+  std::iota(prompt.begin(), prompt.end(), 1u);
+
+  // A first turn publishes the state at the prompt's second page.
+  engine.submit(request(1, std::vector<uint32_t>(prompt.begin(), prompt.begin() + 65)));
+  runUntilIdle(engine);
+  model.nonFinitePrefills = {2};
+  engine.submit(request(2, prompt));
+  runUntilIdle(engine);
+  require(events.starts == std::vector<uint32_t>{0, 64} &&
+              events.failures == std::vector<std::string>{"model_result_invalid"},
+          "the request did not resume from the state and fail its first step");
+  const CacheLookup lookup = cache.lookup(prompt, {});
+  require(lookup.kvBoundary == 64 && !lookup.state &&
+              cache.snapshot().stateCache.invalidations == 1,
+          "the state the failed step computed from stayed, or the blocks below it went");
+
+  model.nonFinitePrefills.clear();
+  engine.submit(request(3, prompt));
+  runUntilIdle(engine);
+  require(events.starts.back() == 0 && events.completedCount == 2,
+          "the next request resumed from the state a failed step computed from");
+}
+
+// A step from the restored state that was finite proves it: a later step
+// that is not finite leaves it, and the next request resumes from it.
+void testNonFiniteLaterStepKeepsTheRestoredState() {
+  test::TestKvStorage storage(32, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor model;
+  Events events;
+  EngineConfig config = test::engineConfig();
+  config.vocabularySize = 1000;
+  engine::Engine engine(config, cache, model, events);
+  guardReleases(storage, engine);
+  std::vector<uint32_t> prompt(129);
+  std::iota(prompt.begin(), prompt.end(), 1u);
+
+  engine.submit(request(1, std::vector<uint32_t>(prompt.begin(), prompt.begin() + 65)));
+  runUntilIdle(engine);
+  // Its prompt's steps from the state succeed; its first decode fails.
+  model.poisonRequest = 2;
+  model.poisonToken = 0xFFFFFFFFU;
+  engine.submit(request(2, prompt));
+  runUntilIdle(engine);
+  require(events.starts == std::vector<uint32_t>{0, 64} &&
+              events.failures == std::vector<std::string>{"model_result_invalid"},
+          "the request did not resume from the state and fail in its decode");
+  require(cache.lookup(prompt, {}).resumeBoundary() == 128 &&
+              cache.snapshot().stateCache.invalidations == 0,
+          "a failure after a finite step from the state took a state out of the cache");
+}
+
+// A result that is not finite can drain after a cancellation has already
+// ended its request: the cancellation stands as the end, and the state the
+// failed step computed from goes all the same.
+void testNonFiniteStepAfterCancellationInvalidatesTheState() {
+  test::TestKvStorage storage(32, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor model;
+  Events events;
+  engine::Engine engine(test::engineConfig(), cache, model, events);
+  guardReleases(storage, engine);
+  std::vector<uint32_t> prompt(129);
+  std::iota(prompt.begin(), prompt.end(), 1u);
+
+  engine.submit(request(1, std::vector<uint32_t>(prompt.begin(), prompt.begin() + 65)));
+  runUntilIdle(engine);
+  model.nonFinitePrefills = {2};
+  model.holdPrefillUntil = std::make_shared<std::atomic<bool>>(false);
+  engine.submit(request(2, prompt));
+  for (double now = 1; now < 100 && !engine.commandInFlight(); ++now)
+    static_cast<void>(engine.tick(now));
+  require(engine.commandInFlight(), "the resumed request did not launch its held prefill");
+  engine.cancel(2);
+  *model.holdPrefillUntil = true;
+  runUntilIdle(engine);
+  require(engine.snapshot().cancelled == 1 && events.failedCount == 0,
+          "the cancellation did not stand as the request's end");
+  require(!cache.lookup(prompt, {}).state && cache.snapshot().stateCache.invalidations == 1,
+          "a cancelled request's step that was not finite left the state it computed from");
 }
 
 void runUntilCheckpoint(engine::Engine &engine, uint64_t publications) {
@@ -9059,7 +9207,11 @@ int main() {
     testPrefillCanCompleteTheRequest();
     testFirstTokenIsSentAtPrefill();
     testFirstTokenSentBeforeASuspensionIsNotSentAgain();
+    testResumedLaneClearsThePagesPastItsRestoredChain();
     testOutOfVocabularyOutputFailsLaneOnly();
+    testNonFiniteFirstStepAfterARestoreInvalidatesTheState();
+    testNonFiniteLaterStepKeepsTheRestoredState();
+    testNonFiniteStepAfterCancellationInvalidatesTheState();
     std::cout << "engine tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

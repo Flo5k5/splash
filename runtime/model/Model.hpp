@@ -320,11 +320,13 @@ struct ModelStepResult final {
   // Raw final-prompt-position logits at the request's scoreTokens, in
   // requested order. Empty for generation and for cancelled/failed scoring.
   std::vector<float> scoreLogits{};
-  // Set when the model computed an unusable result for this lane alone, such
-  // as a non-finite score logit or a selection outside the vocabulary (the
-  // sampling kernels' sentinel for a non-finite logit row). The engine fails
-  // that one request before it publishes cache state or emits output, and the
-  // rest of the batch stands. Broken invariants and GPU faults stay
+  // Set when the model computed an unusable result for this lane alone: a
+  // prefill chunk whose last row is not finite, a non-finite score logit or
+  // a selection outside the vocabulary (the sampling kernels' sentinel for a
+  // non-finite logit row). Every step that publishes cache state is checked
+  // so, which lets the engine keep what earlier steps published. The engine
+  // fails that one request before it publishes cache state or emits output,
+  // and the rest of the batch stands. Broken invariants and GPU faults stay
   // exceptions and remain engine-fatal.
   std::string failure{};
   // The request's first output token, which the step that completes its
