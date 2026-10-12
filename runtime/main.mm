@@ -1,4 +1,5 @@
 #include "AwakeClock.hpp"
+#include "LegacyWeightCache.hpp"
 #include "StderrLine.hpp"
 #include "engine/FdTransport.hpp"
 #include "engine/Bootstrap.hpp"
@@ -19,6 +20,7 @@
 #include <csignal>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <limits.h>
 #include <memory>
@@ -264,6 +266,8 @@ void closePersistentCache(engine::FdTransport &transport,
 }
 
 int runNative(const engine::NativeArguments &arguments) {
+  if (const char *home = std::getenv("HOME"); home && *home)
+    reportLegacyWeightCache(std::filesystem::path(home) / "Library/Caches/Splash/weights");
   engine::FdTransport transport(STDIN_FILENO, STDOUT_FILENO);
   ShutdownSignals signals(transport);
   MemoryPressureMonitor pressureMonitor(transport.controlNotifier());
