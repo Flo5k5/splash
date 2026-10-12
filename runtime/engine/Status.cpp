@@ -97,7 +97,7 @@ std::string runtimeStatusJson(
   const uint64_t peakBytes = std::max(
       {currentBytes, metalMemory.peakAllocatedBytes,
        metalMemory.devicePeakAllocatedBytes});
-  // Warning pressure pauses growth but permits serving; only the governor's
+  // Warning pressure sheds cache but permits serving; only the governor's
   // critical verdict makes host pressure a readiness failure. A status exists
   // only after warmup and the memory audit passed. The thermal state slows
   // serving but never stops it, so it is reported and readiness ignores it.
