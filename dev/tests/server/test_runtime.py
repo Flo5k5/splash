@@ -1737,13 +1737,14 @@ class RuntimeTests(unittest.TestCase):
         self.addCleanup(runtime.close)
         active = runtime.submit(request(1))
         os.read(read_fd, 65536)  # Drain just the first complete request.
-        large = request(0, prompt_tokens=tuple(range(131072)), deadline=0.1)
+        # A loaded CI runner once took over 0.1 s to start the frame.
+        large = request(0, prompt_tokens=tuple(range(131072)), deadline=1.0)
         received = bytearray()
         with ThreadPoolExecutor(max_workers=1) as executor:
             writer = executor.submit(runtime.submit, large)
-            self.assertTrue(select.select([read_fd], [], [], 0.5)[0])
+            self.assertTrue(select.select([read_fd], [], [], 1.0)[0])
             # The frame has started; let its request deadline pass mid-frame.
-            time.sleep(0.3)
+            time.sleep(max(0.0, large.deadline - time.monotonic()) + 0.2)
             self.assertFalse(writer.done())
             while not writer.done():
                 if select.select([read_fd], [], [], 0.05)[0]:
