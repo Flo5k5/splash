@@ -273,7 +273,8 @@ class ProtocolRecoveryTests(unittest.TestCase):
 
     def test_hidden_history_rejects_malformed_signatures_before_submit(self):
         harness = self.harness(FakeRuntime())
-        for signature in (7, None, ["token"]):
+        # A null signature is one left out.
+        for signature in (7, ["token"]):
             for path in ("/v1/messages", "/v1/messages/count_tokens"):
                 body = request_body(
                     messages=[

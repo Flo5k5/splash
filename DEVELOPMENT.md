@@ -357,14 +357,18 @@ default or a request's own, reaches the template as `enable_thinking`, false
 for `none`, and as `reasoning_effort`, not as a token budget, so a template that
 switches reasoning by either follows it. A template that rejects an effort
 renders an alias: `xhigh` for `high` and `max`, `low` for `minimal`; one that
-rejects `none` renders by `enable_thinking` alone while thinking is off.
+rejects `none` renders by `enable_thinking` alone while thinking is off. A
+template that cannot give the thinking a request asks for, one that always or
+never thinks, renders as it can, and the request reasons as its prompt does. A
+template that refuses a request's messages returns 400 with its reason.
 
 ```sh
 splash serve --model mlx-community/Qwen3.8-27B-4bit --default-reasoning-effort none
 ```
 
 `/apply-template` uses the same default. Anthropic `thinking` keeps its protocol
-semantics (off when omitted); judgment endpoints always disable thinking. The
+semantics (off when omitted) unless the request's `chat_template_kwargs` set
+`enable_thinking`; judgment endpoints always disable thinking. The
 built-in chat page sends no effort unless the user picks one.
 
 The console's Started line shows how each chat request reasons: the effort it
@@ -372,8 +376,8 @@ sent, or `absent` and the default it took, its `enable_thinking` when it set
 one, and whether it thinks, as in
 `Started · input 2,473 · cached 0 · effort absent → low · thinking on`.
 
-A Chat request's `chat_template_kwargs`, as vLLM and SGLang accept them, are
-passed to the template as variables and outrank the effort, so
+A Chat or Messages request's `chat_template_kwargs` are passed to the template
+as variables and outrank the effort, and in Messages `thinking`, so
 `{"enable_thinking": false}` turns reasoning off and reaches the template as
 `reasoning_effort` `none` too, as effort `none` does, and `true` turns it on,
 at the template's default effort where the effort is `none`. `enable_thinking`
@@ -441,7 +445,8 @@ API key works; with it on, clients send the server's key. `model` names the
 served model ID or one of its [aliases](#api-model-aliases), as `/v1/models`
 lists them; another name returns 404 `model_not_found`, which Messages, whose
 errors carry no code, answers as a `not_found_error`. Chat, text completion and
-Responses requests that omit it get the served model; Messages requires it.
+Responses requests that omit it, or send it empty, get the served model;
+Messages requires it.
 
 ### Endpoints
 
@@ -464,7 +469,11 @@ Responses requests that omit it get the served model; Messages requires it.
 
 ### Request fields
 
-Chat Completions, text completions, Responses and Messages share these fields:
+A field set to `null` is one left out, at a request's top level on every
+endpoint and in the optional fields Splash reads in its messages, content blocks
+and options, as clients that write every field they do not set as `null` mean
+it; in tool arguments, schemas and template variables `null` is a value. Chat
+Completions, text completions, Responses and Messages share these fields:
 
 - `stream`: stream server-sent events. In Chat and text completions,
   `stream_options.include_usage` adds usage to the stream; their non-streaming
@@ -476,11 +485,13 @@ Chat Completions, text completions, Responses and Messages share these fields:
 - `timeout`: the seconds a request may take from its arrival; it can only
   shorten `--request-timeout`. A request that runs out returns 504
   `request_timeout`.
-- `seed`: an unsigned 64-bit integer, random when omitted
-  ([sampling](#sampling)).
-- `stop`, in Messages `stop_sequences`: a string or up to four strings. It
-  cannot be combined with tools a call may name or with structured output,
-  since it could cut either short.
+- `seed`: a 64-bit integer, random when omitted or `-1`; another negative seed
+  is taken as its 64 bits ([sampling](#sampling)).
+- `stop`, in Messages `stop_sequences`: a string or up to four strings. A stop
+  string ends the output where the model writes it, inside a tool call or
+  structured output too, which it cuts as the token limit does: a call it cuts
+  keeps the arguments it has, and no call of the output counts as made; a cut
+  structured answer is not validated.
 - `return_progress`, with `stream` true: prompt progress before the output
   ([output limits and streaming](#output-limits-and-streaming)).
 - `cache_salt`: a nonempty string. A request shares cached prompts, their KV and
@@ -496,8 +507,12 @@ Chat Completions also takes `messages`, `tools`, `tool_choice` and
 turns' reasoning with it), `max_completion_tokens` or `max_tokens`,
 `ignore_eos` and the [sampling](#sampling) fields. The reply's reasoning comes
 in `reasoning_content`, beside `content`, in the message and in each stream
-delta, and an assistant message sent back may carry its `reasoning_content`.
-`n` other than 1 and `logprobs: true` return 400.
+delta, and an assistant message sent back may carry its `reasoning_content`
+(or `reasoning` text). Message content may hold Responses' `input_text`,
+`output_text` and `input_image` parts too, and a `refusal` part, an assistant's
+refusal, is text. A history tool call whose `arguments` are not a JSON object,
+such as one the output limit cut, is kept as text, so the conversation
+continues. `n` other than 1 and `logprobs: true` return 400.
 
 `POST /v1/completions` serves OpenAI's legacy text completions. `prompt` is one
 string, which the loaded tokenizer encodes as a raw prompt, adding its own
@@ -514,10 +529,11 @@ below, `seed`, `stop`, `priority`, `timeout` and `stream` with
 Responses takes `input` and `instructions`, function `tools` and `namespace`
 groups of them, `tool_choice`, `parallel_tool_calls`, `reasoning.effort`,
 `text.format` for structured output, `max_output_tokens`, the sampling fields,
-and `store` and `previous_response_id` ([Responses state](#responses-state)).
-Reasoning comes back as `reasoning` output items. `conversation`,
-`background: true`, `truncation` other than `disabled` and `context_management`
-edits return 400.
+Chat's `ignore_eos`, `chat_template_kwargs` and `preserve_thinking`, and `store`
+and `previous_response_id` ([Responses state](#responses-state)). Reasoning
+comes back as `reasoning` output items. `conversation`, `background: true` and
+`truncation` other than `disabled` return 400; Splash compacts nothing, so
+`context_management` leaves the input as sent.
 
 Messages takes `max_tokens`, `system`, `messages`, custom `tools` (every one
 declared in the prompt, `defer_loading` ones too, so a `tool_result`'s
@@ -527,8 +543,9 @@ them in order: a `tool_definition` adds a tool or replaces the one of its name,
 and a removed tool is left out until a later block adds it again),
 `tool_choice` (`auto`, `any`, `tool` or `none`, with
 `disable_parallel_tool_use`), `stop_sequences`, `temperature`, `top_p`, `top_k`,
-`thinking` and `output_config`. A request reasons only when `thinking` sets it:
-`{"type": "enabled"}` and `{"type": "adaptive"}` reason at
+`thinking`, `output_config` and Chat's `chat_template_kwargs`, whose
+`enable_thinking` outranks `thinking`. Otherwise a request reasons only when
+`thinking` sets it: `{"type": "enabled"}` and `{"type": "adaptive"}` reason at
 `output_config.effort`, one of `low`, `medium`, `high` (the default), `xhigh`
 and `max`, while `{"type": "disabled"}` and an omitted `thinking` do not;
 `budget_tokens` is not read. Reasoning comes back in `thinking` blocks. With
@@ -538,8 +555,9 @@ reasoning travels encrypted in its `signature` under the key in `thinking.key`
 block back has the reasoning restored. A signature Splash cannot read, such as
 another provider's, keeps the block's visible text without recovering the
 private reasoning. Structured output is `output_config.format` (or
-`output_format`) with a JSON schema. `context_management` accepts only
-`clear_thinking_20251015` with `keep: "all"`, which sets `preserve_thinking`.
+`output_format`) with a JSON schema. In `context_management`, a
+`clear_thinking_20251015` edit with `keep: "all"` sets `preserve_thinking`;
+Splash makes no other edit, so the model reads the conversation as sent.
 
 `POST /tokenize` accepts `{"content":"hello","add_special":false}` and returns
 `{"tokens":[...]}` using the loaded tokenizer. Special-token strings are recognized;
@@ -572,9 +590,9 @@ after the request, as `nc` does at the end of its input, counts as disconnected
 and gets no response. A response write waits up to 30 seconds for a client that
 has stopped reading, past `--request-timeout` too, and the request counts
 against `--queue-size` until then. `/status` reports `http.request_body_bytes`
-and `http.max_request_bytes`. A body's JSON, and JSON inside it such as a
-history tool call's arguments, nests at most 128 levels of arrays and objects;
-deeper is refused as invalid JSON.
+and `http.max_request_bytes`. A body's JSON nests at most 128 levels of arrays
+and objects; deeper is refused as invalid JSON. A history tool call's arguments
+nested deeper stay text, as other arguments that are not a JSON object do.
 
 The server holds at most `--queue-size` + 64 connections at once (96 by
 default), each in a connection slot. A connection waits for its request without
@@ -750,8 +768,7 @@ tool declares for that parameter:
 | not declared | `seven` | `"seven"` |
 
 Calls are not validated against their schemas; a client reports what its tool
-rejects. A `stop` string cannot be combined with tools a call may name
-([request fields](#request-fields)).
+rejects. A `stop` string may cut a call ([request fields](#request-fields)).
 
 The output is read as the chat template lays calls out: a call opens at
 `<tool_call>` and the newline before `<function=`, and a value ends at
@@ -763,9 +780,10 @@ writes may. Tags written otherwise are text. Besides:
   dropped, as is a `</think>` in text;
 - a repeated parameter keeps its first value, which has streamed;
 - text after a call stays content, with or without its `</tool_call>`;
-- a call the token limit cuts keeps the unfinished arguments it has, which
-  Chat and Responses (with status `incomplete`) return and a Messages stream
-  has streamed, while a complete Messages response leaves the call out;
+- a call the token limit or a stop sequence cuts keeps the unfinished
+  arguments it has, which Chat and Responses (with status `incomplete`) return
+  and a Messages stream has streamed, while a complete Messages response leaves
+  the call out;
 - JSON that would decode to a lone surrogate or nest past 122 levels keeps its
   text, which writes back as valid JSON, so that the call's arguments read back
   within the 128 levels the server reads where a request carries them deepest,
@@ -1385,11 +1403,11 @@ owns finite-choice prompts, validation and typed answer math. `output.py` parses
 generated text as it arrives, one parser serving streamed and complete
 responses alike, and `constraints.py` compiles token constraints. Messages and
 Responses build streamed and complete responses from the same block sequence;
-the one difference is a call cut by the token limit, which a complete Messages
-response leaves out. `make architecture-check` prevents lower layers from
-importing the HTTP entry module, and keeps one import style in `server/` and
-`install/`: a module imports its package's modules relatively. The server
-runs as `python -m server.server`; `install/launcher.py` and
+the one difference is a call cut by the token limit or a stop sequence, which a
+complete Messages response leaves out. `make architecture-check` prevents lower
+layers from importing the HTTP entry module, and keeps one import style in
+`server/` and `install/`: a module imports its package's modules relatively.
+The server runs as `python -m server.server`; `install/launcher.py` and
 `install/models.py`, which run as scripts, import their siblings through a
 PEP 366 header. `serve_options.py` defines the options
 `splash serve` shares with the server once, each with its check, default,

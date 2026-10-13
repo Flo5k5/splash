@@ -13,6 +13,7 @@ from dev.tests.server_fixtures import (
     rich_weather_tool,
 )
 from server import api_shapes
+from server import protocol as native_wire
 from server.api_shapes import normalize_responses_input
 
 
@@ -758,6 +759,27 @@ class ResponsesTests(HarnessTestCase):
                     )
         self.assertEqual(runtime.requests, [])
         self.assertEqual(harness.tokenizer.templates, [])
+
+    def test_responses_take_the_chat_extensions(self):
+        runtime = FakeRuntime(Plan([[4]]))
+        harness = self.harness(runtime)
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/responses",
+            responses_body(
+                ignore_eos=True,
+                preserve_thinking=True,
+                chat_template_kwargs={"custom": 1},
+            ),
+        )
+        self.assertEqual(status, 200, payload)
+        # The prompt's render; the generation prompt's probes follow it.
+        _, kwargs = harness.tokenizer.templates[0]
+        self.assertEqual((kwargs["custom"], kwargs["preserve_thinking"]), (1, True))
+        self.assertTrue(
+            runtime.requests[0].frame.flags
+            & native_wire.RequestFlag.IGNORE_END_OF_SEQUENCE
+        )
 
     def test_responses_supports_namespaces(self):
         tools = [
