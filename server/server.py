@@ -751,7 +751,6 @@ class FrontendHandler(BaseHTTPRequestHandler):
             chat,
             deadline=deadline,
             output_field="max_tokens",
-            clamp_output_budget=True,
             thinking_display=thinking_display,
         )
         job.flags |= progress

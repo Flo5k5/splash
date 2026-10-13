@@ -484,21 +484,18 @@ class Frontend:
         *,
         deadline,
         output_field=None,
-        clamp_output_budget=False,
         thinking_display="summarized",
     ):
         """A Chat request, or a Messages request converted to Chat.
-        Output limit errors name output_field, that API's own field; with
-        clamp_output_budget, a limit larger than what the context leaves is
-        lowered to it instead of refused. thinking_display "omitted" hides
-        Messages reasoning behind a signature."""
+        Output limit errors name output_field, that API's own field.
+        thinking_display "omitted" hides Messages reasoning behind a
+        signature."""
         with self._preparation(deadline):
             return self._prepare(
                 body,
                 None,
                 deadline,
                 output_field=output_field,
-                clamp_output_budget=clamp_output_budget,
                 thinking_display=thinking_display,
             )
 
@@ -526,14 +523,11 @@ class Frontend:
             options = self._generation_options(body)
             prompt_tokens = self._completion_prompt(body.get("prompt"))
             remaining_request_time(deadline)
-            # The default is a ceiling: a prompt that leaves less context
-            # generates up to the rest.
             requested = body.get("max_tokens")
             max_new = self._output_budget(
                 COMPLETION_DEFAULT_MAX_TOKENS if requested is None else requested,
                 prompt_tokens,
                 "max_tokens",
-                clamp=requested is None,
             )
             return self._generation_job(options, prompt_tokens, max_new, deadline)
 
@@ -962,7 +956,6 @@ class Frontend:
         deadline,
         *,
         output_field,
-        clamp_output_budget,
         thinking_display,
     ):
         body = _drop_nulls(
@@ -1053,9 +1046,7 @@ class Frontend:
                 if "max_completion_tokens" in body
                 else "max_tokens"
             )
-        max_new = self._output_budget(
-            requested, prompt_tokens, output_field, clamp_output_budget
-        )
+        max_new = self._output_budget(requested, prompt_tokens, output_field)
         return self._generation_job(
             options,
             prompt_tokens,
@@ -1147,28 +1138,17 @@ class Frontend:
             self._cache_salt(body),
         )
 
-    def _output_budget(self, requested, prompt_tokens, field, clamp=False):
-        """The output token budget requested under the API's field name,
-        within the context window the prompt leaves. A request that names
-        none may use all of that window, as in vLLM and SGLang."""
+    def _output_budget(self, requested, prompt_tokens, field):
+        """The output token budget requested under the API's field name. It is
+        a ceiling: a request generates up to the end of the context window
+        its prompt leaves, all of it when the request names no budget."""
         if len(prompt_tokens) >= self.max_context:
             raise ContextLengthError(len(prompt_tokens), self.max_context - 1)
         remaining = self.max_context - len(prompt_tokens)
         max_new = remaining if requested is None else requested
         if not isinstance(max_new, int) or isinstance(max_new, bool) or max_new <= 0:
             raise APIError(400, f"{field} must be a positive integer")
-        if max_new > remaining:
-            if not clamp:
-                raise APIError(
-                    400,
-                    f"prompt and {field} exceed the context window: "
-                    f"{len(prompt_tokens)} + {max_new} > {self.max_context} tokens",
-                    "context_length_exceeded",
-                )
-            # This API treats the output budget as a ceiling. Generate up to
-            # the remaining context and report the length stop if it is reached.
-            max_new = remaining
-        return max_new
+        return min(max_new, remaining)
 
     def _generation_job(self, options, prompt_tokens, max_new, deadline, **fields):
         """The job for a prepared prompt, with the endpoint's own fields."""
@@ -1223,7 +1203,6 @@ class Frontend:
                 namespaces,
                 deadline,
                 output_field="max_output_tokens",
-                clamp_output_budget=False,
                 thinking_display="summarized",
             )
             job.response_store = store
