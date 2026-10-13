@@ -1997,10 +1997,11 @@ void extremeSearches(MetalBackend &backend) {
   }
 }
 
-// A row of non-finite logits, which a non-finite hidden row leaves, has no
-// token to select: greedy and sampled policies select 0xFFFFFFFF for a first
-// token and at every verify row, and acceptance retains it as the next
-// anchor. The model runtime reports that sentinel as the request's own
+// A row with no selectable logit, every one NaN (which a non-finite hidden
+// row leaves) or -inf, has no token to select: greedy and sampled policies
+// select 0xFFFFFFFF for a first token and at every verify row, and
+// acceptance retains it as the next anchor. A penalty on one of its tokens
+// leaves it so. The model runtime reports that sentinel as the request's own
 // failure, which keeps the rest of the batch serving.
 void nonFiniteRowsSelectTheSentinel(MetalBackend &backend) {
   constexpr uint32_t vocabulary = 1003;
@@ -2025,39 +2026,53 @@ void nonFiniteRowsSelectTheSentinel(MetalBackend &backend) {
   batch.inputTokens()[0] = 7;
   for (uint32_t uniform = 0; uniform < 2 * kRows; ++uniform)
     batch.uniforms()[uniform] = 0.5F * (random.unit() + 1.0F);
-  for (const SamplingPolicy &policy : {SamplingPolicy{1, 0.0F, 1.0F, false},
-                                       SamplingPolicy{20, 1.0F, 0.9F, false}}) {
-    const std::string label = policy.samples() ? "sampled" : "greedy";
-    std::fill(batch.logits(), batch.logits() + batch.rows * vocabulary,
-              std::numeric_limits<float>::quiet_NaN());
-    batch.poison();
-    CommandGraph initial;
-    sampling.addInitial(initial, {&policy, 1}, batch.buffers, 0, kStopTokens[0],
-                        kStopTokens[1], {});
-    static_cast<void>(backend.submitCommandAsync(initial.dispatches()).wait());
-    require(batch.outputTokens()[0] == kSentinel,
-            label + ": a first token from a non-finite row is " +
-                std::to_string(batch.outputTokens()[0]));
-    batch.poison();
-    CommandGraph verify;
-    sampling.addVerify(verify, {&policy, 1}, batch.buffers, kStopTokens[0],
-                       kStopTokens[1], {});
-    static_cast<void>(backend.submitCommandAsync(verify.dispatches()).wait());
-    for (uint32_t row = 0; row < kRows; ++row)
-      require(batch.outputTokens()[row] == kSentinel,
-              label + ": verify row " + std::to_string(row) +
-                  " of non-finite logits selected " +
-                  std::to_string(batch.outputTokens()[row]));
-    CommandGraph accept;
-    const std::array<uint32_t, 1> maximumRetained{kRows};
-    sampling.addAcceptance(accept, acceptance, maximumRetained, {&policy, 1},
-                           kStopTokens[0], kStopTokens[1]);
-    static_cast<void>(backend.submitCommandAsync(accept.dispatches()).wait());
-    const uint32_t retained =
-        *static_cast<const uint32_t *>(acceptance.retainedCounts.contents());
-    require(retained >= 1 && retained <= kRows &&
-                batch.outputTokens()[retained - 1] == kSentinel,
-            label + ": acceptance did not retain the sentinel as its anchor");
+  // Token 29 is in the prompt, so repetition rewrites its logit.
+  const std::array<uint32_t, 1> penaltyRows{0};
+  const PenaltyTable penalties{
+      allocate(backend, uint64_t{vocabulary} * sizeof(uint32_t)), penaltyRows};
+  std::memset(penalties.words.contents(), 0, penalties.words.sizeBytes());
+  static_cast<uint32_t *>(penalties.words.contents())[29] = SPLASH_PENALTY_PROMPT_BIT;
+  for (SamplingPolicy policy : {SamplingPolicy{1, 0.0F, 1.0F, false},
+                                SamplingPolicy{20, 1.0F, 0.9F, false}}) {
+    for (const float logit : {std::numeric_limits<float>::quiet_NaN(),
+                              -std::numeric_limits<float>::infinity()}) {
+      for (const float repetition : {1.0F, 1.1F}) {
+        policy.penalties.repetition = repetition;
+        const std::string label =
+            std::string(policy.samples() ? "sampled" : "greedy") +
+            (std::isnan(logit) ? ", NaN" : ", -inf") +
+            (policy.penalties.active() ? ", penalized" : "");
+        std::fill(batch.logits(), batch.logits() + batch.rows * vocabulary, logit);
+        batch.poison();
+        CommandGraph initial;
+        sampling.addInitial(initial, {&policy, 1}, batch.buffers, 0,
+                            kStopTokens[0], kStopTokens[1], penalties);
+        static_cast<void>(backend.submitCommandAsync(initial.dispatches()).wait());
+        require(batch.outputTokens()[0] == kSentinel,
+                label + ": a first token from a row with no selectable logit is " +
+                    std::to_string(batch.outputTokens()[0]));
+        batch.poison();
+        CommandGraph verify;
+        sampling.addVerify(verify, {&policy, 1}, batch.buffers, kStopTokens[0],
+                           kStopTokens[1], penalties);
+        static_cast<void>(backend.submitCommandAsync(verify.dispatches()).wait());
+        for (uint32_t row = 0; row < kRows; ++row)
+          require(batch.outputTokens()[row] == kSentinel,
+                  label + ": verify row " + std::to_string(row) +
+                      " with no selectable logit selected " +
+                      std::to_string(batch.outputTokens()[row]));
+        CommandGraph accept;
+        const std::array<uint32_t, 1> maximumRetained{kRows};
+        sampling.addAcceptance(accept, acceptance, maximumRetained, {&policy, 1},
+                               kStopTokens[0], kStopTokens[1]);
+        static_cast<void>(backend.submitCommandAsync(accept.dispatches()).wait());
+        const uint32_t retained =
+            *static_cast<const uint32_t *>(acceptance.retainedCounts.contents());
+        require(retained >= 1 && retained <= kRows &&
+                    batch.outputTokens()[retained - 1] == kSentinel,
+                label + ": acceptance did not retain the sentinel as its anchor");
+      }
+    }
   }
 }
 
