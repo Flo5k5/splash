@@ -57,6 +57,18 @@ class CacheInfo:
     deduplicated_tokens: int = 0
 
 
+@dataclass(frozen=True)
+class ReasoningRequest:
+    """How a chat request asked to reason: the reasoning effort it sent, None
+    when absent; the effort its template rendered with, the server's default
+    for an absent one and None for the template's own; and its
+    chat_template_kwargs enable_thinking, None when unset."""
+
+    sent: str | None
+    effort: str | None
+    enable_thinking: bool | None
+
+
 @dataclass
 class NativeResult:
     reason: str
@@ -92,6 +104,9 @@ class Job:
     priority: wire.RequestPriority = wire.RequestPriority.NORMAL
     stop_sequences: tuple[str, ...] = ()
     thinking: bool = False
+    # A chat request's reasoning options, which its Started line shows; None
+    # for a request without a chat template.
+    reasoning: ReasoningRequest | None = None
     thinking_display: str = "summarized"
     reasoning_tokens: int = 0
     events: queue.Queue = field(default_factory=queue.Queue)
@@ -751,13 +766,19 @@ class NativeBackend:
             )
             with self.lock:
                 job.cache = cache
-            self._log(
-                {
-                    "outcome": "started",
-                    "prompt_tokens": len(job.prompt_tokens),
-                    "cached_tokens": cache.matched_tokens,
+            record = {
+                "outcome": "started",
+                "prompt_tokens": len(job.prompt_tokens),
+                "cached_tokens": cache.matched_tokens,
+            }
+            if job.reasoning is not None:
+                record["reasoning"] = {
+                    "sent_effort": job.reasoning.sent,
+                    "effort": job.reasoning.effort,
+                    "enable_thinking": job.reasoning.enable_thinking,
+                    "thinking": job.thinking,
                 }
-            )
+            self._log(record)
             job.events.put(("start", None))
         elif isinstance(event, wire.PromptProgressEvent):
             job.events.put(

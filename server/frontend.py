@@ -19,7 +19,7 @@ from .api_shapes import (
     responses_to_chat_body,
     template_messages,
 )
-from .backend import Job, remaining_request_time
+from .backend import Job, ReasoningRequest, remaining_request_time
 from .chat_templates import (
     LATER_SYSTEM_UNSUPPORTED,
     RESERVED_TEMPLATE_KWARGS,
@@ -214,6 +214,8 @@ class Prompt:
     enable_thinking: bool | None = None
     # Its other template variables, which outrank Splash's own.
     template_kwargs: dict = field(default_factory=dict)
+    # The reasoning effort the request sent; None where it sent none.
+    sent_effort: str | None = None
 
 
 @dataclass
@@ -869,6 +871,7 @@ class Frontend:
             preserve_thinking,
             enable_thinking,
             template_kwargs,
+            body.get("reasoning_effort"),
         )
 
     def _tokenize(self, text, **options):
@@ -1059,6 +1062,9 @@ class Frontend:
             max_new,
             deadline,
             thinking=thinking,
+            reasoning=ReasoningRequest(
+                prompt.sent_effort, prompt.reasoning_effort, prompt.enable_thinking
+            ),
             thinking_display=thinking_display,
             tool_policy=tool_policy,
             response_validator=response_validator,
