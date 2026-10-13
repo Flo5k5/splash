@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 
 from . import json_codec
 from . import protocol as wire
@@ -18,6 +17,25 @@ VISION_UNAVAILABLE = (
 )
 
 
+def _field(value, key, default):
+    """`value`'s field `key`, or `default` where it is absent or null, as a
+    null field is one left out."""
+    field = value.get(key)
+    return default if field is None else field
+
+
+# Chat's and Responses' kinds of text part. An assistant's refusal is text it
+# wrote, in a field of its own.
+TEXT_PARTS = ("text", "input_text", "output_text", "refusal")
+
+
+def _part_text(part):
+    text = _field(part, "refusal" if part["type"] == "refusal" else "text", "")
+    if not isinstance(text, str):
+        raise APIError(400, "text message content must be a string")
+    return text
+
+
 def _text_content(content):
     if content is None:
         return ""
@@ -26,15 +44,10 @@ def _text_content(content):
     if isinstance(content, list):
         parts = []
         for part in content:
-            if not isinstance(part, dict) or part.get("type") not in (
-                "text",
-                "input_text",
-            ):
+            kind = part.get("type") if isinstance(part, dict) else None
+            if kind not in TEXT_PARTS:
                 raise APIError(400, "only text message content is supported")
-            text = part.get("text", "")
-            if not isinstance(text, str):
-                raise APIError(400, "text message content must be a string")
-            parts.append(text)
+            parts.append(_part_text(part))
         return "".join(parts)
     raise APIError(400, "message content must be text")
 
@@ -72,16 +85,13 @@ def _user_content(content, document_budget, vision):
         if not isinstance(part, dict):
             raise APIError(400, "message content parts must be objects")
         kind = part.get("type")
-        if kind == "image_url":
+        if kind in ("image_url", "input_image"):
             _require_vision("image", vision)
             image_url = part.get("image_url")
             url = image_url.get("url") if isinstance(image_url, dict) else image_url
             parts.append(_image_part(url))
-        elif kind in ("text", "input_text"):
-            text = part.get("text", "")
-            if not isinstance(text, str):
-                raise APIError(400, "text message content must be a string")
-            parts.append({"type": "text", "text": text})
+        elif kind in TEXT_PARTS:
+            parts.append({"type": "text", "text": _part_text(part)})
         elif kind == "file":
             _require_vision("PDF", vision)
             parts.extend(file_content(part.get("file"), budget=document_budget))
@@ -92,111 +102,21 @@ def _user_content(content, document_budget, vision):
     return _media_content(parts)
 
 
-_JSON_NUMBER = re.compile(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?")
-_JSON_STRING_SPECIAL = re.compile(r'["\\\x00-\x1f]')
-
-
-def _unfinished_json(text):
-    """Recognize unfinished JSON in linear space/time, without building values.
-
-    The stack holds one expectation per container, so flat arrays and long
-    strings use constant auxiliary memory. Only a valid prefix is accepted.
-    """
-    stack = ["value"]
-    pos, size = 0, len(text)
-    while pos < size:
-        char = text[pos]
-        if char in " \t\r\n":
-            pos += 1
-            continue
-        expected = stack[-1]
-        if expected in ("array_end", "object_end"):
-            if char == ("]" if expected == "array_end" else "}"):
-                stack.pop()
-            elif char == ",":
-                stack[-1] = "array_value" if expected == "array_end" else "key"
-            else:
-                return False
-            pos += 1
-            continue
-        if expected == "colon":
-            if char != ":":
-                return False
-            stack[-1] = "object_value"
-            pos += 1
-            continue
-        if expected in ("array_first", "object_first") and char == (
-            "]" if expected == "array_first" else "}"
-        ):
-            stack.pop()
-            pos += 1
-            continue
-        if expected == "done":
-            return False
-        key = expected in ("key", "object_first")
-        if key and char != '"':
-            return False
-        # Record the continuation before consuming a scalar or entering a
-        # nested container. Root completion stays on the stack as a sentinel.
-        if key:
-            stack[-1] = "colon"
-        elif expected == "value":
-            stack[-1] = "done"
-        elif expected == "object_value":
-            stack[-1] = "object_end"
-        else:
-            stack[-1] = "array_end"
-        if char in "[{":
-            stack.append("array_first" if char == "[" else "object_first")
-            pos += 1
-        elif char == '"':
-            pos += 1
-            while True:
-                special = _JSON_STRING_SPECIAL.search(text, pos)
-                if special is None:
-                    return True
-                pos = special.start() + 1
-                char = special.group()
-                if char == '"':
-                    break
-                if char != "\\":
-                    return False
-                if pos == size:
-                    return True
-                escape = text[pos]
-                pos += 1
-                if escape == "u":
-                    end = min(pos + 4, size)
-                    if any(c not in "0123456789abcdefABCDEF" for c in text[pos:end]):
-                        return False
-                    if end - pos < 4:
-                        return True
-                    pos = end
-                elif escape not in '"\\/bfnrt':
-                    return False
-        elif char in "tfn":
-            literal = {"t": "true", "f": "false", "n": "null"}[char]
-            available = text[pos : pos + len(literal)]
-            if not literal.startswith(available):
-                return False
-            pos += len(available)
-            if len(available) < len(literal):
-                return True
-        else:
-            number = _JSON_NUMBER.match(text, pos)
-            if number is None:
-                return char == "-" and pos + 1 == size
-            start, pos = pos, number.end()
-            if size - pos <= 2:
-                suffix = text[pos:]
-                exponent = (
-                    text.find("e", start, pos) >= 0 or text.find("E", start, pos) >= 0
-                )
-                if suffix in ("e", "E", "e+", "e-", "E+", "E-"):
-                    return not exponent
-                if suffix == ".":
-                    return not exponent and text.find(".", start, pos) < 0
-    return stack != ["done"]
+def _call_arguments(arguments):
+    """A history call's arguments: an object, as sent or as JSON text of one;
+    otherwise their text, the string as sent or another value's JSON, which
+    template_messages keeps as text, so that a conversation continues past a
+    call the output limit cut or the model wrote wrong."""
+    if arguments is None:
+        return {}
+    if isinstance(arguments, str):
+        try:
+            # Some providers send a call without arguments as "".
+            parsed = json_codec.loads(arguments.strip() or "{}")
+        except ValueError:
+            return arguments
+        return parsed if isinstance(parsed, dict) else arguments
+    return arguments if isinstance(arguments, dict) else json_codec.dumps(arguments)
 
 
 def normalize_messages(messages, *, vision, deadline):
@@ -230,47 +150,39 @@ def normalize_messages(messages, *, vision, deadline):
             if role in ("user", "tool")
             else _text_content(content),
         }
-        if role == "assistant" and message.get("reasoning_content") is not None:
-            item["reasoning_content"] = _text_content(message["reasoning_content"])
+        if role == "assistant":
+            # Clients send an assistant's reasoning back as Splash's
+            # reasoning_content or as reasoning text.
+            reasoning = message.get("reasoning_content")
+            if reasoning is None and isinstance(message.get("reasoning"), str):
+                reasoning = message["reasoning"]
+            if reasoning is not None:
+                item["reasoning_content"] = _text_content(reasoning)
         if role == "assistant" and message.get("tool_calls") is not None:
             if not isinstance(message["tool_calls"], list):
                 raise APIError(400, "assistant tool_calls must be an array")
             calls = []
             for call in message["tool_calls"]:
                 function = call.get("function") if isinstance(call, dict) else None
-                if not isinstance(function, dict):
-                    raise APIError(400, "invalid assistant tool call")
-                arguments = function.get("arguments", {})
-                unfinished = False
-                if isinstance(arguments, str):
-                    try:
-                        # Some providers send a call without arguments as "".
-                        arguments = json_codec.loads(arguments.strip() or "{}")
-                    except ValueError as error:
-                        # Preserve calls truncated by the output limit in history
-                        # so the conversation can continue. Invalid complete JSON
-                        # is still rejected.
-                        if not _unfinished_json(arguments):
-                            raise APIError(
-                                400, "tool call arguments must be valid JSON"
-                            ) from error
-                        unfinished = True
-                if not (isinstance(arguments, dict) or unfinished) or not isinstance(
+                if not isinstance(function, dict) or not isinstance(
                     function.get("name"), str
                 ):
                     raise APIError(400, "invalid assistant tool call")
                 calls.append(
                     {
                         "type": "function",
-                        "function": {"name": function["name"], "arguments": arguments},
+                        "function": {
+                            "name": function["name"],
+                            "arguments": _call_arguments(function.get("arguments")),
+                        },
                     }
                 )
-                if "id" in call:
+                if call.get("id") is not None:
                     if not isinstance(call["id"], str):
                         raise APIError(400, "tool call id must be a string")
                     calls[-1]["id"] = call["id"]
             item["tool_calls"] = calls
-        if role == "tool" and "tool_call_id" in message:
+        if role == "tool" and message.get("tool_call_id") is not None:
             tool_call_id = message["tool_call_id"]
             if not isinstance(tool_call_id, str):
                 raise APIError(400, "tool_call_id must be a string")
@@ -282,7 +194,8 @@ def normalize_messages(messages, *, vision, deadline):
 
 
 def template_messages(messages):
-    """Keep unfinished call text without presenting it as complete arguments."""
+    """Keep a call whose arguments are text, not an object, as text, without
+    presenting it as a complete call."""
     result = []
     for message in messages:
         calls = message.get("tool_calls", [])
@@ -546,8 +459,6 @@ def responses_to_chat_body(body, items):
         raise APIError(400, "background responses are not supported")
     if body.get("truncation") not in (None, "disabled"):
         raise APIError(400, "only disabled truncation is supported")
-    if body.get("context_management") not in (None, []):
-        raise APIError(400, "Responses context_management edits are not supported")
     if body.get("stream") is not None and not isinstance(body["stream"], bool):
         raise APIError(400, "stream must be a boolean")
     chat = {
@@ -591,6 +502,9 @@ def responses_to_chat_body(body, items):
         "cache_salt",
         "stop",
         "max_output_tokens",
+        "ignore_eos",
+        "chat_template_kwargs",
+        "preserve_thinking",
     ):
         if field_name in body and body[field_name] is not None:
             chat[aliases.get(field_name, field_name)] = body[field_name]
@@ -687,25 +601,23 @@ def anthropic_to_chat_body(body, *, thinking_resolver):
 
 
 def _anthropic_preserve_thinking(context_management):
-    if context_management is None:
-        return None
-    if not isinstance(context_management, dict):
-        raise APIError(400, "context_management must be an object")
-    edits = context_management.get("edits", [])
-    if not isinstance(edits, list):
-        raise APIError(400, "context_management.edits must be an array")
-    for edit in edits:
-        if (
-            not isinstance(edit, dict)
-            or edit.get("type") != "clear_thinking_20251015"
-            or edit.get("keep") != "all"
-        ):
-            raise APIError(
-                400,
-                "only clear_thinking_20251015 with keep: all is supported "
-                "in context_management.edits",
-            )
-    return True if edits else None
+    """True when a Messages request keeps every turn's thinking: its
+    context_management clears none (clear_thinking_20251015 with keep: all).
+    Splash makes no other edit, so the model reads the conversation as
+    sent."""
+    edits = (
+        context_management.get("edits")
+        if isinstance(context_management, dict)
+        else None
+    )
+    if isinstance(edits, list) and any(
+        isinstance(edit, dict)
+        and edit.get("type") == "clear_thinking_20251015"
+        and edit.get("keep") == "all"
+        for edit in edits
+    ):
+        return True
+    return None
 
 
 def _anthropic_thinking(thinking, effort):
@@ -721,12 +633,12 @@ def _anthropic_thinking(thinking, effort):
         raise APIError(400, "thinking.type must be enabled, disabled, or adaptive")
     thinking_type = thinking["type"]
     display = thinking.get("display")
-    if "display" in thinking:
+    if display is not None:
         if thinking_type == "disabled":
             raise APIError(
                 400, "thinking.display requires enabled or adaptive thinking"
             )
-        if display not in (None, "summarized", "omitted", "updates"):
+        if display not in ("summarized", "omitted", "updates"):
             raise APIError(
                 400,
                 "thinking.display must be summarized, omitted, updates, or null",
@@ -753,7 +665,7 @@ def _anthropic_chat(body, thinking_resolver):
     output_config = body.get("output_config", {})
     if not isinstance(output_config, dict):
         raise APIError(400, "output_config must be an object")
-    effort = output_config.get("effort", "high")
+    effort = _field(output_config, "effort", "high")
     if not isinstance(effort, str) or effort not in (
         "low",
         "medium",
@@ -785,6 +697,7 @@ def _anthropic_chat(body, thinking_resolver):
         "response_format": response_format,
         "preserve_thinking": preserve_thinking,
         "reasoning_effort": reasoning_effort,
+        "chat_template_kwargs": body.get("chat_template_kwargs"),
     }
     if body.get("tool_choice") is not None:
         chat.update(_anthropic_tool_choice(body["tool_choice"]))
@@ -795,11 +708,12 @@ def _anthropic_chat(body, thinking_resolver):
 def _anthropic_response_format(body, output_config):
     """The format of a Messages request's output, in output_config.format or
     output_format, as a Chat response_format; None without one."""
-    if "format" in output_config and "output_format" in body:
+    output_format, legacy = output_config.get("format"), body.get("output_format")
+    if output_format is not None and legacy is not None:
         raise APIError(400, "output_config.format and output_format cannot be combined")
-    if "format" not in output_config and "output_format" not in body:
+    output_format = legacy if output_format is None else output_format
+    if output_format is None:
         return None
-    output_format = output_config.get("format", body.get("output_format"))
     if (
         not isinstance(output_format, dict)
         or output_format.get("type") != "json_schema"
@@ -848,7 +762,7 @@ def _anthropic_message(message, thinking_resolver):
             and kind == "thinking"
             and isinstance(block.get("thinking"), str)
         ):
-            signature = block.get("signature", "")
+            signature = _field(block, "signature", "")
             if not isinstance(signature, str):
                 raise APIError(400, "invalid thinking signature")
             if signature:
@@ -909,12 +823,13 @@ def _anthropic_tool_result(block):
     says first that the tool failed where it did."""
     if not isinstance(block.get("tool_use_id"), str):
         raise APIError(400, "invalid Anthropic tool_result block")
-    if not isinstance(block.get("is_error", False), bool):
+    is_error = _field(block, "is_error", False)
+    if not isinstance(is_error, bool):
         raise APIError(400, "tool_result.is_error must be a boolean")
     content = _anthropic_content(
-        _tool_references_as_text(block.get("content", "")), "tool_result"
+        _tool_references_as_text(_field(block, "content", "")), "tool_result"
     )
-    if block.get("is_error"):
+    if is_error:
         failed = "Tool execution failed:\n"
         content = (
             failed + content
@@ -952,7 +867,7 @@ def _anthropic_tools(tools):
         raise APIError(400, "tools must be an array")
     functions = []
     for tool in tools:
-        if isinstance(tool, dict) and tool.get("type", "custom") != "custom":
+        if isinstance(tool, dict) and _field(tool, "type", "custom") != "custom":
             raise APIError(
                 400,
                 "only custom function tools are supported; "
@@ -961,10 +876,13 @@ def _anthropic_tools(tools):
         if (
             not isinstance(tool, dict)
             or not isinstance(tool.get("name"), str)
-            or not isinstance(tool.get("input_schema", {}), (dict, bool))
+            or not isinstance(_field(tool, "input_schema", {}), (dict, bool))
         ):
             raise APIError(400, "invalid Anthropic tool")
-        function = {"name": tool["name"], "parameters": tool.get("input_schema", {})}
+        function = {
+            "name": tool["name"],
+            "parameters": _field(tool, "input_schema", {}),
+        }
         if isinstance(tool.get("description"), str):
             function["description"] = tool["description"]
         if "strict" in tool:
@@ -1043,7 +961,7 @@ def _anthropic_tool_choice(choice):
     tool_choice."""
     if not isinstance(choice, dict):
         raise APIError(400, "tool_choice must be an object")
-    disable_parallel = choice.get("disable_parallel_tool_use", False)
+    disable_parallel = _field(choice, "disable_parallel_tool_use", False)
     if not isinstance(disable_parallel, bool):
         raise APIError(400, "disable_parallel_tool_use must be a boolean")
     kind = choice.get("type")
@@ -1103,14 +1021,15 @@ def responses_response(model, job, status, output, result=None, error=None):
     }
 
 
-def finish_reason(result, tool_calls):
-    """OpenAI finish_reason: tool calls count only when the output was not cut."""
-    if tool_calls and result.reason != "length":
+def finish_reason(result, called):
+    """OpenAI finish_reason: the output's whole tool calls count only when
+    the token limit did not end it."""
+    if called and result.reason != "length":
         return "tool_calls"
     return result.reason
 
 
-def completion_response(model, job, result, message, tool_calls):
+def completion_response(model, job, result, message, called):
     return {
         "id": f"chatcmpl-{job.public_id}",
         "object": "chat.completion",
@@ -1120,7 +1039,7 @@ def completion_response(model, job, result, message, tool_calls):
             {
                 "index": 0,
                 "message": message,
-                "finish_reason": finish_reason(result, tool_calls),
+                "finish_reason": finish_reason(result, called),
             }
         ],
         "usage": usage_dict(result, job),
@@ -1264,8 +1183,10 @@ def responses_output(job, blocks):
     return [responses_item(job, block, index) for index, block in enumerate(blocks)]
 
 
-def anthropic_stop(result, tool_calls, output_clamped_to_context):
-    if tool_calls and result.reason != "length":
+def anthropic_stop(result, called, output_clamped_to_context):
+    """Anthropic's stop_reason: the output's whole tool calls count only when
+    the token limit did not end it."""
+    if called and result.reason != "length":
         return "tool_use"
     if result.reason == "length":
         # Anthropic's reason when the context window, not max_tokens, ends
@@ -1292,7 +1213,7 @@ def anthropic_block(job, block, signature=""):
     input. Reasoning whose display is omitted shows only `signature`. A call
     no longer in progress has complete arguments: the projector writes each
     call it closes as JSON, and a complete response leaves out a call the
-    token limit cut."""
+    token limit or a stop sequence cut."""
     if block.kind == "reasoning":
         thinking = "" if job.thinking_display == "omitted" else block.text
         return {"type": "thinking", "thinking": thinking, "signature": signature}
@@ -1306,7 +1227,7 @@ def anthropic_block(job, block, signature=""):
     }
 
 
-def anthropic_response(model, job, blocks, result, tool_calls, thinking_signature):
+def anthropic_response(model, job, blocks, result, called, thinking_signature):
     content = [anthropic_block(job, block, thinking_signature) for block in blocks]
     if all(item["type"] == "thinking" for item in content):
         content.append({"type": "text", "text": ""})
@@ -1316,9 +1237,7 @@ def anthropic_response(model, job, blocks, result, tool_calls, thinking_signatur
         "role": "assistant",
         "model": model,
         "content": content,
-        "stop_reason": anthropic_stop(
-            result, tool_calls, job.output_clamped_to_context
-        ),
+        "stop_reason": anthropic_stop(result, called, job.output_clamped_to_context),
         "stop_sequence": result.stop_sequence,
         "usage": anthropic_usage(
             result.prompt_tokens, result.completion_tokens, result.cache

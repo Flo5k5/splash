@@ -278,7 +278,7 @@ class TextCompletionTests(unittest.TestCase):
         self.assertEqual(request.priority, wire.RequestPriority.FOREGROUND)
         invalid = (
             ({"min_p": 1.1}, "min_p must be a number in [0, 1]"),
-            ({"seed": 2**64}, "seed must be an unsigned 64-bit integer"),
+            ({"seed": 2**64}, "seed must be a 64-bit integer"),
             ({"priority": "urgent"}, "priority must be"),
             ({"max_tokens": 0}, "max_tokens must be a positive integer"),
             ({"model": "other-model"}, "model other-model not found"),

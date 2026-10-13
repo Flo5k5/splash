@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from itertools import count
 from pathlib import Path
 
+from jinja2 import TemplateError
+
 from . import images as image_input
 from . import json_codec, judgments
 from . import protocol as wire
@@ -103,17 +105,6 @@ def _preparation_checkpoint(deadline, disconnected):
             raise ConnectionResetError("client disconnected during preparation")
 
     return checkpoint
-
-
-def _drop_nulls(body, extras):
-    """The body without the null values of the sampling options and of the
-    endpoint's other nullable fields, which then take their defaults."""
-    nullable = {*wire.SAMPLING_FIELDS, *extras}
-    return {
-        key: value
-        for key, value in body.items()
-        if value is not None or key not in nullable
-    }
 
 
 # Text completions' output budget when max_tokens is omitted: OpenAI's
@@ -306,7 +297,11 @@ class Frontend:
         self.thinking_codec = thinking_codec
 
     def accepts_model(self, model):
-        return isinstance(model, str) and model in self.model_names
+        """Whether a request may name `model`: a name the server answers to,
+        or none, absent or empty, which means the served model."""
+        return model in (None, "") or (
+            isinstance(model, str) and model in self.model_names
+        )
 
     @property
     def input_modalities(self):
@@ -503,10 +498,7 @@ class Frontend:
         """A text completion: the prompt generates as given, with no chat
         template, reasoning split, tools or images."""
         with self._preparation(deadline):
-            body = _drop_nulls(
-                body, ("n", "best_of", "max_tokens", "suffix", "echo", "logprobs")
-            )
-            if not self.accepts_model(body.get("model", self.model)):
+            if not self.accepts_model(body.get("model")):
                 raise APIError(
                     404, f"model {body['model']} not found", "model_not_found"
                 )
@@ -660,7 +652,7 @@ class Frontend:
         )
         if unknown:
             raise APIError(400, f"unsupported fields: {', '.join(unknown)}")
-        if not self.accepts_model(body.get("model", self.model)):
+        if not self.accepts_model(body.get("model")):
             raise APIError(404, f"model {body['model']} not found", "model_not_found")
         try:
             judgments.validate_row(body)
@@ -815,7 +807,7 @@ class Frontend:
             self.preparation_slots.release()
 
     def _prepare_prompt(self, body, tool_namespaces, *, deadline):
-        if not self.accepts_model(body.get("model", self.model)):
+        if not self.accepts_model(body.get("model")):
             raise APIError(404, f"model {body['model']} not found", "model_not_found")
         reasoning_effort = body.get("reasoning_effort")
         if reasoning_effort is None:
@@ -929,21 +921,16 @@ class Frontend:
                 f"Template error · {type(error).__name__} · {location}:{frame.tb_lineno}",
                 error=True,
             )
-            raise APIError(400, "messages could not be rendered") from error
+            # The client reads a template's own refusal, such as a system
+            # message it does not take; other errors may carry internals, and
+            # the log keeps no request content.
+            reason = f": {error}" if isinstance(error, TemplateError) else ""
+            raise APIError(400, f"messages could not be rendered{reason}") from error
         remaining_request_time(deadline)
         thinking, generation_prompt_tokens = False, 0
         if add_generation_prompt:
             thinking, generation_prompt_tokens = _generation_prompt(
                 chat_template.generation_prompt(template), rendered, tokens
-            )
-        requested = template.get("enable_thinking")
-        if (
-            add_generation_prompt
-            and requested is not None
-            and thinking != bool(requested)
-        ):
-            raise APIError(
-                400, "chat template does not support the requested thinking mode"
             )
         return RenderedPrompt(
             rendered, tokens, images, positions, thinking, generation_prompt_tokens
@@ -958,16 +945,6 @@ class Frontend:
         output_field,
         thinking_display,
     ):
-        body = _drop_nulls(
-            body,
-            (
-                "n",
-                "max_tokens",
-                "max_completion_tokens",
-                "stream",
-                "parallel_tool_calls",
-            ),
-        )
         # Fields checked without the prompt fail before it is prepared, which
         # can render documents and build validators.
         options = self._generation_options(body)
@@ -986,14 +963,6 @@ class Frontend:
             prompt.response_schema,
             prompt.response_validator,
         )
-        # A stop sequence could cut a tool call or a structured result short;
-        # under tool_choice none the tools are only described, never called.
-        if options.stop_sequences and (
-            (tools and tool_policy.schemas) or response_schema is not None
-        ):
-            raise APIError(
-                400, "stop cannot be combined with tools or structured output"
-            )
         # Constrained tool calls and structured output generate under a
         # grammar, which decides where the output ends; tools beside a
         # response schema share one.
@@ -1124,11 +1093,16 @@ class Frontend:
         ignore_eos = body.get("ignore_eos", False)
         if not isinstance(ignore_eos, bool):
             raise APIError(400, "ignore_eos must be a boolean")
-        seed = body.get("seed")
-        if seed is None:
-            seed = secrets.randbits(64)
-        if not isinstance(seed, int) or isinstance(seed, bool) or not 0 <= seed < 2**64:
-            raise APIError(400, "seed must be an unsigned 64-bit integer")
+        seed = body.get("seed", -1)
+        if (
+            not isinstance(seed, int)
+            or isinstance(seed, bool)
+            or not -(2**63) <= seed < 2**64
+        ):
+            raise APIError(400, "seed must be a 64-bit integer")
+        # -1 asks for a random seed, and another negative one is taken as
+        # its 64 bits.
+        seed = secrets.randbits(64) if seed == -1 else seed % 2**64
         return GenerationOptions(
             wire.SamplingParameters(top_k=top_k, **numbers),
             stop_sequences,

@@ -161,18 +161,16 @@ def _progress_flag(body):
 def _stream_options(body):
     """A Chat or text completion request's stream and its stream_options."""
     stream = body.get("stream", False)
-    if stream is None:
-        stream = False
-    options = body.get("stream_options")
-    if options is None:
-        options = {}
-    if (
-        not isinstance(stream, bool)
-        or not isinstance(options, dict)
-        or not isinstance(options.get("include_usage", False), bool)
-    ):
+    options = body.get("stream_options", {})
+    if not isinstance(stream, bool) or not isinstance(options, dict):
         raise APIError(400, "invalid streaming options")
-    return stream, {"include_usage": options.get("include_usage", False)}
+    # A null include_usage is one left out, as a null field is.
+    include_usage = options.get("include_usage")
+    if include_usage is None:
+        include_usage = False
+    if not isinstance(include_usage, bool):
+        raise APIError(400, "invalid streaming options")
+    return stream, {"include_usage": include_usage}
 
 
 @dataclass(frozen=True, slots=True)
@@ -236,9 +234,23 @@ class Collected:
     result: NativeResult
     # The output ended inside its reasoning.
     reasoning_open: bool
-    # The id of the call the token limit cut, whose arguments are
-    # unfinished; None when it cut none.
+    # The token limit or a stop sequence ended the output inside a call.
+    cut_in_call: bool
+    # The id of that call, whose arguments are unfinished; None when it cut
+    # none, or none whose name it had read.
     cut_call: str | None
+
+    @property
+    def cut(self):
+        """Whether the output's end cut its last block short: the token limit
+        cuts any block, a stop sequence only a call, as text may end where
+        the client asks."""
+        return self.result.reason == "length" or self.cut_in_call
+
+    @property
+    def called(self):
+        """Whether the output's tool calls count as made: it cut none."""
+        return bool(self.tool_calls) and not self.cut_in_call
 
 
 class FrontendHandler(BaseHTTPRequestHandler):
@@ -683,6 +695,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
         else:
             with self.app.latencies.measure("upload"):
                 body = self._read_json_body(started_at + self.app.request_timeout)
+            # A field set to null is one left out, as clients that write every
+            # field they do not set as null mean it.
+            body = {key: value for key, value in body.items() if value is not None}
             if route.fieldless and body:
                 raise APIError(400, "this endpoint takes no fields")
         serve = getattr(self, route.method)
@@ -872,17 +887,22 @@ class FrontendHandler(BaseHTTPRequestHandler):
         except ConnectionError:
             return True
 
-    def _finalize_content(self, content, job, incomplete, projector):
+    def _finalize_content(self, content, job, result, projector, cut_in_call):
         """The content and calls of the output, and the events the stream
-        still owes. An answer without calls is validated against the response
-        format unless it was cut. `content` is read only without tools: with
-        tools, the projector holds the content."""
+        still owes. The token limit cuts the output wherever it ends, and a
+        stop sequence the call it ends inside; text before a stop sequence is
+        the text the client asked for. An answer without calls is validated
+        against the response format only when the model ended it. `content`
+        is read only without tools: with tools, the projector holds it."""
+        ended = result.reason != "length" and result.stop_sequence is None
         if job.tool_policy is None:
-            if not incomplete:
+            if ended:
                 validate_response_content(content, job.response_validator)
             return content, [], []
-        content, tool_calls, events = projector.finish(incomplete)
-        if not incomplete and not tool_calls:
+        content, tool_calls, events = projector.finish(
+            result.reason == "length" or cut_in_call
+        )
+        if ended and not tool_calls:
             validate_response_content(content, job.response_validator)
         return content, tool_calls, events
 
@@ -941,8 +961,13 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 result = value
         for field, text in splitter.finish():
             append(field, text)
+        cut_in_call = (
+            projector is not None
+            and projector.in_call
+            and (result.reason == "length" or result.stop_sequence is not None)
+        )
         content_text, tool_calls, events = self._finalize_content(
-            "".join(content), job, result.reason == "length", projector
+            "".join(content), job, result, projector, cut_in_call
         )
         publish(events)
         return Collected(
@@ -951,6 +976,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             tool_calls,
             result,
             splitter.reasoning,
+            cut_in_call,
             None if projector is None else projector.call_id,
         )
 
@@ -968,7 +994,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 job,
                 collected.result,
                 message,
-                bool(collected.tool_calls),
+                collected.called,
             ),
         )
 
@@ -989,9 +1015,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
             on_tool_delta=sequencer.tool,
         )
         result = collected.result
-        blocks = sequencer.finish(result.reason == "length", collected.reasoning_open)
+        blocks = sequencer.finish(collected.cut, collected.reasoning_open)
         if collected.cut_call is not None:
-            # A complete message leaves out the call the token limit cut.
+            # A complete message leaves out the call the output cut.
             blocks = [block for block in blocks if block.call_id != collected.cut_call]
         signature = (
             self.app.thinking_codec.encode(collected.reasoning)
@@ -1005,7 +1031,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 job,
                 blocks,
                 result,
-                collected.tool_calls,
+                collected.called,
                 signature,
             ),
         )
@@ -1091,14 +1117,14 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 ),
             )
             result = collected.result
-            sequencer.finish(result.reason == "length", collected.reasoning_open)
+            sequencer.finish(collected.cut, collected.reasoning_open)
             send(
                 "message_delta",
                 {
                     "delta": {
                         "stop_reason": anthropic_stop(
                             result,
-                            collected.tool_calls,
+                            collected.called,
                             job.output_clamped_to_context,
                         ),
                         "stop_sequence": result.stop_sequence,
@@ -1123,7 +1149,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         result = collected.result
         incomplete = result.reason == "length"
         output = responses_output(
-            job, sequencer.finish(incomplete, collected.reasoning_open)
+            job, sequencer.finish(collected.cut, collected.reasoning_open)
         )
         response = responses_response(
             self.app.response_model,
@@ -1358,7 +1384,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             )
             result = collected.result
             incomplete = result.reason == "length"
-            sequencer.finish(incomplete, collected.reasoning_open)
+            sequencer.finish(collected.cut, collected.reasoning_open)
             status = "incomplete" if incomplete else "completed"
             response = responses_response(
                 self.app.response_model, job, status, output, result=result
@@ -1429,7 +1455,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             self._sse(
                 chunk(
                     empty,
-                    finish_reason(result, collected.tool_calls),
+                    finish_reason(result, collected.called),
                     timings=timings_dict(result),
                 )
             )
