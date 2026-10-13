@@ -122,6 +122,31 @@ class DiagnosticsTests(HarnessTestCase):
             "08:02:27 Done · input 168 · cached 0 · deduplicated 64 · output 0\n",
         )
 
+    def test_console_names_tokens_per_speculative_cycle(self):
+        # Five verified drafts accepted 20 tokens: each cycle yielded 5.
+        record = {
+            "outcome": "stop",
+            "prompt_tokens": 168,
+            "completion_tokens": 25,
+            "metrics": {
+                "cache": {"matched_tokens": 0},
+                "speculation": {
+                    "drafted_tokens": 35,
+                    "accepted_draft_tokens": 20,
+                    "cycles": 5,
+                },
+            },
+        }
+        with (
+            mock.patch.object(api.time, "strftime", return_value="08:02:27"),
+            mock.patch("sys.stdout", new_callable=io.StringIO) as output,
+        ):
+            diagnostics.print_request(record)
+        self.assertEqual(
+            output.getvalue(),
+            "08:02:27 Done · input 168 · cached 0 · output 25 · 5.0 tok/cycle\n",
+        )
+
     def test_console_request_start(self):
         with (
             mock.patch.object(api.time, "strftime", return_value="19:03:32"),

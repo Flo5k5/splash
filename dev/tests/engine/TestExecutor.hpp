@@ -368,13 +368,20 @@ public:
         result.push_back({item.requestId, 0, {}, false, DecodeStage::Regular,
                           0, 0});
       } else {
+        const auto speculative = speculativeCounts.find(item.requestId);
+        const uint32_t emitted = speculative == speculativeCounts.end()
+            ? decodeTokens : speculative->second.second + 1;
         const std::vector<uint32_t> tokens =
             item.requestId == poisonRequest && poisonToken
                 ? std::vector<uint32_t>{*poisonToken}
-                : std::vector<uint32_t>(decodeTokens, 42);
+                : std::vector<uint32_t>(emitted, 42);
         ModelStepResult step{item.requestId, 0, tokens, decodeFinishes,
                              DecodeStage::Regular, 0, 0};
         step.outputTokensWithoutKv = decodeTokensWithoutKv;
+        if (speculative != speculativeCounts.end()) {
+          step.draftedTokens = speculative->second.first;
+          step.acceptedDraftTokens = speculative->second.second;
+        }
         result.push_back(std::move(step));
       }
     }
@@ -620,6 +627,7 @@ public:
   bool *kvGrowthBlocked = nullptr;
   bool unblockGrowthOnSuspend = true;
   bool decodeFinishes = true;
+  std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> speculativeCounts;
   uint32_t decodeTokensWithoutKv = 0;
   // When set, the decode step emits poisonToken (instead of 42) for
   // poisonRequest, exercising the engine's output validation.

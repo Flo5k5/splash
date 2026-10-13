@@ -298,6 +298,8 @@ private:
     // and of those its commands read, which it reports when it completes.
     uint32_t unreadDeduplicatedKvTokens = 0;
     uint32_t deduplicatedKvTokens = 0;
+    // Its speculative decoding so far, which it reports when it completes.
+    SpeculativeCounts speculation;
     // A failed dispatch must fit before replay can consume any model work.
     uint64_t resumeKvTargetTokens = 0;
     ResourceWait resourceWait;

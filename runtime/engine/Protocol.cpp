@@ -33,7 +33,7 @@ constexpr uint64_t kStartFixedBytes = 16;
 constexpr uint64_t kPromptProgressFixedBytes = 20;
 constexpr uint64_t kTokensFixedBytes = 16;
 constexpr uint64_t kMaskRequestFixedBytes = 24;
-constexpr uint64_t kDoneFixedBytes = 49;
+constexpr uint64_t kDoneFixedBytes = 61;
 constexpr uint64_t kErrorFixedBytes = 18;
 constexpr uint64_t kStatusJsonFixedBytes = 8;
 
@@ -487,6 +487,14 @@ std::optional<ProtocolIssue> validateDone(const DoneEvent &event) {
     return invalidEvent(IssueCode::InvalidEnumValue, event.requestId,
                         "done finish reason is invalid");
   }
+  const engine::SpeculativeCounts &speculation = event.speculation;
+  // Each cycle verified at least one drafted token and accepted at most all.
+  if (speculation.acceptedDraftTokens > speculation.draftedTokens ||
+      speculation.cycles > speculation.draftedTokens ||
+      (speculation.draftedTokens != 0 && speculation.cycles == 0)) {
+    return invalidEvent(IssueCode::InvalidCount, event.requestId,
+                        "done speculative counts are inconsistent");
+  }
   if (!event.optionLogits.empty()) {
     if (event.optionLogits.size() < ExecutionLimits::minimumScoreOptions ||
         event.optionLogits.size() > ExecutionLimits::maximumScoreOptions) {
@@ -494,7 +502,8 @@ std::optional<ProtocolIssue> validateDone(const DoneEvent &event) {
                           "done option logit count must be in [2, 255]");
     }
     if (event.reason != EngineFinishReason::Stop ||
-        event.completionTokens != 0 || event.decodeMicros != 0) {
+        event.completionTokens != 0 || event.decodeMicros != 0 ||
+        speculation.draftedTokens != 0) {
       return invalidEvent(IssueCode::InvalidCount, event.requestId,
                           "scored done events must stop and carry no "
                           "completion or decode activity");
@@ -619,6 +628,9 @@ EncodedEvent encodeDone(const DoneEvent &event) {
   writer.u64(event.decodeMicros);
   writer.u64(event.wallMicros);
   writer.u32(event.deduplicatedTokens);
+  writer.u32(event.speculation.draftedTokens);
+  writer.u32(event.speculation.acceptedDraftTokens);
+  writer.u32(event.speculation.cycles);
   writer.u32(static_cast<uint32_t>(event.optionLogits.size()));
   for (float logit : event.optionLogits)
     writer.f32(logit);

@@ -71,4 +71,9 @@ def print_request(record):
         parts.append(f"TTFT {ttft / 1000:.1f}s")
     if speed is not None:
         parts.append(f"{speed:.1f} tok/s")
+    speculation = metrics.get("speculation", {})
+    if speculation.get("cycles"):
+        # Each verified draft yields the tokens it accepted and one more.
+        per_cycle = 1 + speculation["accepted_draft_tokens"] / speculation["cycles"]
+        parts.append(f"{per_cycle:.1f} tok/cycle")
     print_status(" · ".join(parts))

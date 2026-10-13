@@ -239,7 +239,7 @@ def timings_dict(result):
     latency = result.metrics["request_latency"]
     prompt_ms = latency.get("start_to_first_token_ms", 0.0)
     prompt_rate = result.prefill_tokens * 1000.0 / prompt_ms if prompt_ms else 0.0
-    return {
+    timings = {
         "prompt_n": result.prompt_tokens,
         "prompt_ms": prompt_ms,
         "prompt_per_second": prompt_rate if math.isfinite(prompt_rate) else 0.0,
@@ -248,6 +248,12 @@ def timings_dict(result):
         "predicted_per_second": latency.get("stream_tokens_per_second", 0.0),
         "cache_n": result.cache.matched_tokens,
     }
+    if result.drafted_tokens:
+        timings.update(
+            draft_n=result.drafted_tokens,
+            draft_n_accepted=result.accepted_draft_tokens,
+        )
+    return timings
 
 
 def metrics_dict(result):
@@ -301,4 +307,10 @@ def metrics_dict(result):
         "request_latency": latency,
         "cache": cache,
     }
+    if result.drafted_tokens:
+        metrics["speculation"] = {
+            "drafted_tokens": result.drafted_tokens,
+            "accepted_draft_tokens": result.accepted_draft_tokens,
+            "cycles": result.draft_cycles,
+        }
     return metrics

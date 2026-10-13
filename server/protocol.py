@@ -15,7 +15,7 @@ from dataclasses import dataclass, fields
 from enum import IntEnum, IntFlag
 from typing import TypeAlias
 
-PROTOCOL_VERSION = 9
+PROTOCOL_VERSION = 10
 # A frame is its header, the magic, the protocol version, the frame type and
 # the payload length, then the payload.
 FRAME_HEADER_BYTES = 16
@@ -55,7 +55,7 @@ _START = struct.Struct("<QII")
 _PROMPT_PROGRESS = struct.Struct("<QIQ")
 _TOKENS = struct.Struct("<QII")
 _MASK_REQUEST = struct.Struct("<QQII")
-_DONE = struct.Struct("<QBIIQQQII")
+_DONE = struct.Struct("<QBIIQQQIIIII")
 _ERROR = struct.Struct("<BBQII")
 _STATUS_JSON = struct.Struct("<Q")
 
@@ -69,7 +69,7 @@ assert _REQUEST.size == 102
 assert _IMAGE_SPAN.size == 32
 assert _READY.size == 9
 assert _START.size == 16
-assert _DONE.size == 49
+assert _DONE.size == 61
 assert _ERROR.size == 18
 assert _STATUS_JSON.size == 8
 
@@ -360,6 +360,9 @@ class DoneEvent:
     # Of the tokens the request computed, those whose KV it then read from a
     # cached block's page.
     deduplicated_tokens: int = 0
+    drafted_tokens: int = 0
+    accepted_draft_tokens: int = 0
+    draft_cycles: int = 0
 
 
 @dataclass(slots=True, frozen=True)
@@ -1019,9 +1022,16 @@ def _decode_event(frame: Frame) -> EngineEvent:
             )
         return MaskRequestEvent(request_id, mask_request_id, words_per_mask, tokens)
     if frame_type is FrameType.DONE:
-        request_id, reason, *counts, deduplicated, logit_count = _DONE.unpack_from(
-            payload
-        )
+        (
+            request_id,
+            reason,
+            *counts,
+            deduplicated,
+            drafted,
+            accepted,
+            cycles,
+            logit_count,
+        ) = _DONE.unpack_from(payload)
         logits = _tail(
             payload, _DONE.size, logit_count, "f", "option logit", request_id
         )
@@ -1037,13 +1047,23 @@ def _decode_event(frame: Frame) -> EngineEvent:
             _fatal(
                 IssueCode.INVALID_REQUEST_ID, "done event request id must be non-zero"
             )
-        event = DoneEvent(request_id, reason, *counts, logits, deduplicated)
+        event = DoneEvent(
+            request_id, reason, *counts, logits, deduplicated, drafted, accepted, cycles
+        )
+        # Each cycle verified at least one drafted token and accepted at most all.
+        if accepted > drafted or cycles > drafted or (drafted and not cycles):
+            _fatal(
+                IssueCode.INVALID_COUNT,
+                "done speculative counts are inconsistent",
+                request_id,
+            )
         if logits and (
             len(logits) < MIN_SCORE_TOKENS
             or not all(map(math.isfinite, logits))
             or reason is not FinishReason.STOP
             or event.completion_tokens
             or event.decode_micros
+            or drafted
         ):
             _fatal(
                 IssueCode.INVALID_COUNT,

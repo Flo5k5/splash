@@ -18,7 +18,7 @@
 // pins the bytes both sides agree on.
 namespace splash::protocol {
 
-inline constexpr uint16_t kProtocolVersion = 9;
+inline constexpr uint16_t kProtocolVersion = 10;
 // A frame is its header, the magic "SPLH", the u16 protocol version, the
 // u16 FrameType and the u64 payload length, then the payload.
 inline constexpr size_t kFrameHeaderBytes = 16;
@@ -191,7 +191,8 @@ struct RequestFrame {
 //                  u32 count, u32 simulation tokens
 //   Done           u64 requestId, u8 reason, u32 promptTokens,
 //                  u32 completionTokens, u64 prefillMicros, u64 decodeMicros,
-//                  u64 wallMicros, u32 deduplicatedTokens, u32 count,
+//                  u64 wallMicros, u32 deduplicatedTokens, u32 draftedTokens,
+//                  u32 acceptedDraftTokens, u32 speculative cycles, u32 count,
 //                  f32 option logits
 //   Error          u8 failureClass, u8 retryable, u64 requestId, u32 code
 //                  bytes, u32 message bytes, the code, the message
@@ -286,6 +287,8 @@ struct DoneEvent {
   // Of the tokens the request computed, those whose KV it then read from a
   // cached block's page (engine::Cache::publishCommittedBlocks).
   uint32_t deduplicatedTokens = 0;
+  // Its speculative decoding; zero without a draft and for scoring.
+  engine::SpeculativeCounts speculation{};
 
   bool operator==(const DoneEvent &) const = default;
 };
