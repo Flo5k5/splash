@@ -36,6 +36,22 @@ def print_status(message, *, error=False):
     stream.flush()
 
 
+def _reasoning_parts(reasoning):
+    """A chat request's reasoning: the effort it sent, or absent and the
+    server's default where that applied, its enable_thinking where it set
+    one, and whether it thinks."""
+    if reasoning["sent_effort"] is not None:
+        parts = [f"effort {reasoning['sent_effort']}"]
+    elif reasoning["effort"] is not None:
+        parts = [f"effort absent → {reasoning['effort']}"]
+    else:
+        parts = ["effort absent"]
+    if reasoning["enable_thinking"] is not None:
+        parts.append(f"enable_thinking {str(reasoning['enable_thinking']).lower()}")
+    parts.append("thinking on" if reasoning["thinking"] else "thinking off")
+    return parts
+
+
 def print_request(record):
     outcome = record["outcome"]
     if outcome == "error":
@@ -44,10 +60,14 @@ def print_request(record):
     if outcome == "started":
         # The engine admitted the request: a long prompt's prefill runs
         # from here until its Done line.
-        print_status(
-            f"Started · input {record['prompt_tokens']:,}"
-            f" · cached {record['cached_tokens']:,}"
-        )
+        parts = [
+            "Started",
+            f"input {record['prompt_tokens']:,}",
+            f"cached {record['cached_tokens']:,}",
+        ]
+        if "reasoning" in record:
+            parts.extend(_reasoning_parts(record["reasoning"]))
+        print_status(" · ".join(parts))
         return
     metrics = record.get("metrics", {})
     latency = metrics.get("request_latency", {})

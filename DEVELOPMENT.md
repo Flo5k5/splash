@@ -367,6 +367,11 @@ splash serve --model mlx-community/Qwen3.8-27B-4bit --default-reasoning-effort n
 semantics (off when omitted); judgment endpoints always disable thinking. The
 built-in chat page sends no effort unless the user picks one.
 
+The console's Started line shows how each chat request reasons: the effort it
+sent, or `absent` and the default it took, its `enable_thinking` when it set
+one, and whether it thinks, as in
+`Started · input 2,473 · cached 0 · effort absent → low · thinking on`.
+
 A Chat request's `chat_template_kwargs`, as vLLM and SGLang accept them, are
 passed to the template as variables and outrank the effort, so
 `{"enable_thinking": false}` turns reasoning off and reaches the template as
