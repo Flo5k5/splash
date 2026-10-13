@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 
@@ -11,7 +10,7 @@ from . import protocol as wire
 from .documents import DocumentBudget, document_parts, file_content
 from .errors import APIError
 from .metrics import timings_dict, usage_dict
-from .tool_schema import TOOL_NAME
+from .tool_schema import TAG_NAME_RULE, is_tag_name
 
 IMAGE_PAD_TOKEN = "<|image_pad|>"
 VISION_UNAVAILABLE = (
@@ -467,18 +466,13 @@ def canonical_responses_input(items):
 
 
 def _namespace_alias(namespace, name):
-    if (
-        not isinstance(namespace, str)
-        or re.fullmatch(r"[A-Za-z0-9_-]{1,64}", namespace) is None
-        or not isinstance(name, str)
-        or re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name) is None
+    """The name a namespace's function goes by in the prompt and its calls,
+    which the tools' own name rule then applies to."""
+    if not (
+        isinstance(namespace, str) and namespace and isinstance(name, str) and name
     ):
         raise APIError(400, "invalid namespace tool name")
-    alias = f"{namespace}__{name}"
-    if len(alias) <= 64:
-        return alias
-    digest = hashlib.sha256(f"{namespace}\0{name}".encode()).hexdigest()[:16]
-    return f"{namespace[:20]}__{name[:24]}__{digest}"
+    return f"{namespace}__{name}"
 
 
 def _response_function(tool, name=None):
@@ -947,8 +941,8 @@ def _tool_references_as_text(content):
 
 def _tool_reference_text(block):
     name = block.get("tool_name")
-    if not isinstance(name, str) or TOOL_NAME.fullmatch(name) is None:
-        raise APIError(400, f"tool_reference.tool_name must match {TOOL_NAME.pattern}")
+    if not is_tag_name(name):
+        raise APIError(400, f"tool_reference.tool_name must be {TAG_NAME_RULE}")
     return {"type": "text", "text": f"\nAvailable tool: {name}\n"}
 
 

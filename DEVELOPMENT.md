@@ -782,15 +782,23 @@ values each member of the value's union lists, as its text, or JSON of a member
 that lists none, leaving out array item bounds and `multipleOf` above 64 and
 patterns the grammar cannot compile (look-around, word boundaries,
 backreferences). The framed schemas of one request are limited to 16 MiB, and a
-strict tool's parameter names cannot contain XML delimiters, start or end with
-whitespace, or run past 256 characters. What a grammar writes reads back as
-written: raw text ends at its first `\n</parameter>\n`, and an enumerated value
-that holds one returns 400.
+strict tool's parameter names follow the rule for a tool's name (below). What a
+grammar writes reads back as written: raw text ends at its first
+`\n</parameter>\n`, and an enumerated value that holds one returns 400.
 
-A tool's schema nests at most 64 levels of JSON objects and arrays, in which an
-object's `properties` map is a level of its own, and cannot reference a remote
-document. Hosted search is unsupported; configure client-owned tools such as
-MCP.
+A strict tool's schema must pass that check, nest at most 64 levels of JSON
+objects and arrays, in which an object's `properties` map is a level of its
+own, and reference no remote document, or the request returns 400. Any other
+tool whose schema does not is still declared as sent, and its arguments convert
+as those of a parameter it does not declare.
+
+A tool's name is written in its calls' tags and read back from them, so it
+holds 1 to 256 characters in Unicode NFC, which a tokenizer such as Qwen's
+keeps text in, other than `<`, `>`, line breaks and lone surrogates, and does
+not start or end with whitespace; a `tool_reference` names a tool the same way.
+A Chat tool or named `tool_choice` that gives no `type` is a function. A
+Responses `namespace` function goes by `namespace__name`. Hosted search is
+unsupported; configure client-owned tools such as MCP.
 
 ### Structured output
 
@@ -800,8 +808,8 @@ in `text.format`, the second without the `json_schema` object around its
 fields: `{"type": "json_schema", "name": ..., "schema": ..., "strict": ...}`.
 Messages takes a schema in `output_config.format` (or
 `output_format`) as `{"type": "json_schema", "schema": ...}`. A schema nests at
-most 64 levels of JSON objects and arrays, as a tool's does, cannot reference a
-remote document, and cannot combine `unevaluatedProperties` with
+most 64 levels of JSON objects and arrays, as a strict tool's does, cannot
+reference a remote document, and cannot combine `unevaluatedProperties` with
 `patternProperties`. `response_format` constrains generation and validates
 final output; it does not inject formatting instructions into the prompt.
 Clients should describe their output requirements in their own messages.

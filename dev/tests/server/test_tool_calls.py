@@ -25,6 +25,7 @@ from dev.tests.server_fixtures import (
 from server import backend as backend_api
 from server import output as model_output
 from server import server as api
+from server import tool_schema
 
 
 class ToolCallTests(HarnessTestCase):
@@ -586,39 +587,120 @@ class ToolCallTests(HarnessTestCase):
                     deadline=FOREVER,
                 )
 
-    def test_tool_names_accept_long_mcp_names_up_to_128_characters(self):
+    def test_tool_names_are_those_the_call_tags_carry(self):
+        # A call reads its function's name back from <function=...> as written.
         runtime = FakeRuntime(Plan([[4]]))
         harness = self.harness(runtime)
-        name = (
-            "mcp__github_enterprise_server__list_pull_request_review_comments_for_repos"
-        )
-        self.assertEqual(len(name), 74)
-        status, _, _ = harness.request(
+        names = [
+            "mcp__github_enterprise_server__list_pull_request_review_comments_for_repos",
+            "mcp.search",
+            "web search",
+            "files:read/v2",
+            "天气",
+            "n" * 256,
+        ]
+        status, _, payload = harness.request(
             "POST",
             "/v1/chat/completions",
             chat_body(
-                tools=[{"type": "function", "function": {"name": name}}],
+                tools=[{"function": {"name": name}} for name in names],
                 reasoning_effort="none",
             ),
         )
-        self.assertEqual(status, 200)
+        self.assertEqual(status, 200, payload)
         _, kwargs = harness.tokenizer.templates[-1]
-        self.assertEqual(kwargs["tools"][0]["function"]["name"], name)
-        cases = (
-            (
-                {"type": "function", "function": {"name": "mcp__" + "a" * 124}},
-                "tool name must match [A-Za-z0-9_-]{1,128}",
-            ),
-            ({"type": "web_search"}, "only function tools are supported"),
+        # A tool that names no type is declared as a function.
+        self.assertEqual(
+            kwargs["tools"],
+            [{"type": "function", "function": {"name": name}} for name in names],
         )
+        rule = (
+            "tool name must be 1 to 256 characters in NFC, without <, >, line "
+            "breaks, lone surrogates or surrounding whitespace"
+        )
+        # A name the tokenizer would write otherwise does not read back: Qwen's
+        # normalizes text to NFC, and none spells a lone surrogate.
+        unreadable = ("cafe\u0301", "\u212bngstrom", "lone\ud800")
+        missing = "a function tool needs a function object"
+        cases = [
+            *(
+                ({"type": "function", "function": {"name": name}}, rule)
+                for name in (
+                    "",
+                    " lead",
+                    "trail\t",
+                    "a>b",
+                    "a<b",
+                    "a\nb",
+                    "n" * 257,
+                    7,
+                    *unreadable,
+                )
+            ),
+            ({"type": "function"}, missing),
+            # A Responses tool sent to Chat.
+            ({"name": "weather", "parameters": {}}, missing),
+            ({"type": "web_search"}, "only function tools are supported"),
+        ]
         for tool, message in cases:
-            with self.subTest(message=message):
+            with self.subTest(tool=tool):
                 status, _, payload = harness.request(
                     "POST", "/v1/chat/completions", chat_body(tools=[tool])
                 )
                 self.assertEqual(status, 400)
                 self.assertEqual(json.loads(payload)["error"]["message"], message)
         self.assertEqual(len(runtime.requests), 1)
+
+    def test_unreadable_schema_only_describes_a_tool_that_is_not_strict(self):
+        # Only a strict tool's grammar is built from its schema. Any other
+        # tool is offered as sent, and its values convert as undeclared ones:
+        # each city below says it is a string, which would keep "3" as text.
+        # The parameters' object, properties map and city take three levels.
+        deep = {"type": "string"}
+        for _ in range(tool_schema.MAX_SCHEMA_DEPTH - 3):
+            deep = {"type": "array", "items": deep}
+        cases = (
+            ({"type": "string", "required": True}, "invalid tool schema for weather: "),
+            (
+                {"type": "string", "$ref": "https://example.com/city"},
+                "remote tool schema reference",
+            ),
+            (
+                {"type": "string", "not": deep},
+                "invalid tool schema for weather: nested more than 64 levels",
+            ),
+        )
+        harness = self.harness(FakeRuntime(*(Plan([[28]]) for _ in cases)))
+        for city, message in cases:
+            for strict in (False, True):
+                tool = {
+                    "type": "function",
+                    "function": {
+                        "name": "weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": city},
+                        },
+                        "strict": strict,
+                    },
+                }
+                with self.subTest(message=message, strict=strict):
+                    status, _, payload = harness.request(
+                        "POST",
+                        "/v1/chat/completions",
+                        chat_body(tools=[tool], reasoning_effort="none"),
+                    )
+                    if strict:
+                        self.assertEqual(status, 400)
+                        self.assertIn(message, json.loads(payload)["error"]["message"])
+                        continue
+                    self.assertEqual(status, 200, payload)
+                    _, kwargs = harness.tokenizer.templates[-1]
+                    self.assertEqual(kwargs["tools"], [tool])
+                    call = json.loads(payload)["choices"][0]["message"]["tool_calls"][0]
+                    self.assertEqual(
+                        json.loads(call["function"]["arguments"]), {"city": 3}
+                    )
 
     def test_pydantic_style_schema_reads_values_through_references(self):
         # The parameter's types come through its local reference, and a value
@@ -644,11 +726,18 @@ class ToolCallTests(HarnessTestCase):
         ]
         named = {"type": "function", "function": {"name": "weather"}}
         cases = (
-            ([4], {"tool_choice": "required"}, []),
-            ([16], {"tool_choice": named}, ["time"]),
-            ([5, 16], {"parallel_tool_calls": False}, ["weather", "time"]),
+            ("required", [4], {"tool_choice": "required"}, []),
+            ("named", [16], {"tool_choice": named}, ["time"]),
+            (
+                "untyped",
+                [16],
+                {"tool_choice": {"function": named["function"]}},
+                ["time"],
+            ),
+            ("single", [5, 16], {"parallel_tool_calls": False}, ["weather", "time"]),
         )
-        for batch, extra, names in cases:
+        grammars = {}
+        for label, batch, extra, names in cases:
             with self.subTest(**extra):
                 factory = FakeConstraintFactory()
                 harness = self.harness(
@@ -660,7 +749,7 @@ class ToolCallTests(HarnessTestCase):
                     chat_body(tools=tools, reasoning_effort="none", **extra),
                 )
                 self.assertEqual(status, 200, payload)
-                self.assertEqual(len(factory.grammars), 1)
+                (grammars[label],) = factory.grammars
                 message = json.loads(payload)["choices"][0]["message"]
                 self.assertEqual(
                     [
@@ -669,6 +758,9 @@ class ToolCallTests(HarnessTestCase):
                     ],
                     names,
                 )
+        # A named choice that names no type names a function.
+        self.assertEqual(grammars["untyped"], grammars["named"])
+        self.assertNotEqual(grammars["named"], grammars["required"])
 
     def test_parallel_calls_stream_as_the_model_writes_them(self):
         # No call is checked against its tool's schema: a value its types
@@ -802,7 +894,7 @@ class ToolCallTests(HarnessTestCase):
             "POST", "/v1/chat/completions", chat_body(tools=[tool])
         )
         self.assertEqual(status, 400)
-        self.assertIn("tool name must match", json.loads(payload)["error"]["message"])
+        self.assertIn("tool name must be", json.loads(payload)["error"]["message"])
         self.assertEqual(factory.grammars, [])
 
 

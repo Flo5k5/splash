@@ -190,15 +190,32 @@ class AnthropicAdapterTest(unittest.TestCase):
         chat = anthropic_to_chat_prompt(body, thinking_resolver=no_signed_thinking)
         self.assertEqual(chat["messages"][-1]["content"], f"\nAvailable tool: {name}\n")
 
-    def test_tool_references_require_valid_names(self):
-        for name in (None, "", 7, [], "bad name", "bad\nname", "x" * 129):
+    def test_tool_references_name_tools_by_the_tool_name_rule(self):
+        for name in ("mcp.search", "web search", "x" * 256):
+            with self.subTest(name=name):
+                chat = anthropic_to_chat_prompt(
+                    tool_search_body([{"type": "tool_reference", "tool_name": name}]),
+                    thinking_resolver=no_signed_thinking,
+                )
+                self.assertIn(f"Available tool: {name}", str(chat["messages"]))
+        for name in (
+            None,
+            "",
+            7,
+            [],
+            " lead",
+            "bad\nname",
+            "a>b",
+            "x" * 257,
+            "e\u0301",
+        ):
             with self.subTest(name=name), self.assertRaises(APIError) as caught:
                 anthropic_to_chat_prompt(
                     tool_search_body([{"type": "tool_reference", "tool_name": name}]),
                     thinking_resolver=no_signed_thinking,
                 )
             self.assertEqual(caught.exception.status, 400)
-            self.assertIn("tool_reference.tool_name", caught.exception.message)
+            self.assertIn("tool_reference.tool_name must be", caught.exception.message)
 
     def test_tool_references_are_only_supported_in_tool_results(self):
         for role in ("user", "assistant"):
@@ -754,6 +771,28 @@ class AnthropicAdapterTest(unittest.TestCase):
 
 
 class AnthropicHTTPContractTest(HarnessTestCase):
+    def test_a_tool_announced_mid_session_takes_any_name_its_calls_carry(self):
+        # A tool_addition announcing mcp.search, then a user turn (#392).
+        harness = self.harness(FakeRuntime())
+        announced = {"name": "mcp.search", "input_schema": {"type": "object"}}
+        body = request_body(
+            messages=[
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": [tool_addition(announced)]},
+                {"role": "user", "content": "say ok"},
+            ]
+        )
+        for path in ("/v1/messages/count_tokens", "/v1/messages"):
+            with self.subTest(path=path):
+                first = len(harness.tokenizer.templates)
+                status, _, payload = harness.request("POST", path, body)
+                self.assertEqual(status, 200, payload)
+                _, kwargs = harness.tokenizer.templates[first]
+                self.assertEqual(
+                    [tool["function"]["name"] for tool in kwargs["tools"]],
+                    ["mcp.search"],
+                )
+
     def test_tool_search_count_and_generation_allow_discovered_tool_calls(self):
         runtime = FakeRuntime(Plan([[5]]), Plan([[5]]))
         tokenizer = FakeTokenizer()

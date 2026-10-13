@@ -428,7 +428,11 @@ class RequestContractTests(HarnessTestCase):
                     [
                         {
                             "type": "function",
-                            "function": {"name": "test", "parameters": schema},
+                            "function": {
+                                "name": "test",
+                                "parameters": schema,
+                                "strict": True,
+                            },
                         }
                     ],
                     "auto",
@@ -459,7 +463,11 @@ class RequestContractTests(HarnessTestCase):
                     [
                         {
                             "type": "function",
-                            "function": {"name": "test", "parameters": schema},
+                            "function": {
+                                "name": "test",
+                                "parameters": schema,
+                                "strict": True,
+                            },
                         }
                     ],
                     "auto",
