@@ -231,6 +231,9 @@ class GenerationOptions:
     seed: int
     priority: wire.RequestPriority
     cache_salt: int
+    # The thinking tokens of a request that thinks, after which its thinking
+    # closes; None for no cap.
+    thinking_token_budget: int | None
 
 
 class Frontend:
@@ -251,6 +254,7 @@ class Frontend:
         served_model_names=(),
         announce_served_name=False,
         default_reasoning_effort=None,
+        default_thinking_token_budget=None,
     ):
         if not isinstance(preparation_capacity, int) or preparation_capacity <= 0:
             raise ValueError("frontend preparation capacity must be positive")
@@ -282,6 +286,13 @@ class Frontend:
         ):
             raise ValueError("invalid default_reasoning_effort")
         self.default_reasoning_effort = default_reasoning_effort
+        if default_thinking_token_budget is not None and (
+            not isinstance(default_thinking_token_budget, int)
+            or isinstance(default_thinking_token_budget, bool)
+            or default_thinking_token_budget < 0
+        ):
+            raise ValueError("invalid default_thinking_token_budget")
+        self.default_thinking_token_budget = default_thinking_token_budget
         self.max_context = max_context
         self.request_timeout = request_timeout
         self.constraint_factory = constraint_factory
@@ -513,6 +524,12 @@ class Frontend:
                 if not isinstance(value, int) or isinstance(value, bool) or value != 1:
                     raise APIError(400, f"{field} must be 1")
             options = self._generation_options(body)
+            # A text completion has no reasoning split, so no thinking is
+            # tracked to close.
+            if body.get("thinking_token_budget") not in (None, -1):
+                raise APIError(
+                    400, "thinking_token_budget is not supported for text completions"
+                )
             prompt_tokens = self._completion_prompt(body.get("prompt"))
             remaining_request_time(deadline)
             requested = body.get("max_tokens")
@@ -1016,6 +1033,8 @@ class Frontend:
                 else "max_tokens"
             )
         max_new = self._output_budget(requested, prompt_tokens, output_field)
+        # A budget the output limit reaches first closes nothing.
+        budget = options.thinking_token_budget
         return self._generation_job(
             options,
             prompt_tokens,
@@ -1024,6 +1043,9 @@ class Frontend:
             thinking=thinking,
             reasoning=ReasoningRequest(
                 prompt.sent_effort, prompt.reasoning_effort, prompt.enable_thinking
+            ),
+            thinking_token_budget=(
+                budget if thinking and budget is not None and budget < max_new else None
             ),
             thinking_display=thinking_display,
             tool_policy=tool_policy,
@@ -1103,6 +1125,17 @@ class Frontend:
         # -1 asks for a random seed, and another negative one is taken as
         # its 64 bits.
         seed = secrets.randbits(64) if seed == -1 else seed % 2**64
+        # -1 sets no cap; an absent or null budget takes the server's.
+        budget = body.get("thinking_token_budget")
+        if budget is None:
+            budget = self.default_thinking_token_budget
+        elif not isinstance(budget, int) or isinstance(budget, bool) or budget < -1:
+            raise APIError(
+                400,
+                "thinking_token_budget must be a non-negative integer or -1 for no cap",
+            )
+        elif budget == -1:
+            budget = None
         return GenerationOptions(
             wire.SamplingParameters(top_k=top_k, **numbers),
             stop_sequences,
@@ -1110,6 +1143,7 @@ class Frontend:
             seed,
             self._priority(body),
             self._cache_salt(body),
+            budget,
         )
 
     def _output_budget(self, requested, prompt_tokens, field):

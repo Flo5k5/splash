@@ -306,6 +306,7 @@ bool NativeRuntime::handleRequest(protocol::RequestFrame &request) {
     engineRequest.sampling = request.sampling;
     engineRequest.constraint = request.constraint;
     engineRequest.flags = request.flags & kRequestFlagBits;
+    engineRequest.thinkingBudget = request.thinkingBudget;
     engineRequest.cacheSalt = request.cacheSalt;
     engineRequest.returnProgress =
         request.flags & protocol::kReturnProgressFlag;

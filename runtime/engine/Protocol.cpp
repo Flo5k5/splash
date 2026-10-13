@@ -365,6 +365,10 @@ std::optional<ProtocolIssue> validateRequest(const RequestFrame &request,
       return invalid(IssueCode::InvalidSampling,
                      "score requests require greedy default sampling");
     }
+    if (request.thinkingBudget) {
+      return invalid(IssueCode::InvalidCount,
+                     "score requests take no thinking budget");
+    }
   }
   // A grammar decides where constrained output ends.
   if ((request.flags & RequestIgnoreEndOfSequence) &&
@@ -674,6 +678,7 @@ ProtocolResult<ClientMessage> decodeRequest(std::vector<uint8_t> &&payload,
   uint32_t promptCount = 0;
   uint32_t imageSpanCount = 0;
   uint32_t scoreCount = 0;
+  ThinkingBudget thinking;
   if (!reader.u64(request.requestId) || !reader.u8(priority) ||
       !reader.u8(constraint) ||
       !reader.u64(request.absoluteDeadlineUnixMicros) ||
@@ -690,13 +695,20 @@ ProtocolResult<ClientMessage> decodeRequest(std::vector<uint8_t> &&payload,
       !reader.u64(request.sampling.seed) || !reader.u32(scoreCount) ||
       !reader.u32(request.generationPromptTokens) ||
       !reader.u32(request.flags) || !reader.u64(request.cacheSalt.lo) ||
-      !reader.u64(request.cacheSalt.hi)) {
+      !reader.u64(request.cacheSalt.hi) || !reader.u32(thinking.tokens) ||
+      !reader.u32(thinking.end) || !reader.u32(thinking.alsoEnds)) {
     return failure<ClientMessage>(
         makeIssue(FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength,
                   0, "request fixed payload is truncated"));
   }
   request.priority = static_cast<RequestPriority>(priority);
   request.constraint = static_cast<ConstraintMode>(constraint);
+  if (thinking.tokens != kNoThinkingBudget)
+    request.thinkingBudget = thinking;
+  else if (thinking.end || thinking.alsoEnds)
+    return failure<ClientMessage>(
+        requestIssue(IssueCode::InvalidCount, request.requestId,
+                     "thinking end tokens need a thinking budget"));
   if (scoreCount > ExecutionLimits::maximumScoreOptions) {
     return failure<ClientMessage>(
         requestIssue(IssueCode::InvalidCount, request.requestId,

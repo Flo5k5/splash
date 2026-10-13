@@ -44,7 +44,7 @@ _MAGIC = b"SPLH"
 _HEADER = struct.Struct("<4sHHQ")
 # Replay can update the integer deadlines without decoding sampling floats.
 _REQUEST_HEAD = struct.Struct("<QBBQQ")
-_REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIffIffffQIIIQQ")
+_REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIffIffffQIIIQQIII")
 _IMAGE_SPAN = struct.Struct("<IIIIQQ")
 _CANCEL = struct.Struct("<Q")
 _MASK_RESPONSE = struct.Struct("<QQI")
@@ -65,7 +65,7 @@ assert (
     and sys.byteorder == "little"
 )
 assert _HEADER.size == FRAME_HEADER_BYTES
-assert _REQUEST.size == 102
+assert _REQUEST.size == 114
 assert _IMAGE_SPAN.size == 32
 assert _READY.size == 9
 assert _START.size == 16
@@ -239,6 +239,22 @@ class ImageSpan:
 
 
 @dataclass(slots=True, frozen=True)
+class ThinkingBudget:
+    """A request that generates inside a thinking block may select at most
+    `tokens` thinking tokens; the engine then selects `end`, which closes the
+    block. Thinking also ends where the request selects `end` or `also_ends`
+    first, such as a tool call's opening that follows thinking directly."""
+
+    tokens: int
+    end: int
+    also_ends: int
+
+
+# The request frame's thinking budget tokens without one.
+_NO_THINKING_BUDGET = 0xFFFFFFFF
+
+
+@dataclass(slots=True, frozen=True)
 class RequestFrame:
     request_id: int
     priority: RequestPriority
@@ -263,6 +279,9 @@ class RequestFrame:
     # The request's cache_salt hashed to 128 bits (Frontend._cache_salt);
     # zero without one.
     cache_salt: int
+    # Only a request that generates inside a thinking block has one; a score
+    # request never does.
+    thinking_budget: ThinkingBudget | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -707,6 +726,16 @@ def _validated_request(
             raise ValueError("score requests require default greedy sampling")
     except (AttributeError, ValueError) as error:
         _fail_request(IssueCode.INVALID_SAMPLING, str(error), request_id)
+    thinking = request.thinking_budget
+    if thinking is not None:
+        try:
+            if scores:
+                raise ValueError("score requests take no thinking budget")
+            _integer(thinking.tokens, 0, _NO_THINKING_BUDGET - 1, "thinking budget")
+            _u32(thinking.end, "thinking end token")
+            _u32(thinking.also_ends, "thinking end token")
+        except (AttributeError, ValueError) as error:
+            _fail_request(IssueCode.INVALID_COUNT, str(error), request_id)
     if scores and constraint is not ConstraintMode.NONE:
         _fail_request(
             IssueCode.INVALID_CONSTRAINT,
@@ -777,6 +806,15 @@ def _request_frame(request: RequestFrame) -> bytearray:
         request.flags,
         request.cache_salt & 0xFFFFFFFFFFFFFFFF,
         request.cache_salt >> 64,
+        *(
+            (_NO_THINKING_BUDGET, 0, 0)
+            if request.thinking_budget is None
+            else (
+                request.thinking_budget.tokens,
+                request.thinking_budget.end,
+                request.thinking_budget.also_ends,
+            )
+        ),
     )
     for index, span in enumerate(request.image_spans):
         _IMAGE_SPAN.pack_into(

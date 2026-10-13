@@ -36,6 +36,9 @@ REQUEST_FIELDS = (
     "flags",
     "cache_salt_lo",
     "cache_salt_hi",
+    "thinking_tokens",
+    "thinking_end",
+    "thinking_also_ends",
 )
 assert len(REQUEST_FIELDS) == len(p._REQUEST.format) - 1
 OFFSET = dict(
@@ -68,6 +71,7 @@ def example_request():
         constraint=p.ConstraintMode.TOKEN_MASK,
         generation_prompt_tokens=2,
         cache_salt=0x00112233445566778899AABBCCDDEEFF,
+        thinking_budget=p.ThinkingBudget(4096, 248069, 248058),
     )
 
 
@@ -89,6 +93,7 @@ def example_score_request():
         sampling=p.SamplingParameters(),
         constraint=p.ConstraintMode.NONE,
         score_tokens=(101, 202, 303),
+        thinking_budget=None,
     )
 
 
@@ -422,6 +427,7 @@ class ProtocolPythonTests(unittest.TestCase):
                 int(request.flags),
                 request.cache_salt & 0xFFFFFFFFFFFFFFFF,
                 request.cache_salt >> 64,
+                *astuple(request.thinking_budget),
             )
             + struct.pack(f"<{len(request.prompt_tokens)}I", *request.prompt_tokens)
             + struct.pack(p._IMAGE_SPAN.format, *astuple(span))
@@ -466,6 +472,10 @@ class ProtocolPythonTests(unittest.TestCase):
             (
                 replace(base, constraint=p.ConstraintMode.TOKEN_MASK),
                 p.IssueCode.INVALID_CONSTRAINT,
+            ),
+            (
+                replace(base, thinking_budget=p.ThinkingBudget(0, 248069, 248069)),
+                p.IssueCode.INVALID_COUNT,
             ),
             (
                 replace(
@@ -648,6 +658,42 @@ class ProtocolPythonTests(unittest.TestCase):
         )
         self.assertEqual(wire[span_offset + 32 :], image.image_pixels)
         self.assertEqual(decode_client(wire), image)
+
+    def test_thinking_budget_follows_the_cache_salt(self):
+        offset = p.FRAME_HEADER_BYTES + OFFSET["thinking_tokens"]
+        request = example_request()
+        wire = p.serialize_message(request)
+        self.assertEqual(
+            struct.unpack_from("<3I", wire, offset), (4096, 248069, 248058)
+        )
+        self.assertEqual(decode_client(wire), request)
+        # Without a budget the tokens word holds the sentinel and the end
+        # tokens are zero; a budget of 0 closes thinking at once.
+        for budget in (None, p.ThinkingBudget(0, 248069, 248069)):
+            with self.subTest(budget=budget):
+                request = replace(example_request(), thinking_budget=budget)
+                wire = p.serialize_message(request)
+                if budget is None:
+                    self.assertEqual(
+                        struct.unpack_from("<3I", wire, offset), (0xFFFFFFFF, 0, 0)
+                    )
+                self.assertEqual(decode_client(wire), request)
+        for budget in (
+            p.ThinkingBudget(0xFFFFFFFF, 248069, 248069),
+            p.ThinkingBudget(-1, 248069, 248069),
+            p.ThinkingBudget(True, 248069, 248069),
+            p.ThinkingBudget(4096, 1 << 32, 248069),
+            p.ThinkingBudget(4096, 248069, 1.0),
+        ):
+            with self.subTest(budget=budget):
+                issue = self.assert_protocol_error(
+                    p.FailureClass.REQUEST_ERROR,
+                    p.IssueCode.INVALID_COUNT,
+                    lambda budget=budget: p.serialize_message(
+                        replace(example_request(), thinking_budget=budget)
+                    ),
+                )
+                self.assertEqual(issue.request_id, example_request().request_id)
 
     def test_generation_prompt_must_leave_a_prompt_token(self):
         request = example_request()

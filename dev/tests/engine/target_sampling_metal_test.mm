@@ -1575,6 +1575,131 @@ void excludedStopTokens(MetalBackend &backend, uint32_t vocabulary) {
   }
 }
 
+// A lane's thinking cutoff (SamplingPolicy::thinkingCutoff) takes the end of
+// thinking at its row whatever the row's logits: the first token after a
+// prompt at row 0, or a verify row, whose draft acceptance then keeps only
+// where it drafted that end. A draft token before the cutoff that ended
+// thinking first, the end or the other ending token, leaves the row its own
+// selection, and a cutoff past the selection's rows dispatches nothing.
+void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
+  const auto stops = shardEdgeStopTokens(vocabulary);
+  const uint32_t end = vocabulary - 3, alsoEnds = vocabulary - 5;
+  Sampling sampling(vocabulary);
+  const Batch batch = makeBatch(backend, vocabulary, kLanes);
+  // Each row's best token, far above the rest, unless the row prefers top.
+  const auto best = [&](uint32_t row) { return 5 + row * 7919 % (vocabulary - 16); };
+  const auto fill = [&](uint32_t row, uint32_t top) {
+    float *values = batch.row(row);
+    for (uint32_t token = 0; token < vocabulary; ++token)
+      values[token] = -4.0F + float(token % 7) * 0.01F;
+    values[top] = 8.0F;
+  };
+  const uint32_t *tokens = batch.outputTokens();
+  float *uniforms = batch.uniforms();
+  const auto cutoffDispatches = [](const CommandGraph &graph) {
+    return std::ranges::count(graph.dispatches(), std::string("decode_sample_thinking_cutoff"),
+                              &splash::metal::ComputeDispatch::pipelineName);
+  };
+
+  for (const float temperature : {0.0F, 0.8F}) {
+    for (const uint32_t row : {0U, 1U}) {
+      fill(kRows - 1, best(kRows - 1));
+      batch.poison();
+      uniforms[SPLASH_UNIFORM_INITIAL] = 0.5F;
+      SamplingPolicy policy{32, temperature};
+      policy.thinkingCutoff = ThinkingCutoff{row, end, alsoEnds};
+      CommandGraph initial;
+      sampling.addInitial(initial, {&policy, 1}, batch.buffers, kRows - 1, stops[0], stops[1], {});
+      require(cutoffDispatches(initial) == (row == 0 ? 1 : 0), "the first token's cutoff dispatch is wrong");
+      static_cast<void>(backend.submitCommandAsync(initial.dispatches()).wait());
+      require(tokens[0] == (row == 0 ? end : best(kRows - 1)), "the first token missed its cutoff");
+    }
+  }
+
+  AcceptanceBuffers acceptance{
+      allocate(backend, uint64_t{kLanes} * kPositions * sizeof(uint32_t)),
+      batch.buffers.draftCandidates,
+      batch.buffers.draftProbabilities,
+      batch.buffers.vocabularyRows,
+      batch.buffers.uniforms,
+      batch.buffers.outputTokens,
+      allocate(backend, kLanes * sizeof(uint32_t)),
+      allocate(backend, kLanes * sizeof(uint32_t))};
+  // A draft token with all of the draft's mass, at verify input row
+  // position + 1.
+  const auto draft = [&](uint32_t lane, uint32_t position, uint32_t token) {
+    static_cast<uint32_t *>(acceptance.proposedTokens.contents())[lane * kPositions + position] = token;
+    batch.inputTokens()[lane * kRows + position + 1] = token;
+    const uint64_t origin = (uint64_t{lane} * kPositions + position) * kDraftCandidates;
+    static_cast<uint32_t *>(acceptance.candidates.contents())[origin] = token;
+    static_cast<float *>(acceptance.proposalProbabilities.contents())[origin] = 1.0F;
+  };
+  enum class Draft { Best, EndsBefore, AlsoEndsBefore, DraftsEnd };
+  const std::array<uint32_t, kLanes> maximumRetained{kRows, kRows, kRows, kRows};
+  for (const uint32_t samplingMask : {0U, 0b0101U, 0b1111U}) {
+    for (const Draft kind : {Draft::Best, Draft::EndsBefore, Draft::AlsoEndsBefore, Draft::DraftsEnd}) {
+      // Lane l's cutoff is at row cuts[l]; kRows cuts nothing.
+      for (const std::array<uint32_t, kLanes> cuts :
+           {std::array<uint32_t, kLanes>{0, 3, 6, 7}, std::array<uint32_t, kLanes>{kRows, 2, 5, 1}}) {
+        std::vector<SamplingPolicy> policies;
+        // The token each lane's row selects, and the rows it retains.
+        std::array<std::array<uint32_t, kRows>, kLanes> expected{};
+        std::array<uint32_t, kLanes> expectedRetained{};
+        for (uint32_t lane = 0; lane < kLanes; ++lane) {
+          SamplingPolicy policy{32, (samplingMask >> lane & 1U) ? 0.8F : 0.0F};
+          const uint32_t cut = cuts[lane];
+          policy.thinkingCutoff = ThinkingCutoff{cut, end, alsoEnds};
+          policies.push_back(policy);
+          for (uint32_t row = 0; row < kRows; ++row) {
+            fill(lane * kRows + row, best(lane * kRows + row));
+            expected[lane][row] = best(lane * kRows + row);
+            if (row < kPositions)
+              draft(lane, row, best(lane * kRows + row));
+          }
+          // Where thinking ends at a draft token the target agrees with
+          // before the cutoff, the cutoff's row keeps its own selection.
+          const bool endsBefore = (kind == Draft::EndsBefore || kind == Draft::AlsoEndsBefore) && cut >= 2 &&
+                                  cut < kRows;
+          if (endsBefore) {
+            const uint32_t at = cut - 2, ending = kind == Draft::EndsBefore ? end : alsoEnds;
+            fill(lane * kRows + at, ending);
+            draft(lane, at, ending);
+            expected[lane][at] = ending;
+          } else if (cut < kRows) {
+            expected[lane][cut] = end;
+            if (kind == Draft::DraftsEnd && cut < kPositions)
+              draft(lane, cut, end);
+          }
+          // The drafts match every row's selection, unless the cutoff's
+          // row ends thinking where the draft did not.
+          const bool rejectsAtCut = cut < kPositions && !endsBefore && kind != Draft::DraftsEnd;
+          expectedRetained[lane] = rejectsAtCut ? cut + 1 : kRows;
+        }
+        std::fill(uniforms, uniforms + kLanes * kUniforms, 0.5F);
+        batch.poison();
+        CommandGraph verify;
+        sampling.addVerify(verify, policies, batch.buffers, stops[0], stops[1], {});
+        require(cutoffDispatches(verify) == 1, "a verify with cutoffs dispatched them other than once");
+        sampling.addAcceptance(verify, acceptance, maximumRetained, policies, stops[0], stops[1]);
+        static_cast<void>(backend.submitCommandAsync(verify.dispatches()).wait());
+        const auto *retained = static_cast<const uint32_t *>(acceptance.retainedCounts.contents());
+        for (uint32_t lane = 0; lane < kLanes; ++lane) {
+          require(retained[lane] == expectedRetained[lane], "a lane retained the wrong tokens at its cutoff");
+          for (uint32_t row = 0; row < retained[lane]; ++row)
+            require(tokens[lane * kRows + row] == expected[lane][row], "a lane's tokens missed its thinking cutoff");
+        }
+      }
+    }
+  }
+
+  SamplingPolicy none{32, 0.0F};
+  none.thinkingCutoff = ThinkingCutoff{kRows, end, alsoEnds};
+  const std::array<SamplingPolicy, 2> uncut{none, SamplingPolicy{}};
+  CommandGraph graph;
+  sampling.addVerify(graph, uncut, batch.buffers, stops[0], stops[1], {});
+  require(cutoffDispatches(graph) == 0, "a verify without a cutoff in its rows dispatched one");
+}
+
 // Ties where a distribution ends: more tokens tie at the logit where top_k
 // or top_p cuts than a group orders in threadgroup memory, and fewer; the
 // distribution keeps the lowest ids among them, and saturated penalized
@@ -2251,6 +2376,8 @@ int main(int argc, char **argv) {
               "the penalties changed no greedy selection");
       stage = "excluded stop tokens, vocabulary " + std::to_string(vocabulary);
       excludedStopTokens(backend, vocabulary);
+      stage = "thinking cutoffs, vocabulary " + std::to_string(vocabulary);
+      thinkingCutoffs(backend, vocabulary);
     }
     for (uint32_t lanes = 1; lanes <= kLanes; ++lanes) {
       for (uint32_t mask = 0; mask < (1U << lanes); ++mask) {

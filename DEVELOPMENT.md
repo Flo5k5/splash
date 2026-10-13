@@ -99,6 +99,7 @@ access.
 | `--served-model-name` | None | Additional model name the API accepts; repeatable. See [API model aliases](#api-model-aliases). |
 | `--announce-served-name` | Off | Report the first `--served-model-name` in responses; needs `--served-model-name`. |
 | `--default-reasoning-effort` | `SPLASH_DEFAULT_REASONING_EFFORT` or the template's | Effort of Chat and Responses requests that set none. See [default reasoning effort](#default-reasoning-effort). |
+| `--thinking-token-budget` | `SPLASH_THINKING_TOKEN_BUDGET` or none | Thinking tokens of a request that sets no budget. See [thinking token budget](#thinking-token-budget). |
 | `--max-request-size` | `128M` | Largest HTTP request body. See [request limits](#request-limits-and-timeouts). |
 | `--max-image-pixels` | `4194304` | Maximum resized pixels per image. An image's vision scratch grows with its patches (pixels / 256), to about 600 MiB at the default. |
 | `--request-timeout` | None | Time a request may take from its arrival; a request's own `timeout` can only shorten it. |
@@ -384,6 +385,33 @@ at the template's default effort where the effort is `none`. `enable_thinking`
 must be a boolean; null leaves it to the effort. They cannot set what Splash
 passes itself, such as `tools` or `add_generation_prompt`.
 
+## Thinking token budget
+
+A reasoning model can spend its whole output limit thinking and return no
+answer. A thinking token budget caps the thinking: once a request has selected
+that many tokens in its thinking block, the engine selects the block's close,
+`</think>`, and the model answers within the output limit that remains. Its `reasoning_tokens` then
+equal the budget.
+
+- Chat Completions and Responses take `thinking_token_budget`, a non-negative
+  integer; `-1` sets no cap, and an absent or null value takes the server's.
+- Messages caps `{"type": "enabled"}` thinking at its `budget_tokens`, which
+  must be at least 1024 and less than `max_tokens`, as in Anthropic's API;
+  adaptive thinking takes the server's budget.
+- `--thinking-token-budget N` (or `SPLASH_THINKING_TOKEN_BUDGET`) is the
+  server's budget; unset, thinking has no cap.
+
+A budget applies only where generation starts in a thinking block, and one the
+output limit reaches first changes nothing. Where the output may call a tool, a
+call's opening ends thinking too, so the close never lands inside a call. Only
+the close is forced, with no transition text, and a close the model selects
+itself before the budget ends the count. Text completions have no reasoning
+split and refuse a budget with 400.
+
+```sh
+splash serve --model mlx-community/Qwen3.8-27B-4bit --thinking-token-budget 12000
+```
+
 ## Agent launchers
 
 Agents must already be installed; `splash claude|opencode|codex|hermes|pi`
@@ -503,6 +531,7 @@ Chat Completions also takes `messages`, `tools`, `tool_choice` and
 `parallel_tool_calls` ([tool calls](#tool-calls)), `response_format`
 ([structured output](#structured-output)), `reasoning_effort` and
 `chat_template_kwargs` ([default reasoning effort](#default-reasoning-effort)),
+`thinking_token_budget` ([thinking token budget](#thinking-token-budget)),
 `preserve_thinking`, which reaches the template (the Qwen templates keep earlier
 turns' reasoning with it), `max_completion_tokens` or `max_tokens`,
 `ignore_eos` and the [sampling](#sampling) fields. The reply's reasoning comes
@@ -528,10 +557,11 @@ below, `seed`, `stop`, `priority`, `timeout` and `stream` with
 
 Responses takes `input` and `instructions`, function `tools` and `namespace`
 groups of them, `tool_choice`, `parallel_tool_calls`, `reasoning.effort`,
-`text.format` for structured output, `max_output_tokens`, the sampling fields,
-Chat's `ignore_eos`, `chat_template_kwargs` and `preserve_thinking`, and `store`
-and `previous_response_id` ([Responses state](#responses-state)). Reasoning
-comes back as `reasoning` output items. `conversation`, `background: true` and
+`thinking_token_budget`, `text.format` for structured output,
+`max_output_tokens`, the sampling fields, Chat's `ignore_eos`,
+`chat_template_kwargs` and `preserve_thinking`, and `store` and
+`previous_response_id` ([Responses state](#responses-state)). Reasoning comes
+back as `reasoning` output items. `conversation`, `background: true` and
 `truncation` other than `disabled` return 400; Splash compacts nothing, so
 `context_management` leaves the input as sent.
 
@@ -548,8 +578,9 @@ and a removed tool is left out until a later block adds it again),
 `thinking` sets it: `{"type": "enabled"}` and `{"type": "adaptive"}` reason at
 `output_config.effort`, one of `low`, `medium`, `high` (the default), `xhigh`
 and `max`, while `{"type": "disabled"}` and an omitted `thinking` do not;
-`budget_tokens` is not read. Reasoning comes back in `thinking` blocks. With
-`thinking.display` `omitted` (or `updates`) a block carries no text, and its
+enabled thinking's `budget_tokens` caps it ([thinking token
+budget](#thinking-token-budget)). Reasoning comes back in `thinking` blocks.
+With `thinking.display` `omitted` (or `updates`) a block carries no text, and its
 reasoning travels encrypted in its `signature` under the key in `thinking.key`
 ([files Splash writes](#files-splash-writes)); a later request that sends the
 block back has the reasoning restored. A signature Splash cannot read, such as
@@ -2156,6 +2187,16 @@ counters include:
 
 The engine receives `ignore_eos` as bit 0 of the request frame's flags word and
 `return_progress` as bit 1; the word rejects undefined bits.
+
+A request that generates in a thinking block may carry a thinking budget: its
+tokens, the token that closes thinking, and a second token that also ends it,
+a call's opening where the output may call a tool. The engine counts the
+thinking tokens it selects. In the selection where the budget runs out, one
+small dispatch gives that row the close, unless a draft token before the row
+ended thinking, and gives a sampled lane's drafted row the target probability 1
+for a drafted close and 0 otherwise, so acceptance keeps the draft only where
+it drafted the close. A selection where no budget runs out dispatches nothing
+more.
 
 Requests carry the score-token IDs and Done events the selected f32 logits; the
 server and the engine must speak the same native wire version. Scoring requires

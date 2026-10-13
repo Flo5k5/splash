@@ -3,6 +3,7 @@
 #include "model/Model.hpp"
 
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -73,11 +74,13 @@ struct EngineRequest final {
   std::vector<uint32_t> scoreTokens{};
   // RequestFlag bits.
   uint32_t flags = 0;
+  // Set only for a request that generates inside a thinking block.
+  std::optional<ThinkingBudget> thinkingBudget;
   CacheSalt cacheSalt;
 
   [[nodiscard]] ModelRequest modelView() const noexcept {
     return {id,       prompt,     images,      imagePixels, maxNewTokens,
-            sampling, constraint, scoreTokens, flags};
+            sampling, constraint, scoreTokens, flags,       thinkingBudget};
   }
 };
 
