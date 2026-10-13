@@ -133,12 +133,14 @@ validateLimits(const ProtocolLimits &limits);
 //   82 u32 flags
 //   86 u64 cacheSalt.lo, u64 cacheSalt.hi
 //  102 u32 thinkingBudget.tokens, kNoThinkingBudget for none
-//  106 u32 thinkingBudget.end, u32 thinkingBudget.alsoEnds, zero without a
-//      budget
-// then the prompt tokens, the 32-byte image spans, the image pixels and the
-// score tokens.
+//  106 u32 thinking end token count, u32 thinkingBudget.alsoEnds, zero
+//      without a budget
+// then the prompt tokens, the 32-byte image spans, the image pixels, the
+// score tokens and the thinking end tokens.
 inline constexpr uint64_t kRequestFixedBytes = 114;
 inline constexpr uint32_t kNoThinkingBudget = 0xFFFFFFFFU;
+// A thinking budget's end holds 1 to this many tokens.
+inline constexpr uint32_t kMaximumThinkingEndTokens = 64;
 
 // The request flags word holds the RequestFlag bits and this one, which asks
 // for PromptProgressEvents while the prompt prefills.

@@ -252,9 +252,14 @@ struct Runtime::Impl {
     uint32_t flags = 0;
     std::optional<uint32_t> pendingToken;
     // While the request thinks under a budget (ModelRequest::thinkingBudget),
-    // that budget with the thinking tokens it may still select; none once
-    // thinking ended.
-    std::optional<ThinkingBudget> thinking;
+    // that budget with the thinking tokens it may still select and, once
+    // they ran out, the tokens of its end it selected; none once thinking
+    // ended.
+    struct Thinking final {
+      ThinkingBudget budget;
+      uint32_t endSelected = 0;
+    };
+    std::optional<Thinking> thinking;
     // A constrained request's final prompt row, held from its prompt's end
     // until its first token is selected under its first mask, suspensions
     // included. Composite cache state never stores it; every cache hit
@@ -296,6 +301,9 @@ struct Runtime::Impl {
     uint32_t accepted = 0;
     uint32_t currentAnchor = 0;
     uint32_t maximumRetained = 0;
+    // The draft proposals the lane's thinking end replaced, which its
+    // speculation counts leave out.
+    uint32_t endDrafts = 0;
     // Why the lane's selection is unusable (invalidSelection), found before
     // any lane commits.
     std::string failure;
@@ -386,16 +394,19 @@ struct Runtime::Impl {
   // Warmup selects greedily, so the first sampled, penalized or constrained
   // request would compile the policy's kernels inside its TTFT and stall the
   // engine meanwhile; compile them now. A sampled, penalized and constrained
-  // lane at its thinking cutoff and a greedy one reach every kernel the
-  // first-token and verify selections dispatch.
+  // lane whose thinking budget ran out and a greedy one reach every kernel
+  // the first-token and verify selections and the drafts they verify
+  // dispatch.
   void preparePolicyPipelines() const {
-    const ops::SamplingPolicy sampled{.topK = 0,
-                                      .temperature = 1.0F,
-                                      .topP = 0.95F,
-                                      .constrained = true,
-                                      .penalties = {1.1F, 0.5F, 0.5F},
-                                      .minP = 0.05F,
-                                      .thinkingCutoff = ops::ThinkingCutoff{}};
+    const std::array<uint32_t, 1> end{};
+    const ops::SamplingPolicy sampled{
+        .topK = 0,
+        .temperature = 1.0F,
+        .topP = 0.95F,
+        .constrained = true,
+        .penalties = {1.1F, 0.5F, 0.5F},
+        .minP = 0.05F,
+        .thinkingCutoff = ops::ThinkingCutoff{.end = end}};
     const std::array<ops::SamplingPolicy, 2> policies{sampled, {}};
     const std::array<uint32_t, 2> stateLanes{0, 1};
     const ops::PenaltyTable penalties{penaltyTable, stateLanes};
@@ -403,6 +414,9 @@ struct Runtime::Impl {
     sampling.addInitial(graph, policies, samplingBuffers(2), 0,
                         geometry.target.stopTokens[0],
                         geometry.target.stopTokens[1], penalties);
+    sampling.addThinkingDrafts(
+        graph, policies,
+        decodeArena->batchSlice(DecodeTensor::ProposedTokens, 2));
     sampling.addVerify(graph, policies, samplingBuffers(2),
                        geometry.target.stopTokens[0],
                        geometry.target.stopTokens[1], penalties);
@@ -885,16 +899,21 @@ struct Runtime::Impl {
   }
 
   // A selection's rows select the request's next tokens in order, so with n
-  // thinking tokens left, its row n closes thinking.
+  // thinking tokens left, its row n starts the budget's end, and once none
+  // are left, its row 0 goes on with the end's tokens not yet selected.
   static ops::SamplingPolicy samplingPolicy(const Request &entry) noexcept {
+    std::optional<ops::ThinkingCutoff> cutoff;
+    if (entry.thinking) {
+      const ThinkingBudget &budget = entry.thinking->budget;
+      cutoff = ops::ThinkingCutoff{
+          budget.tokens,
+          std::span(budget.end).subspan(entry.thinking->endSelected),
+          budget.alsoEnds};
+    }
     return {entry.sampling.topK, entry.sampling.temperature,
             entry.sampling.topP, entry.constraint == ConstraintMode::TokenMask,
             (entry.flags & RequestIgnoreEndOfSequence) != 0,
-            samplingPenalties(entry), entry.sampling.minP,
-            entry.thinking ? std::optional<ops::ThinkingCutoff>(
-                                 {entry.thinking->tokens, entry.thinking->end,
-                                  entry.thinking->alsoEnds})
-                           : std::nullopt};
+            samplingPenalties(entry), entry.sampling.minP, cutoff};
   }
 
   ops::SamplingBuffers samplingBuffers(uint32_t lanes) const {
@@ -941,8 +960,9 @@ struct Runtime::Impl {
   // tokens are one step's selections in order, the new anchor last. The
   // command that selected them has completed, and the next one that reads
   // the lane's words is encoded after this. Each token counts against the
-  // thinking budget until one ends thinking; the cutoff (samplingPolicy)
-  // never lets thinking run past it.
+  // thinking budget until one ends thinking, and once the budget ran out,
+  // it is the end's next token; the cutoff (samplingPolicy) never lets
+  // thinking run past it.
   void commitSelected(Request &entry, std::span<const uint32_t> tokens) {
     if (tokens.empty())
       throw std::logic_error("no selected token to commit");
@@ -951,9 +971,12 @@ struct Runtime::Impl {
     for (const uint32_t token : tokens) {
       if (!entry.thinking)
         break;
-      if (token == entry.thinking->end || token == entry.thinking->alsoEnds)
+      ThinkingBudget &budget = entry.thinking->budget;
+      if (token == budget.end.back() || token == budget.alsoEnds)
         entry.thinking.reset();
-      else if (!entry.thinking->tokens--)
+      else if (budget.tokens)
+        --budget.tokens;
+      else if (token != budget.end[entry.thinking->endSelected++])
         throw std::logic_error("thinking went past its budget");
     }
     entry.pendingToken = tokens.back();
@@ -1522,6 +1545,8 @@ struct Runtime::Impl {
          d(DecodeTensor::SamplingUniforms), d(DecodeTensor::ProposedTokens),
          d(DecodeTensor::ProposalProbs)},
         std::span(anchors).first(lanes), std::span(policies).first(lanes));
+    sampling.addThinkingDrafts(graph, std::span(policies).first(lanes),
+                               d(DecodeTensor::ProposedTokens));
   }
 
   void encodeTargetVerifyBatchForward(CommandGraph &graph,
@@ -1770,13 +1795,17 @@ struct Runtime::Impl {
       commitSelected(entry, {targetTokens, laneResult.retained});
       entry.maskWords.clear();
       entry.verifyMaskInFlight = false;
+      // The end replaced the first proposals, which acceptance keeps as far
+      // as the lane retains them; the draft proposed the others.
+      const uint32_t accepted =
+          std::min(laneResult.accepted, laneResult.retained - 1);
       results.push_back({entry.id,
                          0,
                          std::move(output),
                          false,
                          DecodeStage::Regular,
-                         kDraftProposalTokens,
-                         std::min(laneResult.accepted, laneResult.retained - 1)});
+                         kDraftProposalTokens - laneResult.endDrafts,
+                         accepted - std::min(accepted, laneResult.endDrafts)});
       ModelStepResult &result = results.back();
       if (entry.generatedTokens < entry.maxNewTokens)
         emitTerminalAnchor(entry, result);
@@ -2055,7 +2084,8 @@ StateAdmission Runtime::beginAt(const ModelRequest &request, uint32_t stateLane)
   entry.sampling = request.sampling;
   entry.constraint = request.constraint;
   entry.flags = request.flags;
-  entry.thinking = request.thinkingBudget;
+  if (request.thinkingBudget)
+    entry.thinking = Impl::Request::Thinking{*request.thinkingBudget};
   entry.scoreTokens.assign(request.scoreTokens.begin(),
                            request.scoreTokens.end());
   std::vector<Impl::ImageState> images;
@@ -2415,6 +2445,8 @@ Runtime::decodeAsync(const BatchPlan &plan,
     laneResult.request = &entry;
     laneResult.currentAnchor = *entry.pendingToken;
     laneResult.maximumRetained = std::min(remaining, kDecodeRows);
+    if (const auto cutoff = Impl::samplingPolicy(entry).thinkingCutoff)
+      laneResult.endDrafts = cutoff->replacedProposals();
 
     impl_->prepareDecodeLane(entry, item, lane);
     requests[lane] = &entry;

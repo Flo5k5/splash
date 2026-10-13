@@ -126,20 +126,29 @@ static_assert(sizeof(SamplingPenaltyParams) == 112,
 
 // One selection's thinking cutoffs (ops::SamplingPolicy::thinkingCutoff), its
 // rows laid out as in TargetSamplingParams. A lane whose row is below rows
-// selects end there, unless a draft token before that row is end or
-// also_ends, which ended thinking first; a sampled lane's drafted row then
-// gives its draft token the target probability 1 when it is end, else 0.
+// selects its end token tokens[i] at row + i for each i below its count,
+// unless a draft token before that row is close or also_ends, which ended
+// thinking first; a sampled lane's drafted row then gives its draft token
+// the target probability 1 when it is the row's end token, else 0. A row
+// whose selection is the sentinel of a row with no selectable logit (a token
+// outside the vocabulary) keeps it, so the lane still fails. A lane whose
+// row is 0 drafts its end tokens before the verify
+// (decode_draft_thinking_cutoff), so acceptance keeps them all.
 struct ThinkingCutoffParams {
+  uint32_t vocabulary;
   uint32_t rows;
   uint32_t drafted_rows;
   uint32_t sampling_mask;
   uint32_t row[SPLASH_MAXIMUM_BATCH_WIDTH];
-  uint32_t end[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t count[SPLASH_MAXIMUM_BATCH_WIDTH];
+  // The token that closes thinking, the last of the lane's end.
+  uint32_t close[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t also_ends[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t tokens[SPLASH_MAXIMUM_BATCH_WIDTH][SPLASH_TARGET_VERIFY_ROWS];
 };
 
-static_assert(sizeof(ThinkingCutoffParams) == 60,
-              "Thinking cutoff parameters are 60 bytes on both sides");
+static_assert(sizeof(ThinkingCutoffParams) == 208,
+              "Thinking cutoff parameters are 208 bytes on both sides");
 
 // The batched selector and acceptance kernels' grids cover exactly the
 // dispatch's lanes: per-lane arrays hold those lanes, and entries past them

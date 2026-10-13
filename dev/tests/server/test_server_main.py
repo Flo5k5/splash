@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from dev.tests.server_fixtures import main_args
+from server import backend as backend_api
 from server import diagnostics
 from server import protocol as native_wire
 from server import server as api
@@ -90,7 +91,10 @@ class ServerMainTests(unittest.TestCase):
             pending_limit=1,
         )
         backend_type.assert_called_once_with(
-            runtime, tokenizer, request_logger=diagnostics.print_request
+            runtime,
+            tokenizer,
+            request_logger=diagnostics.print_request,
+            thinking_end=backend_api.DEFAULT_THINKING_END,
         )
         self.assertEqual(app_type.call_args.args[3], 262144)
         # No --request-timeout, no deadline.

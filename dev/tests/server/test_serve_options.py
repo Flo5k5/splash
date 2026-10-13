@@ -55,6 +55,11 @@ OPTIONS = {
     "--thinking-token-budget": values(
         "--thinking-token-budget", {"0": 0, "4096": 4096}, ("-1", "1.5", "many")
     ),
+    "--thinking-end-text": values(
+        "--thinking-end-text",
+        {"</think>": "</think>", "Time is up.\n</think>": "Time is up.\n</think>"},
+        (),
+    ),
     "--kv-format": values("--kv-format", {"int8": "int8", "bf16": "bf16"}, ("fp16",)),
     "--state-format": values(
         "--state-format", {"fp32": "fp32", "bf16": "bf16"}, ("fp16", "int8")
@@ -174,6 +179,7 @@ class ServeOptionsTests(unittest.TestCase):
             "SPLASH_API_KEY",
             "SPLASH_DEFAULT_REASONING_EFFORT",
             "SPLASH_THINKING_TOKEN_BUDGET",
+            "SPLASH_THINKING_END_TEXT",
         ):
             os.environ.pop(name, None)
 
@@ -237,6 +243,19 @@ class ServeOptionsTests(unittest.TestCase):
                     mock.patch.dict(os.environ, {name: "two words"}),
                 ):
                     self.assertIn(flag, self.refuse(parse, required))
+
+    def test_both_parsers_take_the_thinking_end_text_from_the_environment(self):
+        # Any text parses; the server checks it with the model's tokenizer.
+        text = "Time is up.\n</think>"
+        for parse, required in PARSERS:
+            with (
+                self.subTest(parser=parse.__module__),
+                mock.patch.dict(os.environ, {"SPLASH_THINKING_END_TEXT": text}),
+            ):
+                self.assertEqual(parse(required).thinking_end_text, text)
+                # The command line outranks the environment.
+                given = parse([*required, "--thinking-end-text=</think>"])
+                self.assertEqual(given.thinking_end_text, "</think>")
 
     def test_each_parse_has_its_own_lists(self):
         for parse, required in PARSERS:

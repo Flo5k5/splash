@@ -777,6 +777,7 @@ def main_args(**overrides):
             "announce_served_name": False,
             "default_reasoning_effort": None,
             "thinking_token_budget": None,
+            "thinking_end_text": None,
             "max_context": None,
             "max_memory": None,
             "idle_release": None,
@@ -870,12 +871,16 @@ class Harness:
         allowed_hosts=(),
         allowed_origins=(),
         vision=True,
+        thinking_end=backend_api.DEFAULT_THINKING_END,
         **frontend_options,
     ):
         self.tokenizer = tokenizer or FakeTokenizer()
         runtime.pending_limit = queue_size
         self.backend = backend_api.NativeBackend(
-            runtime, self.tokenizer, request_logger=request_logger
+            runtime,
+            self.tokenizer,
+            request_logger=request_logger,
+            thinking_end=thinking_end,
         )
         self.app = make_frontend(
             self.tokenizer,

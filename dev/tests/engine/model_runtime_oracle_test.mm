@@ -1020,23 +1020,30 @@ void requireNonFiniteRowFailsOnlyItsLane(model::Runtime &executor,
 
 // Decodes the requests together from their prompts' ends until each has
 // generated `count` tokens or finished; each one's generated tokens, its
-// first, the prefill's selection, included.
-std::vector<std::vector<uint32_t>>
+// first, the prefill's selection, included, the decode cycle that returned
+// each, and each cycle's anchor, the first token it returned, by index, with
+// its drafted tokens.
+struct JointDecode final {
+  std::vector<uint32_t> tokens;
+  std::vector<uint32_t> cycles;
+  std::vector<std::pair<size_t, uint32_t>> drafts;
+};
+std::vector<JointDecode>
 decodeTogether(model::Runtime &executor, std::span<const uint64_t> ids,
                uint32_t promptTokens,
                std::span<const std::vector<uint32_t>> pageTables, uint32_t count) {
-  std::vector<std::vector<uint32_t>> generated(ids.size());
+  std::vector<JointDecode> generated(ids.size());
   std::vector<bool> finished(ids.size(), false);
-  while (true) {
+  for (uint32_t cycle = 0;; ++cycle) {
     BatchPlan plan{.kind = WorkKind::Decode, .decodeStage = DecodeStage::Regular};
     std::vector<ModelBatchItem> items;
     std::vector<size_t> lanes;
     for (size_t index = 0; index < ids.size(); ++index) {
-      if (finished[index] || generated[index].size() >= count)
+      if (finished[index] || generated[index].tokens.size() >= count)
         continue;
       plan.items.push_back({ids[index], 0});
       items.push_back(withRevision({.requestId = ids[index],
-                                    .logicalPosition = promptTokens + generated[index].size(),
+                                    .logicalPosition = promptTokens + generated[index].tokens.size(),
                                     .pageTable = pageTables[index]}));
       lanes.push_back(index);
     }
@@ -1046,19 +1053,25 @@ decodeTogether(model::Runtime &executor, std::span<const uint64_t> ids,
     require(results.size() == items.size(), "a joint decode lost a lane");
     for (size_t index = 0; index < results.size(); ++index) {
       require(results[index].failure.empty(), "a joint decode failed a lane");
-      std::vector<uint32_t> &tokens = generated[lanes[index]];
-      tokens.insert(tokens.end(), results[index].outputTokens.begin(),
-                    results[index].outputTokens.end());
+      require(results[index].acceptedDraftTokens <= results[index].draftedTokens,
+              "a joint decode accepted more draft tokens than it drafted");
+      JointDecode &decoded = generated[lanes[index]];
+      decoded.drafts.emplace_back(decoded.tokens.size(), results[index].draftedTokens);
+      decoded.tokens.insert(decoded.tokens.end(), results[index].outputTokens.begin(),
+                            results[index].outputTokens.end());
+      decoded.cycles.resize(decoded.tokens.size(), cycle);
       finished[lanes[index]] = results[index].finished;
     }
   }
 }
 
-// A thinking budget closes thinking at its token whatever the model's
-// logits: the first generated token for a budget of 0, else the one after
-// that many thinking tokens, greedy and sampled, while the draft proposes
-// beside it. Lanes decoded together close at their own budgets, and one
-// without a budget thinks on.
+// A thinking budget ends thinking with its end tokens whatever the model's
+// logits: from the first generated token for a budget of 0, else from the
+// one after that many thinking tokens, greedy and sampled, while the draft
+// proposes beside it. Once no thinking token is left, the end's tokens
+// replace the draft's proposals, so a decode cycle returns as many of them as
+// it verifies, and those proposals are not counted as drafted. Lanes decoded
+// together end at their own budgets, and one without a budget thinks on.
 void requireThinkingBudgetClosesThinking(model::Runtime &executor) {
   // "<|im_start|>user\nList every prime number between 1 and 60, then check
   // each one by trial division before you answer.<|im_end|>\n<|im_start|>
@@ -1070,42 +1083,74 @@ void requireThinkingBudgetClosesThinking(model::Runtime &executor) {
       1518,   488,  4087, 13,    248046, 198, 248045, 74455, 198,   248068, 198};
   // The Qwen tokenizer's </think>.
   constexpr uint32_t kThinkEnd = 248069;
+  // The close alone, and "Considering the limited time, I have to give the
+  // solution based on the thinking directly now.\n</think>".
+  const std::array<std::vector<uint32_t>, 2> ends{
+      std::vector<uint32_t>{kThinkEnd},
+      std::vector<uint32_t>{79939, 279, 6973, 854, 11, 353, 599, 310, 2873, 279, 6093, 3018, 383, 279,
+                            7047, 5774, 1381, 13, 198, kThinkEnd}};
   const std::array<std::vector<uint32_t>, 3> pageTables{
       pageRange(108, 4), pageRange(116, 4), pageRange(120, 4)};
   const std::array<uint64_t, 3> ids{301, 302, 303};
-  for (const float temperature : {0.0F, 0.7F}) {
-    for (const uint32_t budget : {0U, 1U, 5U, 12U}) {
-      const std::array<std::optional<uint32_t>, 3> budgets{budget, budget + 7,
-                                                           std::nullopt};
-      for (size_t lane = 0; lane < ids.size(); ++lane) {
-        EngineRequest request = makeRequest(ids[lane], prompt, 48);
-        request.sampling.temperature = temperature;
-        request.sampling.seed = 0x5eed + budget;
-        if (budgets[lane])
-          request.thinkingBudget = ThinkingBudget{*budgets[lane], kThinkEnd, kThinkEnd};
-        beginCold(executor, request, static_cast<uint32_t>(lane));
-        requireOpen(prefillChunk(executor, ids[lane], 0, prompt, pageTables[lane]),
-                    "thinking budget fixture");
-      }
-      const auto generated = decodeTogether(executor, ids, static_cast<uint32_t>(prompt.size()),
-                                            pageTables, budget + 12);
-      for (size_t lane = 0; lane < ids.size(); ++lane) {
-        const std::vector<uint32_t> &tokens = generated[lane];
-        const auto close = std::find(tokens.begin(), tokens.end(), kThinkEnd);
-        if (!budgets[lane]) {
-          require(close == tokens.end(), "a lane without a thinking budget closed its thinking");
-          continue;
+  uint32_t mostEndCycles = 0;
+  for (const std::vector<uint32_t> &end : ends) {
+    const uint32_t length = static_cast<uint32_t>(end.size());
+    for (const float temperature : {0.0F, 0.7F}) {
+      for (const uint32_t budget : {0U, 1U, 5U, 12U}) {
+        const std::array<std::optional<uint32_t>, 3> budgets{budget, budget + 7,
+                                                             std::nullopt};
+        for (size_t lane = 0; lane < ids.size(); ++lane) {
+          EngineRequest request = makeRequest(ids[lane], prompt, 64);
+          request.sampling.temperature = temperature;
+          request.sampling.seed = 0x5eed + budget;
+          if (budgets[lane])
+            request.thinkingBudget = ThinkingBudget{*budgets[lane], end, kThinkEnd};
+          beginCold(executor, request, static_cast<uint32_t>(lane));
+          requireOpen(prefillChunk(executor, ids[lane], 0, prompt, pageTables[lane]),
+                      "thinking budget fixture");
         }
-        require(close != tokens.end() && close - tokens.begin() == *budgets[lane] &&
-                    close + 1 != tokens.end(),
-                "a thinking budget of " + std::to_string(*budgets[lane]) +
-                    " did not close thinking at its token, then go on");
+        const auto generated = decodeTogether(executor, ids, static_cast<uint32_t>(prompt.size()),
+                                              pageTables, budget + 7 + length + 4);
+        for (size_t lane = 0; lane < ids.size(); ++lane) {
+          const std::vector<uint32_t> &tokens = generated[lane].tokens;
+          const auto close = std::find(tokens.begin(), tokens.end(), kThinkEnd);
+          if (!budgets[lane]) {
+            require(close == tokens.end(), "a lane without a thinking budget closed its thinking");
+            continue;
+          }
+          const uint32_t first = *budgets[lane];
+          require(close != tokens.end() && close - tokens.begin() == first + length - 1 &&
+                      std::equal(end.begin(), end.end(), tokens.begin() + first) &&
+                      close + 1 != tokens.end(),
+                  "a thinking budget of " + std::to_string(first) +
+                      " did not end thinking with its end tokens, then go on");
+          // A cycle that cuts past its row 0 may return the end's first
+          // token alone; each cycle after it returns up to eight of them.
+          constexpr uint32_t rows = model::ExecutionLimits::targetVerifyRows;
+          const std::vector<uint32_t> &cycles = generated[lane].cycles;
+          const uint32_t endCycles = cycles[first + length - 1] - cycles[first] + 1;
+          require(endCycles <= 1 + (length - 1 + rows - 1) / rows,
+                  "a thinking budget's end took a decode cycle per token");
+          mostEndCycles = std::max(mostEndCycles, endCycles);
+          // A cycle that starts with no thinking token left, its anchor the
+          // budget's last thinking token or an end token before the close,
+          // drafted the end tokens left in place of the draft's proposals.
+          for (const auto &[anchor, drafted] : generated[lane].drafts) {
+            const uint32_t committed = static_cast<uint32_t>(anchor) + 1;
+            const uint32_t replaced =
+                committed >= first && committed < first + length
+                    ? std::min(first + length - committed, model::ExecutionLimits::draftProposalTokens)
+                    : 0;
+            require(drafted == model::ExecutionLimits::draftProposalTokens - replaced,
+                    "a cycle counted the end tokens it drafted as the draft's");
+          }
+        }
+        for (const uint64_t id : ids)
+          executor.end(id);
       }
-      for (const uint64_t id : ids)
-        executor.end(id);
     }
   }
-  std::cout << "thinking_budget=PASS\n";
+  std::cout << "thinking_budget=PASS most_end_cycles=" << mostEndCycles << "\n";
 }
 
 // A 64-token request with one image of the given span, its pixels a pattern.
