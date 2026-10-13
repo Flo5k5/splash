@@ -12,15 +12,18 @@
 #include <sys/time.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace {
 
@@ -104,6 +107,18 @@ RuntimeResourcesConfig loadableConfig(const char *metallibPath, const std::files
   config.buildId = name;
   config.hostAvailableMemory = [] { return std::optional<uint64_t>(64 * kGiB); };
   return config;
+}
+
+// A local volume of 1000 GiB with `availableBytes` free, which leaves the
+// automatic SSD cache room from 12 GiB on.
+DiskVolume localVolume(uint64_t availableBytes) {
+  return {"/Volumes/Test", availableBytes, 1000 * kGiB, true};
+}
+
+// A volume probe that reads `volume` for every directory.
+std::function<std::optional<DiskVolume>(const std::filesystem::path &)>
+reading(std::optional<DiskVolume> volume) {
+  return [volume](const std::filesystem::path &) { return volume; };
 }
 
 // Startup fails at the loader, whose vision weight files are deliberately
@@ -221,23 +236,37 @@ void testWeightBudgetBeforeLoading(const char *metallibPath) {
 
 // A state's write to the disk tier stages through a state-sized buffer the
 // plan sets aside only when the tier starts: a quota that holds no state
-// leaves the tier off and the budget to KV. The notice and the refusal name
-// the tier as users know it, the SSD cache.
+// leaves the tier off and the budget to KV. An explicit quota's staging is
+// planned whatever it costs, and the automatic one never costs a start. The
+// notices and the refusal name the tier as users know it, the SSD cache.
 void testStateStagingNeedsAStartedTier(const char *metallibPath) {
   const test::TemporaryDirectory root("splash-budget");
   RuntimeResourcesConfig config = budgetConfig(metallibPath, root.path());
   const uint64_t minimum = minimumBytes(config);
   const uint64_t stateBytes = config.model.stateLayout.cachedBytes();
   config.maximumMemoryBytes = minimum;
-  config.maximumCacheDiskBytes = stateBytes - 1;
+  config.cacheDisk = {.bytes = stateBytes - 1};
   const std::string notice = test::capturedStderr([&] {
     requireReachesModelLoader(config, root.path(),
                               "a quota that holds no state set staging aside");
   });
-  require(notice.find("SSD cache disabled (") != std::string::npos,
+  require(notice.find("SSD cache off: its quota holds no state of " +
+                      std::to_string(stateBytes >> 20) + " MiB") != std::string::npos,
           "the notice of a quota that holds no state did not name the SSD cache");
 
-  config.maximumCacheDiskBytes = stateBytes;
+  // The automatic tier lets a budget with no room for its staging start,
+  // and says why it is off.
+  config.cacheDisk = {.automatic = true};
+  const std::string automatic = test::capturedStderr([&] {
+    requireReachesModelLoader(config, root.path(),
+                              "the automatic tier's staging refused a start");
+  });
+  require(automatic.find("SSD cache off: the memory budget has no room for its " +
+                         std::to_string(stateBytes >> 20) +
+                         " MiB of state staging beside the model") != std::string::npos,
+          "the automatic tier did not say the memory budget turned it off");
+
+  config.cacheDisk = {.bytes = stateBytes};
   try {
     auto resources = RuntimeResources::create(config, 0);
     throw std::runtime_error("a model without weights unexpectedly loaded");
@@ -277,18 +306,25 @@ void testImagePatchCapIsBounded(const char *metallibPath) {
                             "a smaller image patch cap did not reach the model loader");
 }
 
-// Startup and the governor sample host memory through the config's probe:
-// without one, the config is refused before the backend is created.
+// Startup and the governor sample host memory through the config's probe,
+// and the automatic SSD cache its volume through another: without either,
+// the config is refused before the backend is created.
 void testHostMemoryProbeIsRequired(const char *metallibPath) {
   const test::TemporaryDirectory root("splash-budget");
-  RuntimeResourcesConfig config = budgetConfig(metallibPath, root.path());
-  config.hostAvailableMemory = {};
-  try {
-    auto resources = RuntimeResources::create(config, 0);
-    throw std::runtime_error("resources were assembled without a host memory probe");
-  } catch (const RuntimeResourcesError &error) {
-    require(error.stage() == RuntimeResourceStage::Configuration,
-            "a missing host memory probe was not a configuration error");
+  for (const bool memory : {true, false}) {
+    RuntimeResourcesConfig config = budgetConfig(metallibPath, root.path());
+    if (memory)
+      config.hostAvailableMemory = {};
+    else
+      config.diskVolume = {};
+    try {
+      auto resources = RuntimeResources::create(config, 0);
+      throw std::runtime_error("resources were assembled without a host memory or volume probe");
+    } catch (const RuntimeResourcesError &error) {
+      require(error.stage() == RuntimeResourceStage::Configuration,
+              memory ? "a missing host memory probe was not a configuration error"
+                     : "a missing volume probe was not a configuration error");
+    }
   }
 }
 
@@ -393,11 +429,15 @@ void testFailedStepIsNamed(const char *metallibPath) {
   // Nothing but the host refuses this model. The suite's one complete start
   // also reports the SSD cache a disk quota gives it, by that name.
   host(64 * kGiB);
-  config.maximumCacheDiskBytes = kGiB;
-  require(test::capturedStderr([&] { static_cast<void>(RuntimeResources::create(config, 0)); })
-                  .find("SSD cache: 1024 MiB for KV pages of ") != std::string::npos,
+  config.cacheDisk = {.bytes = kGiB};
+  const std::string started =
+      test::capturedStderr([&] { static_cast<void>(RuntimeResources::create(config, 0)); });
+  require(started.find("SSD cache: up to ") != std::string::npos &&
+              started.find(" of temporary files in ") != std::string::npos &&
+              started.find("; KV pages of ") != std::string::npos &&
+              started.find("--max-cache-disk 0 turns it off.") != std::string::npos,
           "a start did not report its SSD cache by that name");
-  config.maximumCacheDiskBytes = 0;
+  config.cacheDisk = {};
   const auto failure = [&](uint64_t available) {
     host(available);
     try {
@@ -431,7 +471,7 @@ void testFailedStepIsNamed(const char *metallibPath) {
 void testWriteBudgetOnlyWhenSet(const char *metallibPath) {
   const test::TemporaryDirectory root("splash-write-budget");
   RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "write-budget-test");
-  config.maximumCacheDiskBytes = kGiB;
+  config.cacheDisk = {.bytes = kGiB};
   const auto tier = [&] {
     KvTierSnapshot snapshot;
     static_cast<void>(test::capturedStderr([&] {
@@ -477,7 +517,7 @@ void testStaleCachesGoAtEveryStart(const char *metallibPath) {
 void testMadeCacheRootStaysOutOfBackups(const char *metallibPath) {
   const test::TemporaryDirectory root("splash-backups-model"), caches("splash-backups");
   RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "backups-test");
-  config.maximumCacheDiskBytes = kGiB;
+  config.cacheDisk = {.bytes = kGiB};
   config.persistentCache = true;
   const auto excluded = [](const std::filesystem::path &path) {
     NSURL *url = [NSURL fileURLWithPath:@(path.c_str()) isDirectory:YES];
@@ -494,6 +534,125 @@ void testMadeCacheRootStaysOutOfBackups(const char *metallibPath) {
   std::filesystem::create_directory(config.cacheRoot);
   static_cast<void>(test::capturedStderr([&] { static_cast<void>(RuntimeResources::create(config, 0)); }));
   require(!excluded(config.cacheRoot), "a cache root that was there was excluded from backups");
+}
+
+// The automatic tier keeps its staging only where the plan holds the
+// requested context beside it. Asked for the context the plan holds without
+// the staging but not with it, a start turns the tier off with one line and
+// plans as without it.
+void testAutomaticTierYieldsToTheContext(const char *metallibPath) {
+  const test::TemporaryDirectory root("splash-automatic");
+  RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "automatic-test");
+  config.diskVolume = reading(localVolume(500 * kGiB));
+  uint64_t minimumRequired = 0;
+  const auto start = [&](uint32_t requestedContextTokens, uint32_t &contextTokens,
+                         bool &tier) {
+    return test::capturedStderr([&] {
+      auto resources = RuntimeResources::create(config, requestedContextTokens);
+      contextTokens = resources->memoryPlan().maximumContextTokens();
+      minimumRequired = resources->memoryPlan().breakdown().minimumRequiredBytes;
+      tier = resources->cache().snapshot().kvTier.capacityBytes != 0;
+    });
+  };
+  uint32_t without = 0, with = 0, yielded = 0;
+  bool tier = false;
+  static_cast<void>(start(0, without, tier));
+  // A budget whose KV the staging shortens: the plan's least, the staging
+  // and a little KV.
+  config.maximumMemoryBytes =
+      minimumRequired + config.model.stateLayout.cachedBytes() + 64 * kMiB;
+  static_cast<void>(start(0, without, tier));
+  require(!tier && without, "a start without the SSD cache had one, or no context");
+  config.cacheDisk = {.automatic = true};
+  static_cast<void>(start(0, with, tier));
+  require(tier && with < without,
+          "the automatic tier did not start, or its staging cost the plan no context");
+  const std::string off = start(without, yielded, tier);
+  require(!tier && yielded == without &&
+              off.find("SSD cache off: the memory plan cannot hold a " + std::to_string(without) +
+                       "-token context beside its state staging") != std::string::npos,
+          "the automatic tier kept staging the requested context needs");
+}
+
+// The automatic tier's staging is decided by memory alone, so a start serves
+// the same context whatever room the volume its files would go to has: a
+// relaunch after something else filled the disk announces the context the
+// server serves. The volume decides only whether the files open. A volume
+// without room, one that cannot be measured or one that is not local leaves
+// the tier off with one line and the staging the plan set aside unused; a
+// persistent cache whose root has no room keeps temporary files.
+void testAutomaticContextIgnoresTheVolume(const char *metallibPath) {
+  const test::TemporaryDirectory root("splash-volume"), caches("splash-volume-root");
+  RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "volume-test");
+  struct Started {
+    uint32_t context = 0, planContext = 0;
+    uint64_t staging = 0, minimumRequired = 0;
+    bool tier = false, persistent = false;
+    std::string log;
+  };
+  const auto start = [&] {
+    Started started;
+    started.log = test::capturedStderr([&] {
+      auto resources = RuntimeResources::create(config, 0);
+      started.context = resources->aneFfnOutcome().context;
+      started.planContext = resources->memoryPlan().maximumContextTokens();
+      started.staging = resources->memoryPlan().breakdown().stateStagingBytes;
+      started.minimumRequired = resources->memoryPlan().breakdown().minimumRequiredBytes;
+      const CacheSnapshot cache = resources->cache().snapshot();
+      started.tier = cache.kvTier.capacityBytes != 0;
+      started.persistent = cache.persistent;
+    });
+    return started;
+  };
+  const auto offOnce = [](const Started &started, std::string_view reason) {
+    const size_t at = started.log.find("SSD cache off: ");
+    return at != std::string::npos && started.log.find("SSD cache off", at + 1) == std::string::npos &&
+           started.log.find(reason, at) != std::string::npos &&
+           started.log.find("; the state staging the plan set aside stays unused.", at) !=
+               std::string::npos;
+  };
+  // A budget whose KV the staging shortens: the plan's least, the staging
+  // and a little KV.
+  config.maximumMemoryBytes =
+      start().minimumRequired + config.model.stateLayout.cachedBytes() + 64 * kMiB;
+  const Started off = start();
+  config.cacheDisk = {.automatic = true};
+  config.diskVolume = reading(localVolume(500 * kGiB));
+  const Started room = start();
+  require(!off.tier && room.tier && room.staging == config.model.stateLayout.cachedBytes() &&
+              room.context == room.planContext && room.context < off.context,
+          "the automatic tier did not start beside its staging, or the staging cost no context");
+  const std::array<std::pair<std::optional<DiskVolume>, std::string>, 3> refusals{{
+      {localVolume(11 * kGiB), "11.0 GiB available on /Volumes/Test is too little beyond the 10.0 GiB"},
+      {std::nullopt, "its volume cannot be measured"},
+      {DiskVolume{"/Volumes/Share", 500 * kGiB, 1000 * kGiB, false}, "/Volumes/Share is not a local volume"},
+  }};
+  for (const auto &[volume, reason] : refusals) {
+    config.diskVolume = reading(volume);
+    const Started refused = start();
+    require(!refused.tier && refused.staging == room.staging && refused.context == room.context &&
+                refused.planContext == room.planContext && offOnce(refused, reason),
+            "a volume without room changed the automatic context, or did not leave the tier off "
+            "once (" + reason + ")");
+  }
+  // A persistent cache's root without room leaves the tier temporary files;
+  // with no room for those either, it is off.
+  config.persistentCache = true;
+  config.cacheRoot = caches.path() / "prefix-cache";
+  config.diskVolume = [&](const std::filesystem::path &directory) {
+    return std::optional(localVolume(directory == config.cacheRoot ? 11 * kGiB : 500 * kGiB));
+  };
+  const Started temporary = start();
+  require(temporary.tier && !temporary.persistent && temporary.context == room.context &&
+              temporary.log.find("Persistent cache off: 11.0 GiB available on /Volumes/Test") !=
+                  std::string::npos &&
+              temporary.log.find("SSD cache off") == std::string::npos,
+          "a persistent cache whose root had no room did not keep temporary files");
+  config.diskVolume = reading(localVolume(11 * kGiB));
+  const Started neither = start();
+  require(!neither.tier && neither.context == room.context &&
+              offOnce(neither, "for its root, 11.0 GiB available on /Volumes/Test"),
+          "a persistent cache with no room anywhere did not leave the tier off once");
 }
 
 // The engine asks the governor whether the host pauses growth, and its
@@ -542,6 +701,8 @@ int main(int argc, char **argv) {
       testWriteBudgetOnlyWhenSet(argv[1]);
       testStaleCachesGoAtEveryStart(argv[1]);
       testMadeCacheRootStaysOutOfBackups(argv[1]);
+      testAutomaticTierYieldsToTheContext(argv[1]);
+      testAutomaticContextIgnoresTheVolume(argv[1]);
       testEngineFollowsTheGovernor(argv[1]);
       std::cout << "runtime resources tests passed\n";
       return EXIT_SUCCESS;

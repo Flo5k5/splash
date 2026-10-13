@@ -31,6 +31,13 @@ struct DiskVolume final {
   [[nodiscard]] static DiskVolume of(const struct statfs &status);
 };
 
+// The volume the directory at `path`, or the nearest one above it that
+// exists, lives on; empty when it cannot be measured.
+[[nodiscard]] std::optional<DiskVolume> volumeOf(const std::filesystem::path &path);
+
+// The most --max-cache-disk auto lets the tier hold.
+inline constexpr uint64_t kAutomaticCacheDiskBytes = uint64_t{32} << 30;
+
 // What a disk tier leaves free on its volume: 10 GiB, or 5% of a volume
 // smaller than 200 GiB.
 [[nodiscard]] uint64_t diskFloorBytes(uint64_t volumeBytes) noexcept;
@@ -52,6 +59,14 @@ struct DiskVolume final {
 // frees them cost it at most a third more than it freed.
 [[nodiscard]] uint64_t diskLimitBytes(uint64_t quotaBytes, uint64_t availableBytes,
                                       uint64_t heldBytes, uint64_t floorBytes) noexcept;
+
+// Why the automatic quota leaves the tier off on this volume, where the
+// tier's files would already hold `heldBytes`: it cannot be measured, it is
+// not local, or its limit (diskLimitBytes) would not hold `minimumBytes`.
+// Empty when the tier turns on.
+[[nodiscard]] std::optional<std::string>
+automaticDiskRefusal(const std::optional<DiskVolume> &volume, uint64_t heldBytes,
+                     uint64_t minimumBytes);
 
 // "12.3 GiB".
 [[nodiscard]] std::string gibibytes(uint64_t bytes);

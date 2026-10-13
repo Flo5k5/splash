@@ -249,6 +249,51 @@ void testRefusedAutomatic() {
           "a split that leaves no context was not refused: " + started.log);
 }
 
+// Whether the plan refuses the split is known before anything is set up: a start finds it refused where even the
+// least share leaves less than the context asked for, or with none asked no context. Memory the plan sets aside for
+// something else can refuse a split the plan without it holds, which a start weighs before it decides the split (the
+// SSD cache's automatic staging gives way to the split). A split that does not run is never refused.
+void testRefusalIsArithmetic() {
+  Fake fake;
+  // The plan with `other` bytes set aside beside the split's.
+  const auto beside = [](uint64_t other) { return [other](uint64_t bytes) { return planMemory(bytes + other); }; };
+  const uint32_t least = contextWith(fake.bytes(1)), lessBeside = contextWith(fake.bytes(1) + kGiB);
+  require(!aneFfnRefused(fake.model(), {}, least, planMemory) &&
+              aneFfnRefused(fake.model(), {}, least + 1, planMemory) && lessBeside < least &&
+              aneFfnRefused(fake.model(), {}, least, beside(kGiB)) &&
+              !aneFfnRefused(fake.model(), {}, lessBeside, beside(kGiB)),
+          "the refusal of a context did not follow what the least split leaves");
+  const AneFfnSetting given{.given = AneFfnSetting::Given{0.2}};
+  const uint32_t givenLeaves = contextWith(fake.bytes(7));
+  require(!aneFfnRefused(fake.model(), given, givenLeaves, planMemory) &&
+              aneFfnRefused(fake.model(), given, givenLeaves + 1, planMemory),
+          "a given share was not refused on its own units");
+  // Without --max-context: a least share that leaves some context, but none beside a GiB more.
+  uint64_t holds = 0, none = 16 * kGiB;
+  while (none - holds > kMiB) {
+    const uint64_t middle = holds + (none - holds) / 2;
+    if (contextWith(middle))
+      holds = middle;
+    else
+      none = middle;
+  }
+  fake.unitBytes = holds;
+  require(!aneFfnRefused(fake.model(), {}, 0, planMemory) && aneFfnRefused(fake.model(), {}, 0, beside(kGiB)),
+          "a split that leaves no context beside other memory was not refused, or one that leaves some was");
+  require(!fake.timings && !fake.prepared && !fake.recalled && !fake.remembered,
+          "weighing the refusal set something up");
+  // --disable-ane, a MoE target, layers the split does not take, and a Mac without the interface.
+  Fake moe, unsupported, unavailable;
+  moe.dense = false;
+  unsupported.unsupported = "ANE FFN split needs unrotated quantized projections";
+  unavailable.unavailable = "AppleNeuralEngine lacks _ANEClient";
+  require(!aneFfnRefused(fake.model(), {.enabled = false}, 0, beside(16 * kGiB)) &&
+              !aneFfnRefused(moe.model(), {}, 0, beside(16 * kGiB)) &&
+              !aneFfnRefused(unsupported.model(), {}, 0, beside(16 * kGiB)) &&
+              !aneFfnRefused(unavailable.model(), {}, 0, beside(16 * kGiB)),
+          "a split that does not run was refused");
+}
+
 // Without --max-context the split takes its memory from the KV cache: the start adopts the plan with it and
 // remembers its calibration, and the engine serves the context the plan holds with the split, which the log names
 // beside the GPU's alone.
@@ -500,6 +545,7 @@ int main() {
     testUnsupported();
     testRefusedContext();
     testRefusedAutomatic();
+    testRefusalIsArithmetic();
     testAutomaticContext();
     testDeterministicContext();
     testExplicitContext();

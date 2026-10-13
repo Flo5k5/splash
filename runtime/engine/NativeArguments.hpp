@@ -25,7 +25,8 @@ struct NativeArguments final {
   // Zero for auto.
   uint32_t maxContext = 0;
   uint64_t maxMemoryBytes = 0;
-  uint64_t maxCacheDiskBytes = 0;
+  // Automatic without MAX_CACHE_DISK_BYTES, as the server's default.
+  CacheDiskQuota maxCacheDisk{.automatic = true};
   // --max-cache-disk-writes BYTES: the SSD cache's write budget, the most it
   // writes a day on average; zero for none.
   uint64_t maxCacheDiskWritesBytes = 0;

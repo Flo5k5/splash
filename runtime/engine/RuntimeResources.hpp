@@ -81,6 +81,15 @@ struct PersistentCacheFiles final {
 // every category the model has must report its allocation and identity.
 void requireLoadedModel(const model::LoadedModel &loaded);
 
+// The disk quota cached KV pages and states share (--max-cache-disk):
+// automatic, the tier sized by its volume up to kAutomaticCacheDiskBytes,
+// its staging set aside only where the memory plan has room for it and its
+// files opened only where their volume has, or `bytes`, zero for no tier.
+struct CacheDiskQuota final {
+  bool automatic = false;
+  uint64_t bytes = 0;
+};
+
 struct RuntimeResourcesConfig {
   kv::Format kvFormat = kv::Format::Int8;
   ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
@@ -89,8 +98,8 @@ struct RuntimeResourcesConfig {
   model::ModelDescriptor model;
   std::string buildId;
   uint64_t maximumMemoryBytes = 0;
-  // Disk quota shared by cached KV pages and states; zero disables the tier.
-  uint64_t maximumCacheDiskBytes = 0;
+  // No tier unless set.
+  CacheDiskQuota cacheDisk;
   // The tier's write budget, the most it writes a day on average
   // (--max-cache-disk-writes, model::DiskBudget::setWriteBudget); zero for
   // none, when every write passes.
@@ -102,6 +111,10 @@ struct RuntimeResourcesConfig {
   // back (--persistent-cache), instead of temporary files that go with the
   // process.
   bool persistentCache = false;
+  // The volume a directory lives on (volumeOf), which the automatic quota
+  // reads for each place the tier may keep its files before it opens them.
+  std::function<std::optional<DiskVolume>(const std::filesystem::path &directory)> diskVolume =
+      volumeOf;
   // Patches per image, from --max-image-patches: the engine admits images up
   // to it when the model loaded vision and none otherwise. The wire parser
   // keeps the protocol ceiling.
@@ -217,11 +230,6 @@ public:
   [[nodiscard]] const RuntimeCacheIdentity &cacheIdentity() const noexcept {
     return cacheIdentity_;
   }
-  // What other applications left, measured before the engine took any;
-  // empty when the host could not be measured.
-  [[nodiscard]] std::optional<uint64_t> hostAvailableAtStart() const noexcept {
-    return hostAvailableAtStart_;
-  }
   // The share the prefill FFN's Neural Engine split runs at and the least
   // rows of a chunk it takes; 0 for none.
   [[nodiscard]] double aneFfnShare() const noexcept { return aneFfn_ ? aneFfn_->share() : 0.0; }
@@ -252,8 +260,7 @@ private:
                    std::unique_ptr<DiskSpace> diskSpace,
                    std::unique_ptr<KvPool> kvPool,
                    std::unique_ptr<engine::Cache> cache,
-                   std::unique_ptr<ops::AneFfn> aneFfn, AneFfnOutcome aneFfnOutcome,
-                   std::optional<uint64_t> hostAvailableAtStart);
+                   std::unique_ptr<ops::AneFfn> aneFfn, AneFfnOutcome aneFfnOutcome);
   // Takes back the restore points the last process left in a persistent
   // tier (Cache::adopt) and opens its files for this one.
   void adoptPersistentCache();
@@ -277,7 +284,6 @@ private:
   // Over model_'s images and aneFfn_.
   ReleasableMemory releasableMemory_;
   AneFfnOutcome aneFfnOutcome_;
-  std::optional<uint64_t> hostAvailableAtStart_;
   // Ends a probation once it has lasted, unless the process stops first.
   std::thread probation_;
   std::mutex probationMutex_;

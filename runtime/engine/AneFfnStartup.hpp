@@ -121,4 +121,13 @@ startAneFfn(const AneFfnModel &model, const AneFfnSetting &setting, uint32_t req
             const std::function<EngineMemoryPlanResult(uint64_t aneFfnBytes)> &planMemory,
             const std::function<bool()> &cancelled);
 
+// Whether startAneFfn would find the split `setting` lets `model` run refused
+// by the plan `planMemory` makes: the split may run on this Mac, and even its
+// least share leaves less than `requestedContextTokens`, or with zero no
+// context. Nothing is timed, set up or logged, so a start can weigh other
+// memory the plan sets aside against the split first.
+[[nodiscard]] bool aneFfnRefused(const AneFfnModel &model, const AneFfnSetting &setting,
+                                 uint32_t requestedContextTokens,
+                                 const std::function<EngineMemoryPlanResult(uint64_t aneFfnBytes)> &planMemory);
+
 } // namespace splash::engine

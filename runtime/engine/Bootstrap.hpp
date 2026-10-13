@@ -86,14 +86,6 @@ private:
         reached_;
 };
 
-// Whether memory may not hold a request of contextTokens: the plan within
-// what the host had available at startup, beyond its reserve and the warning
-// margin, holds less. The estimate is conservative, since macOS compresses
-// other applications further once the engine loads.
-[[nodiscard]] bool memoryMayNotHold(const EngineMemoryPlan &plan,
-                                    uint64_t hostAvailableBytes,
-                                    uint32_t contextTokens);
-
 // The wire limits of a model served with maxContext tokens: prompts and
 // outputs up to the context, the engine's step and draft query rows, and a
 // mask row per draft query and the anchor.

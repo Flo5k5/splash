@@ -29,6 +29,23 @@ uint32_t contextOf(const EngineMemoryPlanResult &result) {
   return result.plan ? result.plan->maximumContextTokens() : 0;
 }
 
+// Why the split does not run on `model` as `setting` allows, whatever the
+// memory plan holds: off as given, or not taken by the model or this Mac; none
+// when it may run.
+std::optional<std::pair<Kind, std::string>> notRunning(const AneFfnModel &model, const AneFfnSetting &setting) {
+  if (!model.dense) return std::pair{Kind::Unsupported, std::string("the target has no dense FFN layers")};
+  if (!setting.enabled) return std::pair{Kind::Off, std::string("as given")};
+  if (!model.unsupported.empty()) return std::pair{Kind::Unsupported, model.unsupported};
+  if (std::optional<std::string> reason = model.unavailable()) return std::pair{Kind::Unsupported, std::move(*reason)};
+  return std::nullopt;
+}
+
+// The units of the least split `setting` lets `model` take: the given share's,
+// else one.
+uint32_t leastUnits(const AneFfnModel &model, const AneFfnSetting &setting) {
+  return setting.given ? ane_ffn::nearestUnits(setting.given->share, model.units) : 1;
+}
+
 // Logs `outcome` of a start of `model` as `setting` allows: a model without
 // dense FFN layers and one --disable-ane leaves alone without its layers said, and
 // a refusal of a context the GPU alone does not hold either, which fails the
@@ -77,11 +94,8 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, uint3
   const auto gpuAlone = [&](Kind kind, std::string reason, uint32_t context) {
     return AneFfnStart{{}, {}, {kind, std::move(reason), context, without}};
   };
-  if (!model.dense) return gpuAlone(Kind::Unsupported, "the target has no dense FFN layers", without);
-  if (!setting.enabled) return gpuAlone(Kind::Off, "as given", without);
-  if (!model.unsupported.empty()) return gpuAlone(Kind::Unsupported, model.unsupported, without);
-  if (const std::optional<std::string> reason = model.unavailable())
-    return gpuAlone(Kind::Unsupported, *reason, without);
+  if (std::optional<std::pair<Kind, std::string>> off = notRunning(model, setting))
+    return gpuAlone(off->first, std::move(off->second), without);
   const std::optional<uint32_t> given =
       setting.given ? std::optional(ane_ffn::nearestUnits(setting.given->share, model.units)) : std::nullopt;
   if (setting.given && (setting.given->minimumRows < ops::AneFfn::kMinimumRows ||
@@ -106,7 +120,7 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, uint3
     }
     return low;
   };
-  const uint32_t least = given.value_or(1);
+  const uint32_t least = leastUnits(model, setting);
   if (const uint32_t leaves = contextWith(least); leaves < std::max<uint32_t>(requestedContextTokens, 1)) {
     if (!requestedContextTokens) return gpuAlone(Kind::Refused, "it leaves no memory for context", without);
     return gpuAlone(Kind::Refused,
@@ -262,6 +276,13 @@ AneFfnStart startAneFfn(const AneFfnModel &model, const AneFfnSetting &setting, 
   AneFfnStart start = decide(model, setting, requestedContextTokens, planMemory, cancelled);
   logOutcome(start.outcome, model, setting, requestedContextTokens);
   return start;
+}
+
+bool aneFfnRefused(const AneFfnModel &model, const AneFfnSetting &setting, uint32_t requestedContextTokens,
+                   const std::function<EngineMemoryPlanResult(uint64_t aneFfnBytes)> &planMemory) {
+  return !notRunning(model, setting) &&
+         contextOf(planMemory(model.plannedBytes(leastUnits(model, setting)))) <
+             std::max<uint32_t>(requestedContextTokens, 1);
 }
 
 } // namespace splash::engine

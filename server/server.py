@@ -1650,7 +1650,7 @@ def _native_command(args):
         "auto" if args.max_context is None else str(args.max_context),
         "auto" if args.max_memory is None else str(args.max_memory),
     ]
-    if args.max_cache_disk:
+    if args.max_cache_disk is not None:
         command.append(str(args.max_cache_disk))
     if args.max_cache_disk_writes:
         command.extend(("--max-cache-disk-writes", str(args.max_cache_disk_writes)))

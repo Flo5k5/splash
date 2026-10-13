@@ -94,7 +94,8 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
   int next = 5;
   if (next < argc && !std::string_view(argv[next]).starts_with("--")) {
     const std::string_view quota(argv[next++]);
-    if (quota != "0" && !parsePositive(quota, result.maxCacheDiskBytes))
+    result.maxCacheDisk = {};
+    if (quota != "0" && !parsePositive(quota, result.maxCacheDisk.bytes))
       throw UsageError("MAX_CACHE_DISK_BYTES must be a nonnegative integer");
   }
   // Options follow as --name value pairs; a missing value fails its check.
@@ -139,10 +140,10 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
       throw UsageError("unexpected argument " + std::string(option));
     }
   }
-  if (result.persistentCache && !result.maxCacheDiskBytes)
-    throw UsageError("--persistent-cache requires a MAX_CACHE_DISK_BYTES quota");
-  if (result.maxCacheDiskWritesBytes && !result.maxCacheDiskBytes)
-    throw UsageError("--max-cache-disk-writes requires a MAX_CACHE_DISK_BYTES quota");
+  if (result.persistentCache && !result.maxCacheDisk.automatic && !result.maxCacheDisk.bytes)
+    throw UsageError("--persistent-cache requires an SSD cache, which MAX_CACHE_DISK_BYTES 0 turns off");
+  if (result.maxCacheDiskWritesBytes && !result.maxCacheDisk.automatic && !result.maxCacheDisk.bytes)
+    throw UsageError("--max-cache-disk-writes requires an SSD cache, which MAX_CACHE_DISK_BYTES 0 turns off");
   if (!result.cacheRoot.empty() && !result.persistentCache)
     throw UsageError("--cache-dir requires --persistent-cache on");
   result.modelRoot = requireModelRoot(argv[2]);

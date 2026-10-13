@@ -1,6 +1,6 @@
 // The disk tier's limit on its volume (engine::DiskSpace): the rule, how it
-// behaves as space comes and goes, a measure of real files, and the other
-// caches in a persistent cache's root.
+// behaves as space comes and goes, the automatic tier's start, a measure of
+// real files, and the other caches in a persistent cache's root.
 
 #include "Checked.hpp"
 #include "TestChecks.hpp"
@@ -102,6 +102,27 @@ void testSnapshotCostsAtMostAThird() {
   }
   require(firstFreed && held && start - held <= firstFreed + firstFreed / 3 + 1,
           "a snapshot that keeps freed blocks drained the tier");
+}
+
+// The automatic tier turns on only on a local volume whose limit holds the
+// minimum, the tier's own blocks counted.
+void testAutomaticStart() {
+  const uint64_t minimum = 2 * 153 * kMiB + kGiB;
+  require(automaticDiskRefusal(std::nullopt, 0, minimum)->find("cannot be measured") !=
+              std::string::npos,
+          "an unmeasured volume did not refuse the automatic tier");
+  require(automaticDiskRefusal(DiskVolume{"/Volumes/Share", 500 * kGiB, 1000 * kGiB, false}, 0,
+                               minimum)
+                  ->find("/Volumes/Share is not a local volume") != std::string::npos,
+          "a network volume did not refuse the automatic tier");
+  const std::optional<std::string> refusal =
+      automaticDiskRefusal(localVolume(14 * kGiB), 0, minimum);
+  require(refusal && refusal->find("14.0 GiB available on /Volumes/Test is too little beyond "
+                                 "the 10.0 GiB it keeps free") != std::string::npos,
+          "a volume with too little beyond its floor did not refuse the automatic tier");
+  require(!automaticDiskRefusal(localVolume(18 * kGiB), 0, minimum) &&
+              !automaticDiskRefusal(localVolume(12 * kGiB), 8 * kGiB, minimum),
+          "a volume with room, or the room the tier's own files hold, refused the tier");
 }
 
 // A measure of a real file sets the limit by the rule from what it read and
@@ -266,6 +287,7 @@ int main() {
     testTheRule();
     testTiersOnOneVolumeConverge();
     testSnapshotCostsAtMostAThird();
+    testAutomaticStart();
     testMeasureOfRealFiles();
     testOtherCachesGoFirst();
     testOtherCachesGoAsTheTierGrows();

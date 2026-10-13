@@ -120,15 +120,16 @@ def parse_max_memory(value):
 
 
 def parse_max_cache_disk(value):
+    """'auto' (None), 0 for no SSD cache, or a byte count with an optional K, M
+    or G suffix."""
     if value.strip() == "0":
         return 0
     try:
-        size = parse_max_memory(value)
+        return parse_max_memory(value)
     except argparse.ArgumentTypeError:
-        size = None
-    if size is None:
-        raise argparse.ArgumentTypeError("use 0 to disable, or a size such as 5G")
-    return size
+        raise argparse.ArgumentTypeError(
+            "use auto, 0 to disable, or a size such as 16G"
+        ) from None
 
 
 def parse_max_cache_disk_writes(value):
@@ -443,10 +444,11 @@ SERVE_OPTIONS = (
         "cache",
         dict(
             type=parse_max_cache_disk,
-            default=0,
+            default=None,
             metavar="SIZE",
-            help="SSD quota for cached KV pages and states, e.g. 5G (default: 0, "
-            "disabled)",
+            help="SSD quota for cached KV pages and states: auto follows the "
+            "volume's free space up to 32G, 0 disables, or a size such as 16G "
+            "(default: auto)",
         ),
     ),
     ServeOption(
@@ -467,7 +469,7 @@ SERVE_OPTIONS = (
         dict(
             action="store_true",
             default=False,
-            help="keep the SSD cache across restarts (needs --max-cache-disk)",
+            help="keep the SSD cache across restarts",
         ),
     ),
     ServeOption(
@@ -644,10 +646,14 @@ def check_serve_arguments(parser, args):
     """The checks of the shared options that involve more than one."""
     if args.announce_served_name and not args.served_model_name:
         parser.error("--announce-served-name needs --served-model-name")
-    if args.persistent_cache and not args.max_cache_disk:
-        parser.error("--persistent-cache needs --max-cache-disk")
-    if args.max_cache_disk_writes and not args.max_cache_disk:
-        parser.error("--max-cache-disk-writes needs --max-cache-disk")
+    if args.persistent_cache and args.max_cache_disk == 0:
+        parser.error(
+            "--persistent-cache needs the SSD cache --max-cache-disk 0 turns off"
+        )
+    if args.max_cache_disk_writes and args.max_cache_disk == 0:
+        parser.error(
+            "--max-cache-disk-writes needs the SSD cache --max-cache-disk 0 turns off"
+        )
     if args.cache_dir is not None and not args.persistent_cache:
         parser.error("--cache-dir needs --persistent-cache")
 

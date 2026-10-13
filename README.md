@@ -98,9 +98,9 @@ window. To set your own limits or cache options, add these to `splash serve`:
 | `--kv-format bf16` | Use BF16 KV cache. Default: 8-bit (INT8). |
 | `--state-format bf16` | Use BF16 recurrent states, half the size. Default: FP32. |
 | `--disable-ane` | Prefill on the GPU alone. Default: the 27B also uses the Neural Engine. |
-| `--max-cache-disk 16G` | Keep cached prompts on SSD when memory runs short. Off by default. |
-| `--max-cache-disk-writes 200G` | Cap what the SSD cache writes a day; needs `--max-cache-disk`. No limit by default. |
-| `--persistent-cache` | Keep the SSD cache across restarts; needs `--max-cache-disk`. Off by default. |
+| `--max-cache-disk 16G` | Cap the SSD cache that keeps cached prompts when memory runs short. Default: `auto`, a quarter of the disk's free space beyond 10 GiB, up to 32 GiB; `0` turns it off. |
+| `--max-cache-disk-writes 200G` | Give the SSD cache a write budget of that much a day. No budget by default. |
+| `--persistent-cache` | Keep the SSD cache across restarts. Off by default. |
 
 Use `--max-memory` to leave room for other applications.
 The server listens on localhost without authentication by default. For LAN

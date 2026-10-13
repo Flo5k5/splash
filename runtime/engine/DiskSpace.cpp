@@ -2,6 +2,9 @@
 
 #include "StderrLine.hpp"
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <cstdio>
 #include <stdexcept>
@@ -21,6 +24,22 @@ DiskVolume DiskVolume::of(const struct statfs &status) {
           uint64_t{status.f_blocks} * block, (status.f_flags & MNT_LOCAL) != 0};
 }
 
+std::optional<DiskVolume> volumeOf(const std::filesystem::path &path) {
+  std::filesystem::path directory = path;
+  for (;;) {
+    const int descriptor = ::open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (descriptor >= 0) {
+      struct statfs status {};
+      const bool measured = ::fstatfs(descriptor, &status) == 0;
+      ::close(descriptor);
+      return measured ? std::optional(DiskVolume::of(status)) : std::nullopt;
+    }
+    if (!directory.has_relative_path())
+      return std::nullopt;
+    directory = directory.parent_path();
+  }
+}
+
 uint64_t diskFloorBytes(uint64_t volumeBytes) noexcept {
   return std::min(kFloorBytes, volumeBytes / 20);
 }
@@ -33,6 +52,20 @@ uint64_t diskRoomBytes(uint64_t availableBytes, uint64_t heldBytes, uint64_t flo
 uint64_t diskLimitBytes(uint64_t quotaBytes, uint64_t availableBytes, uint64_t heldBytes,
                         uint64_t floorBytes) noexcept {
   return std::min(quotaBytes, diskRoomBytes(availableBytes, heldBytes, floorBytes) / 4);
+}
+
+std::optional<std::string> automaticDiskRefusal(const std::optional<DiskVolume> &volume,
+                                                uint64_t heldBytes, uint64_t minimumBytes) {
+  if (!volume)
+    return "its volume cannot be measured";
+  if (!volume->local)
+    return volume->mountPoint + " is not a local volume";
+  const uint64_t floor = diskFloorBytes(volume->sizeBytes);
+  if (diskLimitBytes(kAutomaticCacheDiskBytes, volume->availableBytes, heldBytes, floor) <
+      minimumBytes)
+    return gibibytes(volume->availableBytes) + " available on " + volume->mountPoint +
+           " is too little beyond the " + gibibytes(floor) + " it keeps free";
+  return std::nullopt;
 }
 
 std::string gibibytes(uint64_t bytes) {

@@ -83,24 +83,27 @@ OPTIONS = {
     ),
     "--max-cache-disk": values(
         "--max-cache-disk",
-        {"0": 0, "5G": 5 * 1024**3},
-        ("auto", "-1", "0G", "5X", "nan"),
+        {"auto": None, "0": 0, "5G": 5 * 1024**3},
+        ("-1", "0G", "5X", "nan"),
     ),
     "--max-cache-disk-writes": (
         [
             (["--max-cache-disk-writes=0"], 0),
-            (["--max-cache-disk-writes=200G", "--max-cache-disk=5G"], 200 * 1024**3),
+            (["--max-cache-disk-writes=200G"], 200 * 1024**3),
         ],
         [
-            ["--max-cache-disk-writes=200G"],
-            ["--max-cache-disk-writes=-1", "--max-cache-disk=5G"],
-            ["--max-cache-disk-writes=5X", "--max-cache-disk=5G"],
-            ["--max-cache-disk-writes=auto", "--max-cache-disk=5G"],
+            ["--max-cache-disk-writes=200G", "--max-cache-disk=0"],
+            ["--max-cache-disk-writes=-1"],
+            ["--max-cache-disk-writes=5X"],
+            ["--max-cache-disk-writes=auto"],
         ],
     ),
     "--persistent-cache": (
-        [(["--persistent-cache", "--max-cache-disk=5G"], True)],
-        [["--persistent-cache"], ["--persistent-cache", "--max-cache-disk=0"]],
+        [
+            (["--persistent-cache"], True),
+            (["--persistent-cache", "--max-cache-disk=5G"], True),
+        ],
+        [["--persistent-cache", "--max-cache-disk=0"]],
     ),
     "--cache-dir": (
         [
