@@ -499,8 +499,9 @@ string, which the loaded tokenizer encodes as a raw prompt, adding its own
 special tokens such as a BOS and recognizing special-token strings, or one array
 of token IDs from its vocabulary. No chat template, reasoning split, tools or
 images apply: `text` is the generated text, decoded without special tokens.
-`max_tokens` defaults to 16, OpenAI's default for the endpoint as in vLLM and
-SGLang, or to what the context leaves when that is less. The sampling fields
+`max_tokens` defaults to 16, OpenAI's default for the endpoint; that or a
+larger value is lowered to what the context leaves, as in Chat
+([output limits](#output-limits-and-streaming)). The sampling fields
 below, `seed`, `stop`, `priority`, `timeout` and `stream` with
 `stream_options.include_usage` work as in Chat. Batched prompts, `suffix`,
 `echo`, `logprobs`, `best_of` and `n` other than 1 are rejected.
@@ -650,19 +651,17 @@ that served nothing before.
 
 ### Output limits and streaming
 
-Chat's `max_completion_tokens` or `max_tokens` and Responses'
-`max_output_tokens` bound a response's output. Omitted, the output may use
-all the context the prompt leaves, as in vLLM and SGLang: the context limit,
-and `--request-timeout` when set, are the only server bounds on a request that
-names no limit. A value larger than what the context leaves returns 400
-`context_length_exceeded` with the prompt's tokens, the value and the window,
-as in vLLM and SGLang; that error and an invalid value's name the field the
-request sent. Messages requires `max_tokens`; a larger value than the context
-leaves generates up to the context limit, since Claude Code asks for the same
-limit on every turn and does not compact for it. A response the context limit
-ends then has the `stop_reason` `model_context_window_exceeded`, as in
-Anthropic's API, not `max_tokens`. Messages refuses a final assistant message
-(prefill) with 400; `count_tokens` still counts it.
+Chat's `max_completion_tokens` or `max_tokens`, Responses' `max_output_tokens`,
+and text completions' and Messages' `max_tokens` bound a response's output from
+above: a larger value than the context the prompt leaves generates up to the
+context limit, since clients such as Claude Code ask for the same limit on every
+turn. Omitted from Chat or Responses, the output may use all the context the
+prompt leaves: the context limit, and `--request-timeout` when set, are the only
+server bounds on a request that names no limit. A response the context limit
+ends finishes as one its limit ends; Messages gives it the `stop_reason`
+`model_context_window_exceeded`, as in Anthropic's API, not `max_tokens`. An
+invalid value returns 400 naming the field the request sent. Messages refuses
+a final assistant message (prefill) with 400; `count_tokens` still counts it.
 
 Chat and text completions accept `"ignore_eos":true` (default false), as vLLM
 and llama.cpp do: the model never selects its own stop tokens, and a draft
@@ -1026,7 +1025,7 @@ its path, `/v1/systemone`'s included: OpenAI's `server_error` with code
 | Status | `code` | Meaning |
 | --- | --- | --- |
 | 400 | `invalid_request_error` | A malformed request, or a field Splash cannot honor; the message names it. |
-| 400 | `context_length_exceeded` | The prompt, or the prompt and the requested output, exceed the context limit. |
+| 400 | `context_length_exceeded` | The prompt exceeds the context limit, or leaves no room in it for output. |
 | 400 | `capacity_exhausted` | The request cannot fit in memory even alone; retrying fails the same way. |
 | 401 | `authentication_error` | The API key is missing or wrong. |
 | 403 | `forbidden` | A Host or Origin the server does not serve; the message names the flag that admits it. |
