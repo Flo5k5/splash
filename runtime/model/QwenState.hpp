@@ -99,6 +99,14 @@ struct QwenBufferPool final {
   std::vector<std::shared_ptr<DFlashContextWindow>> windows;
   // Cleared when the storage goes away; late returns then just free.
   bool open = true;
+
+  // Takes back the buffers of a cached state.
+  void give(QwenCachedBuffers buffers) {
+    if (!open)
+      return;
+    cells.push_back(std::move(buffers.gdn));
+    windows.push_back(std::move(buffers.window));
+  }
 };
 
 // One copy of a state on its way to disk, in a buffer of the backend's like
@@ -113,10 +121,32 @@ struct StateStaging final {
   }
 };
 
-// A copy of one lane's committed state, either in RAM (a pooled GDN cell and
-// context window, returned to the pool when the last reference drops) or on
-// disk (one slot of the state file). It cannot be rebuilt from KV pages of
-// either format; nothing mutable is exposed.
+// The buffers of one cached state, taken before a prefill command writes a
+// state into them (QwenStateStorage::reserve). Sealing moves them into that
+// state; a reservation dropped unsealed returns them to the pool, which the
+// command's ticket holds off until the GPU is done with them.
+class QwenStateReservation final : public StateReservation {
+public:
+  ~QwenStateReservation() override;
+  QwenStateReservation(const QwenStateReservation &) = delete;
+  QwenStateReservation &operator=(const QwenStateReservation &) = delete;
+
+  // Its buffers until it is sealed.
+  [[nodiscard]] const QwenCachedBuffers &buffers() const;
+
+private:
+  QwenStateReservation(std::shared_ptr<QwenBufferPool> pool, QwenCachedBuffers buffers);
+
+  std::shared_ptr<QwenBufferPool> pool_;
+  QwenCachedBuffers buffers_;
+
+  friend class QwenStateStorage;
+};
+
+// A request's state at a page-aligned boundary, either in RAM (a pooled GDN
+// cell and context window, returned to the pool when the last reference
+// drops) or on disk (one slot of the state file). It cannot be rebuilt from
+// KV pages of either format; nothing mutable is exposed.
 class QwenCompositeState final : public CompositeState {
 public:
   ~QwenCompositeState() override;
@@ -248,6 +278,21 @@ public:
   // cached state makes its slot available for retry.
   [[nodiscard]] std::shared_ptr<const QwenCompositeState>
   snapshot(uint32_t lane);
+  // The steps of a snapshot, for a state a prefill command captures
+  // (Model::reserveState): reserve() takes a cache slot, or returns nullptr
+  // on capacity pressure with nothing allocated; copyState() copies the
+  // lane's committed state into it and copyWindow() the lane's context
+  // window alone; seal() moves the slot's buffers into the cached state of
+  // `lengths`, which leaves the reservation empty.
+  [[nodiscard]] std::shared_ptr<QwenStateReservation> reserve();
+  void copyState(uint32_t lane, QwenStateReservation &reservation) const;
+  void copyWindow(uint32_t lane, QwenStateReservation &reservation) const;
+  [[nodiscard]] std::shared_ptr<const QwenCompositeState>
+  seal(QwenStateReservation &reservation, QwenLogicalLengths lengths) const;
+  // Throws unless `lengths` are a lane's, and with cacheSnapshot a cached
+  // state's: page-aligned, with a whole draft window and its context window.
+  void validateLengths(const QwenLogicalLengths &lengths,
+                       bool cacheSnapshot) const;
   [[nodiscard]] bool canSnapshotToDisk() const noexcept {
     return file_ && file_->writable();
   }
@@ -295,8 +340,6 @@ private:
 
   [[nodiscard]] Lane &lane(uint32_t index);
   [[nodiscard]] const Lane &lane(uint32_t index) const;
-  void validateLengths(const QwenLogicalLengths &lengths,
-                       bool cacheSnapshot) const;
   static void requireAssigned(const Lane &lane);
   // Assigned, with no decoded rows pending: its current cell holds its state.
   static void requireCommitted(const Lane &lane);

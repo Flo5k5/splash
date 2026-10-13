@@ -130,6 +130,24 @@ QwenGdnCell::~QwenGdnCell() {
   tracker_->bytes.fetch_sub(actualAllocatedBytes_, std::memory_order_relaxed);
 }
 
+QwenStateReservation::QwenStateReservation(std::shared_ptr<QwenBufferPool> pool,
+                                           QwenCachedBuffers buffers)
+    : pool_(std::move(pool)), buffers_(std::move(buffers)) {
+  if (!pool_ || !buffers_.gdn || !buffers_.window)
+    throw std::invalid_argument("state reservation buffers are empty");
+}
+
+QwenStateReservation::~QwenStateReservation() {
+  if (buffers_.gdn)
+    pool_->give(std::move(buffers_));
+}
+
+const QwenCachedBuffers &QwenStateReservation::buffers() const {
+  if (!buffers_.gdn)
+    throw std::logic_error("a sealed state reservation holds no buffers");
+  return buffers_;
+}
+
 QwenCompositeState::QwenCompositeState(std::shared_ptr<QwenBufferPool> pool,
                                        QwenCachedBuffers buffers,
                                        CompositeStateLayout layout,
@@ -209,10 +227,8 @@ void QwenCompositeState::label(std::vector<std::byte> label) const {
 }
 
 QwenCompositeState::~QwenCompositeState() {
-  if (!pool_ || !pool_->open)
-    return;
-  pool_->cells.push_back(std::move(buffers_.gdn));
-  pool_->windows.push_back(std::move(buffers_.window));
+  if (pool_)
+    pool_->give(std::move(buffers_));
 }
 
 QwenStateStorage::QwenStateStorage(metal::MetalBackend &backend,
@@ -398,18 +414,43 @@ QwenStateStorage::snapshot(uint32_t index) {
 
 std::shared_ptr<const QwenCompositeState>
 QwenStateStorage::snapshot(uint32_t index, QwenLogicalLengths lengths) {
+  // Before anything is allocated; copyState() and seal() check again.
   requireCommitted(lane(index));
-  const GdnParityBuffers &gdn = current(index);
   validateLengths(lengths, true);
+  const std::shared_ptr<QwenStateReservation> reservation = reserve();
+  if (!reservation)
+    return nullptr;
+  copyState(index, *reservation);
+  return seal(*reservation, lengths);
+}
+
+std::shared_ptr<QwenStateReservation> QwenStateStorage::reserve() {
   Buffers buffers;
   if (!acquire(1, false, "qwen-state-cache", buffers))
     return nullptr;
-  QwenCachedBuffers cached{std::move(buffers.gdn[0]), std::move(buffers.window)};
-  copyExact(cached.gdn->buffers().stateBase, gdn.stateBase,
+  return std::shared_ptr<QwenStateReservation>(new QwenStateReservation(
+      pool_, {std::move(buffers.gdn[0]), std::move(buffers.window)}));
+}
+
+void QwenStateStorage::copyState(uint32_t index, QwenStateReservation &reservation) const {
+  requireCommitted(lane(index));
+  copyExact(reservation.buffers().gdn->buffers().stateBase, current(index).stateBase,
             "cached GDN state");
-  copyExact(cached.window->buffer(), window(index), "cached context window");
+  copyWindow(index, reservation);
+}
+
+void QwenStateStorage::copyWindow(uint32_t index, QwenStateReservation &reservation) const {
+  copyExact(reservation.buffers().window->buffer(), window(index), "cached context window");
+}
+
+std::shared_ptr<const QwenCompositeState>
+QwenStateStorage::seal(QwenStateReservation &reservation, QwenLogicalLengths lengths) const {
+  if (reservation.pool_ != pool_)
+    throw std::invalid_argument("a state reservation of another storage");
+  validateLengths(lengths, true);
+  // A reservation sealed before holds no buffers, which the state refuses.
   return std::shared_ptr<const QwenCompositeState>(new QwenCompositeState(
-      pool_, std::move(cached), layout_, lengths, file_, staging_));
+      pool_, std::exchange(reservation.buffers_, {}), layout_, lengths, file_, staging_));
 }
 
 std::unique_ptr<StateOffload>

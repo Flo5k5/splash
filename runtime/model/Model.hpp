@@ -305,6 +305,16 @@ struct StateAdmission final {
   [[nodiscard]] bool granted() const noexcept { return lane.has_value(); }
 };
 
+// The buffers of one cached state, taken for a state boundary that a prefill
+// command reaches (Model::reserveState). The command's completion seals them
+// into the state of that boundary; whatever it still holds goes back to the
+// model's pool when the last handle goes, which the command's ticket keeps
+// until the GPU is done with them.
+class StateReservation {
+public:
+  virtual ~StateReservation() = default;
+};
+
 struct ModelBatchItem final {
   uint64_t requestId = 0;
   uint64_t logicalPosition = 0;
