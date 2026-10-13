@@ -89,19 +89,24 @@ struct GgufEmbedQ2K {
   }
 };
 // block_q4_0: half d | uchar qs[16], element j in the low nibble of qs[j] and j + 16 in the high one, with zero
-// point 8; block_q4_1 (Min) holds half m after d, the value's offset.
-template <bool Min> struct GgufEmbedQ4 {
-  enum : uint { Weights = 32, Bytes = Min ? 20 : 18, D = 0, M = 2, Codes = Min ? 4 : 2 };
+// point 8; block_q4_1 (Min) holds half m after d, the value's offset. block_q5_0 and block_q5_1 (Fifth) hold
+// uchar qh[4] before qs, element j's fifth bit at bit j, which doubles the zero point.
+template <bool Min, bool Fifth> struct GgufEmbedQ4 {
+  enum : uint { Weights = 32, D = 0, M = 2, High = Min ? 4 : 2, Codes = High + (Fifth ? 4 : 0), Bytes = Codes + 16,
+                Zero = Fifth ? 16 : 8 };
   __attribute__((always_inline)) static bfloat value(device const uchar *block, uint dim) {
 #pragma clang fp reassociate(off)
     const uint l = dim % Weights;
-    const uchar q = (block[Codes + l % 16] >> (4 * (l / 16))) & 15;
+    uint q = (block[Codes + l % 16] >> (4 * (l / 16))) & 15;
+    if (Fifth) q |= ((block[High + l / 8] >> (l % 8)) & 1) << 4;
     if (Min) return bfloat(float(q) * float(gguf_half(block, D)) + float(gguf_half(block, M)));
-    return bfloat(float(int(q) - 8) * float(gguf_half(block, D)));
+    return bfloat(float(int(q) - int(Zero)) * float(gguf_half(block, D)));
   }
 };
-using GgufEmbedQ40 = GgufEmbedQ4<false>;
-using GgufEmbedQ41 = GgufEmbedQ4<true>;
+using GgufEmbedQ40 = GgufEmbedQ4<false, false>;
+using GgufEmbedQ41 = GgufEmbedQ4<true, false>;
+using GgufEmbedQ50 = GgufEmbedQ4<false, true>;
+using GgufEmbedQ51 = GgufEmbedQ4<true, true>;
 
 // block_pq2_0: half d | uchar qs[32], element l in bits 2 (l % 4) of qs[l / 4]; zero point 1. decode is the
 // element in fp32, which the rotated gather (shared/gguf_rotation.metal) transforms before it rounds.

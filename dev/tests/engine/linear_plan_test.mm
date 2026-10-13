@@ -320,7 +320,7 @@ void ggufPlans() {
             "Apple9 stages the IQ2, IQ3_XXS and IQ1 formats at unpadded lanes");
     require(plan({GGUF_FMT_Q2K}).configuration().tile == q2k, "Apple9 stages Q2_K from two unpadded lanes");
     for (const uint32_t format : {GGUF_FMT_Q4K, GGUF_FMT_Q6K, GGUF_FMT_IQ4XS, GGUF_FMT_IQ3S, GGUF_FMT_Q80,
-                                  GGUF_FMT_Q40, GGUF_FMT_MXFP4})
+                                  GGUF_FMT_Q40, GGUF_FMT_Q50, GGUF_FMT_Q51, GGUF_FMT_MXFP4})
       require(plan({format}).configuration().tile == LinearTile::GgufRegister, "Apple9 keeps other formats' registers");
     require(plan({GGUF_FMT_IQ3XXS, GGUF_FMT_Q4K}).configuration().tile == LinearTile::GgufRegister &&
                 plan({GGUF_FMT_IQ3XXS}).storageRows() == plan({GGUF_FMT_Q4K}).storageRows(),

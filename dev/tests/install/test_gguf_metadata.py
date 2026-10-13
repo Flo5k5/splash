@@ -36,6 +36,7 @@ GGML = {
     "F32": 0,
     "F16": 1,
     "Q5_0": 6,
+    "Q5_1": 7,
     "Q8_0": 8,
     "Q2_K": 10,
     "Q4_K": 12,
@@ -368,6 +369,9 @@ class GgufMetadataTests(unittest.TestCase):
         tensors |= {"blk.2.attn_qkv.weight": GGML["IQ1_M"]}
         tensors |= {"blk.5.ffn_up_exps.weight": GGML["IQ2_XXS"]}
         tensors |= {"token_embd.weight": GGML["Q2_K"]}
+        # Q5_0 and Q5_1, the shared experts of bartowski's Q4_0 and Q4_1.
+        tensors |= {"blk.4.ffn_gate_shexp.weight": GGML["Q5_0"]}
+        tensors |= {"blk.4.ffn_up_shexp.weight": GGML["Q5_1"]}
         # llama.cpp's NVFP4, its per-expert tensor scales beside it.
         tensors |= {"blk.6.ffn_up_exps.weight": GGML["NVFP4"]}
         tensors |= {"blk.6.ffn_up_exps.scale": GGML["F32"]}
@@ -376,8 +380,8 @@ class GgufMetadataTests(unittest.TestCase):
         f32 = {name: GGML["F32"] for name in tensors}
         for changes, reason in (
             (
-                {"blk.4.ffn_gate_exps.weight": GGML["Q5_0"]},
-                "ffn_gate_exps.weight Q5_0 [(]1 tensor[)]",
+                {"blk.4.ffn_gate_exps.weight": GGML["F16"]},
+                "ffn_gate_exps.weight F16 [(]1 tensor[)]",
             ),
             (
                 {

@@ -31,11 +31,11 @@ namespace gguf_sg {
 template <class F> struct Shape {
   enum : uint {
     Linear = F::Kind == QuantLinear,
-    HasMin = Linear && F::Zero == 0,                          // Q4_K, Q5_K, Q4_1, Q2_K, MLX affine: s code + m
+    HasMin = Linear && F::Zero == 0,                          // Q4_K, Q5_K, Q4_1, Q5_1, Q2_K, MLX affine: s code + m
     // Linear codes past 127 (MLX affine 8-bit), which enter the MMA as the code itself: no bf16 128 + code holds them
     Wide = QuantWideCodes<F>::value,
     // Linear codes chained from the table's seed of their 16 inputs: s (code - zero) with a zero point (Q6_K, Q3_K,
-    // Q4_0, IQ1, PQ2_0), and Q2_K's min per 16 inputs
+    // Q4_0, Q5_0, IQ1, PQ2_0), and Q2_K's min per 16 inputs
     Seeded = Linear && (!HasMin || F::Group == 16),
     // bf16 bits of the operand of code 0: 128, or 160 - zero when seeded
     Operand = 0x4300 + (Seeded ? kZeroPointOffset - 128 - F::Zero : 0),

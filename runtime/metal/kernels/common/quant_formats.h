@@ -427,6 +427,20 @@ struct FmtQ41 {
     return {float2(float(as_type<half>(ushort(mt & 0xFFFF)))), float2(float(as_type<half>(ushort(mt >> 16))))};
   }
 };
+// Q5_0 and Q5_1 (format F): Q5_K's planes, plane0 the low 4 bits and plane1 the fifth bits; meta and coefficients
+// those of Q4_0 and Q4_1 (Scales), whose zero point the fifth bit doubles. value = d * (q - 16), or d * q + m.
+template <uint F, class Scales> struct FmtQ5 {
+  QUANT_FORMAT(F, QuantLinear, 2 * Scales::Zero, 32, false);
+  typedef FmtQ5K::Payload Payload; typedef FmtQ5K::Chunk Chunk; typedef typename Scales::Meta Meta;
+  static Payload load(device uchar *p0, device uchar *p1) { return FmtQ5K::load(p0, p1); }
+  static Meta loadMeta(device uchar *m) { return Scales::loadMeta(m); }
+  static Chunk chunk(Payload w, ushort c) { return FmtQ5K::chunk(w, c); }
+  static Chunk loadChunk(device uchar *p0, device uchar *p1, ushort c) { return FmtQ5K::loadChunk(p0, p1, c); }
+  static uint4 codes(Chunk q) { return FmtQ5K::codes(q); }
+  static QuantCoef coef(Meta mt, ushort j) { return Scales::coef(mt, j); }
+};
+typedef FmtQ5<GGUF_FMT_Q50, FmtQ40> FmtQ50;
+typedef FmtQ5<GGUF_FMT_Q51, FmtQ41> FmtQ51;
 // MXFP4: plane0 codebook indices; meta the E8M0 exponent e per group. value = 2^(e - 128) * kFP4Values, whose
 // entries are twice the E2M1 values (llama.cpp's GGML_E8M0_TO_FP32_HALF, 2^-128 and 2^-127 subnormal).
 struct FmtMXFP4 {
@@ -529,7 +543,8 @@ QUANT_AFFINE_GROUPS(8)
   X(FmtAF2G32, af2g32) X(FmtAF2G64, af2g64) X(FmtAF2G128, af2g128) X(FmtAF3G32, af3g32) X(FmtAF3G64, af3g64)      \
   X(FmtAF3G128, af3g128) X(FmtAF4G32, af4g32) X(FmtAF4G64, af4g64) X(FmtAF4G128, af4g128) X(FmtAF5G32, af5g32)    \
   X(FmtAF5G64, af5g64) X(FmtAF5G128, af5g128) X(FmtAF6G32, af6g32) X(FmtAF6G64, af6g64) X(FmtAF6G128, af6g128)    \
-  X(FmtAF8G32, af8g32) X(FmtAF8G64, af8g64) X(FmtAF8G128, af8g128) X(FmtNVFP4, nvfp4) X(FmtFP8, fp8)
+  X(FmtAF8G32, af8g32) X(FmtAF8G64, af8g64) X(FmtAF8G128, af8g128) X(FmtNVFP4, nvfp4) X(FmtFP8, fp8)            \
+  X(FmtQ50, q50) X(FmtQ51, q51)
 
 // Runs body(F()) with the format type of run-time format id `format` (GGUF_FMT_*), for kernels whose tiles pick
 // their tensor, and so its format, at run time. The branch is uniform in a threadgroup. The host passes known ids
