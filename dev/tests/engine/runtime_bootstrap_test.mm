@@ -107,11 +107,6 @@ ActualMemoryReport validActual(const EngineMemoryPlan &plan) {
   return actual;
 }
 
-class State final : public CompositeState {
-public:
-  uint64_t bytes() const noexcept override { return 64; }
-};
-
 class Executor final : public model::RuntimeModel {
 public:
   explicit Executor(int throwingStep = -1) : throwingStep_(throwingStep) {}
@@ -146,8 +141,8 @@ public:
                                  completion);
   }
   uint64_t snapshotBytes() const noexcept override { return 64; }
-  std::shared_ptr<const CompositeState> snapshot(uint64_t) override {
-    return std::make_shared<State>();
+  std::shared_ptr<StateReservation> reserveState(uint64_t, uint32_t) override {
+    return {};
   }
   uint64_t reclaimIdleState(bool, model::IdleMemory) noexcept override { return 0; }
   std::optional<std::string> provideMask(uint64_t,

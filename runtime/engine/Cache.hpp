@@ -180,16 +180,22 @@ enum class ReclaimClass : uint8_t { Ordinary, InUse };
 
 // Whether the caller can wait for KV memory a step leaves to come back.
 // CanWait (growth and pressure passes): a KV leaf a state needs is written
-// first, and its page returns when the copy lands. Immediate (a snapshot
-// between commands): only leaves whose page frees now go, through their disk
-// copy or erased; a leaf that needs a demotion is passed over. What happens
-// to a state is the caller's StateCache::Unwritten.
+// first, and its page returns when the copy lands. Immediate (a state's
+// buffers reserved before a command): only leaves whose page frees now go,
+// through their disk copy or erased; a leaf that needs a demotion is passed
+// over. What happens to a state is the caller's StateCache::Unwritten.
 enum class ReclaimTiming : uint8_t { CanWait, Immediate };
 
-// What one step of room for a state's snapshot gave: a recycled state's
-// buffers, which the snapshot takes as they are, or the bytes of a released
-// extent, which the snapshot has to allocate and which may be fewer than a
-// state needs.
+// The class of a state a command captures, which bounds what is taken for
+// its buffers (Cache::reclaimOneState): an optional checkpoint, an ordinary
+// state, or the prompt's replay point, which its conversation's next turn
+// resumes from and is in use.
+enum class StateClass : uint8_t { Checkpoint, Ordinary, InUse };
+
+// What one step of room for a state's buffers gave: a recycled state's
+// buffers, which the reservation takes as they are, or the bytes of a
+// released extent, which the reservation has to allocate and which may be
+// fewer than a state needs.
 struct StateRoom final {
   bool made = false;
   uint64_t extentBytes = 0;
@@ -348,6 +354,11 @@ public:
   [[nodiscard]] bool stateResident(uint64_t kvBlock) const noexcept;
   // False only while this exact disposable publication is pinned.
   bool retireCheckpointState(StateCheckpoint checkpoint) noexcept;
+  // This exact disposable publication is pinned: retireCheckpointState
+  // refuses it.
+  [[nodiscard]] bool checkpointPinned(StateCheckpoint checkpoint) const noexcept {
+    return states_.checkpointPinned(checkpoint);
+  }
 
   // Releases every empty extent, but one with keepRunway, and returns the
   // bytes released.
@@ -417,30 +428,31 @@ public:
   // allocated page no request holds, but with Ordinary not the idle KV that
   // states in use restore through.
   [[nodiscard]] uint32_t reusablePages(ReclaimClass upTo) const;
-  // One step of room for the snapshot of a state to publish at forBlock,
-  // taking nothing of a class above the publication's; the disk tier keeps a
-  // state it admits. An optional publication (checkpointsOnly) takes one
-  // checkpoint. An ordinary one takes what reclaimOne() takes of the
-  // ordinary class, in its order, but only what frees memory now
-  // (ReclaimTiming::Immediate), since the snapshot follows at once: an extent
-  // of free pages, a checkpoint, KV no state restores through, then the
-  // oldest of ordinary states and KV leaves. One in use goes on to the oldest
-  // state in use, last. KV frees memory only as an extent it empties,
-  // released before the call returns, so KV goes only while evicting it can
-  // empty one (extentWithinReach); otherwise the oldest ordinary state goes.
-  // Only a publication in use, whose lane's state moves on with its next
-  // command, drops a victim whose write must wait for the write in flight;
-  // other publications leave it and move on, and a state in use is never
-  // dropped so: while the write in flight holds it, nothing goes. Like every
-  // release, that needs no command in flight; the engine publishes a lane's
-  // states between commands. After a step that gave extent bytes the caller
-  // steps again while its snapshot does not fit and the bytes given are less
-  // than one snapshot; after a step that gave a state it does not, so a
-  // snapshot denied for another reason costs one state or one snapshot's
-  // worth of extents at most. While the engine may not grow (`growth` false)
-  // an extent's bytes are of no use to a snapshot: extents and KV stay, and
-  // every publication takes states alone.
-  [[nodiscard]] StateRoom reclaimOneState(bool checkpointsOnly, uint64_t forBlock, bool growth);
+  // One step of room for the buffers of a state a command will capture
+  // (Model::reserveState), taking nothing of a class above the state's; the
+  // disk tier keeps a state it admits. A checkpoint takes one checkpoint. An
+  // ordinary state takes what reclaimOne() takes of the ordinary class, in
+  // its order, but only what frees memory now (ReclaimTiming::Immediate),
+  // since the reservation follows at once: an extent of free pages, a
+  // checkpoint, KV no state restores through, then the oldest of ordinary
+  // states and KV leaves. One in use goes on to the oldest state in use,
+  // last. KV frees memory only as an extent it empties, released before the
+  // call returns, so KV goes only while evicting it can empty one
+  // (extentWithinReach); otherwise the oldest ordinary state goes. Only a
+  // state in use drops a victim whose write must wait for the write in
+  // flight: refused, it could reach the disk tier only through that write
+  // slot, once its command ends. Other states leave such a victim and move
+  // on, and a state in use is never dropped so: while the write in flight
+  // holds it, nothing goes. Like every release, that needs no command in
+  // flight; the engine reserves a command's states before it submits the
+  // command. After a step that gave extent bytes the caller steps again
+  // while its reservation does not fit and the bytes given are less than
+  // one state's; after a step that gave a state it does not, so a
+  // reservation refused for another reason costs one state or one state's
+  // worth of extents at most. While the engine may not grow (`growth`
+  // false) an extent's bytes are of no use to a reservation: extents and KV
+  // stay, and room comes from states alone.
+  [[nodiscard]] StateRoom reclaimOneState(StateClass state, bool growth);
   // Recycles one unpinned state, preferring checkpoints, for a lane that
   // takes the state's buffers, taking nothing of a class above upTo. For
   // running work (InUse) a state in use goes once no other state is left and
