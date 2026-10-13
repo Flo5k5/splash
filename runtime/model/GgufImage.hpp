@@ -95,10 +95,11 @@ struct Fill {
 // value it equals exactly (rows the kernels read as bf16), widened from BF16
 // to the F32 value it equals (rows the kernels read as F32), as the F32 decay
 // -exp(A_log) of a safetensors GDN's A_log, BF16 or F32, which
-// float(-exp(double)) rounds once, as the F32 values of a quantized
-// safetensors tensor's rows (affine s * code + z, mxfp4, nvfp4 or fp8), which
-// the kernels read unquantized (its MoE router and shared-expert gate, GDN
-// alpha and beta of two formats), or as the F32 1 + w of a BF16 RMSNorm
+// float(-exp(double)) rounds once, as the F32 values of a quantized tensor's
+// native rows, which the GPU decodes as the format's gather does
+// (kernels/common/gguf_embedding_formats.h) and the kernels read unquantized
+// (a safetensors MoE router and shared-expert gate, GDN alpha and beta of two
+// types), or as the F32 1 + w of a BF16 RMSNorm
 // weight w, which transformers stores 1 below the weight the norm multiplies
 // by (exact but for |w| < 2^-16, which it rounds once).
 enum class Conversion : uint8_t { None, NarrowToBfloat16, WidenToFloat32, Decay, DequantizeToFloat32, CenteredNorm };

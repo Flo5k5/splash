@@ -451,8 +451,9 @@ EMBEDDING_TYPES = QUANTIZED_TYPES | {"F16", "BF16"}
 # The tensors the native loader reads from a target, and the types it accepts
 # for each (runtime/model/GgufImage.cpp): quantized projections; F32 norms,
 # small GDN vectors and MoE routers, which llama.cpp keeps unquantized and
-# which run unrounded; GDN alpha and beta, both of one type: a quantized
-# format, F32 or BF16, which preparation widens to the F32 values it equals.
+# which run unrounded; GDN alpha and beta, each a quantized format, F32 or
+# BF16, which preparation widens to the F32 values they hold unless both are
+# of one quantized type.
 F32 = {"F32"}
 MODEL_TENSORS = {
     "token_embd.weight": EMBEDDING_TYPES,
@@ -584,13 +585,6 @@ def require_loadable(metadata):
         if stem != name and stem + ".scale" in metadata.tensors and found != "NVFP4":
             scale = short.removesuffix(".weight") + ".scale"
             unsupported[scale, f"beside {found}"] += 1
-        # The two GDN input gates run as one segment of their shared format.
-        if name.endswith(".ssm_beta.weight") and kind != metadata.tensors.get(
-            name.replace("ssm_beta", "ssm_alpha")
-        ):
-            unsupported[
-                "ssm_alpha.weight and ssm_beta.weight", "of different types"
-            ] += 1
     if unsupported:
         listed = ", ".join(
             f"{tensor} {found} ({count} {'tensor' if count == 1 else 'tensors'})"

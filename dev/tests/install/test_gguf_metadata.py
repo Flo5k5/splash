@@ -353,15 +353,17 @@ class GgufMetadataTests(unittest.TestCase):
         # Layer 3 is full attention; the others around it GDN.
         self.assertIn("blk.3.attn_q.weight", tensors)
         self.assertNotIn("blk.2.attn_q.weight", tensors)
-        # GDN alpha and beta may be both of any one quantized format or both
-        # F32, and the MTP layer (block 40) is never loaded, so its types do
+        # GDN alpha and beta may be of any one quantized format, F32 or of two
+        # types, and the MTP layer (block 40) is never loaded, so its types do
         # not matter.
         tensors |= {"blk.0.ssm_alpha.weight": GGML["IQ4_XS"]}
         tensors |= {"blk.0.ssm_beta.weight": GGML["IQ4_XS"]}
         tensors |= {"blk.1.ssm_alpha.weight": GGML["F32"]}
         tensors |= {"blk.1.ssm_beta.weight": GGML["F32"]}
         tensors |= {"blk.2.ssm_alpha.weight": GGML["Q8_0"]}
-        tensors |= {"blk.2.ssm_beta.weight": GGML["Q8_0"]}
+        tensors |= {"blk.2.ssm_beta.weight": GGML["IQ3_XXS"]}
+        tensors |= {"blk.4.ssm_alpha.weight": GGML["F32"]}
+        tensors |= {"blk.4.ssm_beta.weight": GGML["NVFP4"]}
         tensors |= {"blk.40.ffn_up_exps.weight": GGML["BF16"]}
         tensors |= {"blk.0.ffn_down_exps.weight": GGML["IQ4_XS"]}
         # The low-bit formats of Unsloth's smaller files, the embedding too.
@@ -400,17 +402,13 @@ class GgufMetadataTests(unittest.TestCase):
             ),
             ({"blk.3.attn_q.weight": GGML["BF16"]}, "attn_q.weight BF16"),
             # F32 only where the loader reads floats: not a projection, not
-            # a quantized router or norm, not half an alpha/beta pair.
+            # a quantized router or norm.
             ({"blk.3.attn_q.weight": GGML["F32"]}, "attn_q.weight F32"),
             (
                 {"blk.0.ffn_gate_inp.weight": GGML["Q8_0"]},
                 "ffn_gate_inp.weight Q8_0",
             ),
             ({"output_norm.weight": GGML["F16"]}, "output_norm.weight F16"),
-            (
-                {"blk.1.ssm_alpha.weight": GGML["Q8_0"]},
-                "ssm_alpha.weight and ssm_beta.weight of different types",
-            ),
             (
                 {
                     "blk.1.ssm_alpha.weight": GGML["F16"],

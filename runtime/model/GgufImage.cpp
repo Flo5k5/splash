@@ -42,9 +42,8 @@ bool floatType(uint32_t type) { return type == ggml::kF32; }
 bool embeddingType(uint32_t type) {
   return gguf_embedding_format(imageFormat(type)) || type == ggml::kF16 || type == ggml::kBF16;
 }
-// alpha/beta run as one segment of their shared type: any format of the
-// projections (one repacked tensor) or F32 (one float tensor), which BF16
-// becomes exactly.
+// alpha/beta run as one segment: of their format when both are of one
+// quantized type (one repacked tensor), else F32 (one float tensor).
 bool alphaBetaType(uint32_t type) { return quantizedType(type) || type == ggml::kF32 || type == ggml::kBF16; }
 
 // Plans one image. A missing tensor or one of a type this build cannot load
@@ -104,28 +103,29 @@ public:
   }
 
   // beta (value heads rows) | alpha (value heads rows), rows in grouped head
-  // order: one 256-row tensor of their format padded with zero rows, or F32 as
-  // one float tensor, which BF16 is widened to exactly.
+  // order: one 256-row tensor of their format padded with zero rows when both
+  // are of one quantized type, else one F32 tensor of the values each holds:
+  // F32 as stored, BF16 widened and a quantized type's decoded, all exactly.
   void alphaBeta(const std::string &betaName, const std::string &alphaName) {
-    const GgufTensor *beta = file_.find(betaName), *alpha = file_.find(alphaName);
-    if (!beta || !alpha || beta->type != alpha->type || !alphaBetaType(beta->type)) {
-      reject(betaName, beta);
-      reject(alphaName, alpha);
-      return;
-    }
+    const GgufTensor *beta = find(betaName, alphaBetaType), *alpha = find(alphaName, alphaBetaType);
+    if (!beta || !alpha) return;
     const uint32_t heads = geometry_.gdnValueHeads, hidden = geometry_.hiddenSize;
     for (const GgufTensor *t : {beta, alpha})
       if (t->rows() != heads || t->columns() != hidden)
         throw GgufError("alpha/beta must be [" + std::to_string(heads) + ", hidden]: " + t->name);
-    if (beta->type == ggml::kF32 || beta->type == ggml::kBF16) {
-      const uint64_t widening = beta->type == ggml::kBF16 ? 2 : 1;
-      const uint64_t bytes = (beta->bytes + alpha->bytes) * widening;
-      image_.descriptor(ggml::kF32, 2ull * heads, hidden, {}, {bytes, 0, 0}, betaName);
-      uint64_t destination = image_.section(bytes);
+    if (beta->type != alpha->type || !quantizedType(beta->type)) {
+      const uint64_t rowBytes = uint64_t{hidden} * sizeof(float);
+      image_.descriptor(ggml::kF32, 2ull * heads, hidden, {}, {2 * heads * rowBytes, 0, 0}, betaName);
+      uint64_t destination = image_.section(2 * heads * rowBytes);
       for (const GgufTensor *t : {beta, alpha}) {
-        image_.copyAt(destination, tensorRows(*t, heads, t->bytes / heads, grouped(0, 1)),
-                      widening == 2 ? Conversion::WidenToFloat32 : Conversion::None);
-        destination += t->bytes * widening;
+        if (quantizedType(t->type)) {
+          const uint64_t native = ggufRowBytes(kQuantFormats[imageFormat(t->type)], hidden);
+          image_.copyAt(destination, tensorRows(*t, heads, native, grouped(0, 1)), Conversion::DequantizeToFloat32);
+        } else {
+          image_.copyAt(destination, tensorRows(*t, heads, t->bytes / heads, grouped(0, 1)),
+                        t->type == ggml::kBF16 ? Conversion::WidenToFloat32 : Conversion::None);
+        }
+        destination += heads * rowBytes;
       }
       return;
     }
@@ -331,7 +331,7 @@ uint64_t convertedBytes(const TensorRows &source, Conversion conversion, uint64_
   case Conversion::Decay: return source.type == ggml::kBF16 ? sourceBytes * 2 : sourceBytes;
   case Conversion::DequantizeToFloat32: {
     const uint32_t format = gguf_format_of(source.type);
-    if (!safetensorsFormat(format)) throw GgufError("not a quantized safetensors tensor: " + source.name);
+    if (format == GGUF_FMT_COUNT) throw GgufError("not a quantized tensor: " + source.name);
     return sourceBytes / kQuantFormats[format].block_bytes * kQuantFormats[format].block_elements * 4;
   }
   case Conversion::None: break;

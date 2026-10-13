@@ -119,7 +119,8 @@ void checkDense(const std::filesystem::path &directory) {
 // alpha/beta of any one GGUF tensor type of a format (llama.cpp's NVFP4 as
 // NVFP4), on either architecture: one 256-row tensor of that format, the beta
 // then the alpha rows at its native row bytes in grouped head order; a pair of
-// two types is refused by both names.
+// two types, one F32 tensor of the beta then the alpha rows, each converted as
+// its type needs; a type the loader does not read, refused by name.
 void checkQuantizedAlphaBeta(const std::filesystem::path &directory) {
   for (bool moe : {false, true}) {
     const SmallTarget target = smallTarget(moe);
@@ -153,13 +154,29 @@ void checkQuantizedAlphaBeta(const std::filesystem::path &directory) {
             "planner alpha/beta: one 256-row " + model::ggmlTypeName(type) + " tensor of beta then alpha rows (" +
                 model::gguf::architecture(g.ffnKind) + ")" + (result.error ? ": " + *result.error : ""));
     }
-    for (const auto &[beta, alpha] : {std::pair{kIQ4_XS, kQ8_0}, std::pair{kQ4_K, model::ggml::kF32}}) {
+    using model::gguf::Conversion;
+    const auto conversion = [](uint32_t type) {
+      return type == model::ggml::kF32    ? Conversion::None
+             : type == model::ggml::kBF16 ? Conversion::WidenToFloat32
+                                          : Conversion::DequantizeToFloat32;
+    };
+    const uint64_t floatRows = uint64_t{g.gdnValueHeads} * g.hiddenSize * sizeof(float);
+    for (const auto &[beta, alpha] : {std::pair{kIQ4_XS, kQ8_0}, std::pair{kQ4_K, model::ggml::kF32},
+                                      std::pair{model::ggml::kBF16, model::ggml::kNVFP4},
+                                      std::pair{model::ggml::kF32, model::ggml::kBF16}}) {
       writeGguf(path, tensorsWith(beta, alpha), g);
-      const std::string betaName = "blk.0.ssm_beta.weight (" + model::ggmlTypeName(beta) + ")";
-      const std::string alphaName = "blk.0.ssm_alpha.weight (" + model::ggmlTypeName(alpha) + ")";
-      check(names(plan(path, g), {betaName, alphaName}),
-            "planner refuses alpha/beta of two types by both names: " + betaName + ", " + alphaName);
+      const Plan result = plan(path, g);
+      const auto *b = copyIn(result, "blk.0.ssm_beta.weight"), *a = copyIn(result, "blk.0.ssm_alpha.weight");
+      check(b && a && b->conversion == conversion(beta) && a->conversion == conversion(alpha) &&
+                a->destination == b->destination + floatRows && grouped(b->source.order, 0, 1, g) &&
+                grouped(a->source.order, 0, 1, g) && !repackOf(result.images[0], "blk.0.ssm_beta.weight"),
+            "planner widens alpha/beta of two types into one F32 tensor: " + model::ggmlTypeName(beta) + " beta, " +
+                model::ggmlTypeName(alpha) + " alpha" + (result.error ? ": " + *result.error : ""));
     }
+    writeGguf(path, tensorsWith(kQ8_0, model::ggml::kF16), g);
+    check(names(plan(path, g), {"blk.0.ssm_alpha.weight (F16)"}) &&
+              !names(plan(path, g), {"blk.0.ssm_beta.weight"}),
+          "planner refuses an alpha of a type it does not read by its name alone");
   }
 }
 

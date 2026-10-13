@@ -1243,9 +1243,11 @@ and lists every unsupported tensor in one error:
 - token embeddings: any of the linears' formats, F16 or BF16;
 - norms, the MoE router and shared-expert scalar gate, and the GDN
   convolution, decay and time-step bias: F32;
-- GDN alpha and beta: both of one type, any of the linears' formats (one
-  segment of the GDN input projection), F32 or BF16, which loading widens to
-  the F32 values it equals.
+- GDN alpha and beta: each any of the linears' formats, F32 or BF16. Two of
+  one quantized type load as one segment of the GDN input projection in that
+  format; any other pair loads as one F32 tensor of the values each holds, BF16
+  widened and a quantized type decoded on the GPU by its format's gather
+  (`gguf_embed_f32_<format>`), GGML's own F32 values.
 
 Of Unsloth's files in September 2026 that covers every file of Qwen3.8-27B and
 Qwen3.6-35B-A3B, from UD-IQ1_S up, but UD-Q8_K_XL and BF16, whose BF16 tensors
@@ -1533,7 +1535,8 @@ exponential.
 
 Loading never rounds a target or vision weight but in the F32 values of an MLX
 target's quantized router, shared-expert gate or GDN alpha and beta ([MLX
-targets](#mlx-targets)), and rounds the draft's
+targets](#mlx-targets)) and of a GGUF's quantized alpha or beta beside one of
+another type, which the GPU decodes as GGML does, and rounds the draft's
 projections only as MLX's affine quantization does ([Drafts](#drafts)). A tensor it converts to
 BF16 (vision tensors stored as F32 or F16, a GGUF's convolution taps and
 time-step bias) must be exactly representable in BF16; otherwise loading fails,
@@ -1567,7 +1570,9 @@ embedding and norm epsilon the kernels assume (`rope.freq_base`,
 `GgufPreparation` stages rows in image order on the CPU within the
 staging bound, splitting rows wider than it into column chunks, and runs the
 `gguf_repack` kernel, which writes their planes into the image. Embeddings and
-F32 sections are copied in bounded steps.
+F32 sections are copied in bounded steps; the F32 values of a quantized tensor
+the kernels read unquantized are written the same way by the format's fp32
+gather (`gguf_embed_f32_<format>`), the decode its token gather rounds to bf16.
 
 Each image's record (`WeightFileRecord`) names what it was written from: the
 SHA-256 of the record of every source file's digest, the assembly's
