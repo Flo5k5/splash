@@ -939,16 +939,33 @@ struct Runtime::Impl {
   }
 
   // A selection outside the vocabulary is the sampling kernels' sentinel for a
-  // non-finite logit row: a numerical outcome of this request, which it reports
-  // as its lane failure (ModelStepResult::failure) so the batch survives.
-  [[nodiscard]] std::string invalidSelection(std::span<const uint32_t> tokens) const {
-    const auto found = std::find_if(tokens.begin(), tokens.end(), [&](uint32_t token) {
+  // logit row with no selectable token, its admitted logits all NaN or -inf: a
+  // numerical outcome of this request, which it reports as its lane failure
+  // (ModelStepResult::failure) so the batch survives. The message counts the
+  // row's non-finite logits, which the lane's completed command left in its
+  // logits rows (row k selected token k).
+  [[nodiscard]] std::string invalidSelection(std::span<const uint32_t> tokens,
+                                             uint32_t lane) const {
+    const auto found = std::ranges::find_if(tokens, [&](uint32_t token) {
       return token >= geometry.target.vocabularySize;
     });
     if (found == tokens.end())
       return {};
-    return "target selected out-of-vocabulary token " + std::to_string(*found) +
-           " from a non-finite logit row";
+    const uint32_t vocabulary = geometry.target.vocabularySize;
+    const std::span<const float> row(
+        contents<float>(decodeArena->get(lane, DecodeTensor::Logits),
+                        "unselectable logits") +
+            uint64_t(found - tokens.begin()) * vocabulary,
+        vocabulary);
+    uint32_t nan = 0, positive = 0, negative = 0;
+    for (const float logit : row) {
+      nan += std::isnan(logit);
+      positive += logit == std::numeric_limits<float>::infinity();
+      negative += logit == -std::numeric_limits<float>::infinity();
+    }
+    return "target logits had no selectable token: " + std::to_string(nan) +
+           " NaN, " + std::to_string(positive) + " +inf and " +
+           std::to_string(negative) + " -inf of " + std::to_string(vocabulary);
   }
 
   // A lane of an initial selection, whose final prompt row is at row 0 of
@@ -1050,7 +1067,7 @@ struct Runtime::Impl {
         const uint32_t token = initialToken(selection.lane);
         // A failed selection leaves no anchor: the engine ends the request
         // before any output, and the other lanes go on.
-        result.failure = invalidSelection({&token, 1});
+        result.failure = invalidSelection({&token, 1}, selection.lane);
         if (!result.failure.empty()) {
           entry.resultInvalid = true;
           continue;
@@ -1692,7 +1709,8 @@ struct Runtime::Impl {
       // token, so every retained token is checked.
       const uint32_t *targetTokens = contents<uint32_t>(
           d(DecodeTensor::OutputTokens), "target output tokens");
-      laneResult.failure = invalidSelection({targetTokens, laneResult.retained});
+      laneResult.failure =
+          invalidSelection({targetTokens, laneResult.retained}, lane);
     }
 
     std::vector<ModelStepResult> results;
@@ -2231,7 +2249,7 @@ Runtime::prefillAsync(const BatchPlan &plan,
       if (nextLength == entry.promptTokens && !entry.replayingGeneration &&
           entry.scoreTokens.empty() && entry.constraint == ConstraintMode::None) {
         selected = impl->initialToken(lane);
-        if (std::string failure = impl->invalidSelection({&*selected, 1});
+        if (std::string failure = impl->invalidSelection({&*selected, 1}, lane);
             !failure.empty()) {
           // The chunk's state is not committed; the engine ends the
           // request.

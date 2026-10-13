@@ -956,6 +956,12 @@ void requireNonFiniteRowFailsOnlyItsLane(model::Runtime &executor,
   require(decoded.size() == 2 && !decoded[0].failure.empty() &&
               decoded[0].outputTokens.empty(),
           "a decode from a non-finite state did not fail its lane alone");
+  // The poisoned state leaves every logit NaN, which the failure counts.
+  const std::string vocabulary = std::to_string(kVocabulary);
+  require(decoded[0].failure == "target logits had no selectable token: " +
+                                    vocabulary + " NaN, 0 +inf and 0 -inf of " +
+                                    vocabulary,
+          "the failed decode miscounted its logits: " + decoded[0].failure);
   require(decoded[1].failure.empty() && !decoded[1].outputTokens.empty() &&
               !decoded[1].finished && inVocabulary(decoded[1]),
           "a non-finite lane disturbed its healthy neighbour");

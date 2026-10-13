@@ -2139,11 +2139,13 @@ prefill chunk checks the last row of each lane's final hidden, which a value
 that is not finite anywhere in the chunk, or in the state it computed from,
 reaches through the recurrent state, and through attention on a GPU whose tile
 weighs non-finite keys and values (some families' tiles give them zero weight,
-for every reader); a decode finds one as
-a token the sampling kernels could only select outside the vocabulary, and a
-score request as a score logit. The engine reports `model_result_invalid` for
-that request alone, before it publishes the failing step's cache state or any
-output, and the rest of the batch finishes normally. Since every step that
+for every reader); a token selection finds one as
+a logit row with no selectable token, its admitted logits all NaN or -inf
+(sampling penalties leave those as they are), and a score request as a score
+logit. The engine reports `model_result_invalid` for that request alone, a
+selection's message counting the row's NaN, +inf and -inf logits, before it
+publishes the failing step's cache state or any output, and the rest of the
+batch finishes normally. Since every step that
 publishes was checked, what earlier steps published stays, as it does for a
 cancelled request. A damaged state is one way to such a result: a request
 whose first step from the state it restored is not finite takes that state out
