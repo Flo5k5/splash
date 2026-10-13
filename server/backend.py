@@ -107,6 +107,9 @@ class Job:
     # A chat request's reasoning options, which its Started line shows; None
     # for a request without a chat template.
     reasoning: ReasoningRequest | None = None
+    # The thinking tokens the job may select before its thinking closes, set
+    # only where that comes before the output limit; None for no cap.
+    thinking_token_budget: int | None = None
     thinking_display: str = "summarized"
     reasoning_tokens: int = 0
     events: queue.Queue = field(default_factory=queue.Queue)
@@ -629,9 +632,23 @@ class NativeBackend:
             generation_prompt_tokens=job.generation_prompt_tokens,
             flags=job.flags,
             cache_salt=job.cache_salt,
+            thinking_budget=self._thinking_budget(job),
         )
         return engine_runtime.GenerationRequest(
             frame, job.deadline, self._mask_provider(job), job.image_owner
+        )
+
+    @staticmethod
+    def _thinking_budget(job):
+        """The engine's cutoff of the thinking a job generates in: thinking
+        ends where count_reasoning_tokens ends it, at its close or, where a
+        call may follow, at a call's opening token."""
+        if job.thinking_token_budget is None:
+            return None
+        return wire.ThinkingBudget(
+            job.thinking_token_budget,
+            THINK_END_TOKEN_ID,
+            TOOL_CALL_OPEN_TOKEN_ID if job.may_call_tools else THINK_END_TOKEN_ID,
         )
 
     def release_weights(self, timeout=5.0):

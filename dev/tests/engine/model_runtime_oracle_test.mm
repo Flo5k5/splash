@@ -1018,6 +1018,96 @@ void requireNonFiniteRowFailsOnlyItsLane(model::Runtime &executor,
   std::cout << "non_finite_rows=PASS\n";
 }
 
+// Decodes the requests together from their prompts' ends until each has
+// generated `count` tokens or finished; each one's generated tokens, its
+// first, the prefill's selection, included.
+std::vector<std::vector<uint32_t>>
+decodeTogether(model::Runtime &executor, std::span<const uint64_t> ids,
+               uint32_t promptTokens,
+               std::span<const std::vector<uint32_t>> pageTables, uint32_t count) {
+  std::vector<std::vector<uint32_t>> generated(ids.size());
+  std::vector<bool> finished(ids.size(), false);
+  while (true) {
+    BatchPlan plan{.kind = WorkKind::Decode, .decodeStage = DecodeStage::Regular};
+    std::vector<ModelBatchItem> items;
+    std::vector<size_t> lanes;
+    for (size_t index = 0; index < ids.size(); ++index) {
+      if (finished[index] || generated[index].size() >= count)
+        continue;
+      plan.items.push_back({ids[index], 0});
+      items.push_back(withRevision({.requestId = ids[index],
+                                    .logicalPosition = promptTokens + generated[index].size(),
+                                    .pageTable = pageTables[index]}));
+      lanes.push_back(index);
+    }
+    if (items.empty())
+      return generated;
+    const std::vector<ModelStepResult> results = executor.decode(plan, items);
+    require(results.size() == items.size(), "a joint decode lost a lane");
+    for (size_t index = 0; index < results.size(); ++index) {
+      require(results[index].failure.empty(), "a joint decode failed a lane");
+      std::vector<uint32_t> &tokens = generated[lanes[index]];
+      tokens.insert(tokens.end(), results[index].outputTokens.begin(),
+                    results[index].outputTokens.end());
+      finished[lanes[index]] = results[index].finished;
+    }
+  }
+}
+
+// A thinking budget closes thinking at its token whatever the model's
+// logits: the first generated token for a budget of 0, else the one after
+// that many thinking tokens, greedy and sampled, while the draft proposes
+// beside it. Lanes decoded together close at their own budgets, and one
+// without a budget thinks on.
+void requireThinkingBudgetClosesThinking(model::Runtime &executor) {
+  // "<|im_start|>user\nList every prime number between 1 and 60, then check
+  // each one by trial division before you answer.<|im_end|>\n<|im_start|>
+  // assistant\n<think>\n", which both models think through for well over the
+  // tokens decoded here.
+  const std::vector<uint32_t> prompt{
+      248045, 846,  198,  826,   1396, 9944,  1324, 1881,   220,   16,   321,
+      220,    21,   15,   11,    1179, 1716,  1754, 799,    539,   8818, 12436,
+      1518,   488,  4087, 13,    248046, 198, 248045, 74455, 198,   248068, 198};
+  // The Qwen tokenizer's </think>.
+  constexpr uint32_t kThinkEnd = 248069;
+  const std::array<std::vector<uint32_t>, 3> pageTables{
+      pageRange(108, 4), pageRange(116, 4), pageRange(120, 4)};
+  const std::array<uint64_t, 3> ids{301, 302, 303};
+  for (const float temperature : {0.0F, 0.7F}) {
+    for (const uint32_t budget : {0U, 1U, 5U, 12U}) {
+      const std::array<std::optional<uint32_t>, 3> budgets{budget, budget + 7,
+                                                           std::nullopt};
+      for (size_t lane = 0; lane < ids.size(); ++lane) {
+        EngineRequest request = makeRequest(ids[lane], prompt, 48);
+        request.sampling.temperature = temperature;
+        request.sampling.seed = 0x5eed + budget;
+        if (budgets[lane])
+          request.thinkingBudget = ThinkingBudget{*budgets[lane], kThinkEnd, kThinkEnd};
+        beginCold(executor, request, static_cast<uint32_t>(lane));
+        requireOpen(prefillChunk(executor, ids[lane], 0, prompt, pageTables[lane]),
+                    "thinking budget fixture");
+      }
+      const auto generated = decodeTogether(executor, ids, static_cast<uint32_t>(prompt.size()),
+                                            pageTables, budget + 12);
+      for (size_t lane = 0; lane < ids.size(); ++lane) {
+        const std::vector<uint32_t> &tokens = generated[lane];
+        const auto close = std::find(tokens.begin(), tokens.end(), kThinkEnd);
+        if (!budgets[lane]) {
+          require(close == tokens.end(), "a lane without a thinking budget closed its thinking");
+          continue;
+        }
+        require(close != tokens.end() && close - tokens.begin() == *budgets[lane] &&
+                    close + 1 != tokens.end(),
+                "a thinking budget of " + std::to_string(*budgets[lane]) +
+                    " did not close thinking at its token, then go on");
+      }
+      for (const uint64_t id : ids)
+        executor.end(id);
+    }
+  }
+  std::cout << "thinking_budget=PASS\n";
+}
+
 // A 64-token request with one image of the given span, its pixels a pattern.
 EngineRequest imageRequest(uint64_t id, ImageSpan span) {
   std::vector<uint32_t> prompt(64);
@@ -1965,6 +2055,7 @@ int main(int argc, char **argv) {
     }
     requireNonFiniteRowFailsOnlyItsLane(executor, pages, states, backend,
                                         samplingSeedTokens, prompt128);
+    requireThinkingBudgetClosesThinking(executor);
 
 
     // Compare the active GDN state from one 16-row chunk and two M8 commits

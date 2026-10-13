@@ -84,6 +84,10 @@ void Engine::submit(EngineRequest value) {
                   outOfVocabulary)) {
     throw std::invalid_argument("score token is out of vocabulary");
   }
+  if (value.thinkingBudget && (outOfVocabulary(value.thinkingBudget->end) ||
+                               outOfVocabulary(value.thinkingBudget->alsoEnds))) {
+    throw std::invalid_argument("thinking end token is out of vocabulary");
+  }
   if (!value.images.empty() && !config_.maxImagePatches) {
     throw std::invalid_argument("this model is serving without vision");
   }

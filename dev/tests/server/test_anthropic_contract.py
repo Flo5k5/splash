@@ -400,7 +400,11 @@ class AnthropicAdapterTest(unittest.TestCase):
         )
         invalid.append({"output_config": {"format": FORMAT}, "output_format": FORMAT})
         for fields in invalid:
-            for thinking in (None, {"type": "enabled"}, {"type": "adaptive"}):
+            for thinking in (
+                None,
+                {"type": "enabled", "budget_tokens": 1024},
+                {"type": "adaptive"},
+            ):
                 with self.subTest(fields=fields, thinking=thinking):
                     with self.assertRaises(APIError):
                         anthropic_to_chat_prompt(
@@ -792,7 +796,7 @@ class AnthropicAdapterTest(unittest.TestCase):
         for thinking in (
             None,
             {"type": "disabled"},
-            {"type": "enabled"},
+            {"type": "enabled", "budget_tokens": 1024},
             {"type": "adaptive"},
         ):
             for effort in ("invalid", "none", "ultra", {}):
@@ -1240,7 +1244,11 @@ class AnthropicHTTPContractTest(HarnessTestCase):
         runtime = FakeRuntime()
         harness = self.harness(runtime)
         for effort in (True, 3, [], "invalid"):
-            for thinking in (None, {"type": "adaptive"}, {"type": "enabled"}):
+            for thinking in (
+                None,
+                {"type": "adaptive"},
+                {"type": "enabled", "budget_tokens": 1024},
+            ):
                 for path in ("/v1/messages", "/v1/messages/count_tokens"):
                     with self.subTest(effort=effort, thinking=thinking, path=path):
                         status, _, payload = harness.request(
@@ -1420,15 +1428,17 @@ class AnthropicHTTPContractTest(HarnessTestCase):
                         self.assertNotIn(b"because ", payload)
         self.assertEqual(runtime.requests, [])
         for thinking in (
-            {"type": "enabled"},
+            {"type": "enabled", "budget_tokens": 1024},
             {"type": "adaptive"},
             {"type": "disabled"},
-            {"type": "enabled", "display": None},
+            {"type": "enabled", "budget_tokens": 1024, "display": None},
             {"type": "adaptive", "display": None},
             {"type": "disabled", "display": None},
         ):
             status, _, payload = harness.request(
-                "POST", "/v1/messages", request_body(thinking=thinking)
+                "POST",
+                "/v1/messages",
+                request_body(thinking=thinking, max_tokens=2048),
             )
             self.assertEqual(status, 200, payload)
 
@@ -1588,7 +1598,7 @@ class AnthropicHTTPContractTest(HarnessTestCase):
                         counted = json.loads(payload)
                         self.assertEqual(set(counted), {"input_tokens"})
                 chat, _ = anthropic_to_chat_body(
-                    {**body, "max_tokens": 8}, thinking_resolver=no_signed_thinking
+                    {**body, "max_tokens": 2048}, thinking_resolver=no_signed_thinking
                 )
                 job = harness.app.prepare(chat, deadline=FOREVER)
                 self.assertEqual(counted["input_tokens"], len(job.prompt_tokens))

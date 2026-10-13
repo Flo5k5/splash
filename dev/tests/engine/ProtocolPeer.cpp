@@ -101,6 +101,11 @@ FrameType write(Writer &out, const RequestFrame &request) {
   out.u32(request.flags);
   out.u64(request.cacheSalt.lo);
   out.u64(request.cacheSalt.hi);
+  const ThinkingBudget thinking =
+      request.thinkingBudget.value_or(ThinkingBudget{.tokens = kNoThinkingBudget});
+  out.u32(thinking.tokens);
+  out.u32(thinking.end);
+  out.u32(thinking.alsoEnds);
   out.words(request.promptTokens);
   for (const ImageSpan &span : request.imageSpans) {
     out.u32(span.offset);

@@ -132,9 +132,13 @@ validateLimits(const ProtocolLimits &limits);
 //   78 u32 generationPromptTokens
 //   82 u32 flags
 //   86 u64 cacheSalt.lo, u64 cacheSalt.hi
+//  102 u32 thinkingBudget.tokens, kNoThinkingBudget for none
+//  106 u32 thinkingBudget.end, u32 thinkingBudget.alsoEnds, zero without a
+//      budget
 // then the prompt tokens, the 32-byte image spans, the image pixels and the
 // score tokens.
-inline constexpr uint64_t kRequestFixedBytes = 102;
+inline constexpr uint64_t kRequestFixedBytes = 114;
+inline constexpr uint32_t kNoThinkingBudget = 0xFFFFFFFFU;
 
 // The request flags word holds the RequestFlag bits and this one, which asks
 // for PromptProgressEvents while the prompt prefills.
@@ -173,6 +177,9 @@ struct RequestFrame {
   uint32_t flags = 0;
   // The request's cache_salt as the server hashed it; zero without one.
   engine::CacheSalt cacheSalt;
+  // Only a request that generates inside a thinking block has one; a score
+  // request never does.
+  std::optional<ThinkingBudget> thinkingBudget;
 
   bool operator==(const RequestFrame &) const = default;
 };

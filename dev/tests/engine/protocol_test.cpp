@@ -27,6 +27,7 @@ using splash::ConstraintMode;
 using splash::ImageSpan;
 using splash::RequestIgnoreEndOfSequence;
 using splash::SamplingParameters;
+using splash::ThinkingBudget;
 using splash::engine::EngineFinishReason;
 using splash::engine::RequestPriority;
 using splash::model::ExecutionLimits;
@@ -69,7 +70,8 @@ constexpr size_t scoreCount = seed + 8;
 constexpr size_t generationPrompt = scoreCount + 4;
 constexpr size_t flags = generationPrompt + 4;
 constexpr size_t cacheSalt = flags + 4;
-static_assert(cacheSalt + 16 == kRequestFixedBytes);
+constexpr size_t thinkingBudget = cacheSalt + 16;
+static_assert(thinkingBudget + 12 == kRequestFixedBytes);
 } // namespace request_offset
 
 uint32_t loadU32(const std::vector<uint8_t> &bytes, size_t offset) {
@@ -174,6 +176,7 @@ RequestFrame exampleRequest() {
   request.constraint = ConstraintMode::TokenMask;
   request.generationPromptTokens = 2;
   request.cacheSalt = {0x8899aabbccddeeffULL, 0x0011223344556677ULL};
+  request.thinkingBudget = ThinkingBudget{4096, 248069, 248058};
   return request;
 }
 
@@ -196,6 +199,7 @@ RequestFrame exampleScoreRequest() {
   request.sampling = {.seed = request.sampling.seed};
   request.constraint = ConstraintMode::None;
   request.scoreTokens = {101, 202, 303};
+  request.thinkingBudget.reset();
   return request;
 }
 
@@ -881,6 +885,37 @@ void testRequestFlags() {
   expectRequestIssue(test, score, IssueCode::InvalidConstraint);
 }
 
+// A thinking budget follows the cache salt; without one, its tokens word is
+// kNoThinkingBudget and its end tokens are zero.
+void testThinkingBudget() {
+  constexpr std::string_view test = "thinking budget";
+  const size_t at = kFrameHeaderBytes + request_offset::thinkingBudget;
+  const std::vector<uint8_t> wire = peer::serialize(exampleRequest());
+  CHECK(test, loadU32(wire, at) == 4096 && loadU32(wire, at + 4) == 248069 &&
+                  loadU32(wire, at + 8) == 248058);
+
+  RequestFrame none = exampleRequest();
+  none.thinkingBudget.reset();
+  const std::vector<uint8_t> noneWire = peer::serialize(none);
+  CHECK(test, loadU32(noneWire, at) == kNoThinkingBudget &&
+                  loadU32(noneWire, at + 4) == 0 && loadU32(noneWire, at + 8) == 0);
+  CHECK(test, roundTrip(none) == none);
+  RequestFrame zero = exampleRequest();
+  zero.thinkingBudget->tokens = 0;
+  CHECK(test, roundTrip(zero) == zero);
+
+  std::vector<uint8_t> stray = noneWire;
+  storeU32(stray, at + 8, 248058);
+  const auto decoded = decodeClient(stray, kLimits);
+  CHECK(test, !decoded && decoded.issue &&
+                  decoded.issue->failureClass == FailureClass::RequestError &&
+                  decoded.issue->code == IssueCode::InvalidCount);
+
+  RequestFrame score = exampleScoreRequest();
+  score.thinkingBudget = ThinkingBudget{0, 248069, 248069};
+  expectRequestIssue(test, score, IssueCode::InvalidCount);
+}
+
 std::string jsonOfExactSize(size_t bytes) {
   if (bytes < 8)
     throw std::invalid_argument("JSON size is too small");
@@ -1083,6 +1118,7 @@ int main(int argc, char **argv) {
     testPromptAndImageSpanRejections();
     testSamplingBlock();
     testRequestFlags();
+    testThinkingBudget();
     testBoundedArbitraryStatusJsonAndFrames();
     testFailureTaxonomy();
     testUnnamedRequestFailuresAreFatal();

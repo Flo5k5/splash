@@ -1522,6 +1522,31 @@ kernel void decode_sample_argmax_reduce(
     tokens[s] = token;
 }
 
+// After the selection, the thinking cutoff of each lane that has one
+// (ThinkingCutoffParams): its row selects end. Draft token r is verify input
+// row r + 1.
+kernel void decode_sample_thinking_cutoff(
+    device const uint *input_tokens [[buffer(0)]],
+    device uint *tokens [[buffer(1)]],
+    device TargetVocabularyRow *vocabulary_rows [[buffer(2)]],
+    constant ThinkingCutoffParams &params [[buffer(3)]],
+    uint lane [[threadgroup_position_in_grid]]) {
+  const uint row = params.row[lane];
+  if (row >= params.rows)
+    return;
+  const uint first = lane * params.rows;
+  const uint end = params.end[lane];
+  for (uint r = 0; r < min(row, params.drafted_rows); ++r) {
+    const uint draft = input_tokens[first + r + 1];
+    if (draft == end || draft == params.also_ends[lane])
+      return;
+  }
+  tokens[first + row] = end;
+  if ((params.sampling_mask & (1u << lane)) && row < params.drafted_rows)
+    vocabulary_rows[first + row].draft_probability =
+        input_tokens[first + row + 1] == end ? 1.0f : 0.0f;
+}
+
 inline void accept_greedy_lane(device const uint *draft_tokens,
                                device uint *target_tokens,
                                device uint &retained,

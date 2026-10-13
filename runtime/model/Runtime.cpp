@@ -251,6 +251,10 @@ struct Runtime::Impl {
     // RequestFlag bits.
     uint32_t flags = 0;
     std::optional<uint32_t> pendingToken;
+    // While the request thinks under a budget (ModelRequest::thinkingBudget),
+    // that budget with the thinking tokens it may still select; none once
+    // thinking ended.
+    std::optional<ThinkingBudget> thinking;
     // A constrained request's final prompt row, held from its prompt's end
     // until its first token is selected under its first mask, suspensions
     // included. Composite cache state never stores it; every cache hit
@@ -382,15 +386,16 @@ struct Runtime::Impl {
   // Warmup selects greedily, so the first sampled, penalized or constrained
   // request would compile the policy's kernels inside its TTFT and stall the
   // engine meanwhile; compile them now. A sampled, penalized and constrained
-  // lane and a greedy one reach every kernel the first-token and verify
-  // selections dispatch.
+  // lane at its thinking cutoff and a greedy one reach every kernel the
+  // first-token and verify selections dispatch.
   void preparePolicyPipelines() const {
     const ops::SamplingPolicy sampled{.topK = 0,
                                       .temperature = 1.0F,
                                       .topP = 0.95F,
                                       .constrained = true,
                                       .penalties = {1.1F, 0.5F, 0.5F},
-                                      .minP = 0.05F};
+                                      .minP = 0.05F,
+                                      .thinkingCutoff = ops::ThinkingCutoff{}};
     const std::array<ops::SamplingPolicy, 2> policies{sampled, {}};
     const std::array<uint32_t, 2> stateLanes{0, 1};
     const ops::PenaltyTable penalties{penaltyTable, stateLanes};
@@ -879,11 +884,17 @@ struct Runtime::Impl {
             entry.sampling.frequencyPenalty};
   }
 
+  // A selection's rows select the request's next tokens in order, so with n
+  // thinking tokens left, its row n closes thinking.
   static ops::SamplingPolicy samplingPolicy(const Request &entry) noexcept {
     return {entry.sampling.topK, entry.sampling.temperature,
             entry.sampling.topP, entry.constraint == ConstraintMode::TokenMask,
             (entry.flags & RequestIgnoreEndOfSequence) != 0,
-            samplingPenalties(entry), entry.sampling.minP};
+            samplingPenalties(entry), entry.sampling.minP,
+            entry.thinking ? std::optional<ops::ThinkingCutoff>(
+                                 {entry.thinking->tokens, entry.thinking->end,
+                                  entry.thinking->alsoEnds})
+                           : std::nullopt};
   }
 
   ops::SamplingBuffers samplingBuffers(uint32_t lanes) const {
@@ -929,12 +940,22 @@ struct Runtime::Impl {
   // The one place a token the target selected becomes the pending anchor:
   // tokens are one step's selections in order, the new anchor last. The
   // command that selected them has completed, and the next one that reads
-  // the lane's words is encoded after this.
+  // the lane's words is encoded after this. Each token counts against the
+  // thinking budget until one ends thinking; the cutoff (samplingPolicy)
+  // never lets thinking run past it.
   void commitSelected(Request &entry, std::span<const uint32_t> tokens) {
     if (tokens.empty())
       throw std::logic_error("no selected token to commit");
     if (samplingPenalties(entry).active())
       ops::Sampling::countPenaltyTokens(penaltyWords(entry.stateLane), tokens);
+    for (const uint32_t token : tokens) {
+      if (!entry.thinking)
+        break;
+      if (token == entry.thinking->end || token == entry.thinking->alsoEnds)
+        entry.thinking.reset();
+      else if (!entry.thinking->tokens--)
+        throw std::logic_error("thinking went past its budget");
+    }
     entry.pendingToken = tokens.back();
   }
 
@@ -2034,6 +2055,7 @@ StateAdmission Runtime::beginAt(const ModelRequest &request, uint32_t stateLane)
   entry.sampling = request.sampling;
   entry.constraint = request.constraint;
   entry.flags = request.flags;
+  entry.thinking = request.thinkingBudget;
   entry.scoreTokens.assign(request.scoreTokens.begin(),
                            request.scoreTokens.end());
   std::vector<Impl::ImageState> images;
