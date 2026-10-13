@@ -155,6 +155,22 @@ struct GgufEmbedIQ3S {
     return bfloat(float(gguf_half(block, D)) * float(1 + 2 * s) * float(magnitude) * sign);
   }
 };
+// block_iq2_s: half d | uchar qs[32] | uchar signs[32] | uchar qh[8] | uchar scales[8], eight 32-weight groups of
+// four 8-weight IQ2_S grid entries: entry e of group j is kIQ2SGrid[qs[4 j + e] | (bits 2e of qh[j]) << 8], element k
+// its byte k, negated by bit k of signs[4 j + e]. Entries 0 and 1 scale by the low nibble s of scales[j], 2 and 3 by
+// the high one, as d (0.5 + s) / 4: value = d (0.5 + s) 0.25 grid sign, llama.cpp's operation order.
+struct GgufEmbedIQ2S {
+  enum : uint { Weights = 256, Bytes = 82, D = 0, Codes = 2, Signs = 34, High = 66, Scales = 74 };
+  __attribute__((always_inline)) static bfloat value(device const uchar *block, uint dim) {
+#pragma clang fp reassociate(off)
+    const uint j = (dim % Weights) / 32, e = (dim % 32) / 8, k = dim % 8;
+    const uint index = block[Codes + 4 * j + e] | ((uint(block[High + j]) << (8 - 2 * e)) & 0x300);
+    const uint magnitude = uint(kIQ2SGrid[index] >> (8 * k)) & 0xFF;
+    const uint s = (block[Scales + j] >> (4 * (e / 2))) & 15;
+    const float sign = (block[Signs + 4 * j + e] >> k) & 1 ? -1.0f : 1.0f;
+    return bfloat(float(gguf_half(block, D)) * (0.5f + float(s)) * 0.25f * float(magnitude) * sign);
+  }
+};
 // block_iq1_m: uchar qs[32] | uchar qh[16] | ushort scales[4], eight 32-weight groups of four 8-weight IQ1_S grid
 // entries: entry e of group j is kIQ1SGrid[qs[4 j + e] | (h & 7) << 8] for h nibble e % 2 of qh[2 j + e / 2], whose
 // bit 3 makes its delta -1/8 (else +1/8); element k is nibble k / 4 of the entry's byte k % 4, less 1. Entries e and

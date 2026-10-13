@@ -454,6 +454,7 @@ EMBEDDING_TYPES = {
     "Q4_0",
     "Q4_1",
     "IQ1_M",
+    "IQ2_S",
     "IQ3_S",
     "IQ4_NL",
     "IQ4_XS",
