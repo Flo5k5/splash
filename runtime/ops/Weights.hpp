@@ -130,22 +130,24 @@ private:
 };
 
 // A token table's rows as stored, gathered, never multiplied (Embedding.cpp):
-// native blocks of a gguf_embedding_format (metal/abi/Gguf.h), or bf16
-// values, which a safetensors checkpoint may keep unquantized. A default value
-// holds no rows, which a reader replaces.
+// native blocks of a gguf_embedding_format (metal/abi/Gguf.h), or bf16 or f16
+// values, which a safetensors checkpoint or a GGUF may keep unquantized. A
+// default value holds no rows, which a reader replaces.
 struct NativeRows final {
-  // The formatId of bf16 rows, which no kQuantFormats entry describes.
-  static constexpr uint32_t kBfloat16 = 0xffffffff;
+  // The formatIds of bf16 and f16 rows, which no kQuantFormats entry describes.
+  static constexpr uint32_t kBfloat16 = 0xffffffff, kFloat16 = 0xfffffffe;
 
   NativeRows() = default;
-  // Rows of a gguf_embedding_format or kBfloat16; throws for any other formatId.
+  // Rows of a gguf_embedding_format, kBfloat16 or kFloat16; throws for any other formatId.
   NativeRows(metal::MetalBuffer rows, uint32_t formatId);
   metal::MetalBuffer rows;
   uint32_t formatId = 0;
   [[nodiscard]] bool isBfloat16() const noexcept { return formatId == kBfloat16; }
-  // The kernel name suffix of its format ("bf16" for bf16 rows).
+  // Whether the rows hold 16-bit float values, bf16 or f16, rather than native blocks.
+  [[nodiscard]] bool isFloat() const noexcept { return formatId == kBfloat16 || formatId == kFloat16; }
+  // The kernel name suffix of its format ("bf16" and "f16" for float rows).
   [[nodiscard]] const char *name() const noexcept;
-  // The elements and bytes of one block: its format's native block, or one bf16 value.
+  // The elements and bytes of one block: its format's native block, or one float value.
   [[nodiscard]] uint32_t blockElements() const noexcept;
   [[nodiscard]] uint32_t blockBytes() const noexcept;
 };

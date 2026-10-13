@@ -18,6 +18,10 @@ inline ushort gguf_u16(device const uchar *block, uint at) {
 inline half gguf_half(device const uchar *block, uint at) {
   return as_type<half>(gguf_u16(block, at));
 }
+// The little-endian uint at byte `at` of a block.
+inline uint gguf_u32(device const uchar *block, uint at) {
+  return uint(gguf_u16(block, at)) | uint(gguf_u16(block, at + 2)) << 16;
+}
 
 // block_q4_K: half d | half dmin | uchar scales[12] | uchar qs[128], eight
 // 32-weight groups with 6-bit scales and mins; block_q5_K (Fifth) holds
@@ -160,40 +164,100 @@ struct GgufEmbedIQ3S {
     return bfloat(float(gguf_half(block, D)) * float(1 + 2 * s) * float(magnitude) * sign);
   }
 };
+// The IQ2 and IQ3_XXS grid formats: a block's leading half d, eight 32-weight groups, each element a grid magnitude
+// times a scale of 4-bit s, d (0.5 + s) / 4 (IQ2) or / 2 (IQ3_XXS), negated by its sign bit: value = d (0.5 + s) unit
+// grid sign, llama.cpp's operation order.
+inline bfloat gguf_grid_value(device const uchar *block, uint s, float unit, uint magnitude, bool negative) {
+#pragma clang fp reassociate(off)
+  return bfloat(float(gguf_half(block, 0)) * (0.5f + float(s)) * unit * float(magnitude) * (negative ? -1.0f : 1.0f));
+}
+// Byte k of an eight-weight IQ2 grid entry.
+inline uint gguf_iq2_magnitude(uint64_t entry, uint k) { return uint(entry >> (8 * k)) & 0xFF; }
+// block_iq2_xxs: half d | uchar qs[64], eight 32-weight groups of eight bytes: bytes 0..3 the kIQ2XXSGrid indices of
+// the group's four 8-weight entries, bytes 4..7 a word of their 7-bit sign indices (entry e's at bit 7 e, its eight
+// signs quant_signs7 of it) and the scale s at bits 28..31. Element k of entry e is the entry's byte k, unit 1/4.
+struct GgufEmbedIQ2XXS {
+  enum : uint { Weights = 256, Bytes = 66, D = 0, Codes = 2 };
+  __attribute__((always_inline)) static bfloat value(device const uchar *block, uint dim) {
+    const uint j = (dim % Weights) / 32, e = (dim % 32) / 8, k = dim % 8;
+    const uint aux = gguf_u32(block, Codes + 8 * j + 4);
+    const uint signs = quant_signs7((aux >> (7 * e)) & 127);
+    return gguf_grid_value(block, aux >> 28, 0.25f, gguf_iq2_magnitude(kIQ2XXSGrid[block[Codes + 8 * j + e]], k),
+                           (signs >> k) & 1);
+  }
+};
+// block_iq2_xs: half d | ushort qs[32] | uchar scales[8], eight 32-weight groups of four 8-weight entries: entry e of
+// group j is qs[4 j + e], a 9-bit kIQ2XSGrid index and a 7-bit sign index above it. Entries 0 and 1 take the low
+// nibble s of scales[j], 2 and 3 the high one; unit 1/4.
+struct GgufEmbedIQ2XS {
+  enum : uint { Weights = 256, Bytes = 74, D = 0, Codes = 2, Scales = 66 };
+  __attribute__((always_inline)) static bfloat value(device const uchar *block, uint dim) {
+    const uint j = (dim % Weights) / 32, e = (dim % 32) / 8, k = dim % 8;
+    const uint entry = gguf_u16(block, Codes + 8 * j + 2 * e);
+    const uint s = (block[Scales + j] >> (4 * (e / 2))) & 15;
+    return gguf_grid_value(block, s, 0.25f, gguf_iq2_magnitude(kIQ2XSGrid[entry & 511], k),
+                           (quant_signs7(entry >> 9) >> k) & 1);
+  }
+};
 // block_iq2_s: half d | uchar qs[32] | uchar signs[32] | uchar qh[8] | uchar scales[8], eight 32-weight groups of
-// four 8-weight IQ2_S grid entries: entry e of group j is kIQ2SGrid[qs[4 j + e] | (bits 2e of qh[j]) << 8], element k
-// its byte k, negated by bit k of signs[4 j + e]. Entries 0 and 1 scale by the low nibble s of scales[j], 2 and 3 by
-// the high one, as d (0.5 + s) / 4: value = d (0.5 + s) 0.25 grid sign, llama.cpp's operation order.
+// four 8-weight entries: entry e of group j is kIQ2SGrid[qs[4 j + e] | (bits 2e of qh[j]) << 8], element k negated by
+// bit k of signs[4 j + e]; scales as IQ2_XS's, unit 1/4.
 struct GgufEmbedIQ2S {
   enum : uint { Weights = 256, Bytes = 82, D = 0, Codes = 2, Signs = 34, High = 66, Scales = 74 };
   __attribute__((always_inline)) static bfloat value(device const uchar *block, uint dim) {
-#pragma clang fp reassociate(off)
     const uint j = (dim % Weights) / 32, e = (dim % 32) / 8, k = dim % 8;
     const uint index = block[Codes + 4 * j + e] | ((uint(block[High + j]) << (8 - 2 * e)) & 0x300);
-    const uint magnitude = uint(kIQ2SGrid[index] >> (8 * k)) & 0xFF;
     const uint s = (block[Scales + j] >> (4 * (e / 2))) & 15;
-    const float sign = (block[Signs + 4 * j + e] >> k) & 1 ? -1.0f : 1.0f;
-    return bfloat(float(gguf_half(block, D)) * (0.5f + float(s)) * 0.25f * float(magnitude) * sign);
+    return gguf_grid_value(block, s, 0.25f, gguf_iq2_magnitude(kIQ2SGrid[index], k),
+                           (block[Signs + 4 * j + e] >> k) & 1);
   }
 };
-// block_iq1_m: uchar qs[32] | uchar qh[16] | ushort scales[4], eight 32-weight groups of four 8-weight IQ1_S grid
-// entries: entry e of group j is kIQ1SGrid[qs[4 j + e] | (h & 7) << 8] for h nibble e % 2 of qh[2 j + e / 2], whose
-// bit 3 makes its delta -1/8 (else +1/8); element k is nibble k / 4 of the entry's byte k % 4, less 1. Entries e and
-// e + 1 (e even) scale by 1 + 2 s, s the three bits at 6 (j % 2) + 3 (e / 2) of scales[j / 2], times the half d whose
-// nibble w is the top nibble of scales[w]; value = d (1 + 2 s) (grid + delta), llama.cpp's operation order.
+// block_iq3_xxs: half d | uchar qs[64] | uchar scales_and_signs[32], eight 32-weight groups: group j's element l is
+// byte l % 4 of kIQ3XXSGrid[qs[8 j + l / 4]], its sign bit l % 8 of quant_signs7 of the 7-bit index at bit 7 (l / 8)
+// of word j of scales_and_signs, whose bits 28..31 hold s; unit 1/2.
+struct GgufEmbedIQ3XXS {
+  enum : uint { Weights = 256, Bytes = 98, D = 0, Codes = 2, Signs = 66 };
+  __attribute__((always_inline)) static bfloat value(device const uchar *block, uint dim) {
+    const uint j = (dim % Weights) / 32, l = dim % 32;
+    const uint aux = gguf_u32(block, Signs + 4 * j);
+    const uint magnitude = (kIQ3XXSGrid[block[Codes + 8 * j + l / 4]] >> (8 * (l % 4))) & 0xFF;
+    const uint signs = quant_signs7((aux >> (7 * (l / 8))) & 127);
+    return gguf_grid_value(block, aux >> 28, 0.5f, magnitude, (signs >> (l % 8)) & 1);
+  }
+};
+// The IQ1 formats: element k of an 8-weight kIQ1SGrid entry is nibble k / 4 of the entry's byte k % 4, less 1, plus
+// the entry's delta, -1/8 when `negative` (else +1/8), times d (1 + 2 s) for the half d and 3-bit scale s of its
+// weights: value = d (1 + 2 s) (grid + delta), llama.cpp's operation order.
+inline bfloat gguf_iq1_value(half d, uint s, uint index, uint k, bool negative) {
+#pragma clang fp reassociate(off)
+  const int grid = int((kIQ1SGrid[index] >> (8 * (k % 4) + 4 * (k / 4))) & 15) - 1;
+  return bfloat(float(d) * float(1 + 2 * s) * (float(grid) + (negative ? -0.125f : 0.125f)));
+}
+// block_iq1_s: half d | uchar qs[32] | ushort qh[8], eight 32-weight groups of four 8-weight entries: entry e of
+// group j is qs[4 j + e] with the three bits at 3 e of qh[j] above it; qh[j] holds the group's s at bits 12..14 and
+// its negative delta at bit 15.
+struct GgufEmbedIQ1S {
+  enum : uint { Weights = 256, Bytes = 50, D = 0, Codes = 2, High = 34 };
+  __attribute__((always_inline)) static bfloat value(device const uchar *block, uint dim) {
+    const uint j = (dim % Weights) / 32, e = (dim % 32) / 8, k = dim % 8;
+    const uint qh = gguf_u16(block, High + 2 * j);
+    return gguf_iq1_value(gguf_half(block, D), (qh >> 12) & 7, block[Codes + 4 * j + e] | ((qh >> (3 * e)) & 7) << 8,
+                          k, (qh >> 15) & 1);
+  }
+};
+// block_iq1_m: uchar qs[32] | uchar qh[16] | ushort scales[4], eight 32-weight groups of four 8-weight entries:
+// entry e of group j is qs[4 j + e] with the low three bits of nibble e % 2 of qh[2 j + e / 2] above it, whose bit 3
+// is its negative delta. Entries e and e + 1 (e even) take s, the three bits at 6 (j % 2) + 3 (e / 2) of
+// scales[j / 2], and the half d whose nibble w is the top nibble of scales[w].
 struct GgufEmbedIQ1M {
   enum : uint { Weights = 256, Bytes = 56, Codes = 0, High = 32, Scales = 48 };
   __attribute__((always_inline)) static bfloat value(device const uchar *block, uint dim) {
-#pragma clang fp reassociate(off)
     const uint j = (dim % Weights) / 32, e = (dim % 32) / 8, k = dim % 8;
     const ushort d = (gguf_u16(block, Scales) >> 12) | ((gguf_u16(block, Scales + 2) >> 8) & 0x00F0) |
                      ((gguf_u16(block, Scales + 4) >> 4) & 0x0F00) | (gguf_u16(block, Scales + 6) & 0xF000);
     const uint s = (gguf_u16(block, Scales + 2 * (j / 2)) >> (6 * (j % 2) + 3 * (e / 2))) & 7;
     const uint h = block[High + 2 * j + e / 2] >> (4 * (e % 2));
-    const uint entry = kIQ1SGrid[block[Codes + 4 * j + e] | ((h & 7) << 8)];
-    const int grid = int((entry >> (8 * (k % 4) + 4 * (k / 4))) & 15) - 1;
-    const float delta = h & 8 ? -0.125f : 0.125f;
-    return bfloat(float(as_type<half>(d)) * float(1 + 2 * s) * (float(grid) + delta));
+    return gguf_iq1_value(as_type<half>(d), s, block[Codes + 4 * j + e] | ((h & 7) << 8), k, h & 8);
   }
 };
 // block_mxfp4: uchar e | uchar qs[16], element l in nibble l / 16 of qs[l % 16], an E2M1 code; value =
@@ -236,11 +300,18 @@ template <uint Bits, uint Group> struct GgufEmbedAffine {
     return bfloat(code * s + z);
   }
 };
-// A bf16 token table, which a safetensors checkpoint keeps unquantized: each value is its own block.
+// A bf16 token table, which a safetensors checkpoint or a GGUF keeps unquantized: each value is its own block.
 struct GgufEmbedBF16 {
   enum : uint { Weights = 1, Bytes = 2 };
   __attribute__((always_inline)) static bfloat value(device const uchar *block, uint) {
     return as_type<bfloat>(ushort(block[0] | (block[1] << 8)));
+  }
+};
+// An F16 token table, which a GGUF keeps unquantized: each value is its own block, the half's value rounded to bf16.
+struct GgufEmbedF16 {
+  enum : uint { Weights = 1, Bytes = 2 };
+  __attribute__((always_inline)) static bfloat value(device const uchar *block, uint) {
+    return bfloat(float(gguf_half(block, 0)));
   }
 };
 #define GGUF_EMBED_AFFINE(B)                                                                                       \

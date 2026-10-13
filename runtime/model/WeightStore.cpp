@@ -157,11 +157,14 @@ ops::EmbeddingWeights readBlockEmbedding(WeightFile &file, uint32_t outputSize, 
     const GgufTensorDescriptor d = readGgufDescriptor(file, label);
     if (d.outputSize != outputSize || d.inputSize != inputSize)
         throw WeightStoreError("GGUF embedding does not match the layout: " + std::string(label));
-    if (d.type == ggml::kBF16) {
+    if (d.type == ggml::kBF16 || d.type == ggml::kF16) {
+        const bool bfloat16 = d.type == ggml::kBF16;
+        const std::string name = bfloat16 ? "bf16" : "f16";
         if (d.plane0Bytes != uint64_t{d.outputSize} * d.inputSize * sizeof(uint16_t))
-            throw WeightStoreError("bf16 embedding rows are inconsistent: " + std::string(label));
+            throw WeightStoreError(name + " embedding rows are inconsistent: " + std::string(label));
         return {outputSize, inputSize,
-                ops::NativeRows(file.section(d.plane0Bytes, std::string(label) + "-bf16"), ops::NativeRows::kBfloat16)};
+                ops::NativeRows(file.section(d.plane0Bytes, std::string(label) + "-" + name),
+                                bfloat16 ? ops::NativeRows::kBfloat16 : ops::NativeRows::kFloat16)};
     }
     const uint32_t format = gguf_format_of(d.type);
     if (format == GGUF_FMT_COUNT ||

@@ -38,8 +38,10 @@ uint32_t imageFormat(uint32_t type) { return type == ggml::kNVFP4 ? GGUF_FMT_NVF
 
 bool quantizedType(uint32_t type) { return imageFormat(type) != GGUF_FMT_COUNT; }
 bool floatType(uint32_t type) { return type == ggml::kF32; }
-// The token rows the embedding kernel gathers.
-bool embeddingType(uint32_t type) { return gguf_embedding_format(imageFormat(type)); }
+// The token rows the embedding kernels gather: native rows of a format, or F16 or BF16 values.
+bool embeddingType(uint32_t type) {
+  return gguf_embedding_format(imageFormat(type)) || type == ggml::kF16 || type == ggml::kBF16;
+}
 // alpha/beta run as one segment of their shared type: any format of the
 // projections (one repacked tensor) or F32 (one float tensor), which BF16
 // becomes exactly.

@@ -12,15 +12,17 @@
 namespace splash::ops {
 
 NativeRows::NativeRows(metal::MetalBuffer rows, uint32_t formatId) : rows(std::move(rows)), formatId(formatId) {
-  if (!isBfloat16() && !gguf_embedding_format(formatId))
+  if (!isFloat() && !gguf_embedding_format(formatId))
     throw std::invalid_argument("unsupported native embedding format");
 }
-const char *NativeRows::name() const noexcept { return isBfloat16() ? "bf16" : kQuantFormats[formatId].name; }
+const char *NativeRows::name() const noexcept {
+  return isBfloat16() ? "bf16" : isFloat() ? "f16" : kQuantFormats[formatId].name;
+}
 uint32_t NativeRows::blockElements() const noexcept {
-  return isBfloat16() ? 1 : kQuantFormats[formatId].block_elements;
+  return isFloat() ? 1 : kQuantFormats[formatId].block_elements;
 }
 uint32_t NativeRows::blockBytes() const noexcept {
-  return isBfloat16() ? sizeof(uint16_t) : kQuantFormats[formatId].block_bytes;
+  return isFloat() ? sizeof(uint16_t) : kQuantFormats[formatId].block_bytes;
 }
 
 void Embedding::add(metal::CommandGraph &graph, metal::MetalBuffer tokens,

@@ -343,8 +343,9 @@ std::filesystem::path writeGgufTensor(const std::filesystem::path &path,
     return path;
 }
 
-// GGUF image readers hold a tensor to the sizes the layout expects, and a
-// token gather writes only into buffers holding its rows.
+// GGUF image readers hold a tensor to the sizes the layout expects, read F16
+// and BF16 token rows as float rows, and a token gather writes only into
+// buffers holding its rows.
 void testGgufImageLayout(MetalBackend &backend, const std::filesystem::path &root) {
     constexpr uint32_t rows = 256, columns = 256;
     // Q8_0 planes and native rows as the planner lays them out.
@@ -395,6 +396,18 @@ void testGgufImageLayout(MetalBackend &backend, const std::filesystem::path &roo
             },
             "GGUF embedding does not match the layout",
             "GGUF embedding of other sizes than the layout's was accepted");
+    }
+    // A GGUF's F16 and BF16 token rows read as the gathers' float rows.
+    for (const auto &[type, format] : {std::pair{splash::model::ggml::kF16, splash::ops::NativeRows::kFloat16},
+                                       std::pair{splash::model::ggml::kBF16, splash::ops::NativeRows::kBfloat16}}) {
+        WeightFile file = loaded(writeGgufTensor(root / ("embedding-" + std::to_string(type) + ".bin"),
+                                                 {.type = type,
+                                                  .outputSize = rows,
+                                                  .inputSize = columns,
+                                                  .plane0Bytes = uint64_t{rows} * columns * 2}));
+        const auto table = splash::model::readBlockEmbedding(file, rows, columns, "embedding");
+        file.finish();
+        require(table.blocks().formatId == format, "GGUF float embedding did not read as its float rows");
     }
     WeightFile file = loaded(embedding);
     const auto table = splash::model::readBlockEmbedding(file, rows, columns, "embedding");

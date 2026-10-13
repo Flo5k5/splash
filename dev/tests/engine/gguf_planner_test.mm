@@ -82,6 +82,26 @@ void checkDense(const std::filesystem::path &directory) {
   check(bias && bias->conversion == model::gguf::Conversion::NarrowToBfloat16 && grouped(bias->source.order, 0, 1, g),
         "planner narrows the time bias to bf16 and groups its value heads");
 
+  // A token table of every type the gathers read, but llama.cpp's NVFP4, whose rows the writer converts: copied as
+  // stored.
+  std::vector<uint32_t> tableTypes{model::ggml::kF16, model::ggml::kBF16};
+  for (uint32_t format = 0; format < GGUF_FMT_COUNT; ++format)
+    if (const std::optional<uint32_t> type = ggufType(format);
+        type && gguf_embedding_format(format) && *type != model::ggml::kNVFP4)
+      tableTypes.push_back(*type);
+  for (const uint32_t type : tableTypes) {
+    std::vector<Tensor> tensors = target.tensors;
+    Tensor &table = tensorNamed(tensors, "token_embd.weight");
+    const model::GgmlTypeTraits &traits = *model::ggmlTypeTraits(type);
+    table.type = type;
+    table.data.resize(uint64_t{g.vocabularySize} * g.hiddenSize / traits.blockElements * traits.blockBytes);
+    writeGguf(path, tensors, g);
+    const Plan tables = plan(path, g);
+    check(!tables.error && asStored(copyIn(tables, "token_embd.weight"), table.data),
+          "planner copies a token table as stored: " + model::ggmlTypeName(type) +
+              (tables.error ? ": " + *tables.error : ""));
+  }
+
   // A key or value projection of other than attentionKvHeads heads.
   for (const std::string name : {"blk.1.attn_k.weight", "blk.1.attn_v.weight"}) {
     for (uint64_t rows : {uint64_t{g.attentionHeadDimension}, uint64_t{3} * g.attentionHeadDimension}) {

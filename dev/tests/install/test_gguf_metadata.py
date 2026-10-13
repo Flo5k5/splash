@@ -390,7 +390,7 @@ class GgufMetadataTests(unittest.TestCase):
                 },
                 "attn_qkv.weight BF16 [(]2 tensors[)]",
             ),
-            ({"token_embd.weight": GGML["IQ2_XXS"]}, "token_embd.weight IQ2_XXS"),
+            ({"token_embd.weight": GGML["F32"]}, "token_embd.weight F32"),
             ({"blk.3.attn_q.weight": GGML["BF16"]}, "attn_q.weight BF16"),
             # F32 only where the loader reads floats: not a projection, not
             # a quantized router or norm, not half an alpha/beta pair.
@@ -438,7 +438,9 @@ class GgufMetadataTests(unittest.TestCase):
     def test_loadable_types_are_the_native_formats(self):
         # The installer's lists must be the loader's own: kQuantFormats' GGML
         # types (runtime/metal/abi/QuantFormat.h), and those of the formats
-        # gguf_embedding_format names (runtime/metal/abi/Gguf.h).
+        # gguf_embedding_format does not leave out (runtime/metal/abi/Gguf.h)
+        # with the float types embeddingType names
+        # (runtime/model/GgufImage.cpp).
         abi = Path(__file__).resolve().parents[3] / "runtime/metal/abi"
         header = (abi / "QuantFormat.h").read_text()
         table = header.split("kQuantFormats[GGUF_FMT_COUNT] = {", 1)[1].split("};", 1)[
@@ -463,9 +465,12 @@ class GgufMetadataTests(unittest.TestCase):
         self.assertEqual(set(types.values()), gguf.QUANTIZED_TYPES)
         embedding = (abi / "Gguf.h").read_text().split("gguf_embedding_format", 1)[1]
         embedding = embedding.split("}", 1)[0]
-        names = re.findall(r"GGUF_FMT_(\w+)", embedding)
+        left_out = {ids[name] for name in re.findall(r"!= GGUF_FMT_(\w+)", embedding)}
+        planner = (abi.parents[1] / "model/GgufImage.cpp").read_text()
+        floats = planner.split("bool embeddingType(", 1)[1].split("}", 1)[0]
         self.assertEqual(
-            {types[ids[name]] for name in names if ids[name] in types},
+            {name for index, name in types.items() if index not in left_out}
+            | set(re.findall(r"ggml::k(F16|BF16)\b", floats)),
             gguf.EMBEDDING_TYPES,
         )
 

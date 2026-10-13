@@ -22,7 +22,8 @@ __attribute__((always_inline)) inline void gguf_embedding(device const uint *tok
                    uint index [[thread_position_in_grid]]) { \
     gguf_embedding<F>(tokens, table, output, p, index); \
   }
-// One gather per gguf_embedding_format (metal/abi/Gguf.h), named by its kQuantFormats token, and one of bf16 rows.
+// One gather per gguf_embedding_format (metal/abi/Gguf.h), named by its kQuantFormats token, and those of bf16 and
+// f16 rows.
 GGUF_EMBEDDING_ENTRY(gguf_embed_q4k, GgufEmbedQ4K)
 GGUF_EMBEDDING_ENTRY(gguf_embed_q6k, GgufEmbedQ6K)
 GGUF_EMBEDDING_ENTRY(gguf_embed_q80, GgufEmbedQ80)
@@ -37,11 +38,16 @@ GGUF_EMBEDDING_ENTRY(gguf_embed_pq20, GgufEmbedPQ20)
 GGUF_EMBEDDING_ENTRY(gguf_embed_iq4nl, GgufEmbedIQ4NL)
 GGUF_EMBEDDING_ENTRY(gguf_embed_iq4xs, GgufEmbedIQ4XS)
 GGUF_EMBEDDING_ENTRY(gguf_embed_iq3s, GgufEmbedIQ3S)
+GGUF_EMBEDDING_ENTRY(gguf_embed_iq3xxs, GgufEmbedIQ3XXS)
+GGUF_EMBEDDING_ENTRY(gguf_embed_iq2xxs, GgufEmbedIQ2XXS)
+GGUF_EMBEDDING_ENTRY(gguf_embed_iq2xs, GgufEmbedIQ2XS)
 GGUF_EMBEDDING_ENTRY(gguf_embed_iq2s, GgufEmbedIQ2S)
+GGUF_EMBEDDING_ENTRY(gguf_embed_iq1s, GgufEmbedIQ1S)
 GGUF_EMBEDDING_ENTRY(gguf_embed_iq1m, GgufEmbedIQ1M)
 GGUF_EMBEDDING_ENTRY(gguf_embed_mxfp4, GgufEmbedMXFP4)
 GGUF_EMBEDDING_ENTRY(gguf_embed_nvfp4, GgufEmbedNVFP4)
 GGUF_EMBEDDING_ENTRY(gguf_embed_bf16, GgufEmbedBF16)
+GGUF_EMBEDDING_ENTRY(gguf_embed_f16, GgufEmbedF16)
 #define GGUF_EMBEDDING_AFFINE(B)                                                                \
   GGUF_EMBEDDING_ENTRY(gguf_embed_af##B##g32, GgufEmbedAF##B##G32)                              \
   GGUF_EMBEDDING_ENTRY(gguf_embed_af##B##g64, GgufEmbedAF##B##G64)                              \
