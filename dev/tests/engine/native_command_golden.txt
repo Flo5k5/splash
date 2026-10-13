@@ -9,6 +9,7 @@
 defaults |  | auto auto
 limits | --max-context 100K --max-memory 32G | 102400 34359738368
 disk | --max-cache-disk 5G | auto auto 5368709120
+disk_writes | --max-cache-disk 5G --max-cache-disk-writes 200G | auto auto 5368709120 --max-cache-disk-writes 214748364800
 persistent | --max-cache-disk 5G --persistent-cache | auto auto 5368709120 --persistent-cache on
 persistent_dir | --max-cache-disk 5G --persistent-cache --cache-dir /srv/cache | auto auto 5368709120 --persistent-cache on --cache-dir /srv/cache
 bf16 | --kv-format bf16 | auto auto --kv-format bf16

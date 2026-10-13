@@ -46,7 +46,7 @@ public:
   [[nodiscard]] std::shared_ptr<const CompositeState>
   snapshot(uint64_t requestId);
   [[nodiscard]] uint64_t snapshotBytes() const noexcept override;
-  [[nodiscard]] bool canSnapshotToDisk() const noexcept override;
+  [[nodiscard]] bool canSnapshotToDisk(bool inUse) const noexcept override;
   [[nodiscard]] std::unique_ptr<StateOffload>
   snapshotToDisk(uint64_t requestId, std::function<void()> completion) override;
   [[nodiscard]] uint64_t reclaimIdleState(bool keepLane,

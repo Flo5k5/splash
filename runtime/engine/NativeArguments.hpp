@@ -26,6 +26,9 @@ struct NativeArguments final {
   uint32_t maxContext = 0;
   uint64_t maxMemoryBytes = 0;
   uint64_t maxCacheDiskBytes = 0;
+  // --max-cache-disk-writes BYTES: the SSD cache's write budget, the most it
+  // writes a day on average; zero for none.
+  uint64_t maxCacheDiskWritesBytes = 0;
   // --persistent-cache on|off: whether the cache tier keeps its files for the
   // next process, instead of temporary ones.
   bool persistentCache = false;

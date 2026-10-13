@@ -21,11 +21,6 @@ uint64_t systemUnixMicros() noexcept {
       std::chrono::duration_cast<std::chrono::microseconds>(now).count());
 }
 
-double awakeMilliseconds() noexcept {
-  const auto now = AwakeClock::now().time_since_epoch();
-  return std::chrono::duration<double, std::milli>(now).count();
-}
-
 NativeRuntime::NativeRuntime(NativeLoopConfig config, double idleReleaseSeconds,
                              engine::Cache &cache, model::Model &model,
                              ByteSink output, StatusProvider statusProvider,

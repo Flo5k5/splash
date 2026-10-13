@@ -111,7 +111,7 @@ public:
       *pool_ += bytes();
   }
   uint64_t bytes() const noexcept override { return 64; }
-  bool canOffload() const noexcept override { return true; }
+  bool canOffload(bool) const noexcept override { return true; }
   std::unique_ptr<StateOffload> offload(std::function<void()>) const override {
     return std::make_unique<OffloadTicket>(control_);
   }
@@ -126,7 +126,7 @@ class KeptState final : public CompositeState {
 public:
   explicit KeptState(std::shared_ptr<OffloadControl> control) : control_(std::move(control)) {}
   uint64_t bytes() const noexcept override { return 64; }
-  bool canOffload() const noexcept override { return true; }
+  bool canOffload(bool) const noexcept override { return true; }
   std::unique_ptr<StateOffload> persist(std::function<void()>) const override {
     return std::make_unique<OffloadTicket>(control_);
   }
@@ -507,7 +507,7 @@ public:
   // Without a cache slot the production model writes the lane's state to
   // the disk tier; the fake has one when `stateTier` is set, with quota for
   // every state.
-  bool canSnapshotToDisk() const noexcept override { return stateTier != nullptr; }
+  bool canSnapshotToDisk(bool) const noexcept override { return stateTier != nullptr; }
   std::unique_ptr<StateOffload> snapshotToDisk(uint64_t, std::function<void()>) override {
     ++diskSnapshots;
     return std::make_unique<OffloadTicket>(stateTier);

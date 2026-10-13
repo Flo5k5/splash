@@ -274,7 +274,7 @@ void testDirectDiskSnapshot(metal::MetalBackend &backend) {
       backend, governor.allocationAdmission(), kStateLayout,
       std::make_shared<model::SlotFile>(kStateSlotBytes,
                                         std::make_shared<model::DiskBudget>(kStateSlotBytes)));
-  require(storage.canSnapshotToDisk(), "a state file that holds one state refuses writes");
+  require(storage.canSnapshotToDisk(false), "a state file that holds one state refuses writes");
   require(static_cast<bool>(storage.tryActivateLane(0, 321)), "lane activation failed");
   storage.swapParity(0);
   const model::GdnParityBuffers &current = storage.current(0);
@@ -319,6 +319,36 @@ void testDirectDiskSnapshot(metal::MetalBackend &backend) {
   require(finishWhenReady(*again), "the second direct disk write failed");
   again.reset();
   storage.releaseLane(0, 321);
+}
+
+// A state's write, from a lane or from a cached copy, takes its slot from
+// the write budget. Overdrawn, the budget holds back writes not in use
+// until it refills, and lets those in use pass.
+void testStateWritesDrawOnTheWriteBudget(metal::MetalBackend &backend) {
+  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
+                          queryHostAvailableMemory, 0);
+  double now = 0.0;
+  auto budget = std::make_shared<model::DiskBudget>(4 * kStateSlotBytes, [&now] { return now; });
+  // Two slots a day, half a slot at once.
+  budget->setWriteBudget(2 * kStateSlotBytes);
+  model::QwenStateStorage storage(backend, governor.allocationAdmission(), kStateLayout,
+                                  std::make_shared<model::SlotFile>(kStateSlotBytes, budget));
+  require(static_cast<bool>(storage.tryActivateLane(0, 456)), "lane activation failed");
+  storage.updateLengths(0, published(4096));
+  auto cached = storage.snapshot(0);
+  require(cached && storage.canSnapshotToDisk(false) && cached->canOffload(false),
+          "a write budget with room held a state back");
+  auto write = storage.snapshotToDisk(0, {});
+  require(write && finishWhenReady(*write), "the lane's state was not written");
+  require(!storage.canSnapshotToDisk(false) && storage.canSnapshotToDisk(true) &&
+              !cached->canOffload(false) && cached->canOffload(true),
+          "an overdrawn write budget did not hold back only what is not in use");
+  now = 86'400'000.0 / 4 + 1.0;
+  require(storage.canSnapshotToDisk(false) && cached->canOffload(false),
+          "the write budget did not admit writes once it refilled");
+  write.reset();
+  cached.reset();
+  storage.releaseLane(0, 456);
 }
 
 // A state need not fill its slot: the write zeros the slot past it and the
@@ -545,7 +575,7 @@ void testReservations(metal::MetalBackend &backend) {
     reservation.reset();
     require(storage.idleCells() == 0 && storage.idleWindows() == 0,
             "a sealed reservation returned the buffers its state holds");
-    require(state->canOffload(), "a sealed state cannot be written to the disk tier");
+    require(state->canOffload(false), "a sealed state cannot be written to the disk tier");
     auto write = state->offload({});
     require(write && finishWhenReady(*write), "a sealed state's disk write failed");
     fill(storage.current(0).stateBase, 99);
@@ -585,6 +615,7 @@ void run(const std::string &metallib) {
   testOffloadAllocationFailure(backend);
   testDiskRestore(backend);
   testDirectDiskSnapshot(backend);
+  testStateWritesDrawOnTheWriteBudget(backend);
   testStateSmallerThanSlot(backend);
   testPersistentStateComesBack(backend);
   testPersistKeepsTheRamCopy(backend);

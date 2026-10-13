@@ -3,6 +3,7 @@
 #include "TestChecks.hpp"
 #include "TestKvPool.hpp"
 #include "TestKvTier.hpp"
+#include "TestWriteBudget.hpp"
 #include "engine/Cache.hpp"
 #include "model/SlotFile.hpp"
 
@@ -39,6 +40,8 @@ struct TransferControl {
   bool success = true;
   uint32_t slots = 0;
   uint32_t capacity = 2;
+  // The write budget the states' file shares with the KV tier, if any.
+  std::shared_ptr<const model::DiskBudget> writeBudget;
 };
 
 // A write the tier admits while the quota has a slot; its disk copy holds
@@ -52,7 +55,9 @@ public:
   ~TieredState() override { if (disk_) --control_->slots; }
   uint64_t bytes() const noexcept override { return 100; }
   uint64_t residentBytes() const noexcept override { return disk_ ? 0 : bytes(); }
-  bool canOffload() const noexcept override { return !disk_; }
+  bool canOffload(bool inUse) const noexcept override {
+    return !disk_ && (!control_->writeBudget || control_->writeBudget->admits(inUse));
+  }
   std::unique_ptr<StateOffload> offload(std::function<void()>) const override {
     return writeState(control_);
   }
@@ -159,8 +164,9 @@ struct CacheFixture {
 
   // With running, the request that cached the chain stays unfinished, so
   // none of its KV is a victim, as for a request publishing its states.
-  explicit CacheFixture(engine::KvTier *tier = nullptr, bool running = false)
-      : cache(pool, tier, nullptr) {
+  explicit CacheFixture(engine::KvTier *tier = nullptr, bool running = false,
+                        std::shared_ptr<model::DiskBudget> budget = nullptr)
+      : cache(pool, tier, std::move(budget)) {
     storage.budgetPages = 4;
     for (uint32_t block = 0; block < 4; ++block) {
       for (uint32_t row = 0; row < KvCache::pageTokens; ++row)
@@ -2100,6 +2106,94 @@ void testUnusableTierDropsTheLeafInstead() {
   require(admitTokens(deep.cache, 2, 64).granted(),
           "the dropped leaf's page did not come back");
   deep.cache.endRequest(2);
+}
+
+// The write budget decides which states are written: while it is spent, a
+// state not in use goes without a copy, and one in use is written all the
+// same.
+void testSpentWriteBudgetHoldsBackStatesNotInUse() {
+  constexpr auto reuse = CacheReclaimMode::KeepExtents;
+  test::WriteBudget writes;
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  control->writeBudget = writes.budget;
+  writes.spend();
+  {
+    test::TestKvTier tier;
+    CacheFixture fixture(&tier);
+    fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control),
+                                        false);
+    require(reclaimStateBytes(fixture.cache, reuse) == 100 && control->slots == 0 &&
+                !fixture.cache.snapshot().stateCache.entries,
+            "a state not in use was written, or kept, while the write budget was spent");
+  }
+  test::TestKvTier tier;
+  CacheFixture fixture(&tier);
+  const StateUse use = fixture.cache.useState(fixture.blocks[3]);
+  fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control),
+                                      false);
+  require(reclaimStateBytes(fixture.cache, reuse) == 100 && fixture.cache.pollTransfers() &&
+              control->slots == 1,
+          "a state in use was not written while the write budget was spent");
+}
+
+// KV is written only for a state, and passes the budget: a state written
+// while the budget had room keeps its whole chain when the budget runs out
+// before the chain's pages are written, instead of going with the leaves
+// that could not be.
+void testSpentWriteBudgetKeepsTheChainsOfWrittenStates() {
+  constexpr auto reuse = CacheReclaimMode::KeepExtents;
+  test::WriteBudget writes;
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  control->writeBudget = writes.budget;
+  test::TestKvTier tier;
+  tier.capacity = 8;
+  CacheFixture fixture(&tier);
+  fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control),
+                                      false);
+  require(reclaimStateBytes(fixture.cache, reuse) == 100 && fixture.cache.pollTransfers() &&
+              control->slots == 1,
+          "the state was not written while the budget had room");
+  writes.spend();
+  for (uint32_t leaf = 0; leaf < 4; ++leaf) {
+    require(fixture.cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress &&
+                tier.demotions == leaf + 1,
+            "a page the written state needs was not written while the budget was spent");
+    tier.complete();
+    require(fixture.cache.pollTransfers(), "the page did not land");
+  }
+  const CacheSnapshot held = fixture.cache.snapshot();
+  require(held.kvTier.diskBlocks == 4 && held.stateCache.entries == 1 && control->slots == 1 &&
+              !held.kvTier.demotionsRefused && fixture.lookup(129).state.has_value(),
+          "the written state lost its chain when the budget ran out");
+}
+
+// A limit that cannot hold one slot makes no room: a leaf a written state
+// needs is not written, and nothing the tier holds is given up for it.
+void testLimitBelowASlotMakesNoRoom() {
+  constexpr auto reuse = CacheReclaimMode::KeepExtents;
+  auto budget = std::make_shared<model::DiskBudget>(uint64_t{1} << 30);
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  test::TestKvTier tier;
+  tier.capacity = 8;
+  CacheFixture fixture(&tier, false, budget);
+  fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control),
+                                      false);
+  require(reclaimStateBytes(fixture.cache, reuse) == 100 && fixture.cache.pollTransfers() &&
+              control->slots == 1,
+          "the state was not written");
+  require(fixture.cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress &&
+              tier.demotions == 1,
+          "the deepest page the state needs was not written");
+  tier.complete();
+  require(fixture.cache.pollTransfers(), "the page did not land");
+  budget->setLimitBytes(tier.slotBytes() - 1);
+  static_cast<void>(fixture.cache.reclaimOne(reuse, ReclaimClass::InUse));
+  const CacheSnapshot held = fixture.cache.snapshot();
+  require(tier.demotions == 1 && held.kvTier.diskBlocks == 1 && control->slots == 1,
+          "a limit below a slot wrote a page, or gave copies up to make room");
 }
 
 // The failure seen at 23G: a leaf with disk-only children whose demotion is
@@ -4219,6 +4313,9 @@ int main() {
     testDiskCopiesNoStateNeedsGoWithTheLeaf();
     testRefusedDemotionKeepsTheLeafWhileTransfersLand();
     testUnusableTierDropsTheLeafInstead();
+    testSpentWriteBudgetHoldsBackStatesNotInUse();
+    testSpentWriteBudgetKeepsTheChainsOfWrittenStates();
+    testLimitBelowASlotMakesNoRoom();
     testSecondStateWaitsForTheWrite();
     testWaitingCheckpointHoldsBackNothingElse();
     testFullTierStopsTheScan();

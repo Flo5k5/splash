@@ -1,5 +1,6 @@
 #pragma once
 
+#include "AwakeClock.hpp"
 #include "engine/Engine.hpp"
 #include "engine/Protocol.hpp"
 #include "engine/Status.hpp"
@@ -18,9 +19,9 @@ namespace splash::engine {
 
 // The clocks a native loop reads unless told others: the system clock in
 // Unix microseconds, which a request's absolute deadline is on, and the awake
-// clock (AwakeClock) in milliseconds, which it measures every duration on.
+// clock in milliseconds (awakeMilliseconds), which it measures every duration
+// on.
 [[nodiscard]] uint64_t systemUnixMicros() noexcept;
-[[nodiscard]] double awakeMilliseconds() noexcept;
 
 // The loop's constructor refuses a config without its metrics, its weights,
 // their admission or its clocks.

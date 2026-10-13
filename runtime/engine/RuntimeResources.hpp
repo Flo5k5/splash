@@ -5,6 +5,7 @@
 #include "engine/MemoryPlan.hpp"
 #include "engine/Cache.hpp"
 #include "engine/CacheDirectory.hpp"
+#include "engine/DiskSpace.hpp"
 #include "engine/MemoryGovernor.hpp"
 #include "engine/KvPageTier.hpp"
 #include "ops/PageStorage.hpp"
@@ -90,6 +91,10 @@ struct RuntimeResourcesConfig {
   uint64_t maximumMemoryBytes = 0;
   // Disk quota shared by cached KV pages and states; zero disables the tier.
   uint64_t maximumCacheDiskBytes = 0;
+  // The tier's write budget, the most it writes a day on average
+  // (--max-cache-disk-writes, model::DiskBudget::setWriteBudget); zero for
+  // none, when every write passes.
+  uint64_t cacheDiskWritesPerDay = 0;
   // Where persistent caches live, one directory per persistentCacheNamespace():
   // every start removes those nobody used for two weeks. Empty for none.
   std::filesystem::path cacheRoot;
@@ -168,9 +173,9 @@ private:
 
 // Owns every process-wide native resource exactly once. Members go in
 // reverse declaration order: what the engine gives back while idle -> Neural
-// Engine split -> Cache -> KV pool -> KV disk tier -> state storage -> KV
-// page storage -> governor -> loaded model -> Metal backend -> a persistent
-// tier's directory, whose lock goes last.
+// Engine split -> Cache -> KV pool -> the disk tier's space -> KV disk tier
+// -> state storage -> KV page storage -> governor -> loaded model -> Metal
+// backend -> a persistent tier's directory, whose lock goes last.
 // The KV disk tier must go before the KV page storage: its IO worker reads
 // and writes pages in place in the extents, and its destructor waits for
 // every transfer in flight. A persistent tier's files are sealed first,
@@ -244,6 +249,7 @@ private:
                    std::unique_ptr<kv::PageStorage> kvPages,
                    std::unique_ptr<model::QwenStateStorage> stateStorage,
                    std::unique_ptr<KvPageTier> kvTier,
+                   std::unique_ptr<DiskSpace> diskSpace,
                    std::unique_ptr<KvPool> kvPool,
                    std::unique_ptr<engine::Cache> cache,
                    std::unique_ptr<ops::AneFfn> aneFfn, AneFfnOutcome aneFfnOutcome,
@@ -263,6 +269,8 @@ private:
   std::unique_ptr<kv::PageStorage> kvPages_;
   std::unique_ptr<model::QwenStateStorage> stateStorage_;
   std::unique_ptr<KvPageTier> kvTier_;
+  // What the cache measures the disk tier's volume with (Cache::keepDiskLimit).
+  std::unique_ptr<DiskSpace> diskSpace_;
   std::unique_ptr<KvPool> kvPool_;
   std::unique_ptr<engine::Cache> cache_;
   std::unique_ptr<ops::AneFfn> aneFfn_;

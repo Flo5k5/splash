@@ -91,9 +91,20 @@ constexpr std::chrono::hours kStaleCache{24 * 14};
 // (server/backend.py `CRASH_LOOP_WINDOW_SECONDS`).
 constexpr std::chrono::seconds kProbation{60};
 
+// A cache root the engine made stays out of Time Machine backups, as
+// ~/Library/Caches and $TMPDIR do: its files change with every write.
+void excludeFromBackups(const std::filesystem::path &root) {
+  NSURL *url = [NSURL fileURLWithPath:@(root.c_str()) isDirectory:YES];
+  NSError *error = nil;
+  if (![url setResourceValue:@YES forKey:NSURLIsExcludedFromBackupKey error:&error])
+    logLine("Persistent cache root ", root.string(), " stays in Time Machine backups (",
+            error.localizedDescription.UTF8String, ").");
+}
+
 // A persistent tier's directory under root and its files, empty when another
 // process holds the directory or it cannot be used: the tier then keeps
-// temporary files, as without one.
+// temporary files, as without one. A root it makes is excluded from
+// backups.
 PersistentCacheFiles openPersistentCache(const std::filesystem::path &root,
                                          const std::string &cacheNamespace,
                                          uint64_t kvSlotBytes, uint64_t stateSlotBytes,
@@ -102,8 +113,12 @@ PersistentCacheFiles openPersistentCache(const std::filesystem::path &root,
   try {
     if (root.empty())
       throw std::runtime_error("no home directory to keep it in");
+    std::error_code ignored;
+    const bool made = !std::filesystem::exists(root, ignored);
     PersistentCacheFiles files;
     files.directory = CacheDirectory::open(root, cacheNamespace, kCacheLockWait, cancelled);
+    if (made && std::filesystem::exists(root, ignored))
+      excludeFromBackups(root);
     if (!files.directory) {
       if (!cancelled || !cancelled())
         logLine("Persistent cache ", (root / cacheNamespace).string(),
@@ -232,7 +247,7 @@ std::string persistentCacheNamespace(const RuntimeCacheIdentity &identity,
             << SPLASH_DRAFT_SLIDING_WINDOW << '\n'
             << "context " << draft.contextWidth << " q4 " << SPLASH_DRAFT_CONTEXT_GROUP << '\n';
   // 128 bits name it.
-  return model::weightDigest(canonical.str()).substr(0, 32);
+  return model::weightDigest(canonical.str()).substr(0, CacheDirectory::kNamespaceDigits);
 }
 
 RuntimeResourcesError::RuntimeResourcesError(RuntimeResourceStage stage,
@@ -250,7 +265,7 @@ RuntimeResources::RuntimeResources(
     std::unique_ptr<MemoryGovernor> memoryGovernor,
     std::unique_ptr<kv::PageStorage> kvPages,
     std::unique_ptr<model::QwenStateStorage> stateStorage,
-    std::unique_ptr<KvPageTier> kvTier,
+    std::unique_ptr<KvPageTier> kvTier, std::unique_ptr<DiskSpace> diskSpace,
     std::unique_ptr<KvPool> kvPool, std::unique_ptr<engine::Cache> cache,
     std::unique_ptr<ops::AneFfn> aneFfn, AneFfnOutcome aneFfnOutcome,
     std::optional<uint64_t> hostAvailableAtStart)
@@ -261,7 +276,7 @@ RuntimeResources::RuntimeResources(
       cacheIdentity_(std::move(cacheIdentity)),
       memoryGovernor_(std::move(memoryGovernor)), kvPages_(std::move(kvPages)),
       stateStorage_(std::move(stateStorage)), kvTier_(std::move(kvTier)),
-      kvPool_(std::move(kvPool)),
+      diskSpace_(std::move(diskSpace)), kvPool_(std::move(kvPool)),
       cache_(std::move(cache)), aneFfn_(std::move(aneFfn)),
       releasableMemory_(*model_.images, idleSplit(aneFfn_.get())),
       aneFfnOutcome_(std::move(aneFfnOutcome)), hostAvailableAtStart_(hostAvailableAtStart) {}
@@ -333,7 +348,13 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   stateLayout.target.format = config.stateFormat;
   const uint64_t stateBytes = stateLayout.cachedBytes();
   if (config.maximumCacheDiskBytes) {
+    // A write budget, when one is set, refills on the awake clock the engine
+    // schedules its wake-ups on (awakeMilliseconds), so a write it holds
+    // back is taken up again when the budget admits it. Without one every
+    // write passes.
     diskBudget = std::make_shared<model::DiskBudget>(config.maximumCacheDiskBytes);
+    if (config.cacheDiskWritesPerDay)
+      diskBudget->setWriteBudget(config.cacheDiskWritesPerDay);
     try {
       stateFile = std::make_shared<model::SlotFile>(
           model::SlotFile::slotBytesFor(stateBytes), diskBudget);
@@ -492,29 +513,34 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     // When another process holds it or it cannot be used, the tier keeps
     // temporary files, as without one.
     PersistentCacheFiles persistentCache;
+    const std::string cacheNamespace =
+        persistentCacheNamespace(cacheIdentity, loaded.stateLayout(config.stateFormat));
     if (stateFile && config.persistentCache) {
       persistentCache = openPersistentCache(
-          config.cacheRoot,
-          persistentCacheNamespace(cacheIdentity, loaded.stateLayout(config.stateFormat)),
+          config.cacheRoot, cacheNamespace,
           model::SlotFile::slotBytesFor(kvPages->bytesPerPage()), stateFile->slotBytes(),
           diskBudget, config.cancelled);
       if (persistentCache.directory)
         stateFile = persistentCache.states;
     }
-    // After the open, which holds this start's own cache: a held one stays.
+    // The root's caches nobody holds, looked at after the open, which holds
+    // this start's own cache: a held one stays. The stale ones go, and the
+    // rest share the root's limit with a persistent tier.
+    std::vector<CacheDirectory::Idle> otherCaches;
     if (!config.cacheRoot.empty())
-      CacheDirectory::removeStale(config.cacheRoot, kStaleCache);
+      otherCaches = CacheDirectory::removeStale(CacheDirectory::idle(config.cacheRoot), kStaleCache);
     auto stateStorage = std::make_unique<model::QwenStateStorage>(
         *backend, memoryGovernor->allocationAdmission(), loaded.stateLayout(config.stateFormat),
         stateFile);
     std::unique_ptr<KvPageTier> kvTier;
+    std::unique_ptr<DiskSpace> diskSpace;
     if (diskBudget) {
+      const uint64_t slotBytes = model::SlotFile::slotBytesFor(kvPages->bytesPerPage());
+      std::shared_ptr<model::SlotFile> kvFile = persistentCache.kv;
       try {
-        const uint64_t slotBytes = model::SlotFile::slotBytesFor(kvPages->bytesPerPage());
-        kvTier = std::make_unique<KvPageTier>(
-            *kvPages, persistentCache.kv
-                          ? persistentCache.kv
-                          : std::make_shared<model::SlotFile>(slotBytes, diskBudget));
+        if (!kvFile)
+          kvFile = std::make_shared<model::SlotFile>(slotBytes, diskBudget);
+        kvTier = std::make_unique<KvPageTier>(*kvPages, kvFile);
         logLine("SSD cache: ", config.maximumCacheDiskBytes / kMiB, " MiB for KV pages of ",
                 slotBytes / 1024, " KiB and states of ", stateBytes / kMiB,
                 " MiB; a state's write stages through ", stateStagingBytes / kMiB,
@@ -524,11 +550,22 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         // would keep or replace their copies.
         if (persistentCache.directory)
           throw;
+        kvFile.reset();
         logLine("SSD cache KV storage disabled; state storage remains enabled (",
                 error.what(), ").");
       }
+      // The volume sizes the tier before it takes anything back. A
+      // persistent tier's root holds the other caches nobody holds too.
+      std::vector<std::shared_ptr<model::SlotFile>> files{stateFile};
+      if (kvFile)
+        files.push_back(kvFile);
+      diskSpace = std::make_unique<DiskSpace>(
+          diskBudget, std::move(files),
+          persistentCache.directory ? std::move(otherCaches) : std::vector<CacheDirectory::Idle>{});
     }
     auto cache = std::make_unique<engine::Cache>(*kvPool, kvTier.get(), diskBudget);
+    if (diskSpace)
+      cache->setDiskMeasure([space = diskSpace.get()] { space->measure(); });
 
     if (stateStorage->actualAllocatedBytes() != 0) {
       throw std::runtime_error("lane state was allocated eagerly");
@@ -549,7 +586,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         std::move(persistentCache), std::move(backend), std::move(loaded),
         std::move(operators), std::move(memoryPlan), std::move(cacheIdentity),
         std::move(memoryGovernor), std::move(kvPages), std::move(stateStorage),
-        std::move(kvTier), std::move(kvPool), std::move(cache),
+        std::move(kvTier), std::move(diskSpace), std::move(kvPool), std::move(cache),
         std::move(aneFfn.split), std::move(aneFfn.outcome), hostAvailableAtStart));
     result->adoptPersistentCache();
     return result;

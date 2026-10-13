@@ -210,7 +210,11 @@ public:
   // model's pool, and idle-state reclaim frees them.
   [[nodiscard]] virtual uint64_t bytes() const noexcept = 0;
   [[nodiscard]] virtual uint64_t residentBytes() const noexcept { return bytes(); }
-  [[nodiscard]] virtual bool canOffload() const noexcept { return false; }
+  // Whether the disk tier takes this state's write now, for a state in use
+  // or not: a RAM copy, the tier's state file takes writes, its limit holds
+  // a state's slot, and the write budget admits one of the class
+  // (model::SlotFile::takesWrite).
+  [[nodiscard]] virtual bool canOffload(bool) const noexcept { return false; }
   // Starts writing this state to the disk tier and returns the ticket that
   // carries its disk copy; the source is free as soon as the call returns.
   // A null ticket means that the disk quota cannot admit another state.
@@ -597,9 +601,10 @@ public:
   reserveState(uint64_t requestId, uint32_t tokens) = 0;
   // The bytes one cached state's buffers take.
   [[nodiscard]] virtual uint64_t snapshotBytes() const noexcept = 0;
-  // Whether the disk tier takes a state written from a lane: a tier exists
-  // and its state file accepts writes. The quota is the write's own concern.
-  [[nodiscard]] virtual bool canSnapshotToDisk() const noexcept { return false; }
+  // Whether the disk tier takes a state written from a lane now, for a
+  // state in use or not, as CompositeState::canOffload. Room in the quota is
+  // the write's own concern.
+  [[nodiscard]] virtual bool canSnapshotToDisk(bool) const noexcept { return false; }
   // Writes the request's committed state at its current page-aligned
   // boundary to the disk tier from the lane's own buffers, for a state no
   // cached state's buffers could be reserved for; the ticket carries its disk

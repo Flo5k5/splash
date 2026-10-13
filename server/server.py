@@ -1652,6 +1652,8 @@ def _native_command(args):
     ]
     if args.max_cache_disk:
         command.append(str(args.max_cache_disk))
+    if args.max_cache_disk_writes:
+        command.extend(("--max-cache-disk-writes", str(args.max_cache_disk_writes)))
     if args.persistent_cache:
         command.extend(("--persistent-cache", "on"))
     if args.cache_dir is not None:

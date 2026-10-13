@@ -118,6 +118,9 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
       if (value != "on" && value != "off")
         throw UsageError("--persistent-cache requires on or off");
       result.persistentCache = value == "on";
+    } else if (option == "--max-cache-disk-writes") {
+      if (value != "0" && !parsePositive(value, result.maxCacheDiskWritesBytes))
+        throw UsageError("--max-cache-disk-writes requires a nonnegative integer byte count");
     } else if (option == "--cache-dir") {
       if (value.empty())
         throw UsageError("--cache-dir requires a directory");
@@ -138,6 +141,8 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
   }
   if (result.persistentCache && !result.maxCacheDiskBytes)
     throw UsageError("--persistent-cache requires a MAX_CACHE_DISK_BYTES quota");
+  if (result.maxCacheDiskWritesBytes && !result.maxCacheDiskBytes)
+    throw UsageError("--max-cache-disk-writes requires a MAX_CACHE_DISK_BYTES quota");
   if (!result.cacheRoot.empty() && !result.persistentCache)
     throw UsageError("--cache-dir requires --persistent-cache on");
   result.modelRoot = requireModelRoot(argv[2]);

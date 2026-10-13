@@ -109,6 +109,11 @@ void testServerCommandLines(const char *path) {
          read.maxMemoryBytes = 32 * kGiB;
        }},
       {"disk", [](NativeArguments &read) { read.maxCacheDiskBytes = 5 * kGiB; }},
+      {"disk_writes",
+       [](NativeArguments &read) {
+         read.maxCacheDiskBytes = 5 * kGiB;
+         read.maxCacheDiskWritesBytes = 200 * kGiB;
+       }},
       {"persistent",
        [](NativeArguments &read) {
          read.maxCacheDiskBytes = 5 * kGiB;
@@ -153,6 +158,7 @@ void testServerCommandLines(const char *path) {
     return read.modelRoot == meant.modelRoot && read.maxContext == meant.maxContext &&
            read.maxMemoryBytes == meant.maxMemoryBytes &&
            read.maxCacheDiskBytes == meant.maxCacheDiskBytes &&
+           read.maxCacheDiskWritesBytes == meant.maxCacheDiskWritesBytes &&
            read.persistentCache == meant.persistentCache && read.cacheRoot == meant.cacheRoot &&
            read.kvFormat == meant.kvFormat && read.stateFormat == meant.stateFormat &&
            read.decodeShare == meant.decodeShare &&
@@ -222,6 +228,14 @@ void testRefusals() {
           "--cache-dir requires a directory");
   refuses({"auto", "auto", "5G"},
           "MAX_CACHE_DISK_BYTES must be a nonnegative integer");
+  for (const char *writes : {"200G", "-1", "1.5", ""})
+    refuses({"auto", "auto", "5368709120", "--max-cache-disk-writes", writes},
+            "--max-cache-disk-writes requires a nonnegative integer byte count");
+  refuses({"auto", "auto", "--max-cache-disk-writes", "214748364800"},
+          "--max-cache-disk-writes requires a MAX_CACHE_DISK_BYTES quota");
+  require(parse(model, {"auto", "auto", "5368709120", "--max-cache-disk-writes", "0"})
+                  .maxCacheDiskWritesBytes == 0,
+          "--max-cache-disk-writes 0 set a write budget");
   refuses({"auto", "auto", "--max-memory", "32G"},
           "unexpected argument --max-memory");
   for (const char *memory : {"0", "32G", "-1"})

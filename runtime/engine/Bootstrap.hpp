@@ -138,10 +138,13 @@ public:
         return *nativeLoop_;
     }
 
-    // The memory control pass the transport runs at a command-free point
-    // (MemoryControl::run), after it samples the thermal state.
+    // The control pass the transport runs at a command-free point: it
+    // samples the thermal state, keeps the disk tier within what its volume
+    // leaves it (Cache::keepDiskLimit), and runs the memory control pass
+    // (MemoryControl::run).
     [[nodiscard]] bool controlPass(MemoryPressure pressure) {
         sampleThermalState();
+        resources_->cache().keepDiskLimit();
         return memoryControl_.run(pressure);
     }
     // The status document, with the metrics and the loop timing the

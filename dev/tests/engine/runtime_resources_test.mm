@@ -9,6 +9,8 @@
 
 #import <Foundation/Foundation.h>
 
+#include <sys/time.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -83,6 +85,24 @@ RuntimeResourcesConfig budgetConfig(const char *metallibPath, const std::filesys
                                             model::TargetSource::Safetensors, model::VisionSource::Safetensors);
   config.buildId = "budget-test";
   writeCheckpoints(root, config.model);
+  return config;
+}
+
+// A model under root whose weights load, which nothing but the host
+// refuses: `name` names its descriptor and build.
+RuntimeResourcesConfig loadableConfig(const char *metallibPath, const std::filesystem::path &root,
+                                      const std::string &name) {
+  const PlannedModel planned = plannedModel();
+  static_cast<void>(test::writeSyntheticModel(root, planned.target, planned.draft, planned.vision));
+  RuntimeResourcesConfig config;
+  config.metallibPath = metallibPath;
+  config.modelRoot = root;
+  config.model = model::makeModelDescriptor(name, planned.target, planned.draft, planned.vision,
+                                            model::TargetSource::Safetensors,
+                                            model::VisionSource::Safetensors);
+  config.model.sourceIdentity = "synthetic";
+  config.buildId = name;
+  config.hostAvailableMemory = [] { return std::optional<uint64_t>(64 * kGiB); };
   return config;
 }
 
@@ -366,16 +386,7 @@ void testLoadedVisionIsRequiredOnlyWithVision() {
 void testFailedStepIsNamed(const char *metallibPath) {
   using namespace std::chrono_literals;
   const test::TemporaryDirectory root("splash-assembly");
-  const PlannedModel planned = plannedModel();
-  static_cast<void>(test::writeSyntheticModel(root.path(), planned.target, planned.draft, planned.vision));
-  RuntimeResourcesConfig config;
-  config.metallibPath = metallibPath;
-  config.modelRoot = root.path();
-  config.model = model::makeModelDescriptor("assembly-test", planned.target, planned.draft,
-                                            planned.vision, model::TargetSource::Safetensors,
-                                            model::VisionSource::Safetensors);
-  config.model.sourceIdentity = "synthetic";
-  config.buildId = "assembly-test";
+  RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "assembly-test");
   const auto host = [&](uint64_t available) {
     config.hostAvailableMemory = [available] { return std::optional<uint64_t>(available); };
   };
@@ -413,6 +424,76 @@ void testFailedStepIsNamed(const char *metallibPath) {
   require(window.retryUntil(before, first) == first + 30s &&
               window.retryUntil(after, first + 20s) == first + 50s,
           "a failure after the weights loaded did not count as progress");
+}
+
+// The SSD cache holds no write back unless a write budget is set; one that
+// is set starts with a quarter of a day's.
+void testWriteBudgetOnlyWhenSet(const char *metallibPath) {
+  const test::TemporaryDirectory root("splash-write-budget");
+  RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "write-budget-test");
+  config.maximumCacheDiskBytes = kGiB;
+  const auto tier = [&] {
+    KvTierSnapshot snapshot;
+    static_cast<void>(test::capturedStderr([&] {
+      snapshot = RuntimeResources::create(config, 0)->cache().snapshot().kvTier;
+    }));
+    return snapshot;
+  };
+  const KvTierSnapshot unset = tier();
+  require(unset.capacityBytes == kGiB && !unset.writeBudgetBytes &&
+              unset.writesGated == DiskWritesGate::No,
+          "the SSD cache had a write budget nobody set");
+  config.cacheDiskWritesPerDay = 8 * kGiB;
+  const KvTierSnapshot set = tier();
+  require(set.writeBudgetBytes == 2 * kGiB && set.writesGated == DiskWritesGate::No,
+          "a write budget that was set did not start with a quarter of a day's");
+}
+
+// Every start removes the caches under its root that nobody used for two
+// weeks and keeps the others, one without --persistent-cache or the SSD
+// cache too.
+void testStaleCachesGoAtEveryStart(const char *metallibPath) {
+  const test::TemporaryDirectory root("splash-stale-model"), caches("splash-stale");
+  RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "stale-test");
+  config.cacheRoot = caches.path() / "prefix-cache";
+  const std::string stale(CacheDirectory::kNamespaceDigits, 'a'),
+      fresh(CacheDirectory::kNamespaceDigits, 'b');
+  for (const std::string &name : {stale, fresh}) {
+    auto directory = CacheDirectory::open(config.cacheRoot, name, std::chrono::milliseconds(0));
+    std::ofstream(directory->kvSlots()) << "cache";
+  }
+  const timeval old[2] = {{0, 0}, {1000000000, 0}};
+  for (const char *file : {"lock", "kv.slots"})
+    require(::utimes((config.cacheRoot / stale / file).c_str(), old) == 0,
+            "a cache file could not be aged");
+  static_cast<void>(test::capturedStderr([&] { static_cast<void>(RuntimeResources::create(config, 0)); }));
+  require(!std::filesystem::exists(config.cacheRoot / stale) &&
+              std::filesystem::exists(config.cacheRoot / fresh / "kv.slots"),
+          "a start without a persistent cache kept a stale cache under its root, or removed another");
+}
+
+// A cache root the engine makes for a persistent cache stays out of Time
+// Machine backups; one that was there keeps its own setting.
+void testMadeCacheRootStaysOutOfBackups(const char *metallibPath) {
+  const test::TemporaryDirectory root("splash-backups-model"), caches("splash-backups");
+  RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "backups-test");
+  config.maximumCacheDiskBytes = kGiB;
+  config.persistentCache = true;
+  const auto excluded = [](const std::filesystem::path &path) {
+    NSURL *url = [NSURL fileURLWithPath:@(path.c_str()) isDirectory:YES];
+    NSNumber *value = nil;
+    return [url getResourceValue:&value forKey:NSURLIsExcludedFromBackupKey error:nil] &&
+           value.boolValue;
+  };
+  config.cacheRoot = caches.path() / "made" / "prefix-cache";
+  static_cast<void>(test::capturedStderr([&] { static_cast<void>(RuntimeResources::create(config, 0)); }));
+  require(std::filesystem::is_directory(config.cacheRoot) && excluded(config.cacheRoot) &&
+              !excluded(caches.path() / "made"),
+          "the cache root the engine made was not excluded from backups, or its parent was");
+  config.cacheRoot = caches.path() / "there";
+  std::filesystem::create_directory(config.cacheRoot);
+  static_cast<void>(test::capturedStderr([&] { static_cast<void>(RuntimeResources::create(config, 0)); }));
+  require(!excluded(config.cacheRoot), "a cache root that was there was excluded from backups");
 }
 
 // The engine asks the governor whether the host pauses growth, and its
@@ -458,6 +539,9 @@ int main(int argc, char **argv) {
       testModelBeyondBudgetIsRefusedBeforeLoading(argv[1]);
       testStartupAdmissionIgnoresModelSize(argv[1]);
       testFailedStepIsNamed(argv[1]);
+      testWriteBudgetOnlyWhenSet(argv[1]);
+      testStaleCachesGoAtEveryStart(argv[1]);
+      testMadeCacheRootStaysOutOfBackups(argv[1]);
       testEngineFollowsTheGovernor(argv[1]);
       std::cout << "runtime resources tests passed\n";
       return EXIT_SUCCESS;

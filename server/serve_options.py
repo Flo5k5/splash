@@ -131,6 +131,20 @@ def parse_max_cache_disk(value):
     return size
 
 
+def parse_max_cache_disk_writes(value):
+    """0 for no write budget, or a byte count a day with an optional K, M or G
+    suffix."""
+    if value.strip() == "0":
+        return 0
+    try:
+        size = parse_max_memory(value)
+    except argparse.ArgumentTypeError:
+        size = None
+    if size is None:
+        raise argparse.ArgumentTypeError("use 0 for no limit, or a size such as 200G")
+    return size
+
+
 def parse_cache_dir(value):
     if not value.strip():
         raise argparse.ArgumentTypeError("must name a directory")
@@ -436,6 +450,18 @@ SERVE_OPTIONS = (
         ),
     ),
     ServeOption(
+        "--max-cache-disk-writes",
+        "cache",
+        dict(
+            type=parse_max_cache_disk_writes,
+            default=0,
+            metavar="SIZE",
+            help="the most the SSD cache writes a day, e.g. 200G; the state a "
+            "conversation resumes from and KV pages pass it (default: 0, no "
+            "limit)",
+        ),
+    ),
+    ServeOption(
         "--persistent-cache",
         "cache",
         dict(
@@ -620,6 +646,8 @@ def check_serve_arguments(parser, args):
         parser.error("--announce-served-name needs --served-model-name")
     if args.persistent_cache and not args.max_cache_disk:
         parser.error("--persistent-cache needs --max-cache-disk")
+    if args.max_cache_disk_writes and not args.max_cache_disk:
+        parser.error("--max-cache-disk-writes needs --max-cache-disk")
     if args.cache_dir is not None and not args.persistent_cache:
         parser.error("--cache-dir needs --persistent-cache")
 

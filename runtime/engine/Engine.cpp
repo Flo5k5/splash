@@ -1180,7 +1180,7 @@ void Engine::publishReachedStateBoundaries(
       } else if (cache_.reuseStoredState(block, checkpoint)) {
         // No cache slot takes a RAM copy of a state already on disk.
         ++counters_.deduplicatedStatePublications;
-      } else if (model_.canSnapshotToDisk() &&
+      } else if (model_.canSnapshotToDisk(cache_.stateInUse(block)) &&
                  cache_.publishStateToDisk(
                      block,
                      [&](std::function<void()> completion) {

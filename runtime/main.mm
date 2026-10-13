@@ -155,6 +155,7 @@ void printUsage(std::string_view executable) {
       " MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto [MAX_CACHE_DISK_BYTES]"
       " [--kv-format int8|bf16] [--state-format fp32|bf16] [--decode-share SHARE]"
       " [--max-image-patches PATCHES] [--persistent-cache on|off] [--cache-dir DIRECTORY]"
+      " [--max-cache-disk-writes BYTES]"
       " [--idle-release SECONDS|off] [--idle-sleep prevent|allow] [--ane on|off]");
   writeStderrLine("       " + command + " model-check mlx-affine none|safetensors CONFIG [DRAFT_CONFIG]");
   writeStderrLine("       " + command + " model-check gguf none|gguf CONFIG GGUF_METADATA [DRAFT_CONFIG]");
@@ -196,6 +197,7 @@ bootstrapConfig(const engine::NativeArguments &arguments) {
   config.resources.buildId = SPLASH_BUILD_ID;
   config.resources.maximumMemoryBytes = arguments.maxMemoryBytes;
   config.resources.maximumCacheDiskBytes = arguments.maxCacheDiskBytes;
+  config.resources.cacheDiskWritesPerDay = arguments.maxCacheDiskWritesBytes;
   config.resources.persistentCache = arguments.persistentCache;
   config.resources.cacheRoot = arguments.cacheRoot;
   if (const std::filesystem::path caches = splashCaches();
