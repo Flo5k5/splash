@@ -27,7 +27,7 @@ static_assert(kGgufRepackStagingBytes <= std::numeric_limits<uint32_t>::max());
 // The source row image row `row` of `rows` is read from.
 uint64_t sourceRow(const gguf::TensorRows &rows, uint64_t row) {
   const gguf::RowOrder &order = rows.order;
-  if (row < order.from) return row;
+  if (row < order.from) return rows.first + row;
   if (!order.headRows || !order.keyHeads || !order.valueHeadsPerKey)
     throw GgufError("invalid weight row permutation");
   const uint64_t head = (row - order.from) / order.headRows;
@@ -35,7 +35,7 @@ uint64_t sourceRow(const gguf::TensorRows &rows, uint64_t row) {
       ((head % order.valueHeadsPerKey) * order.keyHeads + head / order.valueHeadsPerKey) * order.headRows +
       (row - order.from) % order.headRows;
   if (source >= rows.rows) throw GgufError("weight row permutation is out of bounds");
-  return source;
+  return rows.first + source;
 }
 
 void requireRange(uint64_t offset, uint64_t bytes, uint64_t available) {

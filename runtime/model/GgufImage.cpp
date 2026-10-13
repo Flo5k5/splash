@@ -73,6 +73,36 @@ public:
     image_.repack(std::move(repack));
   }
 
+  // The routed experts' gate and up tensors, of `experts` * width rows each:
+  // ffn_gate_exps and ffn_up_exps, or llama.cpp's fused ffn_gate_up_exps
+  // (create_tensor_gate_up_exps), each expert's gate rows then its up rows,
+  // which the two tensors take expert by expert.
+  void gateUpExperts(const std::string &prefix, uint64_t experts, uint64_t width, uint64_t columns) {
+    const std::string fusedName = prefix + "ffn_gate_up_exps.weight";
+    if (!file_.find(fusedName)) {
+      quantized(prefix + "ffn_gate_exps.weight", experts * width, columns);
+      quantized(prefix + "ffn_up_exps.weight", experts * width, columns);
+      return;
+    }
+    const GgufTensor *fused = find(fusedName, quantizedType);
+    if (!fused) return;
+    if (fused->rows() != 2 * experts * width || fused->columns() != columns)
+      throw GgufError("unexpected shape for " + fusedName);
+    const uint32_t format = imageFormat(fused->type);
+    const TensorRows rows = tensorRows(*fused, 2 * experts * width, ggufRowBytes(kQuantFormats[format], columns));
+    // Expert e's gate rows are rows 2e width.. of the fused tensor, its up rows the next width.
+    for (const uint64_t up : {0, 1}) {
+      Repack repack = image_.planes(format, experts * width, columns, fusedName);
+      for (uint64_t expert = 0; expert < experts; ++expert) {
+        TensorRows expertRows = rows;
+        expertRows.first = (2 * expert + up) * width;
+        expertRows.rows = width;
+        repack.sources.push_back(std::move(expertRows));
+      }
+      image_.repack(std::move(repack));
+    }
+  }
+
   // beta (value heads rows) | alpha (value heads rows), rows in grouped head
   // order: one 256-row tensor of their format padded with zero rows, or F32 as
   // one float tensor, which BF16 is widened to exactly.
@@ -257,8 +287,7 @@ Image layerImage(const GgufFile &file, const QwenTargetDimensions &g, std::vecto
   if (g.ffnKind == QwenFfnKind::SparseMoe) {
     const uint64_t routed = g.experts, width = g.expertIntermediateSize;
     b.floatTensor(p + "ffn_gate_inp.weight", routed, g.hiddenSize);
-    b.quantized(p + "ffn_gate_exps.weight", routed * width, g.hiddenSize);
-    b.quantized(p + "ffn_up_exps.weight", routed * width, g.hiddenSize);
+    b.gateUpExperts(p, routed, width, g.hiddenSize);
     b.quantized(p + "ffn_down_exps.weight", routed * g.hiddenSize, width);
     b.quantized(p + "ffn_gate_shexp.weight", width, g.hiddenSize);
     b.quantized(p + "ffn_up_shexp.weight", width, g.hiddenSize);

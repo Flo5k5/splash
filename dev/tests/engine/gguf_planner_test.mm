@@ -207,6 +207,33 @@ void checkMoe(const std::filesystem::path &directory) {
               std::to_string(tensor.dims[0]));
   }
   check(layer.repacks.size() == quantized, "planner repacks only the layer's quantized tensors");
+
+  // llama.cpp's fused ffn_gate_up_exps: the gate tensor takes each expert's first width rows of it, the up tensor
+  // the next width; one of a type the loader does not read is refused by name.
+  const uint64_t width = g.expertIntermediateSize;
+  std::vector<Tensor> fused = withFusedGateUp(target.tensors, 0, g.experts);
+  writeGguf(path, fused, g);
+  const Plan fusedPlan = plan(path, g);
+  std::vector<const model::gguf::Repack *> halves;
+  if (!fusedPlan.error)
+    for (const model::gguf::Repack &repack : fusedPlan.images[0].repacks)
+      if (repack.sources.front().name == "blk.0.ffn_gate_up_exps.weight") halves.push_back(&repack);
+  bool split = halves.size() == 2;
+  for (size_t half = 0; split && half < 2; ++half) {
+    split = halves[half]->rows == g.experts * width && halves[half]->sources.size() == g.experts;
+    for (uint64_t expert = 0; split && expert < g.experts; ++expert) {
+      const model::gguf::TensorRows &rows = halves[half]->sources[expert];
+      split = rows.first == (2 * expert + half) * width && rows.rows == width &&
+              rows.rowBytes == gguf_reference::rowBytes(Fmt(gguf_format_of(rows.type)), g.hiddenSize);
+    }
+  }
+  check(split, "planner splits llama.cpp's fused gate/up experts into each expert's gate and up rows" +
+                   (fusedPlan.error ? ": " + *fusedPlan.error : ""));
+  tensorNamed(fused, "blk.0.ffn_gate_up_exps.weight").type = model::ggml::kBF16;
+  tensorNamed(fused, "blk.0.ffn_gate_up_exps.weight").data.resize(2 * g.experts * width * g.hiddenSize * 2);
+  writeGguf(path, fused, g);
+  check(names(plan(path, g), {"blk.0.ffn_gate_up_exps.weight (BF16)"}),
+        "planner refuses a fused gate/up experts tensor of a type it does not read by name");
 }
 
 // The rotary embedding and norms the kernels compute: a GGUF declares their

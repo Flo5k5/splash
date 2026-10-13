@@ -1255,6 +1255,12 @@ lmstudio-community's files, so those load too. A format's image takes the bits
 per weight of its GGUF blocks, but for Q3_K's and Q6_K's padded meta units (1/16
 bit more) and IQ3_S's chunk words (4.06 bits for its 3.44).
 
+A MoE layer may hold its routed experts' gate and up weights in llama.cpp's
+fused `ffn_gate_up_exps` (`create_tensor_gate_up_exps`, as byteshape's files
+do), each expert's gate rows then its up rows. The planner reads each expert's
+rows of it into the gate and up tensors, so the images are those of the two
+tensors.
+
 llama.cpp's NVFP4 (type 40, as in `cdiamond/Qwen3.8-27B-iMatrix-NVFP4-MTP-GGUF`)
 is `block_nvfp4`: 64 elements, a UE4M3 scale per 16 (an E4M3 byte whose bit 7
 llama.cpp ignores, reading 0x7F as 0) and E2M1 codes, beside an optional F32

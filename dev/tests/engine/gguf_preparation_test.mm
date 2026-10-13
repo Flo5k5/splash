@@ -233,6 +233,11 @@ void checkMoe(MetalBackend &backend, const std::filesystem::path &directory, con
   check(slice(image, beta->destination, gates.size()) == gates,
         "prepared F32 alpha/beta tensor: beta then alpha rows in grouped order");
 
+  const auto fusedPath = directory / "moe-fused.gguf";
+  writeGguf(fusedPath, withFusedGateUp(target.tensors, 0, g.experts), g);
+  check(preparedImages(backend, fusedPath, g) == preparedImages(backend, path, g),
+        "llama.cpp's fused ffn_gate_up_exps prepares into the images of the gate and up tensors it holds");
+
   // A layer may have tensors on opposite sides of the 4 GiB boundary. Keep
   // the file sparse and zero the old location so a truncated offset cannot
   // read the right data.

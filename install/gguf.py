@@ -494,18 +494,32 @@ MOE_TENSORS = {
     "ffn_up_shexp.weight": QUANTIZED_TYPES,
     "ffn_down_shexp.weight": QUANTIZED_TYPES,
 }
+# A MoE layer whose gate and up experts are llama.cpp's fused tensor
+# (create_tensor_gate_up_exps): each expert's gate rows, then its up rows.
+FUSED_MOE_TENSORS = {
+    name: types
+    for name, types in MOE_TENSORS.items()
+    if name not in ("ffn_gate_exps.weight", "ffn_up_exps.weight")
+} | {"ffn_gate_up_exps.weight": QUANTIZED_TYPES}
 
 
 def loaded_tensors(metadata):
     """Each tensor the native loader reads from the target that metadata
     describes, with the types it accepts. MTP layers are not loaded; every
-    full_attention_interval-th layer is full attention, the others GDN."""
+    full_attention_interval-th layer is full attention, the others GDN. A MoE
+    layer whose header lists the fused gate/up experts tensor reads it in place
+    of the two."""
     arch = text_architecture(metadata)
     period = metadata.positive(arch + ".full_attention_interval")
-    ffn = MOE_TENSORS if arch == "qwen35moe" else DENSE_TENSORS
     tensors = dict(MODEL_TENSORS)
     for layer in range(loaded_layers(metadata, arch)):
         mixer = ATTENTION_TENSORS if (layer + 1) % period == 0 else GDN_TENSORS
+        if arch != "qwen35moe":
+            ffn = DENSE_TENSORS
+        elif f"blk.{layer}.ffn_gate_up_exps.weight" in metadata.tensors:
+            ffn = FUSED_MOE_TENSORS
+        else:
+            ffn = MOE_TENSORS
         for name, types in (LAYER_TENSORS | mixer | ffn).items():
             tensors[f"blk.{layer}.{name}"] = types
     return tensors

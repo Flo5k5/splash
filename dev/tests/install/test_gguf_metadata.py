@@ -372,6 +372,9 @@ class GgufMetadataTests(unittest.TestCase):
         # Q5_0 and Q5_1, the shared experts of bartowski's Q4_0 and Q4_1.
         tensors |= {"blk.4.ffn_gate_shexp.weight": GGML["Q5_0"]}
         tensors |= {"blk.4.ffn_up_shexp.weight": GGML["Q5_1"]}
+        # llama.cpp's fused gate/up experts in place of the two tensors.
+        del tensors["blk.7.ffn_gate_exps.weight"], tensors["blk.7.ffn_up_exps.weight"]
+        tensors |= {"blk.7.ffn_gate_up_exps.weight": GGML["IQ3_XXS"]}
         # llama.cpp's NVFP4, its per-expert tensor scales beside it.
         tensors |= {"blk.6.ffn_up_exps.weight": GGML["NVFP4"]}
         tensors |= {"blk.6.ffn_up_exps.scale": GGML["F32"]}
@@ -391,6 +394,10 @@ class GgufMetadataTests(unittest.TestCase):
                 "attn_qkv.weight BF16 [(]2 tensors[)]",
             ),
             ({"token_embd.weight": GGML["F32"]}, "token_embd.weight F32"),
+            (
+                {"blk.7.ffn_gate_up_exps.weight": GGML["BF16"]},
+                "ffn_gate_up_exps.weight BF16 [(]1 tensor[)]",
+            ),
             ({"blk.3.attn_q.weight": GGML["BF16"]}, "attn_q.weight BF16"),
             # F32 only where the loader reads floats: not a projection, not
             # a quantized router or norm, not half an alpha/beta pair.

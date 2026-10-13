@@ -66,11 +66,12 @@ struct TensorScale {
   bool bfloat16 = false, reciprocal = false;
 };
 
-// Rows [0, rows) of one source tensor in image order, read from `file`: rows of
-// rowBytes bytes at `offset` of its tensor data, or its format's native rows,
-// which the writer builds from a quantized safetensors tensor's tensors
-// (safetensors.codes or safetensors.bfloat16 set) or from llama.cpp's NVFP4
-// rows (ggufNvfp4RowBytes set: rows of block_nvfp4 that long from `offset` on).
+// Rows [first, first + rows) of one source tensor in image order, read from
+// `file`: rows of rowBytes bytes at `offset` of its tensor data, or its
+// format's native rows, which the writer builds from a quantized safetensors
+// tensor's tensors (safetensors.codes or safetensors.bfloat16 set) or from
+// llama.cpp's NVFP4 rows (ggufNvfp4RowBytes set: rows of block_nvfp4 that long
+// from `offset` on).
 struct TensorRows {
   std::string name;
   uint32_t type = 0;   // ggml type, or a loader's (metal/abi/QuantFormat.h)
@@ -82,6 +83,7 @@ struct TensorRows {
   SafetensorsSource safetensors{};
   TensorScale scale{};
   uint64_t ggufNvfp4RowBytes = 0;
+  uint64_t first = 0; // the source row of image row 0
 };
 
 // Header and descriptor bytes.
