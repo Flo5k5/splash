@@ -144,6 +144,15 @@ struct QwenTargetPrefillCapture final {
   uint32_t rows = 0;
 };
 
+// A state a prefill command captures at a row inside it (a state boundary):
+// each GDN layer's convolution and recurrent state, as a command ending at
+// that row stores them, in the views of a cache cell.
+struct QwenTargetStateCapture final {
+  uint32_t row = 0;
+  std::span<const metal::MetalBuffer> convolution;
+  std::span<const metal::MetalBuffer> recurrent;
+};
+
 struct QwenTargetPrefillSequence final {
   uint32_t rowBegin = 0;
   uint32_t rows = 0;
@@ -158,6 +167,8 @@ struct QwenTargetPrefillSequence final {
   std::span<const metal::MetalBuffer> recurrentOut;
   std::array<QwenTargetPrefillCapture, 2> captures{};
   uint32_t captureCount = 0;
+  // In row order, each inside (0, rows).
+  std::span<const QwenTargetStateCapture> stateCaptures;
 };
 
 struct QwenTargetPrefillBuffers final {
