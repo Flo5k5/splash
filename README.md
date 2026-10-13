@@ -69,8 +69,10 @@ automatically:
 | Qwen3.8-27B | `unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M` | `mlx-community/Qwen3.8-27B-4bit` |
 | Qwen3.6-35B-A3B | `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M` | `mlx-community/Qwen3.6-35B-A3B-4bit` |
 
-Unsloth GGUF variants span **1–8 bits**, including mixed-precision UD formats;
-`UD-Q8_K_XL` and BF16 targets are not supported.
+Unsloth GGUF variants span **1–8 bits**, including mixed-precision UD formats
+up to `UD-Q8_K_XL`, whose BF16 tensors load too. Whole-BF16 and F16 models are
+not supported: the installer refuses a GGUF whose projections and experts are
+all BF16, F16 or F32.
 [Prism ML Ternary Bonsai 2](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf)
 is also supported in PQ2_0 (7.2 GB), including vision. Pass `OWNER/REPO:VARIANT`
 to `--model`, as in the quick start. MLX targets can be affine 2–8-bit,

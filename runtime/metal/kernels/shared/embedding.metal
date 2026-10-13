@@ -23,7 +23,7 @@ __attribute__((always_inline)) inline void gguf_embedding(device const uint *tok
     gguf_embedding<F>(tokens, table, output, p, index); \
   }
 // Two gathers per gguf_embedding_format (metal/abi/Gguf.h), named by its kQuantFormats token: gguf_embed_<token>
-// into bf16 and gguf_embed_f32_<token> into fp32; and the bf16 gathers of bf16 and f16 rows.
+// into bf16 and gguf_embed_f32_<token> into fp32.
 #define GGUF_EMBEDDING_FORMAT(f, F) GGUF_GATHER(gguf_embed_##f, F, bfloat) GGUF_GATHER(gguf_embed_f32_##f, F, float)
 GGUF_EMBEDDING_FORMAT(q4k, GgufEmbedQ4K)
 GGUF_EMBEDDING_FORMAT(q6k, GgufEmbedQ6K)
@@ -48,8 +48,8 @@ GGUF_EMBEDDING_FORMAT(iq1m, GgufEmbedIQ1M)
 GGUF_EMBEDDING_FORMAT(mxfp4, GgufEmbedMXFP4)
 GGUF_EMBEDDING_FORMAT(nvfp4, GgufEmbedNVFP4)
 GGUF_EMBEDDING_FORMAT(fp8, GgufEmbedFP8)
-GGUF_GATHER(gguf_embed_bf16, GgufEmbedBF16, bfloat)
-GGUF_GATHER(gguf_embed_f16, GgufEmbedF16, bfloat)
+GGUF_EMBEDDING_FORMAT(bf16, GgufEmbedBF16)
+GGUF_EMBEDDING_FORMAT(f16, GgufEmbedF16)
 #define GGUF_EMBEDDING_AFFINE(B)                                                                \
   GGUF_EMBEDDING_FORMAT(af##B##g32, GgufEmbedAF##B##G32)                                        \
   GGUF_EMBEDDING_FORMAT(af##B##g64, GgufEmbedAF##B##G64)                                        \

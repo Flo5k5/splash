@@ -310,14 +310,14 @@ template <uint Bits, uint Group> struct GgufEmbedAffine {
     return fma(code, s, z);
   }
 };
-// A bf16 token table, which a safetensors checkpoint or a GGUF keeps unquantized: each value is its own block.
+// BF16 and F16 values, which a GGUF keeps unquantized (a safetensors checkpoint its bf16 token table): each value is
+// its own block, ggml's; the token gathers round an F16 value to bf16.
 struct GgufEmbedBF16 {
   enum : uint { Weights = 1, Bytes = 2 };
   __attribute__((always_inline)) static float decode(device const uchar *block, uint) {
     return float(as_type<bfloat>(ushort(block[0] | (block[1] << 8))));
   }
 };
-// An F16 token table, which a GGUF keeps unquantized: each value is its own block, the half's value rounded to bf16.
 struct GgufEmbedF16 {
   enum : uint { Weights = 1, Bytes = 2 };
   __attribute__((always_inline)) static float decode(device const uchar *block, uint) {

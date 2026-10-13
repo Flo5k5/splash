@@ -1130,10 +1130,11 @@ holding its tower) and the tower's configuration, so a model of no family
 Splash serves is told so whatever its tower, and the check runs again with the
 draft's `config.json` once the family's draft is chosen.
 A model the engine refuses is refused with its reason, and so is a GGUF with
-tensors of types the loader cannot read (`gguf.require_loadable`, [GGUF
-targets](#gguf-targets)); no weight file is downloaded for either. Tensor
-shapes, and an MLX vision tower's weights, which must not be quantized
-(`VisionLoader.cpp`), are checked only when the model loads.
+tensors of types the loader cannot read or with every projection and expert
+unquantized (`gguf.require_loadable`, [GGUF targets](#gguf-targets)); no
+weight file is downloaded for either. Tensor shapes, and an MLX vision tower's
+weights, which must not be quantized (`VisionLoader.cpp`), are checked only
+when the model loads.
 `families.FAMILIES` names the draft trained for each family; repository names
 and model-card `base_model` fields play no part. An MLX target must declare
 `quantization` in `config.json` in formats it loads ([MLX
@@ -1234,28 +1235,46 @@ for that variant: the file named with the model name its GGUFs share, then
 (`upstream.select_gguf`). Before any weight download, its header must list
 every tensor the loader reads with a type it accepts for that tensor
 (`gguf.loaded_tensors`, checked by `gguf.require_loadable`; a test holds its
-quantized types to `runtime/metal/abi/QuantFormat.h`). The native loader checks again
+format types to `runtime/metal/abi/QuantFormat.h`). The native loader checks again
 and lists every unsupported tensor in one error:
 
 - linears and experts: Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, Q4_1,
   Q5_0, Q5_1, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS,
-  IQ4_NL, MXFP4, NVFP4 or PQ2_0;
-- token embeddings: any of the linears' formats, F16 or BF16;
+  IQ4_NL, MXFP4, NVFP4, PQ2_0, BF16 or F16;
+- token embeddings: any of the linears' formats;
 - norms, the MoE router and shared-expert scalar gate, and the GDN
   convolution, decay and time-step bias: F32;
-- GDN alpha and beta: each any of the linears' formats, F32 or BF16. Two of
-  one quantized type load as one segment of the GDN input projection in that
-  format; any other pair loads as one F32 tensor of the values each holds, BF16
-  widened and a quantized type decoded on the GPU by its format's gather
-  (`gguf_embed_f32_<format>`), GGML's own F32 values.
+- GDN alpha and beta: each any of the linears' formats or F32. Two of one
+  quantized type other than BF16 and F16 load as one segment of the GDN input
+  projection in that format; any other pair loads as one F32 tensor of the
+  values each holds, every type but F32 decoded on the GPU by its format's
+  gather (`gguf_embed_f32_<format>`), GGML's own F32 values. A BF16 or F16
+  pair stays such a float segment: it reads the input unrotated, as Prism's
+  BF16 alpha and beta need, and leaves the GDN input projection on Apple9's
+  register tile, which takes no F16.
+
+BF16 and F16 are formats of the image like the quantized ones, for the tensors
+a quantized file keeps unquantized: UD-Q8_K_XL keeps the 27B's attention
+projections and LM head and some of the 35B-A3B's projections and experts in
+BF16, and other publishers keep alpha and beta, GDN projections, experts or
+the token table in F16. Their planes hold the values as stored, with an FP32
+scale of 1 per 256 values; the staged tiles round each value once to half, the
+Apple9 register tile reads BF16 exactly and takes no F16, so a projection with
+an F16 weight stages there, as do all of a model's experts when any expert
+weight is F16. Whole-BF16 and F16 models are not a target: before any weight
+download, the installer refuses a GGUF whose linears and experts, the LM head
+among them, are all BF16, F16 or F32 (`gguf.require_loadable`), with one
+message that asks for a quantized variant, not a list of tensors. The token
+table, alpha and beta do not count, and one quantized linear or expert is
+enough, so these files pass; the native loader does not check this.
 
 Of Unsloth's files in September 2026 that covers every file of Qwen3.8-27B and
-Qwen3.6-35B-A3B, from UD-IQ1_S up, but UD-Q8_K_XL and BF16, whose BF16 tensors
-need kernels that do not exist yet. llama-quantize's default type selection
-stores alpha and beta in the file type's format (Q4_K in a Q4_K_M), as in
-lmstudio-community's files, so those load too. A format's image takes the bits
-per weight of its GGUF blocks, but for Q3_K's and Q6_K's padded meta units (1/16
-bit more) and IQ3_S's chunk words (4.06 bits for its 3.44).
+Qwen3.6-35B-A3B from UD-IQ1_S to UD-Q8_K_XL. llama-quantize's default type
+selection stores alpha and beta in the file type's format (Q4_K in a Q4_K_M),
+as in lmstudio-community's files, so those load too. A format's image takes
+the bits per weight of its GGUF blocks, but for Q3_K's and Q6_K's padded meta
+units (1/16 bit more), IQ3_S's chunk words (4.06 bits for its 3.44) and BF16's
+and F16's scales (1/8 bit more).
 
 A MoE layer may hold its routed experts' gate and up weights in llama.cpp's
 fused `ffn_gate_up_exps` (`create_tensor_gate_up_exps`, as byteshape's files
@@ -1665,7 +1684,10 @@ rounding of its fp32-accumulated sum. They read their activations as the Table16
 `decode_linear_gguf_prepare` when none did. The formats whose operands those kernels build from
 grid lookups, IQ3_XXS, the IQ2 formats and IQ1 (`apple9StagesFormat`), and Q2_K from two lanes
 decode faster on the staged tile there, which a projection all of whose segments are in them
-takes wherever the tile holds its lanes' rows unpadded. On Apple10 (M5) the staged tile
+takes wherever the tile holds its lanes' rows unpadded. F16, whose 11-bit significands bf16 does
+not hold, has no register kernels (`quant_register_format`): a projection with an F16 segment, or
+a gate/up pair with one, stages at every lane count, and its decode storage holds the staged
+tile's rows. On Apple10 (M5) the staged tile
 (`LinearTile::GgufStaged`) runs the kernels of `runtime/metal/kernels/shared/gguf_linear.metal`,
 which dequantize each weight once to half in threadgroup memory (`kernels/common/gguf_staged.h`)
 for MPP `matmul2d`, the neural accelerator's path, on bf16 activations. A step's weights, and
@@ -1686,7 +1708,10 @@ per core and inputs per partition, from measured occupancy, Apple9's staged tile
 register tile's) that does not depend on the batch width. The MoE experts
 (`runtime/ops/MoE.cpp`) run the same numerics per family over the grouped rows: the register
 form in `linear_gguf_sgmatrix.metal`, the staged one in `kernels/shared/moe_gguf.metal`, which
-Apple9 takes for experts mostly in the formats it stages (`MoeShape::expertFormat`). Their
+Apple9 takes for experts mostly in the formats it stages (`MoeShape::expertFormat`) and for
+experts with an F16 weight (`MoeShape::registerFormats`). One `MoeShape` serves all of a model's
+MoE layers, so one F16 routed or shared expert tensor in any layer stages every layer's experts
+there. Their
 passes launch the live tiles alone: the grouping kernel writes each pass's grid with the tile
 count, and the pass reads it as an indirect dispatch (`ComputeDispatch::indirectThreadgroups`).
 The staged tile runs gate and up in one pass where they share their routed and their shared
@@ -1734,14 +1759,15 @@ the alpha/beta, norm, convolution and router bytes they write and the golden ima
 `gguf-dequant`, the staged tile's dequantizer, built with the production Metal flags, against
 the half rounding of every reference weight; `gguf-rotation`, `gguf_rotate` and the rotated
 PQ2_0 token gather bitwise against the fp32 butterflies and within one bf16 step of fp64;
-`gguf-projection`, every GGUF projection through
-`ops::Linear` with each tile forced, so both decode tiles run on every GPU, at one to four
-lanes, every K split and epilogue, fused segments, every format's gate with the next format's up
-and the prefill tiles, each output inside the fp64 bound of `GgufFormatReference.hpp`, and the
-one-pass gate/up bitwise against the two passes at the same K split; and `gguf-moe`: the float
-projections on both float tiles and the MoE layer on every GGUF plan, the staged 8- and 32-row
-tiles and the Apple9 register tile whatever GPU runs it, in every format, against fp64, and
-bitwise against the full grids and two gate/up passes. The goldens and how to regenerate them are
+`gguf-projection`, every GGUF projection through `ops::Linear` with each tile forced, so both
+decode tiles run on every GPU, each in every format it takes (the register tile all but F16), at
+one to four lanes, every K split and epilogue, fused segments, every format's gate with the next
+format's up and the prefill tiles, each output inside the fp64 bound of
+`GgufFormatReference.hpp`, and the one-pass gate/up bitwise against the two passes at the same K
+split; and `gguf-moe`: the float projections on both float tiles and the MoE layer on every GGUF
+plan, the staged 8- and 32-row tiles and the Apple9 register tile whatever GPU runs it, each in
+every format it takes as each routed and shared expert tensor, against fp64, and bitwise against
+the full grids and two gate/up passes. The goldens and how to regenerate them are
 in `dev/tests/fixtures/weight-goldens/`; with `SPLASH_GGML_ORACLE=<libggml-base.dylib>`,
 `gguf-reference` also compares the reference with GGML directly and prints GGML's hashes.
 

@@ -151,6 +151,12 @@ kernel void gguf_repack(device const uchar *src [[buffer(0)]], device uchar *dst
       if (j == 0) for (uint i = 0; i < QUANT_FP8_VALUES; ++i) meta[i] = blk[i];   // g
       break;
     }
+    case GGUF_FMT_BF16: case GGUF_FMT_F16: {   // 256 values, element e of group j value 32 j + e; no scale: g = 1
+      device const ushort *values = (device const ushort *)blk + 32 * j;
+      for (uint e = 0; e < 32; ++e) ((device ushort *)out0)[quant_slot(e)] = values[e];
+      if (j == 0) *((device float *)meta) = 1.0f;
+      break;
+    }
     case GGUF_FMT_IQ3XXS: case GGUF_FMT_IQ2XXS: case GGUF_FMT_IQ2XS:   // {d, qs[64 | 32], signs and scales[32] | scales[8]}
       gguf_copy_native(blk, j, f, 2, 66, 0, out0, out1, meta);
       break;

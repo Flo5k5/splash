@@ -391,8 +391,9 @@ def processor_config(vision):
     }
 
 
-# GGML tensor type names, and the quantized formats the native loader reads
-# (runtime/metal/abi/QuantFormat.h, checked by the tests).
+# GGML tensor type names, the quantized types the native loader reads, and the
+# types of its formats: those, BF16 and F16 (runtime/metal/abi/QuantFormat.h,
+# checked by the tests).
 TENSOR_TYPES = {
     0: "F32",
     1: "F16",
@@ -444,56 +445,60 @@ QUANTIZED_TYPES = {
     "NVFP4",
     "PQ2_0",
 }
-# The token rows the embedding kernels gather: native rows of every quantized
-# format (gguf_embedding_format in runtime/metal/abi/Gguf.h), or F16 or BF16
-# values (embeddingType in runtime/model/GgufImage.cpp).
-EMBEDDING_TYPES = QUANTIZED_TYPES | {"F16", "BF16"}
+FORMAT_TYPES = QUANTIZED_TYPES | {"BF16", "F16"}
+# Splash loads quantized GGUFs: BF16 and F16 are formats for the tensors a
+# quantized file keeps unquantized, and require_loadable refuses a target whose
+# projections and experts are all of these types.
+UNQUANTIZED_TYPES = {"BF16", "F16", "F32"}
+# The token rows the embedding kernels gather: native rows of every format
+# (gguf_embedding_format in runtime/metal/abi/Gguf.h).
+EMBEDDING_TYPES = FORMAT_TYPES
 # The tensors the native loader reads from a target, and the types it accepts
-# for each (runtime/model/GgufImage.cpp): quantized projections; F32 norms,
+# for each (runtime/model/GgufImage.cpp): projections of a format; F32 norms,
 # small GDN vectors and MoE routers, which llama.cpp keeps unquantized and
-# which run unrounded; GDN alpha and beta, each a quantized format, F32 or
-# BF16, which preparation widens to the F32 values they hold unless both are
-# of one quantized type.
+# which run unrounded; GDN alpha and beta, each of a format or F32, which
+# preparation widens to the F32 values they hold unless both are of one
+# quantized type.
 F32 = {"F32"}
 MODEL_TENSORS = {
     "token_embd.weight": EMBEDDING_TYPES,
     "output_norm.weight": F32,
-    "output.weight": QUANTIZED_TYPES,
+    "output.weight": FORMAT_TYPES,
 }
 LAYER_TENSORS = {"attn_norm.weight": F32, "post_attention_norm.weight": F32}
 ATTENTION_TENSORS = {
-    "attn_q.weight": QUANTIZED_TYPES,
-    "attn_k.weight": QUANTIZED_TYPES,
-    "attn_v.weight": QUANTIZED_TYPES,
+    "attn_q.weight": FORMAT_TYPES,
+    "attn_k.weight": FORMAT_TYPES,
+    "attn_v.weight": FORMAT_TYPES,
     "attn_q_norm.weight": F32,
     "attn_k_norm.weight": F32,
-    "attn_output.weight": QUANTIZED_TYPES,
+    "attn_output.weight": FORMAT_TYPES,
 }
 GDN_TENSORS = {
-    "attn_qkv.weight": QUANTIZED_TYPES,
-    "attn_gate.weight": QUANTIZED_TYPES,
-    "ssm_alpha.weight": QUANTIZED_TYPES | {"F32", "BF16"},
-    "ssm_beta.weight": QUANTIZED_TYPES | {"F32", "BF16"},
+    "attn_qkv.weight": FORMAT_TYPES,
+    "attn_gate.weight": FORMAT_TYPES,
+    "ssm_alpha.weight": FORMAT_TYPES | F32,
+    "ssm_beta.weight": FORMAT_TYPES | F32,
     "ssm_conv1d.weight": F32,
     "ssm_a": F32,
     "ssm_dt.bias": F32,
     "ssm_norm.weight": F32,
-    "ssm_out.weight": QUANTIZED_TYPES,
+    "ssm_out.weight": FORMAT_TYPES,
 }
 DENSE_TENSORS = {
-    "ffn_gate.weight": QUANTIZED_TYPES,
-    "ffn_up.weight": QUANTIZED_TYPES,
-    "ffn_down.weight": QUANTIZED_TYPES,
+    "ffn_gate.weight": FORMAT_TYPES,
+    "ffn_up.weight": FORMAT_TYPES,
+    "ffn_down.weight": FORMAT_TYPES,
 }
 MOE_TENSORS = {
     "ffn_gate_inp.weight": F32,
-    "ffn_gate_exps.weight": QUANTIZED_TYPES,
-    "ffn_up_exps.weight": QUANTIZED_TYPES,
-    "ffn_down_exps.weight": QUANTIZED_TYPES,
+    "ffn_gate_exps.weight": FORMAT_TYPES,
+    "ffn_up_exps.weight": FORMAT_TYPES,
+    "ffn_down_exps.weight": FORMAT_TYPES,
     "ffn_gate_inp_shexp.weight": F32,
-    "ffn_gate_shexp.weight": QUANTIZED_TYPES,
-    "ffn_up_shexp.weight": QUANTIZED_TYPES,
-    "ffn_down_shexp.weight": QUANTIZED_TYPES,
+    "ffn_gate_shexp.weight": FORMAT_TYPES,
+    "ffn_up_shexp.weight": FORMAT_TYPES,
+    "ffn_down_shexp.weight": FORMAT_TYPES,
 }
 # A MoE layer whose gate and up experts are llama.cpp's fused tensor
 # (create_tensor_gate_up_exps): each expert's gate rows, then its up rows.
@@ -501,7 +506,7 @@ FUSED_MOE_TENSORS = {
     name: types
     for name, types in MOE_TENSORS.items()
     if name not in ("ffn_gate_exps.weight", "ffn_up_exps.weight")
-} | {"ffn_gate_up_exps.weight": QUANTIZED_TYPES}
+} | {"ffn_gate_up_exps.weight": FORMAT_TYPES}
 
 
 def loaded_tensors(metadata):
@@ -568,12 +573,29 @@ def require_rotation(metadata):
 
 
 def require_loadable(metadata):
-    """Reject a target the native loader cannot read, from its header alone,
-    so an unusable file is never downloaded: every tensor it reads must be
-    present, with a type it accepts for that tensor."""
+    """Reject a target Splash does not load, from its header alone, so an
+    unusable file is never downloaded: a whole-BF16, F16 or F32 model, whose
+    projections and experts are all unquantized, or a file the native loader
+    cannot read, missing a tensor it reads or storing one in a type it does
+    not accept for that tensor."""
     require_rotation(metadata)
+    loaded = loaded_tensors(metadata)
+    # The projections and experts are the tensors read only in a format, but
+    # the token table; one missing or of a type the loader does not know is
+    # listed below instead.
+    weights = {
+        TENSOR_TYPES.get(metadata.tensors.get(name))
+        for name, types in loaded.items()
+        if types == FORMAT_TYPES and name != "token_embd.weight"
+    }
+    if weights <= UNQUANTIZED_TYPES:
+        raise ModelError(
+            "this GGUF stores every projection and expert unquantized (BF16, F16 "
+            "or F32): Splash loads quantized GGUFs, not whole-BF16 or F16 models; "
+            "choose a quantized variant of the repository"
+        )
     unsupported = collections.Counter()
-    for name, types in loaded_tensors(metadata).items():
+    for name, types in loaded.items():
         kind = metadata.tensors.get(name)
         found = "missing" if kind is None else TENSOR_TYPES.get(kind, f"type {kind}")
         short = name.split(".", 2)[-1] if name.startswith("blk.") else name
