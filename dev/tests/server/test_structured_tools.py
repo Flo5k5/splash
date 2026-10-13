@@ -544,6 +544,60 @@ class StructuredToolGrammarTest(unittest.TestCase):
                 with self.subTest(strict=strict, name=name):
                     self.assert_not_complete(call.format(name, "1"), **settings)
 
+    def test_a_tool_with_an_unreadable_schema_takes_free_arguments(self):
+        # Its schema, which says n is a string, is not read: a grammar holds
+        # its calls to the tags alone, beside a strict tool or a response
+        # format too, and its values convert untyped.
+        unreadable = {
+            "type": "function",
+            "function": {
+                "name": "note",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"n": {"type": "string", "required": True}},
+                },
+            },
+        }
+        call = (
+            "<tool_call>\n<function=note>\n<parameter=n>\n7\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        for tools, schema in (
+            ([unreadable], None),
+            ([unreadable, *strict_tools(TOOLS[1])], None),
+            ([unreadable], SCHEMA),
+        ):
+            with self.subTest(tools=len(tools), schema=schema is not None):
+                self.assert_complete(
+                    call, choice="required", schema=schema, tools=tools
+                )
+                _, calls, _ = project(call, policy("required", tools=tools))
+                self.assertEqual(
+                    json.loads(calls[0]["function"]["arguments"]), {"n": 7}
+                )
+
+    def test_function_names_read_back_as_the_grammar_writes_them(self):
+        # A name may hold any characters but the tags' delimiters and line
+        # breaks: the grammar writes it as declared, and reading returns it.
+        names = [
+            "mcp.search",
+            "web search",
+            "天气",
+            'say "hi" \\ bye',
+            "n" * tool_schema.MAX_NAME_LENGTH,
+        ]
+        tools = [{"type": "function", "function": {"name": name}} for name in names]
+        settings = {"choice": "required", "schema": None, "tools": tools}
+        call = "<tool_call>\n<function={}>\n</function>\n</tool_call>"
+        for name in names:
+            with self.subTest(name=name):
+                self.assert_complete(call.format(name), **settings)
+                _, calls, _ = project(
+                    call.format(name), policy("required", tools=tools)
+                )
+                self.assertEqual([call["function"]["name"] for call in calls], [name])
+        self.assert_not_complete(call.format("mcp_search"), **settings)
+
     def test_single_member_string_type_array_preserves_enum_grammar(self):
         scalar = {
             "type": "object",
