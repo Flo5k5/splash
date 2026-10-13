@@ -671,7 +671,7 @@ def anthropic_to_chat_body(body, *, thinking_resolver):
     chat, thinking_display = _anthropic_chat(body, thinking_resolver)
     # Anthropic continues a final assistant message (a prefill); Splash would
     # close that turn and start another, so it refuses it.
-    if body["messages"][-1]["role"] == "assistant":
+    if chat["messages"] and chat["messages"][-1]["role"] == "assistant":
         raise APIError(
             400,
             "a final assistant message (prefill) is not supported; "
