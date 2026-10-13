@@ -126,6 +126,27 @@ def stream_events(payload):
 
 
 class AnthropicAdapterTest(unittest.TestCase):
+    def test_billing_only_system_suffix_does_not_hide_an_assistant_prefill(self):
+        body = request_body(
+            messages=[
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "unfinished answer"},
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "x-anthropic-billing-header: accounting",
+                        }
+                    ],
+                },
+            ]
+        )
+        counted = anthropic_to_chat_prompt(body, thinking_resolver=no_signed_thinking)
+        self.assertEqual(counted["messages"][-1]["role"], "assistant")
+        with self.assertRaisesRegex(APIError, "final assistant message"):
+            anthropic_to_chat_body(body, thinking_resolver=no_signed_thinking)
+
     def test_tool_references_preserve_text_order_and_error_status(self):
         for is_error in (False, True):
             with self.subTest(is_error=is_error):
