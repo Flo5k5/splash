@@ -1662,12 +1662,13 @@ def parse_args(argv=None):
         "--persistent-cache",
         action="store_true",
         help="instead of the smoke, check a conversation's prefix across a clean "
-        "restart of a server with --persistent-cache in a fresh cache directory "
-        "(needs --max-cache-disk)",
+        "restart of a server with --persistent-cache in a fresh cache directory",
     )
     arguments = parser.parse_args(argv)
-    if arguments.persistent_cache and arguments.max_cache_disk is None:
-        parser.error("--persistent-cache needs --max-cache-disk")
+    if arguments.persistent_cache and arguments.max_cache_disk == "0":
+        parser.error(
+            "--persistent-cache needs the SSD cache --max-cache-disk 0 turns off"
+        )
     return resolve_server_arguments(arguments)
 
 

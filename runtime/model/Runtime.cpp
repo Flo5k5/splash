@@ -2637,8 +2637,8 @@ uint64_t Runtime::snapshotBytes() const noexcept {
   return impl_->states.layout().cachedBytes();
 }
 
-bool Runtime::canSnapshotToDisk() const noexcept {
-  return impl_->states.canSnapshotToDisk();
+bool Runtime::canSnapshotToDisk(bool inUse) const noexcept {
+  return impl_->states.canSnapshotToDisk(inUse);
 }
 
 std::unique_ptr<StateOffload>

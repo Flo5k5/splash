@@ -171,9 +171,6 @@ public:
   // model supports or one request's KV capacity holds (less the speculative
   // scratch); requests share the budget dynamically.
   [[nodiscard]] uint32_t maximumContextTokens() const noexcept;
-  // The ceiling this plan would advertise with at most memoryBytes, within
-  // its configured limit; zero when one request cannot fit there.
-  [[nodiscard]] uint32_t contextTokensWithin(uint64_t memoryBytes) const;
 
   [[nodiscard]] std::string toStatusJson() const;
 

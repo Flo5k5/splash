@@ -154,7 +154,8 @@ void printUsage(std::string_view executable) {
       " serve-native MODEL_DIRECTORY"
       " MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto [MAX_CACHE_DISK_BYTES]"
       " [--kv-format int8|bf16] [--state-format fp32|bf16] [--decode-share SHARE]"
-      " [--max-image-patches PATCHES] [--cache-dir DIRECTORY]"
+      " [--max-image-patches PATCHES] [--persistent-cache on|off] [--cache-dir DIRECTORY]"
+      " [--max-cache-disk-writes BYTES]"
       " [--idle-release SECONDS|off] [--idle-sleep prevent|allow] [--ane on|off]");
   writeStderrLine("       " + command + " model-check mlx-affine none|safetensors CONFIG [DRAFT_CONFIG]");
   writeStderrLine("       " + command + " model-check gguf none|gguf CONFIG GGUF_METADATA [DRAFT_CONFIG]");
@@ -179,6 +180,13 @@ std::filesystem::path executablePath() {
   return path;
 }
 
+// Splash's caches in the home directory; empty without one.
+std::filesystem::path splashCaches() {
+  const char *home = std::getenv("HOME");
+  return home && *home ? std::filesystem::path(home) / "Library/Caches/Splash"
+                       : std::filesystem::path();
+}
+
 engine::RuntimeBootstrapConfig
 bootstrapConfig(const engine::NativeArguments &arguments) {
   engine::RuntimeBootstrapConfig config;
@@ -188,8 +196,13 @@ bootstrapConfig(const engine::NativeArguments &arguments) {
   config.resources.model = arguments.model;
   config.resources.buildId = SPLASH_BUILD_ID;
   config.resources.maximumMemoryBytes = arguments.maxMemoryBytes;
-  config.resources.maximumCacheDiskBytes = arguments.maxCacheDiskBytes;
-  config.resources.persistentCacheRoot = arguments.persistentCacheRoot;
+  config.resources.cacheDisk = arguments.maxCacheDisk;
+  config.resources.cacheDiskWritesPerDay = arguments.maxCacheDiskWritesBytes;
+  config.resources.persistentCache = arguments.persistentCache;
+  config.resources.cacheRoot = arguments.cacheRoot;
+  if (const std::filesystem::path caches = splashCaches();
+      config.resources.cacheRoot.empty() && !caches.empty())
+    config.resources.cacheRoot = caches / "prefix-cache";
   config.resources.kvFormat = arguments.kvFormat;
   config.resources.stateFormat = arguments.stateFormat;
   config.resources.maximumImagePatches = arguments.maxImagePatches;
@@ -267,8 +280,8 @@ void closePersistentCache(engine::FdTransport &transport,
 }
 
 int runNative(const engine::NativeArguments &arguments) {
-  if (const char *home = std::getenv("HOME"); home && *home)
-    reportLegacyWeightCache(std::filesystem::path(home) / "Library/Caches/Splash/weights");
+  if (const std::filesystem::path caches = splashCaches(); !caches.empty())
+    reportLegacyWeightCache(caches / "weights");
   engine::FdTransport transport(STDIN_FILENO, STDOUT_FILENO);
   ShutdownSignals signals(transport);
   MemoryPressureMonitor pressureMonitor(transport.controlNotifier());

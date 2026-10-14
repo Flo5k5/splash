@@ -93,8 +93,9 @@ access.
 | `--kv-format` | `int8` | Target KV storage: `int8` or `bf16`. See [KV cache precision](#kv-cache-precision). |
 | `--state-format` | `fp32` | Recurrent state storage: `fp32` or `bf16`. See [state precision](#state-precision). |
 | `--idle-release` | `10m` | Time without a request before the engine unwires its memory and frees the weights; the next request restores them. `off` keeps both. See [weight loading](#weight-loading). |
-| `--max-cache-disk` | `0` (off) | SSD quota for cached KV pages and states, e.g. `16G`; kept for the session, or across restarts with `--persistent-cache`. See [SSD cache](#ssd-cache). |
-| `--persistent-cache` | Off | Keep the SSD cache across restarts; needs `--max-cache-disk`. See [persistent cache](#persistent-cache). |
+| `--max-cache-disk` | `auto` | SSD quota for cached KV pages and states: `auto` follows the volume's free space up to 32 GiB, a size such as `16G` sets the quota, `0` turns the cache off. Kept for the session, or across restarts with `--persistent-cache`. See [SSD cache](#ssd-cache). |
+| `--max-cache-disk-writes` | `0` (no limit) | The most the SSD cache writes a day, e.g. `200G`. See [SSD cache](#ssd-cache). |
+| `--persistent-cache` | Off | Keep the SSD cache across restarts. See [persistent cache](#persistent-cache). |
 | `--cache-dir` | `~/Library/Caches/Splash/prefix-cache` | Where `--persistent-cache` keeps its files; needs `--persistent-cache`. |
 | `--served-model-name` | None | Additional model name the API accepts; repeatable. See [API model aliases](#api-model-aliases). |
 | `--announce-served-name` | Off | Report the first `--served-model-name` in responses; needs `--served-model-name`. |
@@ -109,12 +110,13 @@ access.
 | `--disable-ane` | Off | Prefill on the GPU alone. By default a dense model's long prompts also use the Neural Engine when that is faster. See [Neural Engine prefill](#neural-engine-prefill). |
 | `--allow-idle-sleep` | Off | Let the Mac sleep automatically while requests run; by default it stays awake until they finish (the display may still sleep). |
 
-Sizes (`--max-memory`, `--max-cache-disk`, `--max-request-size`) are a whole
-number of bytes, or one with a `K`, `M` or `G` suffix in binary units: `28G`
-is 28 GiB, and `28GB`, `28GiB` and `28g` say the same. Token counts
-(`--max-context`) are a whole number, or one with a `K` suffix of 1024 tokens:
-`100K` is 102,400 tokens. `--max-memory` and `--max-context` also take `auto`,
-their default, and `--max-cache-disk 0` turns the SSD cache off. Durations
+Sizes (`--max-memory`, `--max-cache-disk`, `--max-cache-disk-writes`,
+`--max-request-size`) are a whole number of bytes, or one with a `K`, `M` or
+`G` suffix in binary units: `28G` is 28 GiB, and `28GB`, `28GiB` and `28g` say
+the same. Token counts (`--max-context`) are a whole number, or one with a `K`
+suffix of 1024 tokens: `100K` is 102,400 tokens. `--max-memory`, `--max-context` and `--max-cache-disk`
+also take `auto`, their default, `--max-cache-disk 0` turns the SSD cache off,
+and `--max-cache-disk-writes 0`, its default, sets no write budget. Durations
 (`--idle-release`, `--request-timeout`) are seconds, or a number with an `s`,
 `m` or `h` suffix, such as `90s`, `30m` or `1.5h`; `--idle-release off` never
 releases.
@@ -231,49 +233,116 @@ configurations ask for.
 
 ### SSD cache
 
-`--max-cache-disk SIZE` keeps cached prompts on the SSD when memory runs short.
-Default: `0` (off). Evicted KV pages and request states that a later request
-could resume from are written to the SSD within that quota, and a request that
-matches them reads them back instead of computing that part of its prompt
-again.
+The SSD cache keeps cached prompts on the SSD when memory runs short. Evicted
+KV pages and request states that a later request could resume from are written
+to the SSD, and a request that matches them reads them back instead of
+computing that part of its prompt again. Without it, a request that runs out of
+memory cannot keep its progress checkpoints and replays its prompt after each
+suspension. It does not raise the context limit.
 
-Without it, a request that runs out of memory cannot keep its progress
-checkpoints and replays its prompt after each suspension. With it off, startup
-suggests it in one line when the memory available at startup may not hold the
-advertised context. It does not raise the context limit. A quota smaller than
-the working set can cause repeated reads and writes; it is not a write-rate
-limit. Its state writes stage through a buffer of one state (64 MiB for 35B,
-153 MiB for 27B), which the memory plan sets aside within `--max-memory`; a
-quota too small for one state leaves it off.
+`--max-cache-disk` sizes it. The default, `auto`, holds at most a quarter of
+what its volume has beyond the space it keeps free (10 GiB, or 5% of a volume
+smaller than 200 GiB), its own files counted, and at most 32 GiB. Free space is
+what `df` reports, without the purgeable space the Finder counts. The engine
+measures it twice a second and whenever a write finds the volume full: as other
+files fill the volume the cache shrinks, giving up its oldest copies the way a
+full quota does, and it grows back as they go, so several servers on one volume
+each settle at a share that leaves the free space above the floor. A size such
+as `16G` is a quota the same rule keeps within a local volume's free space; off
+a local volume, such as a network share, the quota alone is the limit. `0`
+turns the cache off.
+
+State writes stage through a buffer of one state (64 MiB for 35B, 153 MiB for
+27B) that the memory plan sets aside within `--max-memory`; on a 24 GB Mac
+serving 27B that costs 4,096 tokens of context. A size sets it aside whatever
+it costs, as before, and a quota too small for one state leaves the cache off.
+`auto` sets it aside only where the memory plan holds the model and the
+requested context beside it, and gives it up to the
+[Neural Engine split](#neural-engine-prefill) where the plan holds the split
+only without it; otherwise startup says why the cache is off, and the plan is
+as without it. Memory alone decides this, so every start of a model on a Mac
+advertises the same context, whatever room the disk has. The disk decides only
+whether the cache's files open: `auto` opens them only where its limit, a
+quarter of what a local volume has beyond the floor, would hold two states and
+1 GiB of KV, on the volume of every place the cache may keep its files. Where
+no files open, startup says why the cache is off, and the staging stays unused.
+
+A write that finds the volume full while it shows room beyond the floor met a
+limit the engine cannot see, such as a volume quota, or a volume that filled
+and freed again before the engine measured it. Once a second write does, the
+cache keeps within what it holds, serving and replacing its copies within that
+until the server stops, and the log says so once. Off a local volume a second
+write that finds the volume full does the same.
+
+`--max-cache-disk-writes SIZE` sets a write budget that spares the drive: the
+most the cache writes a day on average, such as `200G`, at most a quarter of a
+day's at once. It is off by default, when every write the cache needs goes
+ahead. Once set, the budget decides which states are written: while it is
+spent, a state a later request could reuse is dropped instead of written, and
+so is a suspended request's progress checkpoint. It paces writes rather than
+capping them: the state a conversation resumes from is written all the same,
+KV pages are written only for a state, to keep the chain of one on the SSD
+reachable or to complete a persistent restore point, and pass it too, and each
+server process has a budget of its own that every start begins with a quarter
+of a day's of. All of these count against the budget, so later states pay for
+them. A quota smaller than the working set can cause repeated reads and
+writes.
+
+Startup prints one line: where the files are, the limit and why, the write
+budget when one is set, and that `--max-cache-disk 0` turns the cache off.
+`/status` reports under `disk` the quota (`capacity_bytes`), what the volume
+leaves of it now (`limit_bytes`), `used_bytes`, `volume_available_bytes`, what
+holds writes back (`writes_gated`: `no`, `budget`, or `closed` once a file
+stopped taking writes) and `write_budget_bytes`, the bytes the next state's
+write not in use may take now. Without a write budget `writes_gated` is never
+`budget` and `write_budget_bytes` is 0.
 
 Restarts recompute everything unless `--persistent-cache` is on (see
-[persistent cache](#persistent-cache)); `--max-cache-disk` alone keeps evicted
-KV pages and states for the session only.
+[persistent cache](#persistent-cache)); otherwise the cache keeps evicted KV
+pages and states for the session only, in temporary files whose space returns
+when the engine exits.
 
 ### Persistent cache
 
 `--persistent-cache` keeps the SSD cache across restarts of the same model, so a
-restart, an upgrade or a crash keeps conversations' prefixes. It needs
-`--max-cache-disk` and shares its quota.
+restart, an upgrade or a crash keeps conversations' prefixes. It follows
+`--max-cache-disk`, which sizes it as it does the SSD cache; `0` turns both
+off.
 
 Files live in `~/Library/Caches/Splash/prefix-cache/<namespace>/` (mode 0700;
-`--cache-dir` sets the root). The namespace digests the model manifests, the KV
-and state layouts and the cache format, so no model reads another's cache. One
-engine holds a directory at a time; another waits 20 s, then uses temporary
-files. A namespace unused for 14 days is removed.
+`--cache-dir` sets the root, which the engine keeps out of Time Machine when it
+creates it). The namespace digests the model manifests, the KV and state
+layouts and the cache format, so no model reads another's cache. One engine
+holds a directory at a time; another waits 20 s, then uses temporary files, as
+`auto` does when the root's volume is not local or leaves the cache too little
+room.
+One limit, the quota or what the volume leaves, bounds the whole root, and this
+cache may use all of it: other models' caches nobody holds count against it,
+and while the root holds more, as this cache grows or the volume fills, those
+caches are removed, the least recently used first, before this one gives up a
+copy of its own. A cache nobody holds when a running server removes it may be
+the one another server is starting to open; that start then begins cold.
+Every start, with `--persistent-cache` or without it, removes the namespaces
+under its root (`--cache-dir`, else the default) that nobody used for 14 days,
+so a cache left behind when it is turned off goes too. Only a directory named
+as a namespace is, 32 hex digits, counts as a cache: nothing else under the
+root is touched.
 
 Each conversation's newest restore point at least 2048 tokens deep is written
 10 s after publication, unless the conversation has gone past it; its RAM copy
-stays. These writes pause while the cache has written 128 GiB in the last hour.
-A full quota keeps restore points whole: it drops copies no point needs first,
-then the oldest point.
+stays. With a write budget set, a point waits while the budget is spent,
+nothing of it written; once the budget admits its state, the state is written
+and then the pages of its chain. A point larger than what the cache may hold
+now, its quota or what the volume leaves it, is not written. A full quota
+keeps restore points whole: it drops copies no point needs first, then the
+oldest point.
 
 A start takes back every recorded point whose chain is whole. A clean stop
-writes the waiting points (newest first, up to 6 s) and syncs the files. After
-a crash the next start takes back what reached the disk and runs on probation
-for a minute; if it fails then, the start after it begins empty. `/status`
-reports all this under `disk` (`persistent`, `kv_copies`, `taken_back`,
-`write_behind`).
+writes the waiting points (newest first, up to 6 s, whatever the write budget)
+and syncs the files. After a crash the next start takes back what reached the
+disk and runs on probation for a minute; if it fails then, the start after it
+begins empty. `/status` reports all this under `disk` (`persistent`,
+`kv_copies`, `taken_back`, `write_behind`).
 
 ## Model storage
 
@@ -322,8 +391,8 @@ are not moved.
 | --- | --- |
 | `~/Library/Application Support/Splash` | The data directory of a packaged install: `models/`, the installed models' links into the Hugging Face cache and the metadata derived from GGUFs; `runtime/`, the locks of running servers; and `thinking.key`, which encrypts the Messages reasoning a response hides. A source checkout keeps the first two in `install/models` and `build/runtime`. |
 | Hugging Face cache (`HF_HUB_CACHE`, by default `~/.cache/huggingface/hub`) | Model and draft downloads, with Splash's pins under `refs/splash` ([revisions](#revisions)). |
-| `~/Library/Caches/Splash/prefix-cache` (`--cache-dir`) | The [persistent cache](#persistent-cache), with `--persistent-cache` only. |
-| `$TMPDIR/splash-cache-*` | The [SSD cache](#ssd-cache)'s files without `--persistent-cache`, or when another process holds the persistent cache's directory or it cannot be used: one of KV pages and one of states, together at most about `--max-cache-disk`. Each is unlinked as it is created, so no directory lists it, and its space returns when the engine exits, even after a crash. `--cache-dir` does not move them; they follow `TMPDIR`. |
+| `~/Library/Caches/Splash/prefix-cache` (`--cache-dir`) | The [persistent cache](#persistent-cache), with `--persistent-cache` only, within the [SSD cache](#ssd-cache)'s limit. Every start removes the caches there that nobody used for 14 days. |
+| `$TMPDIR/splash-cache-*` | The [SSD cache](#ssd-cache)'s files, on by default, without `--persistent-cache`, or when another process holds the persistent cache's directory or it cannot be used: one of KV pages and one of states, together at most about the SSD cache's limit, which follows the volume's free space up to 32 GiB unless `--max-cache-disk` sets it. Each is unlinked as it is created, so no directory lists it and macOS's storage settings count it as System Data, and its space returns when the engine exits, even after a crash. `--cache-dir` does not move them; they follow `TMPDIR`. |
 | `~/Library/Logs/Splash/crash` | [Crash traces](#failures-and-crash-traces), with `SPLASH_CRASH_TRACE=1` only. |
 | Pi's `models.json` (`~/.pi/agent`, or `PI_CODING_AGENT_DIR`) and the Hermes profile (`~/.hermes/profiles/splash`, or `splash-<port>`) | The settings `splash pi` and `splash hermes` write ([agent launchers](#agent-launchers)). Every agent keeps its sessions in its own home; `splash claude`, `codex` and `opencode` pass their settings at launch and write none. |
 
@@ -1051,8 +1120,10 @@ until the pressure lifts.
 
 `GET /metrics` exports in Prometheus text format the `requests`,
 `memory_actual` and `metrics` fields above, the status's scheduler, KV, cache,
-admission and image counts, and readiness, memory pressure and thermal state;
-the table's other fields are in `/status` alone.
+admission and image counts, the SSD cache's quota, limit, use, volume space,
+write budget, what holds its writes back and the bytes it read and wrote, and
+readiness, memory pressure and thermal state; the table's other fields are in
+`/status` alone.
 `splash_kv_free_allocated_pages` counts free pages of allocated extents, not
 remaining capacity; memory headroom is `splash_memory_headroom_bytes`. Consumers
 should tolerate missing native fields while the engine is unavailable, and
@@ -1804,13 +1875,16 @@ nothing. The split's buffers are a memory category of their own (`Neural Engine
 split`), which comes out of the KV cache, the more of it the more channels the
 ANE takes: with `--max-context` the split takes at most the channels whose plan
 still holds that context, and if even the fewest do not, the GPU runs alone and
-the start warns how much context any split leaves. Without it the engine serves
-the automatic context, which while the split may run is what the plan holds
-with the split this Mac's calibration of the model takes (below), the GPU
-alone's if it found no gain, whatever the start then makes of it: a split that
-failed leaves the GPU alone at the same context, and the memory the split would
-hold stays with the KV cache. Every start of a model on a Mac, the server's
-relaunch of the engine after a failure among them, so serves the same context.
+the start warns how much context any split leaves. The
+[SSD cache](#ssd-cache)'s automatic state staging gives way to the split: where
+the fewest channels fit only without it, the cache turns off. Without
+`--max-context` the engine serves the automatic context, which while the split
+may run is what the plan holds with the split this Mac's calibration of the
+model takes (below), the GPU alone's if it found no gain, whatever the start
+then makes of it: a split that failed leaves the GPU alone at the same context,
+and the memory the split would hold stays with the KV cache. Every start of a
+model on a Mac, the server's relaunch of the engine after a failure among them,
+so serves the same context.
 Until a calibration is remembered, a start that fails assumes the largest split
 the model could take (all its channel units but one, or the most whose plan
 holds any context). The log line names it beside the context without the split
@@ -2090,9 +2164,10 @@ replay state fits beside it; refused memory, the replay state takes its buffers
 rather than another lane's checkpoint. With the SSD cache it costs a write as
 well: reclaim takes checkpoints first and writes the states it evicts to the
 SSD, this one too (153 MiB for 27B), and one published straight to the SSD,
-when no RAM slot took it, stays there. The persistent cache's hourly write limit
-does not pause these writes, and a full quota makes room for one by dropping the
-oldest copy, perhaps an older conversation's restore point.
+when no RAM slot took it, stays there. These writes draw on the SSD cache's
+write budget when one is set, which drops them while it is spent, a suspended
+request's own too, and a full quota makes room for one by dropping the oldest
+copy, perhaps an older conversation's restore point.
 Contended prefill adapts toward a 500 ms slice, keeping
 2048-token chunks for long unopposed work. Without contention, a prompt that can
 finish within one 2048-token chunk ends its chunk at its last row instead of
@@ -2138,12 +2213,75 @@ prefix keeps its disk copy, so its next eviction needs no write while that copy
 remains cached. The KV tier takes no Metal memory. The state staging buffer,
 one state, is a buffer of the backend's like every other: resident, and set
 aside by the memory plan within `--max-memory` when the tier starts. A quota too
-small for one state leaves the tier disabled and sets nothing aside. With the
-tier off, startup suggests it when the memory plan, within what the host had
-available at startup beyond its reserve and the warning margin, holds less than
-the context limit (`EngineMemoryPlan::contextTokensWithin`). The estimate is
-conservative, since macOS compresses other applications further once the
-engine loads.
+small for one state leaves the tier disabled and sets nothing aside, and so
+does the automatic quota where the plan has no room for the staging beside the
+model and the requested context, so a start the staging would fail goes on
+without the tier, and where the plan refuses the Neural Engine split beside the
+staging but not without it (`aneFfnRefused`): the split wins. The disk plays no
+part in the plan, so every start of a model on a Mac serves the same context,
+the server's relaunch of the engine among them (`server/runtime.py` stops
+relaunching an engine whose context changed). The tier's files open after the
+plan, where the disk takes them; where none open, the tier turns off and the
+staging the plan set aside stays unused. The automatic quota opens them only
+on a volume with room for the tier (`automaticDiskRefusal`, reading volumes
+through `RuntimeResourcesConfig::diskVolume`): the temporary files', where it
+goes without a persistent cache or whenever the root cannot be used, and a
+persistent tier's root, with the root's caches nobody holds counted as the
+tier's, since the tier may take their place. A root that refuses, or whose
+open fails, leaves the tier temporary files if their volume takes it.
+
+The volume sizes the tier only once its files are open, before a persistent
+tier takes anything back, and again at every control pass and whenever a write
+finds the volume full. `DiskSpace` reads the volume with `fstatfs` on the first
+file's descriptor, which names the right volume however the file was made, and
+sets the budget's limit to min(quota, max(0, available + held - floor) / 4),
+held being the blocks the tier's files take (`st_blocks`). The tier's own writes
+and punches move bytes between available and held, so they leave the limit
+where it is, while space anything else takes or frees moves it by a quarter.
+Several tiers on one volume each settle at (available - floor) / (tiers + 3) of
+what was available before them, and blocks a local snapshot keeps when the tier
+frees them cost it at most a third more than it freed. A limit below what the
+tier holds is met at the next control pass by giving copies up in the order a
+full quota replaces them, never a copy in transfer or the only copy of a state
+in use, and a limit below one slot makes no room at all. Off a local volume, or
+one that cannot be measured, the quota is the limit. A persistent tier's limit
+bounds its whole root, and the tier may use all of it: the other caches nobody
+holds, looked at once at start, count among what it holds, and while the root
+holds more than the limit, as the tier grows or the volume shrinks, they go,
+oldest first, before any copy of the tier's. A write that finds the volume
+full (`ENOSPC`, `EDQUOT`) only reports it, and the engine measures the volume
+at its next poll of transfers, once the writes that landed or failed are
+collected. A volume that shows room above the floor, or one the tier does not
+follow, met a limit the measure cannot see, or filled and freed again before
+the measure. The first such write changes nothing; from the second on, the
+limit is capped at what the tier holds then, its live slots, for the rest of
+the process, and each such write lowers the cap again. The files go on taking
+writes, so the tier keeps serving and replaces copies within what it has; only
+a write that fails for another reason stops a file.
+
+The write budget, set only by `--max-cache-disk-writes`
+(`RuntimeResourcesConfig::cacheDiskWritesPerDay`), is a token bucket in the
+disk budget, counted at submission in whole slots by every write of either
+file. Without it the bucket has no rate and admits every write, so nothing
+below is ever held back. It is the process's: each start begins with a
+quarter of a day's. It decides which states are written, and nothing else: one gate on the engine thread, the state file writable, its
+limit holding a slot and the budget admitting the state's class (a state in
+use passes), is read only by the state's admission probes
+(`CompositeState::canOffload`, `Model::canSnapshotToDisk`), never by a
+reservation, an acquire or a write, so a write the engine admitted is never
+refused for it. KV is demoted only for a chain a state on the SSD needs, and
+copied only for a persistent point whose state was written, so those writes
+pass the budget: a state the budget let through keeps its chain, and what a
+chain costs comes out of later states' share. The budget therefore paces the
+writes rather than bounding them: writes of states in use and of KV pass it,
+and every start begins with a quarter of a day's.
+While the budget is spent an evicted state is dropped, and `Cache::persist`
+reports the tier busy before it writes anything of a point; once the budget
+admits the point's state, the state is written first and the pages of its
+chain after it. It refuses a point for a file that stopped taking writes, or
+one larger than the tier's limit, its quota or what the volume leaves it. The
+budget refills on the awake clock the native loop schedules its wake-ups on,
+and write-behind wakes when the budget has room again.
 
 Writes happen when RAM reclamation selects a victim. States copy through one
 staging buffer, freeing their RAM immediately. KV leaves needed by a state
@@ -2191,28 +2329,33 @@ blocks to the volume (`F_PUNCHHOLE`) once its file's IO worker finishes the
 transfer it is in, so the two files together occupy about the live slots instead
 of each keeping its high-water mark; `/status` reports that as `disk.file_bytes`
 beside `disk.used_bytes`. Until the punch the other file can take that quota, so
-allocated blocks can briefly exceed `--max-cache-disk` by the slots freed but
-not yet punched, bounded by the transfer each file's worker is in: about 2% of a
-10G tier in a 25-minute churn run on an M5 Max. A volume sized exactly to the
-quota can therefore fill; the write that finds it full stops that file's writes
-for the rest of the process, as below, while serving continues. On a volume that
-cannot punch holes the files keep the blocks of freed slots, which the runtime
-reports once.
+allocated blocks can briefly exceed the limit by the slots freed but not yet
+punched, bounded by the transfer each file's worker is in: about 2% of a 10G
+tier in a 25-minute churn run on an M5 Max. A write that finds the volume full
+anyway only reports it: its file goes on, and the engine measures the volume at
+once and shrinks to the new limit. If the volume still shows room above the
+floor, the write met a limit the measure cannot see, such as a volume quota or
+a disk image whose host is full, or the volume filled and freed again; after a
+second such write the tier keeps within what it holds, with one log line, while
+serving continues. On a volume that cannot punch holes the files keep the
+blocks of freed slots, which the runtime reports once; the limit counts them.
 
 Transfers use `pread`/`pwrite` with `F_NOCACHE`, every one an aligned range:
 whole 1 MiB chunks of 16 KiB-aligned memory that start at an aligned offset of
 the slot (a state's staging buffer and lane buffers) move directly, everything
-else through the file's own 1 MiB buffer. A failed write disables further writes
-to that file. Failed KV writes retain RAM pages; failed state writes invalidate
-the disk copy. A failed read invalidates its cached data, allowing lookup to
-fall back to the surviving prefix.
+else through the file's own 1 MiB buffer. A write that fails for another reason
+than a full volume disables further writes to that file, with one log line.
+Failed KV writes retain RAM pages; failed state writes invalidate the disk
+copy. A failed read invalidates its cached data, allowing lookup to fall back
+to the surviving prefix.
 
 With `--persistent-cache`, each slot's record carries a CRC-32C of its payload;
 a copy that fails it on first read is a miss.
 
-`/status` reports the shared quota and KV transfers under `disk`. Its cumulative
-`read_bytes` and `written_bytes` count bytes transferred by file IO across KV
-and state files, including partial or cancelled transfers. They exclude
+`/status` reports the shared quota, its limit, the write budget and KV
+transfers under `disk`. Its cumulative `read_bytes` and `written_bytes` count
+bytes transferred by file IO across KV and state files, including partial or
+cancelled transfers. They exclude
 filesystem metadata and physical SSD write amplification. State transfers appear
 under `state` (`disk_bytes`, `offloads`, `disk_hits`, `disk_promotions`). Cache
 counters include:

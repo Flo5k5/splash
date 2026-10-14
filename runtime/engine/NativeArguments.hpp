@@ -25,10 +25,17 @@ struct NativeArguments final {
   // Zero for auto.
   uint32_t maxContext = 0;
   uint64_t maxMemoryBytes = 0;
-  uint64_t maxCacheDiskBytes = 0;
-  // --cache-dir: where the cache tier keeps its files for the next process;
-  // empty for temporary ones.
-  std::filesystem::path persistentCacheRoot;
+  // Automatic without MAX_CACHE_DISK_BYTES, as the server's default.
+  CacheDiskQuota maxCacheDisk{.automatic = true};
+  // --max-cache-disk-writes BYTES: the SSD cache's write budget, the most it
+  // writes a day on average; zero for none.
+  uint64_t maxCacheDiskWritesBytes = 0;
+  // --persistent-cache on|off: whether the cache tier keeps its files for the
+  // next process, instead of temporary ones.
+  bool persistentCache = false;
+  // --cache-dir: where persistent caches live; empty for the default,
+  // ~/Library/Caches/Splash/prefix-cache.
+  std::filesystem::path cacheRoot;
   kv::Format kvFormat = kv::Format::Int8;
   ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
   double decodeShare = EngineConfig{}.decodeShare;

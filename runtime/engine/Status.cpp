@@ -75,6 +75,15 @@ const char *priorityName(engine::RequestPriority priority) noexcept {
   return "unknown";
 }
 
+const char *writesGatedName(DiskWritesGate gate) noexcept {
+  switch (gate) {
+  case DiskWritesGate::No: return "no";
+  case DiskWritesGate::Budget: return "budget";
+  case DiskWritesGate::Closed: return "closed";
+  }
+  return "unknown";
+}
+
 } // namespace
 
 std::string runtimeStatusJson(
@@ -201,8 +210,12 @@ std::string runtimeStatusJson(
       << ",\"invalidations\":" << state.invalidations
       << "}"
       << ",\"disk\":{\"capacity_bytes\":" << resources.kvTier.capacityBytes
+      << ",\"limit_bytes\":" << resources.kvTier.limitBytes
       << ",\"used_bytes\":" << resources.kvTier.usedBytes
       << ",\"file_bytes\":" << resources.kvTier.fileBytes
+      << ",\"volume_available_bytes\":" << resources.kvTier.volumeAvailableBytes
+      << ",\"writes_gated\":" << json::quote(writesGatedName(resources.kvTier.writesGated))
+      << ",\"write_budget_bytes\":" << resources.kvTier.writeBudgetBytes
       << ",\"read_bytes\":" << resources.kvTier.readBytes
       << ",\"written_bytes\":" << resources.kvTier.writtenBytes
       << ",\"kv_blocks\":" << resources.kvTier.diskBlocks

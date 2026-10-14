@@ -72,12 +72,24 @@ struct CacheLookupSnapshot final {
   uint64_t lostStateMisses = 0;
 };
 
+// What holds the disk tier's writes back: nothing, the write budget (states
+// not in use wait for it; only when one is set), or a file that stopped
+// taking writes.
+enum class DiskWritesGate : uint8_t { No, Budget, Closed };
+
 struct KvTierSnapshot final {
-  // The disk quota shared by KV pages and states, its current use, and the
-  // bytes its files occupy on disk.
+  // The disk quota shared by KV pages and states, the limit its volume leaves
+  // it now, its current use, and the bytes its files occupy on disk.
   uint64_t capacityBytes = 0;
+  uint64_t limitBytes = 0;
   uint64_t usedBytes = 0;
   uint64_t fileBytes = 0;
+  // What the volume had available when the limit was last set.
+  uint64_t volumeAvailableBytes = 0;
+  DiskWritesGate writesGated = DiskWritesGate::No;
+  // What writes not in use may take now; zero once overdrawn, and zero
+  // without a write budget, when nothing is held back.
+  uint64_t writeBudgetBytes = 0;
   uint64_t readBytes = 0;
   uint64_t writtenBytes = 0;
   uint64_t demotions = 0;
@@ -231,8 +243,7 @@ public:
   // makes the cache persistent: its copies are labelled for the next
   // process, and the quota keeps whole restore points by the recency of
   // their states (dropOldestPoint).
-  Cache(KvPool &pool, KvTier *kvTier,
-        std::shared_ptr<const model::DiskBudget> diskBudget);
+  Cache(KvPool &pool, KvTier *kvTier, std::shared_ptr<model::DiskBudget> diskBudget);
   Cache(const Cache &) = delete;
   Cache &operator=(const Cache &) = delete;
 
@@ -240,27 +251,45 @@ public:
   // Before the first request, takes back the restore points an earlier
   // process left in a persistent tier: each state whose block's chain is
   // whole, and that chain. Everything else stays behind, and once the files
-  // finish adoption its slots are free. Then the oldest copies go while the
-  // quota is exceeded. Ids and recency continue after those taken back.
+  // finish adoption its slots are free. Then copies go while the disk limit
+  // is exceeded, as keepDiskLimit() gives them up. Ids and recency continue
+  // after those taken back.
   [[nodiscard]] CacheAdoption adopt(std::vector<PersistedKv> blocks,
                                     std::vector<PersistedState> states);
   // One step of making the restore point at this block durable in a
-  // persistent tier, while it stays in RAM: the pages of its chain that have
-  // no disk copy are written, root first, beside the commands that may read
-  // them, then the state from its own buffers. Nothing starts while a
-  // restore waits, and the pages take a small share of the tier's writes.
-  // A point is unneeded once it is gone or an ordinary state on its only
-  // branch below supersedes it: its conversation went on from there. One
-  // larger than the quota, or given up to make room for itself, is refused.
+  // persistent tier, while it stays in RAM: the state is written from its
+  // own buffers once the write budget admits it, the tier busy until then,
+  // and then the pages of its chain that have no disk copy, root first,
+  // beside the commands that may read them; they pass the budget, as every
+  // KV write does. Nothing starts while a restore waits, and the pages take
+  // a small share of the tier's writes. A point is unneeded once it is gone
+  // or an ordinary state on its only branch below supersedes it: its
+  // conversation went on from there. One larger than what the tier may hold
+  // now (its limit), or given up to make room for itself, is refused, and so
+  // is every point once a file stopped taking writes.
   [[nodiscard]] PersistStatus persist(uint64_t block);
   // At a clean stop: the label of each state copy a persistent tier keeps
   // takes its state's current recency and class, which the next process
   // keeps and orders them by. KV copies keep the labels of their writes: a
   // chain goes with the states that need it (dropOldestPoint).
   void relabelStates() const;
-  // Bytes the disk tier has written in all.
-  [[nodiscard]] uint64_t diskWrittenBytes() const noexcept {
-    return diskBudget_ ? diskBudget_->writtenBytes() : 0;
+  // Measures the volume the disk tier lives on and sets the budget's limit
+  // (DiskSpace::measure), for keepDiskLimit(); none without such a tier.
+  void setDiskMeasure(std::function<void()> measure) { diskMeasure_ = std::move(measure); }
+  // At a control pass, and when a write found the volume full: measures it
+  // again, then gives up copies while the tier holds more than the limit,
+  // in the order a full quota replaces them (freeDiskSpace), never a copy in
+  // transfer or the only copy of a state in use.
+  void keepDiskLimit();
+  // When the write budget admits a state's write not in use again, on its
+  // clock; empty while it does now or without a budget.
+  [[nodiscard]] std::optional<double> diskWritesAdmittedAt() const noexcept {
+    return diskBudget_ ? diskBudget_->admitsAgainAt() : std::nullopt;
+  }
+  // At a clean stop: the write budget holds nothing back any more.
+  void liftDiskWriteBudget() noexcept {
+    if (diskBudget_)
+      diskBudget_->lift();
   }
 
   void setCompletionNotifier(std::function<void()> notifier) {
@@ -349,6 +378,9 @@ public:
   // The request holding the handle is unfinished and its conversation
   // resumes from the state at this block: see StateCache::useState.
   [[nodiscard]] StateUse useState(uint64_t kvBlock) { return states_.useState(kvBlock); }
+  // A state at this block is in use, published or yet to be: its writes
+  // pass the disk tier's write budget.
+  [[nodiscard]] bool stateInUse(uint64_t kvBlock) const noexcept { return states_.inUse(kvBlock); }
   [[nodiscard]] StateCheckpoint checkpointState(uint64_t kvBlock) const noexcept;
   // The state at this block has a RAM copy.
   [[nodiscard]] bool stateResident(uint64_t kvBlock) const noexcept;
@@ -571,11 +603,12 @@ private:
   // one, by demotion when a state on it or below it depends on it, by
   // erasure otherwise, with any disk copies below it. Pending when the tier
   // cannot take it right now. A leaf that a disk subtree depends on is
-  // dropped only once a failed write has closed the tier, together with
-  // that subtree. Immediate passes over a leaf that needs a demotion.
+  // dropped only once a file stopped taking writes, together with that
+  // subtree. Immediate passes over a leaf that needs a demotion.
   [[nodiscard]] LeafReclaim reclaimKvLeaf(uint64_t block, ReclaimTiming timing);
   [[nodiscard]] LeafReclaim demoteKv(uint64_t block);
-  // A failed write closes the tier; existing copies stay readable.
+  // A file that stopped taking writes closes the KV tier; existing copies
+  // stay readable. KV writes pass the write budget (model::DiskBudget).
   [[nodiscard]] bool kvTierWritable() const noexcept { return tier_ && tier_->writable(); }
   // Only a state restores a disk-only chain, through its own block and every
   // block above.
@@ -595,8 +628,11 @@ private:
   // it is in transfer or active, it is erased with the states on it, in use
   // or not, and the poisoned block leaves with its last user.
   void dropPoisoned();
-  // A slot for a new KV copy, replacing older copies while the quota is full;
-  // inUse when a state in use needs the copy.
+  // The KV tier's part of pollTransfers().
+  [[nodiscard]] bool pollTierTransfers();
+  // A slot for a new KV copy, replacing older copies while the tier is at its
+  // limit, and none while the limit cannot hold one; inUse when a state in
+  // use needs the copy.
   [[nodiscard]] std::shared_ptr<KvDiskSlot> acquireDiskSlot(bool inUse);
   // Gives up one disk copy for a new copy, in use or not: the oldest
   // redundant one, KV or state, else the oldest that is the only copy, never
@@ -605,6 +641,9 @@ private:
   // it restores through, go only for a copy in use, and after every other.
   // False when the disk holds nothing the new copy may displace.
   [[nodiscard]] bool freeDiskSpace(bool inUse);
+  // Gives up copies not in use while the tier holds more than its limit;
+  // returns how many went.
+  uint32_t fitDiskLimit();
   // In a persistent tier a redundant copy is what the next process takes
   // back, and the unit worth keeping is a restore point, a state and its
   // chain. A copy no state needs goes first (dropUnneededCopy), then the
@@ -640,7 +679,8 @@ private:
   KvTier *tier_;
   bool persistent_;
   CacheAdoption adoption_;
-  std::shared_ptr<const model::DiskBudget> diskBudget_;
+  std::shared_ptr<model::DiskBudget> diskBudget_;
+  std::function<void()> diskMeasure_;
   CacheRecency recency_;
   KvCache kv_;
   StateCache states_;

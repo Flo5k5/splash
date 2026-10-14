@@ -108,16 +108,27 @@ void testServerCommandLines(const char *path) {
          read.maxContext = 102400;
          read.maxMemoryBytes = 32 * kGiB;
        }},
-      {"disk", [](NativeArguments &read) { read.maxCacheDiskBytes = 5 * kGiB; }},
+      // No quota is the automatic one.
+      {"disk_auto", [](NativeArguments &) {}},
+      {"disk_off", [](NativeArguments &read) { read.maxCacheDisk = {}; }},
+      {"disk", [](NativeArguments &read) { read.maxCacheDisk = {.bytes = 5 * kGiB}; }},
+      {"disk_writes", [](NativeArguments &read) { read.maxCacheDiskWritesBytes = 200 * kGiB; }},
+      {"persistent_auto", [](NativeArguments &read) { read.persistentCache = true; }},
       {"persistent",
        [](NativeArguments &read) {
-         read.maxCacheDiskBytes = 5 * kGiB;
-         read.persistentCacheRoot = "/srv/cache";
+         read.maxCacheDisk = {.bytes = 5 * kGiB};
+         read.persistentCache = true;
+       }},
+      {"persistent_dir",
+       [](NativeArguments &read) {
+         read.maxCacheDisk = {.bytes = 5 * kGiB};
+         read.persistentCache = true;
+         read.cacheRoot = "/srv/cache";
        }},
       {"bf16", [](NativeArguments &read) { read.kvFormat = kv::Format::BFloat16; }},
       {"disk_bf16",
        [](NativeArguments &read) {
-         read.maxCacheDiskBytes = 5 * kGiB;
+         read.maxCacheDisk = {.bytes = 5 * kGiB};
          read.kvFormat = kv::Format::BFloat16;
        }},
       {"state_bf16",
@@ -129,7 +140,7 @@ void testServerCommandLines(const char *path) {
        }},
       {"decode_share",
        [](NativeArguments &read) {
-         read.maxCacheDiskBytes = 5 * kGiB;
+         read.maxCacheDisk = {.bytes = 5 * kGiB};
          read.decodeShare = 0.0;
        }},
       {"image_patches", [](NativeArguments &read) { read.maxImagePatches = 4096; }},
@@ -146,8 +157,10 @@ void testServerCommandLines(const char *path) {
   const auto same = [](const NativeArguments &read, const NativeArguments &meant) {
     return read.modelRoot == meant.modelRoot && read.maxContext == meant.maxContext &&
            read.maxMemoryBytes == meant.maxMemoryBytes &&
-           read.maxCacheDiskBytes == meant.maxCacheDiskBytes &&
-           read.persistentCacheRoot == meant.persistentCacheRoot &&
+           read.maxCacheDisk.automatic == meant.maxCacheDisk.automatic &&
+           read.maxCacheDisk.bytes == meant.maxCacheDisk.bytes &&
+           read.maxCacheDiskWritesBytes == meant.maxCacheDiskWritesBytes &&
+           read.persistentCache == meant.persistentCache && read.cacheRoot == meant.cacheRoot &&
            read.kvFormat == meant.kvFormat && read.stateFormat == meant.stateFormat &&
            read.decodeShare == meant.decodeShare &&
            read.maxImagePatches == meant.maxImagePatches &&
@@ -207,12 +220,23 @@ void testRefusals() {
   refuses({"auto", "auto", "--idle-sleep", "never"},
           "--idle-sleep requires prevent or allow");
   refuses({"auto", "auto", "--ane", "gpu"}, "--ane requires on or off");
-  refuses({"auto", "auto", "--cache-dir", "/srv/cache"},
-          "--cache-dir requires a MAX_CACHE_DISK_BYTES quota");
-  refuses({"auto", "auto", "5368709120", "--cache-dir", ""},
+  refuses({"auto", "auto", "--persistent-cache", "yes"}, "--persistent-cache requires on or off");
+  refuses({"auto", "auto", "0", "--persistent-cache", "on"},
+          "--persistent-cache requires an SSD cache, which MAX_CACHE_DISK_BYTES 0 turns off");
+  refuses({"auto", "auto", "5368709120", "--cache-dir", "/srv/cache"},
+          "--cache-dir requires --persistent-cache on");
+  refuses({"auto", "auto", "5368709120", "--persistent-cache", "on", "--cache-dir", ""},
           "--cache-dir requires a directory");
   refuses({"auto", "auto", "5G"},
           "MAX_CACHE_DISK_BYTES must be a nonnegative integer");
+  for (const char *writes : {"200G", "-1", "1.5", ""})
+    refuses({"auto", "auto", "5368709120", "--max-cache-disk-writes", writes},
+            "--max-cache-disk-writes requires a nonnegative integer byte count");
+  refuses({"auto", "auto", "0", "--max-cache-disk-writes", "214748364800"},
+          "--max-cache-disk-writes requires an SSD cache, which MAX_CACHE_DISK_BYTES 0 turns off");
+  require(parse(model, {"auto", "auto", "5368709120", "--max-cache-disk-writes", "0"})
+                  .maxCacheDiskWritesBytes == 0,
+          "--max-cache-disk-writes 0 set a write budget");
   refuses({"auto", "auto", "--max-memory", "32G"},
           "unexpected argument --max-memory");
   for (const char *memory : {"0", "32G", "-1"})

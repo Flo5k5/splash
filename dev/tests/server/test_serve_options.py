@@ -83,12 +83,27 @@ OPTIONS = {
     ),
     "--max-cache-disk": values(
         "--max-cache-disk",
-        {"0": 0, "5G": 5 * 1024**3},
-        ("auto", "-1", "0G", "5X", "nan"),
+        {"auto": None, "0": 0, "5G": 5 * 1024**3},
+        ("-1", "0G", "5X", "nan"),
+    ),
+    "--max-cache-disk-writes": (
+        [
+            (["--max-cache-disk-writes=0"], 0),
+            (["--max-cache-disk-writes=200G"], 200 * 1024**3),
+        ],
+        [
+            ["--max-cache-disk-writes=200G", "--max-cache-disk=0"],
+            ["--max-cache-disk-writes=-1"],
+            ["--max-cache-disk-writes=5X"],
+            ["--max-cache-disk-writes=auto"],
+        ],
     ),
     "--persistent-cache": (
-        [(["--persistent-cache", "--max-cache-disk=5G"], True)],
-        [["--persistent-cache"], ["--persistent-cache", "--max-cache-disk=0"]],
+        [
+            (["--persistent-cache"], True),
+            (["--persistent-cache", "--max-cache-disk=5G"], True),
+        ],
+        [["--persistent-cache", "--max-cache-disk=0"]],
     ),
     "--cache-dir": (
         [
@@ -382,14 +397,6 @@ class ServeOptionsTests(unittest.TestCase):
                     api._native_command(api.parse_args([*required, *options])),
                     [args.binary, "serve-native", args.model_root, *arguments],
                 )
-        # A persistent cache names its directory; the server picks the default.
-        persistent_args = api.parse_args(
-            [*required, "--max-cache-disk", "5G", "--persistent-cache"]
-        )
-        self.assertEqual(
-            api._native_command(persistent_args)[-2:],
-            ["--cache-dir", str(serve_options.DEFAULT_CACHE_DIR)],
-        )
 
 
 if __name__ == "__main__":

@@ -558,25 +558,6 @@ void testStartupRetryWindowOpensAtFirstFailure() {
   }
 }
 
-// The disk tier suggestion follows the plan within the host's headroom
-// beyond its reserve and the warning margin; a host with no more than those
-// holds nothing.
-void testMemoryMayNotHoldBeyondHostHeadroom() {
-  const EngineMemoryPlan plan = memoryPlan();
-  const auto &budget = plan.breakdown();
-  const uint64_t held = EngineMemoryPolicy::hostAvailableReserveBytes(
-                            budget.physicalMemoryBytes) +
-                        kHostWarningMarginBytes;
-  const uint64_t available = held + budget.minimumRequiredBytes + 64 * kMiB;
-  const uint32_t fits = plan.contextTokensWithin(available - held);
-  require(fits && fits < plan.maximumContextTokens() &&
-              !memoryMayNotHold(plan, available, fits) &&
-              memoryMayNotHold(plan, available, fits + 1) &&
-              !memoryMayNotHold(plan, 64 * kGiB, plan.maximumContextTokens()) &&
-              memoryMayNotHold(plan, held, 1),
-          "the disk tier suggestion does not follow the host's headroom");
-}
-
 // The parser's limits follow the model: prompts and outputs up to the served
 // context, the engine's step and draft query rows, and a mask row of the
 // vocabulary for each draft query and the anchor.
@@ -604,7 +585,6 @@ int main() {
     testWarmupErrorsCannotMasqueradeAsMemoryLimits();
     testExceptionsMemoryAndReadyWriteAreFailClosed();
     testStartupRetryWindowOpensAtFirstFailure();
-    testMemoryMayNotHoldBeyondHostHeadroom();
     testProtocolLimitsFollowTheModel();
     std::cout << "native bootstrap tests passed\n";
     return EXIT_SUCCESS;

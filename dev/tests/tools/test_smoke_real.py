@@ -215,14 +215,18 @@ class SmokeRealTests(unittest.TestCase):
                         command[index + 1 : index + 3], ["--cache-dir", "/tmp/cache"]
                     )
 
-    def test_persistent_cache_scenario_needs_a_disk_quota(self):
+    def test_persistent_cache_scenario_needs_the_ssd_cache(self):
         model = ["--model", "mlx-community/Qwen3.8-27B-4bit"]
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            smoke_real.parse_args([*model, "--persistent-cache"])
-        arguments = smoke_real.parse_args(
-            [*model, "--persistent-cache", "--max-cache-disk", "4G"]
-        )
-        self.assertTrue(arguments.persistent_cache)
+            smoke_real.parse_args(
+                [*model, "--persistent-cache", "--max-cache-disk", "0"]
+            )
+        for quota in ([], ["--max-cache-disk", "4G"]):
+            with self.subTest(quota=quota):
+                arguments = smoke_real.parse_args(
+                    [*model, "--persistent-cache", *quota]
+                )
+                self.assertTrue(arguments.persistent_cache)
         self.assertFalse(smoke_real.parse_args(model).persistent_cache)
 
     def test_stop_requires_a_clean_exit(self):

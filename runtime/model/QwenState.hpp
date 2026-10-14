@@ -159,8 +159,8 @@ public:
   [[nodiscard]] uint64_t residentBytes() const noexcept override {
     return disk_ ? 0 : bytes();
   }
-  [[nodiscard]] bool canOffload() const noexcept override {
-    return !disk_ && file_ && file_->writable();
+  [[nodiscard]] bool canOffload(bool inUse) const noexcept override {
+    return !disk_ && file_ && file_->takesWrite(inUse);
   }
   [[nodiscard]] std::unique_ptr<StateOffload>
   offload(std::function<void()> completion) const override;
@@ -179,7 +179,7 @@ private:
                      std::shared_ptr<SlotFile::Slot> disk);
   // Copies the spans of one state into staging and starts the write that
   // carries them to disk; the ticket's state() is the disk copy. Null when
-  // the tier cannot admit another state. The engine starts one state write
+  // the quota cannot admit another state. The engine starts one state write
   // at a time (StateCache::startWrite), so the staging copy is free here.
   [[nodiscard]] static std::unique_ptr<StateOffload>
   write(const std::shared_ptr<SlotFile> &file,
@@ -293,12 +293,13 @@ public:
   // state's: page-aligned, with a whole draft window and its context window.
   void validateLengths(const QwenLogicalLengths &lengths,
                        bool cacheSnapshot) const;
-  [[nodiscard]] bool canSnapshotToDisk() const noexcept {
-    return file_ && file_->writable();
+  [[nodiscard]] bool canSnapshotToDisk(bool inUse) const noexcept {
+    return file_ && file_->takesWrite(inUse);
   }
   // Writes the lane's committed state to the disk tier from its own cells,
   // taking no cache slot; the ticket carries the disk copy. Null without a
-  // tier that accepts writes, or when the quota cannot admit another state.
+  // tier that takes it (canSnapshotToDisk(true)), or when the quota cannot
+  // admit another state. The caller asked the write budget first.
   [[nodiscard]] std::unique_ptr<StateOffload>
   snapshotToDisk(uint32_t lane, std::function<void()> completion);
   // Restores `state` into the lane's current cell, and into its context

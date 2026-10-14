@@ -127,6 +127,11 @@ void testCleanRuntimeStatus(const char *goldenPath) {
   engine.resources.kvTier.readBytes = 12345;
   engine.resources.kvTier.writtenBytes = 67890;
   engine.resources.kvTier.fileBytes = 24680;
+  engine.resources.kvTier.capacityBytes = 34359738368;
+  engine.resources.kvTier.limitBytes = 8589934592;
+  engine.resources.kvTier.usedBytes = 4096;
+  engine.resources.kvTier.volumeAvailableBytes = 46170898432;
+  engine.resources.kvTier.writesGated = engine::DiskWritesGate::Budget;
   engine.resources.persistent = true;
   engine.resources.kvTier.copies = 64;
   engine.resources.adoption = {2, 96, 4096, 1};
@@ -227,6 +232,11 @@ void testCleanRuntimeStatus(const char *goldenPath) {
               json.find("\"written_bytes\":67890") != std::string::npos &&
               json.find("\"file_bytes\":24680,") != std::string::npos,
           "disk byte accounting was not exposed");
+  require(json.find("\"disk\":{\"capacity_bytes\":34359738368,\"limit_bytes\":8589934592,"
+                    "\"used_bytes\":4096,\"file_bytes\":24680,"
+                    "\"volume_available_bytes\":46170898432,\"writes_gated\":\"budget\","
+                    "\"write_budget_bytes\":0,") != std::string::npos,
+          "the disk tier's limit, volume and write budget were not exposed");
   require(json.find("\"persistent\":true,\"kv_copies\":64,\"kv_copy_failures\":0,"
                     "\"taken_back\":{\"states\":2,\"kv_blocks\":96,\"bytes\":4096,"
                     "\"left_behind\":1},\"write_behind\":{\"waiting\":1,\"durable\":5,"
