@@ -118,8 +118,8 @@ public:
   // arrival, on the runtime's clock.
   [[nodiscard]] engine::EngineSnapshot statusSnapshot() const;
   [[nodiscard]] WeightsSnapshot weightsSnapshot() const {
-    return {idleReleaseSeconds_, config_.weights->released(), weightRestores_,
-            weightRestoreFailures_};
+    return {idleReleaseSeconds_, config_.weights->released(),
+            restoreStarted_.has_value(), weightRestores_, weightRestoreFailures_};
   }
   // The engine's (Engine::resourceWaitSnapshot), with the requests a refused
   // restore holds waiting for memory.
@@ -149,6 +149,9 @@ private:
 
   bool handle(protocol::ClientMessage &message);
   bool handleRequest(protocol::RequestFrame &request);
+  // Gives the weights back when the engine holds no request and no restore is
+  // under way; true when it did.
+  bool releaseWeights();
   bool restoreWeights();
   bool weightsRefused(metal::AllocationFailure failure);
   bool handleCancel(const protocol::CancelFrame &cancel);

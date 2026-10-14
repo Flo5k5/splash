@@ -1535,6 +1535,23 @@ bool answeredStatus(const LoopFixture &fixture, uint64_t correlationId) {
   });
 }
 
+// Sends a release request and returns the weights' snapshot its answer reports:
+// the status document that answers it is written from the loop's snapshot of the
+// moment (RuntimeBootstrap::statusJson).
+WeightsSnapshot releaseAnswer(LoopFixture &fixture, uint64_t correlationId) {
+  std::optional<WeightsSnapshot> reported;
+  fixture.status = [&] {
+    reported = fixture.loop.weightsSnapshot();
+    return test::readyStatusJson();
+  };
+  require(fixture.loop.receive(
+              protocol::peer::serialize(protocol::ReleaseRequestFrame{correlationId})) &&
+              answeredStatus(fixture, correlationId) && reported,
+          "a release request was not answered with a status document");
+  fixture.status = test::readyStatusJson;
+  return *reported;
+}
+
 // The control pass between commands releases the weights once the engine has
 // held no request for the idle release, counted from Ready or from the end of
 // the last request however long it ran, never while one is there. A request
@@ -1697,6 +1714,11 @@ void testIdleReleaseRestoresTheSplitLast() {
   require(idlePass() && !loaded, "the idle release kept the split's program");
   require(imagesBack(1) && !loaded && !memory.released(),
           "the restore ended with the last image, before the split's program");
+  // The weights are no longer released, but the restore is still under way: a
+  // release request leaves it alone, and its answer reports it.
+  const WeightsSnapshot answer = releaseAnswer(fixture, 1);
+  require(!answer.released && answer.restoring && !memory.released() && !loaded,
+          "a release request before the split's program was back was answered as a release");
   require(loop.tick() && loaded && loads == 1 && loop.weightsSnapshot().restores == 1,
           "the tick after the last image did not load the split's program");
   runUntilIdle(loop);
@@ -1867,17 +1889,27 @@ void testRefusedRestoreWaitsForMemory() {
 }
 
 // With --idle-release off the control pass never releases the weights,
-// however long the engine holds no request.
-void testIdleReleaseOffKeepsTheWeights() {
+// however long the engine holds no request, but a release request still does,
+// and the next request restores them.
+void testIdleReleaseOffReleasesOnlyOnRequest() {
   Weights weights;
   engine::NativeLoopConfig config;
   config.engine.maxContext = 1024;
   config.weights = &weights;
   LoopFixture fixture(config, {}, {}, std::numeric_limits<double>::infinity());
-  fixture.loop.announceReady();
+  engine::NativeRuntime &loop = fixture.loop;
+  loop.announceReady();
   fixture.monotonic += 1e12;
-  fixture.loop.releaseIdleWeights();
+  loop.releaseIdleWeights();
   require(!weights.released(), "weights were released with the idle release off");
+  const WeightsSnapshot answer = releaseAnswer(fixture, 5);
+  require(weights.released() && answer.released && !answer.restoring &&
+              answer.idleReleaseSeconds == std::numeric_limits<double>::infinity(),
+          "a release request did not release the weights with the idle release off");
+  require(loop.receive(protocol::peer::serialize(request(1))), "the request after the release failed");
+  runUntilIdle(loop);
+  require(!weights.released() && weights.restores == Weights::kImages,
+          "the request did not restore the weights released with the idle release off");
   // An idle release that is not positive is refused.
   for (double seconds : {0.0, -1.0, std::numeric_limits<double>::quiet_NaN()}) {
     rejects([&] { LoopFixture refusedFixture(config, {}, {}, seconds); },
@@ -1886,51 +1918,52 @@ void testIdleReleaseOffKeepsTheWeights() {
   }
 }
 
-// A release request gives the weights back now, with the idle release off, when the
-// engine holds no request and no restore is under way; the answer is the status
-// document either way. The next request restores them as after the idle release.
+// A release request gives the weights back now, as the idle release does, when
+// the engine holds no request and no restore is under way, and otherwise leaves
+// them as they are. Either way its answer reports what the engine did: released
+// and not restoring only once the weights are given back; a restore under way,
+// which leaves them released until its last image, as restoring. The next
+// request restores them as after the idle release.
 void testReleaseRequestGivesTheWeightsBackWhenIdle() {
   Weights weights;
   ReleasableMemory memory(weights, std::nullopt);
   engine::NativeLoopConfig config;
   config.engine.maxContext = 1024;
   config.weights = &memory;
-  LoopFixture fixture(config, {}, {}, std::numeric_limits<double>::infinity());
+  LoopFixture fixture(config);
   engine::NativeRuntime &loop = fixture.loop;
   loop.announceReady();
   require(!weights.released(), "the weights were released before any release request");
 
-  require(loop.receive(protocol::peer::serialize(protocol::ReleaseRequestFrame{5})) &&
-              answeredStatus(fixture, 5),
-          "a release request was not answered with a status document");
-  require(weights.released() && loop.weightsSnapshot().released &&
-              loop.weightsSnapshot().restores == 0,
+  WeightsSnapshot answer = releaseAnswer(fixture, 5);
+  require(weights.released() && answer.released && !answer.restoring && answer.restores == 0,
           "an idle engine did not release its weights on request");
-  // A second request changes nothing and is answered again.
-  require(loop.receive(protocol::peer::serialize(protocol::ReleaseRequestFrame{6})) &&
-              answeredStatus(fixture, 6) && weights.released(),
+  // A second release request changes nothing, and is answered as the first.
+  answer = releaseAnswer(fixture, 6);
+  require(weights.released() && answer.released && !answer.restoring,
           "releasing released weights again failed");
 
-  // A request restores them, an image per tick.
+  // A request restores them, an image per tick. A release request during the
+  // restore leaves it alone, and its answer reports the restore.
   require(loop.receive(protocol::peer::serialize(request(1))) && loop.tick() &&
-              weights.released(),
+              weights.held() == 1,
           "the request did not start the restore");
-  // A release request during the restore leaves it alone.
-  require(loop.receive(protocol::peer::serialize(protocol::ReleaseRequestFrame{7})) &&
-              answeredStatus(fixture, 7),
-          "a release request during the restore was not answered");
+  answer = releaseAnswer(fixture, 7);
+  require(weights.held() == 1 && answer.released && answer.restoring,
+          "a release request during the restore released the weights, or its answer did not "
+          "report the restore");
   while (weights.released())
     require(loop.tick(), "a tick did not write back an image");
   require(weights.restores == Weights::kImages, "the restore was disturbed by a release request");
 
   // With a request in service the weights stay.
-  require(loop.receive(protocol::peer::serialize(request(2))) &&
-              loop.receive(protocol::peer::serialize(protocol::ReleaseRequestFrame{8})) &&
-              answeredStatus(fixture, 8) && !weights.released(),
+  require(loop.receive(protocol::peer::serialize(request(2))), "a second request failed");
+  answer = releaseAnswer(fixture, 8);
+  require(!weights.released() && !answer.released && !answer.restoring,
           "the weights were released under a request");
   runUntilIdle(loop);
-  require(loop.receive(protocol::peer::serialize(protocol::ReleaseRequestFrame{9})) &&
-              weights.released(),
+  answer = releaseAnswer(fixture, 9);
+  require(weights.released() && answer.released && !answer.restoring,
           "the engine did not release once its request ended");
 }
 
@@ -2036,7 +2069,7 @@ int main() {
     testIdleWeightsAreReleasedAndRestored(true);
     testIdleReleaseRestoresTheSplitLast();
     testRefusedRestoreWaitsForMemory();
-    testIdleReleaseOffKeepsTheWeights();
+    testIdleReleaseOffReleasesOnlyOnRequest();
     testReleaseRequestGivesTheWeightsBackWhenIdle();
     testHoldingRequestsSpansFirstToLastRequest();
     testMemoryStatusReporterLogsTransitionsOnly();

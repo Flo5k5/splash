@@ -227,8 +227,9 @@ struct StatusRequestFrame {
 };
 
 // Asks the engine to give its weights back now, as the idle release does, when
-// it holds no request. The answer is a StatusJson with the same correlationId,
-// whose `weights.released` says whether the weights are released.
+// it holds no request and restores none, with the idle release on or off. The
+// answer is a StatusJson with the same correlationId, whose `weights` section
+// says whether the weights are released: `released` and not `restoring`.
 struct ReleaseRequestFrame {
   uint64_t correlationId = 0;
 

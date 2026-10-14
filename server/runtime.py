@@ -641,9 +641,10 @@ class MultiplexedRuntime:
         return self._status(timeout, None, fail_unanswered)
 
     def release_weights(self, timeout: float = 5.0) -> wire.StatusJsonEvent:
-        """Asks the engine to give its weights back now. It does so only when
-        it holds no request and no restore is under way; the status JSON that
-        answers shows which (`weights.released`). The next request restores
+        """Asks the engine to give its weights back now. It does so only while
+        it holds no request and no restore is under way, with
+        `--idle-release off` too; the status JSON that answers shows which
+        (`weights`: `released` and not `restoring`). The next request restores
         them, as after the idle release."""
         return self._status(timeout, None, False, release=True)
 

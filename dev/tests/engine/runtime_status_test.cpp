@@ -221,7 +221,7 @@ void testCleanRuntimeStatus(const char *goldenPath) {
                                   .oldestWaitMilliseconds = 1250.0, .draining = true};
   const std::string json = runtimeStatusJson(
       memoryPlan, engine, metal, warmup, audit(memoryPlan), metrics, executorTelemetry,
-      identity, governor, true, {}, wait, NativeLoopTiming{1843.25}, {600.0, false, 2, 1}, aneFfn,
+      identity, governor, true, {}, wait, NativeLoopTiming{1843.25}, {600.0, false, false, 2, 1}, aneFfn,
       ThermalState::Fair);
   std::ifstream golden(goldenPath);
   const std::string expected{std::istreambuf_iterator<char>(golden), {}};
@@ -545,23 +545,29 @@ void testResourceWaitDiagnostics() {
 }
 
 // The weights' idle release, null with --idle-release off, whether they are
-// released, how often they were written back and how often a restore gave up.
+// released and whether a restore is under way, how often they were written
+// back and how often a restore gave up.
 void testWeightsStatus() {
   const auto memoryPlan = plan();
   const auto status = [&](WeightsSnapshot weights) {
     return runtimeStatusJson(memoryPlan, {}, {}, {}, {}, {}, {}, {}, {}, true, {}, {}, {},
                              weights, {}, {});
   };
-  require(status({600.0, true, 2, 1})
+  require(status({600.0, true, false, 2, 1})
                   .find("\"weights\":{\"idle_release_seconds\":600,\"released\":true,"
-                        "\"restores\":2,\"restore_failures\":1}") != std::string::npos,
+                        "\"restoring\":false,\"restores\":2,\"restore_failures\":1}") !=
+              std::string::npos,
           "the weights' status is missing or inaccurate");
-  require(status({1234567.5, false, 0}).find("\"idle_release_seconds\":1234567.5,") !=
+  require(status({600.0, true, true, 2, 1})
+                  .find("\"released\":true,\"restoring\":true,") != std::string::npos,
+          "a restore under way is missing from the weights' status");
+  require(status({1234567.5, false, false, 0}).find("\"idle_release_seconds\":1234567.5,") !=
               std::string::npos,
           "the idle release lost precision");
-  require(status({std::numeric_limits<double>::infinity(), false, 0})
+  require(status({std::numeric_limits<double>::infinity(), false, false, 0})
                   .find("\"weights\":{\"idle_release_seconds\":null,\"released\":false,"
-                        "\"restores\":0,\"restore_failures\":0}") != std::string::npos,
+                        "\"restoring\":false,\"restores\":0,\"restore_failures\":0}") !=
+              std::string::npos,
           "an idle release that is off is not null");
 }
 

@@ -806,14 +806,21 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
     def _post_memory_release(self, body, deadline):
         weights = self.app.backend.release_weights().get("weights") or {}
-        if weights.get("released") is not True:
-            raise APIError(
+        # A restore leaves the weights released until its last image is back.
+        if weights.get("released") is True and weights.get("restoring") is False:
+            self._json(200, {"released": True, "weights": weights})
+            return
+        # An answer about the engine's state, not a failure: the console does
+        # not log it.
+        self._safe_error(
+            APIError(
                 409,
-                "the engine is serving requests or restoring its weights; "
-                "the weights stay loaded",
+                "the engine is serving requests or restoring its weights; it "
+                "releases them only while idle",
                 "engine_busy",
-            )
-        self._json(200, {"released": True, "weights": weights})
+            ),
+            log=False,
+        )
 
     def _post_systemone(self, body, deadline):
         answers = {}

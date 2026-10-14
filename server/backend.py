@@ -697,9 +697,11 @@ class NativeBackend:
     def release_weights(self, timeout=5.0):
         """Asks the engine to give its weights back now; returns its status.
 
-        It releases only while no request is in service and no restore is
-        under way; `weights.released` in the returned snapshot says whether it
-        did. The next request restores the weights as after the idle release.
+        It releases them only while no request is in service and no restore is
+        under way, with `--idle-release off` too; the returned snapshot's
+        `weights` says whether they are released: `released` and not
+        `restoring`. The next request restores the weights as after the idle
+        release.
         """
         with self.lock:
             if self.closing:
