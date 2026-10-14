@@ -536,8 +536,8 @@ void persistentRoundTrip(metal::MetalBackend &backend, engine::MemoryGovernor &g
 void run(const std::string &metallib) {
   metal::MetalBackend backend(metallib);
   engine::MemoryGovernor governor(
-      backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
-      engine::queryHostAvailableMemory, 0);
+      backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
+      engine::queryHostMemory, 0);
   for (const auto format : {kv::Format::Int8, kv::Format::BFloat16}) {
     roundTrip(backend, governor, kv::Layout{2, 2, 256, format});
     roundTrip(backend, governor, kv::Layout{10, 2, 256, format}); // Qwen3.6-35B

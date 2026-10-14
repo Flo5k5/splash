@@ -15,6 +15,7 @@
 #include <numeric>
 #include <optional>
 #include <stdexcept>
+#include <utility>
 
 using namespace splash;
 using namespace splash::engine;
@@ -2379,7 +2380,7 @@ struct HostPause final {
 
   void attach(EngineConfig &config, test::TestKvStorage &storage, KvPool &pool) {
     config.growthPaused = [this] { return paused; };
-    config.serving = [this](bool value) { serving = value; };
+    config.serving = [this](bool value) { return std::exchange(serving, value); };
     storage.allocationFailure = metal::AllocationFailure::HostPressure;
     storage.growthAllowed = [this, &pool](uint32_t) {
       if (paused && !serving)
@@ -2632,7 +2633,7 @@ void testEngineLimitBindsThroughTheHostPause() {
   bool serving = false;
   EngineConfig config = test::engineConfig();
   config.growthPaused = [&] { return paused; };
-  config.serving = [&](bool value) { serving = value; };
+  config.serving = [&](bool value) { return std::exchange(serving, value); };
   // As the governor does, the host refuses first unless a request in service
   // needs the pages, then the engine's limit of two extents.
   storage.growthAllowed = [&](uint32_t) {

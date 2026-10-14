@@ -130,8 +130,8 @@ void testLayoutFormulas() {
 }
 
 void testOffloadAllocationFailure(metal::MetalBackend &backend) {
-  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
-                          queryHostAvailableMemory, 0);
+  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
+                          queryHostMemory, 0);
   constexpr model::CompositeStateLayout layout{{1, 3, 128, 1, 128, 128},
                                                {1, 1, 4, 128}};
   const uint64_t slotBytes = model::SlotFile::slotBytesFor(layout.cachedBytes());
@@ -189,8 +189,8 @@ void testOffloadAllocationFailure(metal::MetalBackend &backend) {
 }
 
 void testDiskRestore(metal::MetalBackend &backend) {
-  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
-                          queryHostAvailableMemory, 0);
+  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
+                          queryHostMemory, 0);
   model::QwenStateStorage storage(
       backend, governor.allocationAdmission(), kStateLayout,
       std::make_shared<model::SlotFile>(kStateSlotBytes,
@@ -268,8 +268,8 @@ void testDiskRestore(metal::MetalBackend &backend) {
 // cache buffer is taken, the disk copy restores every byte of the active
 // parity, and a full quota refuses until a disk copy is dropped.
 void testDirectDiskSnapshot(metal::MetalBackend &backend) {
-  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
-                          queryHostAvailableMemory, 0);
+  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
+                          queryHostMemory, 0);
   model::QwenStateStorage storage(
       backend, governor.allocationAdmission(), kStateLayout,
       std::make_shared<model::SlotFile>(kStateSlotBytes,
@@ -325,8 +325,8 @@ void testDirectDiskSnapshot(metal::MetalBackend &backend) {
 // the write budget. Overdrawn, the budget holds back writes not in use
 // until it refills, and lets those in use pass.
 void testStateWritesDrawOnTheWriteBudget(metal::MetalBackend &backend) {
-  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
-                          queryHostAvailableMemory, 0);
+  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
+                          queryHostMemory, 0);
   double now = 0.0;
   auto budget = std::make_shared<model::DiskBudget>(4 * kStateSlotBytes, [&now] { return now; });
   // Two slots a day, half a slot at once.
@@ -360,8 +360,8 @@ void testStateSmallerThanSlot(metal::MetalBackend &backend) {
   constexpr model::CompositeStateLayout unaligned{target, {1, 1, 1, 64}};
   static_assert(aligned.cachedBytes() % kHostPageBytes == 0 &&
                 unaligned.cachedBytes() % kHostPageBytes != 0);
-  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
-                          queryHostAvailableMemory, 0);
+  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
+                          queryHostMemory, 0);
   for (const auto &[layout, slotBytes] :
        {std::pair{aligned, aligned.cachedBytes() + kHostPageBytes},
         std::pair{unaligned, model::SlotFile::slotBytesFor(unaligned.cachedBytes())}}) {
@@ -397,8 +397,8 @@ void testStateSmallerThanSlot(metal::MetalBackend &backend) {
 // window, and a state whose slot changed after its record fails its
 // restore.
 void testPersistentStateComesBack(metal::MetalBackend &backend) {
-  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
-                          queryHostAvailableMemory, 0);
+  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
+                          queryHostMemory, 0);
   std::string name = (std::filesystem::temp_directory_path() / "splash-states-XXXXXX").string();
   require(::mkdtemp(name.data()) != nullptr, "temporary directory could not be made");
   const std::filesystem::path directory = name;
@@ -465,8 +465,8 @@ void testPersistentStateComesBack(metal::MetalBackend &backend) {
 // RAM copy's own buffers: no staging, and the RAM copy keeps them. The disk
 // copy restores every byte.
 void testPersistKeepsTheRamCopy(metal::MetalBackend &backend) {
-  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
-                          queryHostAvailableMemory, 0);
+  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
+                          queryHostMemory, 0);
   model::QwenStateStorage storage(
       backend, governor.allocationAdmission(), kStateLayout,
       std::make_shared<model::SlotFile>(kStateSlotBytes,
@@ -503,8 +503,8 @@ void testPersistKeepsTheRamCopy(metal::MetalBackend &backend) {
 // each buffer goes back to the pool once, and nothing once its storage is
 // gone.
 void testReservations(metal::MetalBackend &backend) {
-  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
-                          queryHostAvailableMemory, 0);
+  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
+                          queryHostMemory, 0);
   bool admitNew = true;
   uint32_t admissions = 0;
   const metal::AllocationAdmission admit = [admit = governor.allocationAdmission(), &admitNew, &admissions](
@@ -621,8 +621,8 @@ void run(const std::string &metallib) {
   testPersistKeepsTheRamCopy(backend);
   testReservations(backend);
   MemoryGovernor governor(
-      backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
-      queryHostAvailableMemory, 0);
+      backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
+      queryHostMemory, 0);
   // Switched off to prove that a pooled cache slot needs no new admission;
   // the count is of the admissions granted.
   bool admitNewAllocations = true;

@@ -1735,8 +1735,8 @@ while the same writers write the images again (`WeightImages::restore`), an
 image per tick so that the loop keeps answering status and cancellations; this
 takes about as long as the load at startup and logs `Weights restored in N s`.
 The governor admits each image's memory (`MemoryGovernor::allocationAdmission`)
-as memory the waiting requests need: the host's margins do not refuse it, as
-they do not refuse memory a request in service needs, and it fits the
+as memory the waiting requests need: neither the host's margins nor macOS's
+warning refuse it, as for a request in service, and it fits the
 engine's limit, since the cache does not grow while the engine holds no
 request; critical pressure refuses it. A refused image, or one the driver or
 its writer cannot allocate, stays released, and the images before it stay. The
@@ -2147,12 +2147,31 @@ the refused request itself while a pass defers it, even one that recovery does
 not try, which still waits for memory) and those waiting for a disk restore
 (`restoring`), reports suspended requests, recovery draining and the oldest
 current wait age, which for a request holding admission closed runs from when
-its wait began. Memory transitions also appear in the console. When macOS runs
-short of memory, growth that no request in service needs pauses and the cache
-gives memory back, a paced pass at a time, down to one lane's state buffers and
-one KV extent. A pass counts only memory that leaves the engine; a cached state
-it evicts first refills the lane's state buffers it keeps. A request in service
-keeps growing within `--max-memory`, first into cached pages no request holds:
+its wait began. Memory transitions also appear in the console. Growth that no
+request in service needs, and so the cache, leaves other applications their
+memory: it keeps a spare reserve of 7% of the Mac's memory (2 to 7 GiB) and a
+1 GiB margin free of the host's spare memory, the free, file-backed and
+purgeable pages and half of what compressing the anonymous pages would free at
+the compressor's present ratio, at most a quarter of them. When the spare memory
+runs short of that, such growth pauses and the cache gives memory back, a paced
+pass at a time, down to one lane's state buffers and one KV extent. So it does,
+however much spare memory there is, while macOS reports warning memory pressure,
+its signal for caches to give memory back: each pass then returns up to 1 GiB
+until the level is normal again and keeps the state a follow-up resumes from,
+even while a request waits, whose growth the warning refuses as well (`/status`:
+`memory_governor.system_pressure`, and `growth_allowed` is false meanwhile). A
+pass counts only memory that leaves the engine; a cached state it evicts first
+refills the lane's state buffers it keeps. A start needs only what macOS can
+hand out at all beyond a reserve of a tenth of a small Mac's memory and 2 GiB of
+a larger one, counting what compressing the anonymous pages would free at the
+compressor's present ratio, at most half of them, short of critical pressure:
+what it allocates, the KV runway, arenas and warmup included, is memory a
+request in service needs until serving begins (`/status`:
+`memory_governor.host_available_bytes` and `host_reserve_bytes`; the spare
+memory and its reserve are `host_spare_bytes` and `host_spare_reserve_bytes`,
+and `host_headroom_bytes` is the room above them). A request in service keeps
+growing through host pressure and macOS's warning, short of critical pressure,
+within `--max-memory`, first into cached pages no request holds:
 it takes cached KV, and a cached state only where it sits on the KV that goes
 next, since a state's buffers give it no page. A new request waits while another
 is in service unless it can start from what the engine already holds, and with
@@ -2595,10 +2614,12 @@ On a 24 GB Mac, `test-agent-real` stops a client's workflow at macOS's warning
 memory pressure, which the smaller GGUF variants such a Mac uses can reach under
 an agent's load; `SPLASH_TEST_PRESSURE_STOP=4` stops only at critical pressure,
 to observe how the engine sheds its cache. The runtime oracle in `test-real` has
-no production memory guard: the weights, and then what the runtime
-allocates as it runs, must fit in what macOS has available above its reserve,
-so it stops, naming what it needs, while other programs hold that memory. With
-only desktop applications open, a 24 GB Mac runs it for those variants.
+no production memory guard: the weights must fit in what macOS has available
+above its reserve, and what the runtime then allocates as it runs must leave
+the spare reserve and the 1 GiB margin of the spare memory free, as growth that
+no request in service needs does, so it stops, naming what it needs, while
+other programs hold that memory. With only desktop applications open, a 24 GB
+Mac runs it for those variants.
 
 Compare performance on the same idle Mac with the same model and workload.
 Keep generated reports, profiles, local paths and experiment notes out of the

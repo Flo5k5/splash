@@ -58,29 +58,29 @@ struct EngineConfig final {
   // cannot hold them. Allocation reads the cause of a refusal instead.
   std::function<bool()> growthPaused;
   // Marks the allocations that follow as memory a request in service needs,
-  // which the pause does not hold back, and clears the mark
-  // (MemoryGovernor::setServing).
-  std::function<void(bool)> serving;
+  // which the pause does not hold back, or clears the mark, and returns the
+  // mark it replaced (MemoryGovernor::setServing).
+  std::function<bool(bool)> serving;
 };
 
 // While an active one lives, allocations are memory a request in service
-// needs (EngineConfig::serving).
+// needs (EngineConfig::serving). It restores the mark it found, so that a
+// start's mark (RuntimeResources::beginServing) outlives an allocation the
+// engine marks before serving begins.
 class Serving final {
 public:
-  Serving(const std::function<void(bool)> &mark, bool active)
-      : mark_(active ? &mark : nullptr) {
-    if (mark_)
-      (*mark_)(true);
-  }
+  Serving(const std::function<bool(bool)> &mark, bool active)
+      : mark_(active ? &mark : nullptr), previous_(mark_ && (*mark_)(true)) {}
   ~Serving() {
     if (mark_)
-      (*mark_)(false);
+      (*mark_)(previous_);
   }
   Serving(const Serving &) = delete;
   Serving &operator=(const Serving &) = delete;
 
 private:
-  const std::function<void(bool)> *mark_;
+  const std::function<bool(bool)> *mark_;
+  bool previous_;
 };
 
 // What a request fails with once it has waited the resource wait limit for
