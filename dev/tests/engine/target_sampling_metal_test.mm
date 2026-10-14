@@ -1586,7 +1586,10 @@ void excludedStopTokens(MetalBackend &backend, uint32_t vocabulary) {
 // selection's rows dispatches nothing. At a lane's row 0 the end tokens
 // replace its draft's proposals before the verify, so acceptance keeps all
 // its rows the end covers, and a row with no selectable logit keeps its
-// sentinel in place of its end token, so the lane still fails.
+// sentinel in place of its end token, so the lane still fails. The end of a
+// constrained lane that waits for its mask starts at the first row from its
+// cutoff's on whose mask admits the end's first token, the rows before
+// keeping their own selections, and replaces no proposals.
 void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
   const auto stops = shardEdgeStopTokens(vocabulary);
   const uint32_t close = vocabulary - 3, alsoEnds = vocabulary - 5;
@@ -1635,6 +1638,33 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
         require(cutoffDispatches(initial) == (row == 0 ? 1 : 0), "the first token's cutoff dispatch is wrong");
         static_cast<void>(backend.submitCommandAsync(initial.dispatches()).wait());
         require(tokens[0] == (row == 0 ? end[0] : best(kRows - 1)), "the first token missed its cutoff");
+      }
+    }
+  }
+  // A constrained lane whose end waits for its mask selects the end's first
+  // token as its first token only where its first mask row admits it, and
+  // its own selection elsewhere.
+  uint32_t *masks = batch.masks();
+  const uint32_t words = batch.maskWords();
+  // Lane l's mask row `row` refuses `token`.
+  const auto refuse = [&](uint32_t lane, uint32_t row, uint32_t token) {
+    masks[(uint64_t{lane} * (kRows + 1) + row) * words + token / 32] &= ~(1U << token % 32);
+  };
+  for (const std::vector<uint32_t> &end : ends) {
+    for (const float temperature : {0.0F, 0.8F}) {
+      for (const bool admitted : {false, true}) {
+        fill(kRows - 1, best(kRows - 1));
+        std::fill_n(masks, words, ~0U);
+        if (!admitted)
+          refuse(0, 0, end[0]);
+        batch.poison();
+        uniforms[SPLASH_UNIFORM_INITIAL] = 0.5F;
+        SamplingPolicy policy{32, temperature, 1.0F, true};
+        policy.thinkingCutoff = ThinkingCutoff{0, end, alsoEnds, true};
+        CommandGraph initial;
+        sampling.addInitial(initial, {&policy, 1}, batch.buffers, kRows - 1, stops[0], stops[1], {});
+        static_cast<void>(backend.submitCommandAsync(initial.dispatches()).wait());
+        require(tokens[0] == (admitted ? end[0] : best(kRows - 1)), "a first token's end did not wait for its mask");
       }
     }
   }
@@ -1736,6 +1766,63 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
     }
   }
 
+  // A constrained lane's end that waits for its mask starts at the first row
+  // from its cutoff's on whose mask admits the end's first token, as where a
+  // grammar admits the end only between whole characters: lane l's cutoff is
+  // at row cuts[l], and the masks of that row and the next waits[l] - 1
+  // refuse that token. Those rows keep their own selections, as every row
+  // does where no row of the selection admits it, and a draft token among
+  // them that ends thinking, which their masks admit, leaves every row its
+  // own. Such an end replaces no proposals: only the verify reads its masks.
+  enum class Waiting { Best, DraftsFirst, EndsWhileWaiting };
+  using LaneRows = std::array<uint32_t, kLanes>;
+  for (const std::vector<uint32_t> &end : ends) {
+    for (const uint32_t samplingMask : {0U, 0b0101U, 0b1111U}) {
+      for (const Waiting kind : {Waiting::Best, Waiting::DraftsFirst, Waiting::EndsWhileWaiting}) {
+        for (const auto &[cuts, waits] : {std::pair{LaneRows{0, 3, 6, 2}, LaneRows{1, 2, 1, 3}},
+                                          std::pair{LaneRows{0, 1, 5, 7}, LaneRows{kRows, 0, 3, 1}}}) {
+          std::vector<SamplingPolicy> policies;
+          std::array<std::array<uint32_t, kRows>, kLanes> expected{};
+          std::array<std::array<uint32_t, kPositions>, kLanes> drafts{};
+          std::fill_n(masks, uint64_t{kLanes} * (kRows + 1) * words, ~0U);
+          for (uint32_t lane = 0; lane < kLanes; ++lane) {
+            SamplingPolicy policy{32, (samplingMask >> lane & 1U) ? 0.8F : 0.0F, 1.0F, true};
+            policy.thinkingCutoff = ThinkingCutoff{cuts[lane], end, alsoEnds, true};
+            policies.push_back(policy);
+            for (uint32_t row = 0; row < kRows; ++row) {
+              fill(lane * kRows + row, best(lane * kRows + row));
+              expected[lane][row] = best(lane * kRows + row);
+              if (row < kPositions)
+                drafts[lane][row] = best(lane * kRows + row);
+            }
+            // Verify row r reads mask row r + 1.
+            const uint32_t start = std::min(cuts[lane] + waits[lane], kRows);
+            for (uint32_t row = cuts[lane]; row < start; ++row)
+              refuse(lane, row + 1, end[0]);
+            if (kind == Waiting::EndsWhileWaiting && end.size() > 1 && cuts[lane] < start && start <= kPositions) {
+              const uint32_t at = start - 1;
+              fill(lane * kRows + at, close);
+              expected[lane][at] = drafts[lane][at] = close;
+            } else {
+              for (uint32_t index = 0; index < end.size() && start + index < kRows; ++index)
+                expected[lane][start + index] = end[index];
+              if (kind == Waiting::DraftsFirst && start < kPositions)
+                drafts[lane][start] = end[0];
+            }
+            for (uint32_t position = 0; position < kPositions; ++position)
+              draft(lane, position, drafts[lane][position]);
+          }
+          CommandGraph drafted;
+          sampling.addThinkingDrafts(drafted, policies, acceptance.proposedTokens);
+          require(draftDispatches(drafted) == 0, "an end that waits for its mask replaced proposals");
+          batch.poison();
+          CommandGraph verify;
+          verifyLanes(verify, policies, expected, drafts);
+        }
+      }
+    }
+  }
+
   // At row 0, lane 0 has more end tokens left than verify rows, lane 1 three
   // and lane 3 the close alone; each one's draft proposes its own best
   // tokens, which the end replaces. Lane 2's end starts at its row 2, which
@@ -1786,6 +1873,36 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
     }
   }
 
+  // Of constrained lanes at row 0, only those whose ends do not wait replace
+  // their proposals with their ends, lane 1 three and lane 2 seven, and a
+  // batch whose ends all wait dispatches nothing.
+  const std::array<ThinkingCutoff, kLanes> drafting{
+      ThinkingCutoff{0, whole, alsoEnds, true}, ThinkingCutoff{0, whole.last(3), alsoEnds},
+      ThinkingCutoff{0, whole, alsoEnds}, ThinkingCutoff{0, whole.last(1), alsoEnds, true}};
+  const std::array<uint32_t, kLanes> replaced{0, 3, kPositions, 0};
+  std::vector<SamplingPolicy> draftingPolicies;
+  for (uint32_t lane = 0; lane < kLanes; ++lane) {
+    SamplingPolicy policy{32, 0.0F, 1.0F, true};
+    policy.thinkingCutoff = drafting[lane];
+    draftingPolicies.push_back(policy);
+    require(drafting[lane].replacedProposals() == replaced[lane], "an end counted the wrong replaced proposals");
+    for (uint32_t position = 0; position < kPositions; ++position)
+      proposed[lane * kPositions + position] = best(lane * kRows + position);
+  }
+  CommandGraph replacing;
+  sampling.addThinkingDrafts(replacing, draftingPolicies, acceptance.proposedTokens);
+  static_cast<void>(backend.submitCommandAsync(replacing.dispatches()).wait());
+  for (uint32_t lane = 0; lane < kLanes; ++lane) {
+    for (uint32_t position = 0; position < kPositions; ++position)
+      require(proposed[lane * kPositions + position] ==
+                  (position < replaced[lane] ? drafting[lane].end[position] : best(lane * kRows + position)),
+              "an end replaced other proposals than those of a lane whose end does not wait");
+  }
+  CommandGraph waiting;
+  sampling.addThinkingDrafts(waiting, std::array{draftingPolicies[0], draftingPolicies[3]},
+                             acceptance.proposedTokens);
+  require(draftDispatches(waiting) == 0, "ends that all wait dispatched drafts");
+
   // Lane l's row nonFinite[l] has no selectable logit: it keeps its sentinel,
   // which acceptance retains after the end tokens before it.
   constexpr uint32_t kSentinel = 0xFFFFFFFFU;
@@ -1831,6 +1948,25 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
   sampling.addVerify(graph, uncut, batch.buffers, stops[0], stops[1], {});
   require(cutoffDispatches(graph) == 0 && draftDispatches(graph) == 0,
           "a verify without a cutoff in its rows dispatched one");
+
+  // Only a constrained lane has masks for its end to wait for, and the
+  // kernel reads them at the end's first token, which must be inside the
+  // vocabulary.
+  SamplingPolicy unconstrained{32, 0.0F};
+  unconstrained.thinkingCutoff = ThinkingCutoff{0, end, alsoEnds, true};
+  const std::array<uint32_t, 2> outside{vocabulary, close};
+  SamplingPolicy outsideStart{32, 0.0F, 1.0F, true};
+  outsideStart.thinkingCutoff = ThinkingCutoff{0, outside, alsoEnds, true};
+  for (const auto &[policy, refusal] :
+       {std::pair{unconstrained, "unconstrained lane's thinking end waits"},
+        std::pair{outsideStart, "waits for a mask starts outside the vocabulary"}}) {
+    rejects(
+        [&] {
+          CommandGraph refused;
+          sampling.addVerify(refused, {&policy, 1}, batch.buffers, stops[0], stops[1], {});
+        },
+        refusal, "a thinking end waited for a mask it cannot read");
+  }
 }
 
 // Ties where a distribution ends: more tokens tie at the logit where top_k

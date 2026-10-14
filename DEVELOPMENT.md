@@ -464,7 +464,12 @@ answer. A thinking token budget caps the thinking: once a request has selected
 that many tokens in its thinking block, the engine selects the thinking end,
 which closes the block with `</think>`, and the model answers within the output
 limit that remains. Its `reasoning_tokens` then equal the budget plus the end's
-tokens before `</think>`.
+tokens before `</think>`. Where a grammar constrains the output, as for
+structured output and in the cases [tool calls](#tool-calls) lists, thinking can
+end only between whole characters: where the budget's last token holds part of
+a character, as a byte of a rare Chinese character or of an emoji can, the
+request thinks on until the character is complete, a token or a few, and its
+`reasoning_tokens` count those tokens too.
 
 - Chat Completions and Responses take `thinking_token_budget`, a non-negative
   integer; `-1` sets no cap, and an absent or null value takes the server's.
@@ -2449,7 +2454,11 @@ the end starts at a selection's row 0, before which no draft token can end
 thinking, and a second small dispatch replaces the lane's draft proposals with
 the end tokens left before the verify, so a decode cycle accepts as many of
 them as it verifies; the request's speculation counts leave those proposals
-out. A selection where no budget runs out dispatches nothing more.
+out. A constrained request's end waits for its grammar: it starts at the first
+row from the cut whose mask admits its first token, the rows before it keeping
+their own selections, which the engine counts as thinking past the budget, and
+it replaces no proposals before it has started, as only the verify reads the
+masks. A selection where no budget runs out dispatches nothing more.
 
 Requests carry the score-token IDs and Done events the selected f32 logits; the
 server and the engine must speak the same native wire version. Scoring requires

@@ -904,9 +904,22 @@ struct Runtime::Impl {
             entry.sampling.frequencyPenalty};
   }
 
+  // A constrained request's grammar admits the end of its thinking only where
+  // the thinking text may end, such as between whole characters. Until the
+  // end starts, it waits for a row whose mask admits its first token, and
+  // the request thinks past its budget meanwhile: a few tokens, such as the
+  // rest of a character the budget's last token began. The end's other
+  // tokens are text, which the grammar admits after its first.
+  static bool thinkingEndWaits(const Request &entry) noexcept {
+    return entry.constraint == ConstraintMode::TokenMask &&
+           !entry.thinking->endSelected;
+  }
+
   // A selection's rows select the request's next tokens in order, so with n
   // thinking tokens left, its row n starts the budget's end, and once none
-  // are left, its row 0 goes on with the end's tokens not yet selected.
+  // are left, its row 0 goes on with the end's tokens not yet selected; an
+  // end that waits (thinkingEndWaits) starts at the first of those rows
+  // whose mask admits it.
   static ops::SamplingPolicy samplingPolicy(const Request &entry) noexcept {
     std::optional<ops::ThinkingCutoff> cutoff;
     if (entry.thinking) {
@@ -914,7 +927,7 @@ struct Runtime::Impl {
       cutoff = ops::ThinkingCutoff{
           budget.tokens,
           std::span(budget.end).subspan(entry.thinking->endSelected),
-          budget.alsoEnds};
+          budget.alsoEnds, thinkingEndWaits(entry)};
     }
     return {entry.sampling.topK, entry.sampling.temperature,
             entry.sampling.topP, entry.constraint == ConstraintMode::TokenMask,
@@ -967,8 +980,9 @@ struct Runtime::Impl {
   // command that selected them has completed, and the next one that reads
   // the lane's words is encoded after this. Each token counts against the
   // thinking budget until one ends thinking, and once the budget ran out,
-  // it is the end's next token; the cutoff (samplingPolicy) never lets
-  // thinking run past it.
+  // it is the end's next token, or while the end waits (thinkingEndWaits),
+  // a thinking token past the budget; the cutoff (samplingPolicy) never lets
+  // thinking run past it otherwise.
   void commitSelected(Request &entry, std::span<const uint32_t> tokens) {
     if (tokens.empty())
       throw std::logic_error("no selected token to commit");
@@ -982,7 +996,9 @@ struct Runtime::Impl {
         entry.thinking.reset();
       else if (budget.tokens)
         --budget.tokens;
-      else if (token != budget.end[entry.thinking->endSelected++])
+      else if (token == budget.end[entry.thinking->endSelected])
+        ++entry.thinking->endSelected;
+      else if (!thinkingEndWaits(entry))
         throw std::logic_error("thinking went past its budget");
     }
     entry.pendingToken = tokens.back();

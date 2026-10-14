@@ -102,10 +102,11 @@ struct SamplingParameters final {
 };
 
 // A request that generates inside a thinking block may select at most
-// `tokens` thinking tokens; the target then selects the `end` tokens in
-// order, the last of which closes the block. Thinking also ends where the
-// request selects that close or `alsoEnds` first, such as a tool call's
-// opening that follows thinking directly; no other end token is either.
+// `tokens` thinking tokens, and a constrained one more until its grammar
+// admits the end; the target then selects the `end` tokens in order, the
+// last of which closes the block. Thinking also ends where the request
+// selects that close or `alsoEnds` first, such as a tool call's opening that
+// follows thinking directly; no other end token is either.
 struct ThinkingBudget final {
   uint32_t tokens = 0;
   std::vector<uint32_t> end;

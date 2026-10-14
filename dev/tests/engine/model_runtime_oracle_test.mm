@@ -19,6 +19,7 @@
 #include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -1464,6 +1465,158 @@ void requireThinkingBudgetClosesThinking(model::Runtime &executor) {
   std::cout << "thinking_budget=PASS most_end_cycles=" << mostEndCycles << "\n";
 }
 
+// Decodes constrained requests together as decodeTogether does, from the
+// selection of their first tokens on: lane l's mask at output position p,
+// whose first token is position 0, is maskAt(l, p).
+std::vector<JointDecode>
+decodeConstrainedTogether(model::Runtime &executor, std::span<const uint64_t> ids, uint32_t promptTokens,
+                          std::span<const std::vector<uint32_t>> pageTables, uint32_t count, const auto &maskAt) {
+  BatchPlan first{.kind = WorkKind::Decode, .constrained = true, .decodeStage = DecodeStage::ApplyInitialMask};
+  std::vector<ModelBatchItem> firstItems;
+  for (size_t index = 0; index < ids.size(); ++index) {
+    provideMask(executor, ids[index], maskAt(index, 0));
+    first.items.push_back({ids[index], 0});
+    firstItems.push_back(
+        withRevision({.requestId = ids[index], .logicalPosition = promptTokens, .pageTable = pageTables[index]}));
+  }
+  for (const ModelStepResult &result : executor.decode(first, firstItems))
+    require(result.failure.empty() && result.outputTokens.empty() && result.nextDecodeStage == DecodeStage::Regular,
+            "a constrained joint decode failed or emitted a first token");
+  std::vector<JointDecode> generated(ids.size());
+  std::vector<bool> finished(ids.size(), false);
+  for (uint32_t cycle = 0;; ++cycle) {
+    BatchPlan plan{.kind = WorkKind::Decode, .constrained = true, .decodeStage = DecodeStage::Regular};
+    std::vector<ModelBatchItem> items;
+    std::vector<size_t> lanes;
+    for (size_t index = 0; index < ids.size(); ++index) {
+      if (finished[index] || generated[index].tokens.size() >= count)
+        continue;
+      plan.items.push_back({ids[index], 0});
+      items.push_back(withRevision({.requestId = ids[index],
+                                    .logicalPosition = promptTokens + generated[index].tokens.size(),
+                                    .pageTable = pageTables[index]}));
+      lanes.push_back(index);
+    }
+    if (items.empty())
+      return generated;
+    PendingMaskedDecode pending = beginMaskedDecode(executor, plan, items);
+    require(pending.maskRequests.size() == lanes.size(), "a constrained joint decode lost a mask request");
+    // The rows of a lane's mask: at its anchor's position, then after each
+    // simulated token.
+    for (const ModelMaskRequest &request : pending.maskRequests) {
+      const size_t index = std::ranges::find(ids, request.requestId) - ids.begin();
+      const uint32_t anchor = static_cast<uint32_t>(generated[index].tokens.size());
+      std::vector<uint32_t> words;
+      for (uint32_t row = 0; row <= request.simulationTokens.size(); ++row)
+        std::ranges::copy(maskAt(index, anchor + row), std::back_inserter(words));
+      provideMask(executor, request.requestId, words);
+    }
+    const std::vector<ModelStepResult> results = finishMaskedDecode(std::move(pending));
+    require(results.size() == items.size(), "a constrained joint decode lost a lane");
+    for (size_t index = 0; index < results.size(); ++index) {
+      require(results[index].failure.empty(), "a constrained joint decode failed a lane");
+      require(results[index].acceptedDraftTokens <= results[index].draftedTokens,
+              "a constrained joint decode accepted more draft tokens than it drafted");
+      JointDecode &decoded = generated[lanes[index]];
+      decoded.drafts.emplace_back(decoded.tokens.size(), results[index].draftedTokens);
+      decoded.tokens.insert(decoded.tokens.end(), results[index].outputTokens.begin(),
+                            results[index].outputTokens.end());
+      decoded.cycles.resize(decoded.tokens.size(), cycle);
+      finished[lanes[index]] = results[index].finished;
+    }
+  }
+}
+
+// A constrained request's grammar admits the end of thinking only where the
+// thinking text may end, between whole characters, so the end waits for a
+// mask that admits it. Here the masks give the bytes of U+20000 as the Qwen
+// tokenizer splits them, F0, A0 80 and 80, from the budget's last thinking
+// token on (from the first token for a budget of 0) and admit every token
+// elsewhere: each budgeted lane thinks past its budget until the character
+// is complete and then ends thinking with its end tokens, greedy and sampled,
+// lanes decoded together ending at their own budgets. Until its first token
+// is selected, the end replaces no draft proposals, as only the verify reads
+// the masks; its other tokens replace them as for any request.
+void requireConstrainedThinkingEndWaitsForItsMask(model::Runtime &executor) {
+  // The prompt of requireThinkingBudgetClosesThinking.
+  const std::vector<uint32_t> prompt{
+      248045, 846,  198,  826,   1396, 9944,  1324, 1881,   220,   16,   321,
+      220,    21,   15,   11,    1179, 1716,  1754, 799,    539,   8818, 12436,
+      1518,   488,  4087, 13,    248046, 198, 248045, 74455, 198,   248068, 198};
+  constexpr uint32_t kThinkEnd = 248069;
+  constexpr std::array<uint32_t, 3> kCharacter{172, 61084, 222};
+  const std::array<std::vector<uint32_t>, 2> ends{
+      std::vector<uint32_t>{kThinkEnd},
+      std::vector<uint32_t>{79939, 279, 6973, 854, 11, 353, 599, 310, 2873, 279, 6093, 3018, 383, 279,
+                            7047, 5774, 1381, 13, 198, kThinkEnd}};
+  const std::array<std::vector<uint32_t>, 3> pageTables{
+      pageRange(108, 4), pageRange(116, 4), pageRange(120, 4)};
+  const std::array<uint64_t, 3> ids{311, 312, 313};
+  constexpr uint32_t rows = model::ExecutionLimits::targetVerifyRows;
+  constexpr uint32_t proposals = model::ExecutionLimits::draftProposalTokens;
+  for (const std::vector<uint32_t> &end : ends) {
+    const uint32_t length = static_cast<uint32_t>(end.size());
+    for (const float temperature : {0.0F, 0.7F}) {
+      for (const uint32_t budget : {0U, 1U, 5U, 12U}) {
+        const std::array<std::optional<uint32_t>, 3> budgets{budget, budget + 7, std::nullopt};
+        // Where a lane's character begins.
+        const auto character = [&](size_t lane) { return *budgets[lane] ? *budgets[lane] - 1 : 0; };
+        for (size_t lane = 0; lane < ids.size(); ++lane) {
+          EngineRequest request = makeRequest(ids[lane], prompt, 64);
+          request.constraint = ConstraintMode::TokenMask;
+          request.sampling.temperature = temperature;
+          request.sampling.seed = 0x5eed + budget;
+          if (budgets[lane])
+            request.thinkingBudget = ThinkingBudget{*budgets[lane], end, kThinkEnd};
+          beginCold(executor, request, static_cast<uint32_t>(lane));
+          require(prefillChunk(executor, ids[lane], 0, prompt, pageTables[lane]).nextDecodeStage ==
+                      DecodeStage::ApplyInitialMask,
+                  "a constrained thinking budget fixture skipped its first mask");
+        }
+        const auto maskAt = [&](size_t lane, uint32_t position) {
+          std::vector<uint32_t> words(kMaskWords, ~0U);
+          if (budgets[lane] && position >= character(lane) && position < character(lane) + kCharacter.size())
+            words = singletonMasks(std::span(kCharacter).subspan(position - character(lane), 1));
+          return words;
+        };
+        const auto generated = decodeConstrainedTogether(
+            executor, ids, static_cast<uint32_t>(prompt.size()), pageTables, budget + 7 + length + 6, maskAt);
+        for (size_t lane = 0; lane < ids.size(); ++lane) {
+          const std::vector<uint32_t> &tokens = generated[lane].tokens;
+          const auto close = std::find(tokens.begin(), tokens.end(), kThinkEnd);
+          if (!budgets[lane]) {
+            require(close == tokens.end(), "a constrained lane without a thinking budget closed its thinking");
+            continue;
+          }
+          // The end starts once the character is complete.
+          const uint32_t start = character(lane) + static_cast<uint32_t>(kCharacter.size());
+          require(tokens.size() > start + length &&
+                      std::ranges::equal(kCharacter, std::span(tokens).subspan(character(lane), kCharacter.size())) &&
+                      std::ranges::equal(end, std::span(tokens).subspan(start, length)) &&
+                      close - tokens.begin() == start + length - 1,
+                  "a constrained thinking budget of " + std::to_string(*budgets[lane]) +
+                      " did not wait for its mask to end thinking, then go on");
+          const std::vector<uint32_t> &cycles = generated[lane].cycles;
+          require(cycles[start + length - 1] - cycles[start] + 1 <= 1 + (length - 1 + rows - 1) / rows,
+                  "a constrained thinking budget's end took a decode cycle per token");
+          // Only a cycle whose anchor is the end's first token or one after
+          // it, before the close, drafted the end tokens left.
+          for (const auto &[anchor, drafted] : generated[lane].drafts) {
+            const uint32_t committed = static_cast<uint32_t>(anchor) + 1;
+            const uint32_t replaced =
+                committed > start && committed < start + length ? std::min(start + length - committed, proposals) : 0;
+            require(drafted == proposals - replaced,
+                    "a constrained cycle counted the end tokens it drafted as the draft's");
+          }
+        }
+        for (const uint64_t id : ids)
+          executor.end(id);
+      }
+    }
+  }
+  std::cout << "constrained_thinking_budget=PASS\n";
+}
+
 // A 64-token request with one image of the given span, its pixels a pattern.
 EngineRequest imageRequest(uint64_t id, ImageSpan span) {
   std::vector<uint32_t> prompt(64);
@@ -2465,6 +2618,7 @@ int main(int argc, char **argv) {
     requireNonFiniteRowFailsOnlyItsLane(executor, pages, states, backend,
                                         samplingSeedTokens, prompt128);
     requireThinkingBudgetClosesThinking(executor);
+    requireConstrainedThinkingEndWaitsForItsMask(executor);
     requireStatesCapturedInsideCommands(executor, backend, pages, states, aneFfn.get(), samplingSeedTokens);
     requireCapturesOutliveTheirItems(executor, states, samplingSeedTokens);
 
