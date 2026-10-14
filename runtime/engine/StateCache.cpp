@@ -229,6 +229,12 @@ bool StateCache::retireCheckpointState(StateCheckpoint checkpoint) noexcept {
   return erase(checkpoint.kvBlock, true).evicted;
 }
 
+bool StateCache::checkpointPinned(StateCheckpoint checkpoint) const noexcept {
+  const auto found = entries_.find(checkpoint.kvBlock);
+  return found != entries_.end() && found->second.checkpoint &&
+         found->second.publication == checkpoint.publication && found->second.pins;
+}
+
 void StateCache::makeOrdinary(uint64_t kvBlock, Entry &entry) {
   kv_.noteState(kvBlock);
   if (!entry.checkpoint)

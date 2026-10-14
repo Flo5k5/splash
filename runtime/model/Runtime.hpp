@@ -37,8 +37,14 @@ public:
               std::function<void()> completion) override;
   [[nodiscard]] std::vector<ModelStepResult>
   decode(const BatchPlan &plan, std::span<const ModelBatchItem> items);
+  [[nodiscard]] std::shared_ptr<StateReservation>
+  reserveState(uint64_t requestId, uint32_t tokens) override;
+  // Copies the request's committed state at its current page-aligned
+  // boundary into a cached state, as a prefill command captures the state at
+  // its end: warmup's and the native oracle's states. Null when the pool has
+  // no free buffers and the governor denies new ones.
   [[nodiscard]] std::shared_ptr<const CompositeState>
-  snapshot(uint64_t requestId) override;
+  snapshot(uint64_t requestId);
   [[nodiscard]] uint64_t snapshotBytes() const noexcept override;
   [[nodiscard]] bool canSnapshotToDisk() const noexcept override;
   [[nodiscard]] std::unique_ptr<StateOffload>

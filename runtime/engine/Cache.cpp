@@ -556,18 +556,18 @@ std::optional<Cache::Victim> Cache::reclaimOldest(const VictimScan &scan) {
   return std::nullopt;
 }
 
-StateRoom Cache::reclaimOneState(bool checkpointsOnly, uint64_t forBlock, bool growth) {
+StateRoom Cache::reclaimOneState(StateClass state, bool growth) {
   using Unwritten = StateCache::Unwritten;
-  const bool inUse = !checkpointsOnly && states_.inUse(forBlock);
-  // Only a publication in use cannot leave a victim to the write in flight:
-  // its lane's state moves on with the next command.
-  const Unwritten unwritten = inUse ? Unwritten::Drop : Unwritten::Wait;
-  const auto recycle = [&](const std::optional<CacheEvictionCandidate> &state,
+  const bool checkpointsOnly = state == StateClass::Checkpoint;
+  // Only a state in use cannot leave a victim to the write in flight:
+  // refused, it reaches the disk tier only through that write.
+  const Unwritten unwritten = state == StateClass::InUse ? Unwritten::Drop : Unwritten::Wait;
+  const auto recycle = [&](const std::optional<CacheEvictionCandidate> &candidate,
                            Unwritten mode) {
-    return state && states_.reclaim(state->id, mode).evicted;
+    return candidate && states_.reclaim(candidate->id, mode).evicted;
   };
-  // Without growth an extent's bytes are no room for a snapshot, and only
-  // states go.
+  // Without growth an extent's bytes are no room for a state's buffers, and
+  // only states go.
   if (growth && !checkpointsOnly) {
     if (const CacheReclaimResult released = releaseExtent(false); released.reclaimedBytes)
       return {true, released.reclaimedBytes};
@@ -592,7 +592,7 @@ StateRoom Cache::reclaimOneState(bool checkpointsOnly, uint64_t forBlock, bool g
   } else if (recycle(states_.ordinaryCandidate(false), unwritten)) {
     return {true};
   }
-  if (inUse && recycle(states_.inUseCandidate(), Unwritten::Wait))
+  if (state == StateClass::InUse && recycle(states_.inUseCandidate(), Unwritten::Wait))
     return {true};
   return {};
 }

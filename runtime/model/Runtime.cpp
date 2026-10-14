@@ -51,7 +51,7 @@ public:
 
   DeferredMetalTicket(CommandTicket ticket, Completion completion,
                       bool representativePrefillTiming = true)
-      : ticket_(std::move(ticket)), completion_(std::move(completion)),
+      : completion_(std::move(completion)), ticket_(std::move(ticket)),
         representativePrefillTiming_(representativePrefillTiming) {}
 
   bool ready() const noexcept override { return ticket_.ready(); }
@@ -80,8 +80,11 @@ public:
   }
 
 private:
-  CommandTicket ticket_;
+  // Before the ticket, which goes first: a ticket dropped unconsumed waits for
+  // its command before the completion lets go of what the command writes,
+  // such as the state reservations of its items.
   Completion completion_;
+  CommandTicket ticket_;
   double wallMilliseconds_ = 0.0;
   bool representativePrefillTiming_;
 };
@@ -527,13 +530,15 @@ struct Runtime::Impl {
   // the rows kept for reuse past the cache's bytes: the state returned owns
   // them. Boundaries deeper inside an image keep only the embedding cache.
   std::shared_ptr<const CompositeState>
-  holdStraddledRows(const Request &entry, std::shared_ptr<const CompositeState> state) {
+  holdStraddledRows(const Request &entry, uint64_t boundary,
+                    std::shared_ptr<const CompositeState> state) {
     std::erase_if(stateHolds, [](const std::weak_ptr<const HeldState> &hold) {
       return hold.expired();
     });
-    const uint64_t boundary = states.metadata(entry.stateLane).lengths.targetTokens;
     for (const ImageState &image : entry.images) {
-      // The chunk that ended at the boundary encoded the image it reached.
+      // The command that reached the boundary encoded the image, and a
+      // command's states are held before it releases the rows of the images
+      // it finished.
       if (image.span.offset >= boundary || image.span.end() <= boundary)
         continue;
       if (image.span.end() - boundary >= kv::kPageTokens)
@@ -1136,6 +1141,18 @@ struct Runtime::Impl {
         static_cast<uint32_t>(pages.size()));
   }
 
+  // A state a lane's prefill command captures
+  // (ModelBatchItem::stateCaptures): the buffers it is written to, which the
+  // command's items hold, its row among the lane's rows, whether it lies at
+  // the command's end, where the completion copies the lane's state rather
+  // than the command writing it, and the lengths it is sealed with.
+  struct RaggedStateCapture final {
+    QwenStateReservation *reservation = nullptr;
+    uint32_t row = 0;
+    bool atEnd = false;
+    QwenLogicalLengths lengths;
+  };
+
   struct RaggedPrefillSequence final {
     Request *entry = nullptr;
     const ModelBatchItem *item = nullptr;
@@ -1148,6 +1165,7 @@ struct Runtime::Impl {
     ChunkedPrefillParams chunk;
     MetalBuffer pageTable;
     DispatchDraftCapturePlan captures;
+    std::vector<RaggedStateCapture> stateCaptures;
   };
 
   struct RaggedPrefillBatch final {
@@ -1160,6 +1178,55 @@ struct Runtime::Impl {
                          uint32_t rows, uint32_t width) const {
     return backend.view(tensor, bytesFor<uint16_t>(uint64_t{begin} * width),
                         bytesFor<uint16_t>(uint64_t{rows} * width));
+  }
+
+  // The states a lane's command captures, ascending in (logicalPosition,
+  // logicalPosition + tokenCount]. Each one's lengths fold the command's
+  // draft captures below it into the lane's, as a command ending there would
+  // commit them, and must be a cached state's: page-aligned with the whole
+  // draft window, which a plan that does not give one fails here, before
+  // anything is submitted.
+  std::vector<RaggedStateCapture>
+  stateCaptures(const ModelBatchItem &item, const DispatchDraftCapturePlan &draftCaptures,
+                const QwenLogicalLengths &lengths) const {
+    std::vector<RaggedStateCapture> result;
+    result.reserve(item.stateCaptures.size());
+    const uint64_t end = item.logicalPosition + item.tokenCount;
+    uint64_t previous = item.logicalPosition;
+    for (const StateCapture &capture : item.stateCaptures) {
+      auto *reservation = dynamic_cast<QwenStateReservation *>(capture.reservation.get());
+      if (!reservation || capture.tokens <= previous || capture.tokens > end)
+        throw std::invalid_argument("invalid prefill state capture");
+      QwenLogicalLengths captured = lengths;
+      captured.targetTokens = capture.tokens;
+      for (const DispatchDraftCaptureSpan &span : draftCaptures)
+        if (span.absoluteBegin < capture.tokens)
+          captured = advanceDraftContext(captured, capture.tokens, span.absoluteBegin,
+                                         std::min(span.absoluteEnd, capture.tokens),
+                                         span.resetDraftState, true);
+      states.validateLengths(captured, true);
+      result.push_back({reservation, static_cast<uint32_t>(capture.tokens - item.logicalPosition),
+                        capture.tokens == end, captured});
+      previous = capture.tokens;
+    }
+    return result;
+  }
+
+  // The states a lane's committed command captured, in order: one at the
+  // command's end takes the lane's new cell and window, as snapshot() does,
+  // and the others the command wrote. Each holds its straddled image rows
+  // before the command releases the rows of the images it finished.
+  std::vector<std::shared_ptr<const CompositeState>>
+  sealStates(const Request &entry, std::span<const RaggedStateCapture> captures) {
+    std::vector<std::shared_ptr<const CompositeState>> sealed;
+    sealed.reserve(captures.size());
+    for (const RaggedStateCapture &capture : captures) {
+      if (capture.atEnd)
+        states.copyState(entry.stateLane, *capture.reservation);
+      sealed.push_back(holdStraddledRows(entry, capture.lengths.targetTokens,
+                                         states.seal(*capture.reservation, capture.lengths)));
+    }
+    return sealed;
   }
 
   RaggedPrefillBatch
@@ -1193,6 +1260,7 @@ struct Runtime::Impl {
         throw std::invalid_argument("ragged prefill exceeds actual-row budget");
       }
       auto captures = activeDraftCaptures(entry, item);
+      std::vector<RaggedStateCapture> captured = stateCaptures(item, captures, metadata.lengths);
       const uint32_t capturedRows = captureRows(captures);
       const uint32_t attentionStride =
           ((item.tokenCount + kTileRows - 1) / kTileRows) * kTileRows;
@@ -1203,7 +1271,7 @@ struct Runtime::Impl {
       batch.sequences.push_back({&entry, &item, lane, batch.rows,
                                  attentionStride, queryOffset, kvOffset,
                                  batch.capturedRows, chunk, std::move(pageTable),
-                                 std::move(captures)});
+                                 std::move(captures), std::move(captured)});
       entries[lane] = &entry;
       batch.rows += item.tokenCount;
       batch.capturedRows += capturedRows;
@@ -1267,12 +1335,17 @@ struct Runtime::Impl {
                                  states.draft(lane), rebuild.rows, rebuild.begin);
   }
 
+  // A state captured inside a command takes the context rows the command
+  // captures below its boundary into its window, which holds the lane's
+  // older rows (prefillAsync); the lane's window then goes on to rows that
+  // overwrite them. A state at the command's end takes the lane's window.
   void addRaggedDraftContext(CommandGraph &graph,
                              const RaggedPrefillBatch &batch) {
     if (!batch.capturedRows)
       return;
     std::array<DFlashPrefillSpan, kLaneCount * 2> spans{};
     uint32_t spanCount = 0;
+    std::vector<DFlashWindowCapture> windowCaptures;
     for (const RaggedPrefillSequence &sequence : batch.sequences) {
       for (const DispatchDraftCaptureSpan &capture : sequence.captures) {
         DFlashPrefillSpan &span = spans.at(spanCount++);
@@ -1282,16 +1355,30 @@ struct Runtime::Impl {
         span.ring = states.draft(sequence.entry->stateLane);
         span.window = states.window(sequence.entry->stateLane);
       }
+      for (const RaggedStateCapture &state : sequence.stateCaptures) {
+        if (state.atEnd)
+          continue;
+        const uint64_t boundary = state.lengths.targetTokens;
+        for (const DispatchDraftCaptureSpan &draft : sequence.captures)
+          if (draft.absoluteBegin < boundary)
+            windowCaptures.push_back(
+                {sequence.captureBegin + draft.compactDestinationRow,
+                 static_cast<uint32_t>(std::min<uint64_t>(draft.absoluteEnd, boundary) -
+                                       draft.absoluteBegin),
+                 draft.absoluteBegin, state.reservation->buffers().window->buffer()});
+      }
     }
     draftModel.addContextPrefill(graph, draftPrefillBuffers(*prefillArena), batch.capturedRows,
-                                 std::span(spans).first(spanCount));
+                                 std::span(spans).first(spanCount), windowCaptures);
   }
 
   // What a ragged prefill command leaves its completion, by lane, indexed
-  // like `entries`: its draft captures, and the last row of the target's
-  // final hidden it computed, which no later work in the command writes.
+  // like `entries`: its draft captures, the states it captures, and the last
+  // row of the target's final hidden it computed, which no later work in the
+  // command writes.
   struct RaggedPrefillOutputs final {
     std::array<DispatchDraftCapturePlan, kLaneCount> captures{};
+    std::array<std::vector<RaggedStateCapture>, kLaneCount> stateCaptures{};
     std::array<MetalBuffer, kLaneCount> lastRows{};
   };
 
@@ -1338,6 +1425,8 @@ struct Runtime::Impl {
     std::vector<MetalBuffer> convolutionOut(stateBindingCount);
     std::vector<MetalBuffer> recurrentIn(stateBindingCount);
     std::vector<MetalBuffer> recurrentOut(stateBindingCount);
+    // Each lane's states inside its rows, in their reservations' cells.
+    std::array<std::vector<QwenTargetStateCapture>, kLaneCount> stateCaptures;
     for (uint32_t lane = 0; lane < batch.sequences.size(); ++lane) {
       const RaggedPrefillSequence &sequence = batch.sequences[lane];
       QwenTargetPrefillSequence &destination = modelSequences[lane];
@@ -1366,6 +1455,13 @@ struct Runtime::Impl {
         recurrentIn[stateBegin + layer] = in.recurrentLayers[layer];
         recurrentOut[stateBegin + layer] = out.recurrentLayers[layer];
       }
+      for (const RaggedStateCapture &capture : sequence.stateCaptures) {
+        if (capture.atEnd)
+          continue;
+        const GdnParityBuffers &cell = capture.reservation->buffers().gdn->buffers();
+        stateCaptures[lane].push_back({capture.row, cell.convolutionLayers, cell.recurrentLayers});
+      }
+      destination.stateCaptures = stateCaptures[lane];
       destination.captureCount = sequence.captures.size();
       for (uint32_t index = 0; index < sequence.captures.size(); ++index) {
         const DispatchDraftCaptureSpan &capture = sequence.captures[index];
@@ -1420,6 +1516,7 @@ struct Runtime::Impl {
     RaggedPrefillOutputs outputs;
     for (const RaggedPrefillSequence &sequence : batch.sequences) {
       outputs.captures[sequence.lane] = sequence.captures;
+      outputs.stateCaptures[sequence.lane] = sequence.stateCaptures;
       outputs.lastRows[sequence.lane] =
           prefillU16(finalHidden, sequence.rowBegin + sequence.item->tokenCount - 1, 1,
                      geometry.target.hiddenSize);
@@ -2210,6 +2307,16 @@ Runtime::prefillAsync(const BatchPlan &plan,
                              return image.rows && image.rows->encoding;
                            });
       });
+  // A state captured inside the command starts from the lane's context
+  // window as the command finds it, whose older rows the command's own rows
+  // overwrite. It is copied once, before the command runs: a rerun (below)
+  // would find the window the failed run wrote.
+  for (uint32_t lane = 0; lane < items.size(); ++lane)
+    for (const Impl::RaggedStateCapture &capture : outputs.stateCaptures[lane])
+      if (!capture.atEnd)
+        impl_->states.copyWindow(entries[lane]->stateLane, *capture.reservation);
+  // The completion's items hold the states' reservations until the ticket
+  // has waited for every run of the command.
   std::vector<ModelBatchItem> copiedItems(items.begin(), items.end());
   CommandTicket command =
       impl_->aneFfn ? impl_->aneFfn->commit(graph, std::move(completion))
@@ -2221,9 +2328,11 @@ Runtime::prefillAsync(const BatchPlan &plan,
     // the split has stopped: the GPU runs the chunk again alone, which
     // computes what it would have the first time. Nothing of the chunk is
     // committed before the code below: state parity, lengths, the selected
-    // token and the image rows' state. The rerun writes the same KV and draft
-    // rows; a restored lane's rebuild may read window slots the failed run
-    // filled with its own rows, but each belongs to a position the rerun
+    // token, the states it captures and the image rows' state. The rerun
+    // writes the same KV and draft rows, and the same cells and window rows of
+    // the states it captures, whose older window rows were copied before the
+    // first run; a restored lane's rebuild may read window slots the failed
+    // run filled with its own rows, but each belongs to a position the rerun
     // captures again, and that capture overwrites the ring slot after the
     // rebuild; clearForColdStart clears the current state again, which
     // neither command writes; synchronizedPageTable writes nothing at the
@@ -2251,36 +2360,6 @@ Runtime::prefillAsync(const BatchPlan &plan,
     std::array<bool, kLaneCount> finite{};
     for (uint32_t lane = 0; lane < items.size(); ++lane)
       finite[lane] = Impl::finiteRow(outputs.lastRows[lane]);
-    for (uint32_t lane = 0; lane < items.size(); ++lane) {
-      if (!finite[lane])
-        continue;
-      const uint64_t chunkEnd = items[lane].logicalPosition + items[lane].tokenCount;
-      for (Impl::ImageState &image : entries[lane]->images) {
-        if (!image.rows)
-          continue;
-        Impl::ImageRows &rows = *image.rows;
-        if (rows.encoding) {
-          rows.encoding = false;
-          rows.encoded = true;
-          rows.pixels = MetalBuffer{};
-        }
-        // Its last row is injected: the cache owns the rows from now on, so
-        // reclaim can free them while the request decodes.
-        if (image.span.end() <= chunkEnd) {
-          impl->retain(image.rows);
-          image.rows.reset();
-        }
-      }
-    }
-    // The images the command encoded for those lanes alone stay to be
-    // encoded again by their next use.
-    for (uint32_t lane = 0; lane < items.size(); ++lane) {
-      if (finite[lane])
-        continue;
-      for (Impl::ImageState &image : entries[lane]->images)
-        if (image.rows && image.rows->encoding)
-          image.rows->encoding = false;
-    }
 
     std::vector<ModelStepResult> results;
     results.reserve(items.size());
@@ -2374,7 +2453,43 @@ Runtime::prefillAsync(const BatchPlan &plan,
       }
       if (entry.promptComplete)
         entry.replayingGeneration = false;
+      if (result.failure.empty())
+        result.capturedStates = impl->sealStates(entry, outputs.stateCaptures[lane]);
       results.push_back(std::move(result));
+    }
+
+    // The images of the lanes whose rows are finite are encoded, and an
+    // image whose last row is injected goes to the cache, after the states
+    // above took the rows they hold.
+    for (uint32_t lane = 0; lane < items.size(); ++lane) {
+      if (!finite[lane])
+        continue;
+      const uint64_t chunkEnd = items[lane].logicalPosition + items[lane].tokenCount;
+      for (Impl::ImageState &image : entries[lane]->images) {
+        if (!image.rows)
+          continue;
+        Impl::ImageRows &rows = *image.rows;
+        if (rows.encoding) {
+          rows.encoding = false;
+          rows.encoded = true;
+          rows.pixels = MetalBuffer{};
+        }
+        // Its last row is injected: the cache owns the rows from now on, so
+        // reclaim can free them while the request decodes.
+        if (image.span.end() <= chunkEnd) {
+          impl->retain(image.rows);
+          image.rows.reset();
+        }
+      }
+    }
+    // The images the command encoded for those lanes alone stay to be
+    // encoded again by their next use.
+    for (uint32_t lane = 0; lane < items.size(); ++lane) {
+      if (finite[lane])
+        continue;
+      for (Impl::ImageState &image : entries[lane]->images)
+        if (image.rows && image.rows->encoding)
+          image.rows->encoding = false;
     }
     impl->counters.lastPrefillWallSeconds = timing.wallSeconds;
     impl->counters.totalPrefillWallSeconds += timing.wallSeconds;
@@ -2501,12 +2616,21 @@ uint32_t Runtime::residentLane(uint64_t requestId) {
   return entry.stateLane;
 }
 
+std::shared_ptr<StateReservation> Runtime::reserveState(uint64_t requestId, uint32_t tokens) {
+  static_cast<void>(residentLane(requestId));
+  if (!tokens || tokens % kv::kPageTokens)
+    throw std::invalid_argument("a state boundary is page-aligned");
+  return impl_->states.reserve();
+}
+
 std::shared_ptr<const CompositeState> Runtime::snapshot(uint64_t requestId) {
-  std::shared_ptr<const CompositeState> state =
-      impl_->states.snapshot(residentLane(requestId));
+  const uint32_t lane = residentLane(requestId);
+  std::shared_ptr<const CompositeState> state = impl_->states.snapshot(lane);
   if (!state)
     return state;
-  return impl_->holdStraddledRows(impl_->request(requestId), std::move(state));
+  return impl_->holdStraddledRows(impl_->request(requestId),
+                                  impl_->states.metadata(lane).lengths.targetTokens,
+                                  std::move(state));
 }
 
 uint64_t Runtime::snapshotBytes() const noexcept {

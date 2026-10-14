@@ -185,6 +185,8 @@ public:
   // false only when the matching checkpoint is pinned; absent, replaced and
   // upgraded publications already satisfy the postcondition.
   bool retireCheckpointState(StateCheckpoint checkpoint) noexcept;
+  // The matching checkpoint is pinned: retireCheckpointState refuses it.
+  [[nodiscard]] bool checkpointPinned(StateCheckpoint checkpoint) const noexcept;
   // An unfinished request's conversation resumes from the state at this
   // block, published or yet to be. Until the handle is released that state
   // is in use, and so is the KV it restores through: the candidates below

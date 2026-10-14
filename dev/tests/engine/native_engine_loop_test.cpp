@@ -1113,8 +1113,10 @@ ScoreBesideChat runScoreBesideChat(bool invalidScore) {
   loop.announceReady();
 
   // Whole KV pages, so the last prompt chunk is the one that publishes the
-  // final block. The chat lane deliberately does not share this prefix.
-  auto scored = scoreRequest(21, 4 * KvCache::pageTokens);
+  // final block: beside the chat's 65 rows the first command takes all but
+  // the last of them. The chat lane deliberately does not share this prefix.
+  auto scored = scoreRequest(
+      21, model::ExecutionLimits::prefillTokenBudget - 2 * KvCache::pageTokens);
   for (uint32_t index = 0; index < scored.promptTokens.size(); ++index)
     scored.promptTokens[index] = 1000 + index;
   require(loop.receive(protocol::peer::serialize(scored)),

@@ -239,6 +239,8 @@ std::string runtimeStatusJson(
       << ",\"recycled_state_publications\":"
       << core.recycledStatePublications
       << ",\"disk_state_publications\":" << core.diskStatePublications
+      << ",\"state_captures\":" << core.stateCaptures
+      << ",\"capture_cuts\":" << core.captureCuts
       << ",\"replay_state_publication_failures\":"
       << core.replayStatePublicationFailures
       << ",\"lazy_junctions\":" << lookup.lazyJunctions
