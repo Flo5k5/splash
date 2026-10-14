@@ -1086,6 +1086,17 @@ bool Engine::checkpointShared(const Request &active) const {
          });
 }
 
+bool Engine::checkpointReclaimable(const Request &active) const {
+  // A pin keeps a state out of every victim choice, in either tier.
+  const StateCheckpoint point = active.latestCheckpoint;
+  return point && cache_.checkpointState(point.kvBlock).publication == point.publication &&
+         !cache_.checkpointPinned(point);
+}
+
+bool Engine::checkpointPinned(const Request &active) const {
+  return !checkpointShared(active) && cache_.checkpointPinned(active.latestCheckpoint);
+}
+
 bool Engine::retireCheckpoint(Request &active) {
   // Shared progress points remain disposable under memory pressure, but a
   // lane's normal rolling replacement must not retire its peer's recovery point.
@@ -1132,12 +1143,17 @@ void Engine::publishReachedStateBoundaries(
                                         : counters_.junctionMaterializations;
     // The command captured the state of every boundary it reached, but some
     // checkpoints inside it (below) and one at its end whose buffers were
-    // refused (reserveCaptures).
+    // refused (reserveCaptures): refused while the lane held a checkpoint,
+    // that state is taken from the lane now (fromLane).
     std::shared_ptr<const CompositeState> state;
     bool recycled = false;
+    bool fromLane = false;
     if (captured < captures.size() && captures[captured].tokens == objective.tokens) {
       recycled = captures[captured].recycled;
-      state = states[captured++];
+      fromLane = captures[captured].fromLane;
+      if (!fromLane)
+        state = states[captured];
+      ++captured;
       if (objective.tokens != promptProcessed)
         ++counters_.stateCaptures;
     } else if (objective.tokens != promptProcessed) {
@@ -1161,16 +1177,37 @@ void Engine::publishReachedStateBoundaries(
     } else {
       // The previous recovery point retires here or after the publication.
       // Here, before a checkpoint or a junction is published, a resident one
-      // goes, unless it already gave its buffers to this command's states
-      // (reserveCapture); a restore lease can delay this optional
-      // publication. A checkpoint only on disk stays the recovery point
-      // until a junction's state is published, and retires after the
-      // publication, as does the one a reused state leaves. The prompt's
-      // replay point keeps the lane's checkpoint (below).
-      const bool resident = cache_.stateResident(active.latestCheckpoint.kvBlock);
-      if ((checkpoint || (!replay && resident)) && !retireCheckpoint(active) && checkpoint) {
+      // goes, and gives its buffers to the state of a boundary the command
+      // ended at without them (below). One only on disk gives none: it stays
+      // the recovery point until this state is published, and retires after
+      // the publication, as does the one a reused state leaves. No checkpoint
+      // is published while a restore lease pins the one before it. The
+      // prompt's replay point keeps the lane's checkpoint (below).
+      if (checkpoint && checkpointPinned(active)) {
         ++failures;
         continue;
+      }
+      const bool resident = cache_.stateResident(active.latestCheckpoint.kvBlock);
+      if (!replay && resident)
+        static_cast<void>(retireCheckpoint(active));
+      // The command has completed, so the state it ended at for its lane's
+      // checkpoint is taken from the lane now. The replay point keeps that
+      // checkpoint only beside buffers of its own; refused them, it takes
+      // the checkpoint's unless a peer still holds it. Then room comes from
+      // cache the state's class may take.
+      if (fromLane) {
+        state = model_.snapshot(active.request.id);
+        if (!state && replay && resident && !checkpointShared(active) &&
+            retireCheckpoint(active))
+          state = model_.snapshot(active.request.id);
+        if (!state)
+          recycled = makeStateRoom(checkpoint ? StateClass::Checkpoint
+                                   : replay   ? StateClass::InUse
+                                              : StateClass::Ordinary,
+                                   [&] {
+                                     state = model_.snapshot(active.request.id);
+                                     return state != nullptr;
+                                   });
       }
       if (state) {
         cache_.publishCompositeState(block, std::move(state), checkpoint);
@@ -1200,8 +1237,8 @@ void Engine::publishReachedStateBoundaries(
     // disposable as any checkpoint, for a later request that shares the
     // prompt up to it but not up to the replay point. The lane holds it
     // until this state is published; a refused publication leaves it the
-    // lane's recovery point, unless it gave its buffers to a state of this
-    // command.
+    // lane's recovery point, unless it retired above to give this state its
+    // buffers.
     if (!replay)
       static_cast<void>(retireCheckpoint(active));
     active.latestCheckpoint = checkpoint ? cache_.checkpointState(block)
@@ -1373,8 +1410,8 @@ uint32_t Engine::reserveCaptures(Request &active, const BatchItem &item, Reclaim
     if (kind == StateClass::InUse && !states.empty() && boundaries[index - 1].disposable) {
       // The prompt's replay point keeps the checkpoint the command captures
       // before it beside buffers of its own, and takes that checkpoint's
-      // when refused the pool and the admission, as it takes a resident
-      // one's.
+      // when refused the pool and the admission, as it takes its lane's
+      // after a command.
       if (std::shared_ptr<StateReservation> buffers =
               model_.reserveState(active.request.id, tokens)) {
         states.push_back({tokens, std::move(buffers)});
@@ -1386,8 +1423,11 @@ uint32_t Engine::reserveCaptures(Request &active, const BatchItem &item, Reclaim
       return true;
     }
     Reservation reservation = reserveCapture(active, kind, tokens, states.empty());
-    if (!reservation.buffers)
+    if (!reservation.buffers) {
+      if (reservation.fromLane)
+        captures.push_back({tokens, false, true});
       return false;
+    }
     states.push_back({tokens, std::move(reservation.buffers)});
     captures.push_back({tokens, reservation.recycled});
     return true;
@@ -1426,37 +1466,42 @@ uint32_t Engine::reserveCaptures(Request &active, const BatchItem &item, Reclaim
 Engine::Reservation Engine::reserveCapture(Request &active, StateClass kind, uint32_t tokens,
                                            bool followsCheckpoint) {
   const uint64_t id = active.request.id;
-  // The lane's resident checkpoint, unless a peer still holds it, hands its
-  // buffers over rather than the oldest state, perhaps another lane's
-  // checkpoint, going. Every state but the prompt's replay point retires it
-  // when published, and takes its buffers first. The replay point keeps it
-  // cached beside a state that fits, and takes them only when refused.
-  const auto handOff = [&] {
-    return followsCheckpoint && cache_.stateResident(active.latestCheckpoint.kvBlock) &&
-           !checkpointShared(active) && retireCheckpoint(active);
-  };
-  if (kind != StateClass::InUse)
-    static_cast<void>(handOff());
   Reservation result{model_.reserveState(id, tokens)};
-  // apply() publishes no checkpoint while the one before it cannot retire,
-  // which stays the lane's recovery point then.
-  const bool predecessorPinned = kind == StateClass::Checkpoint && followsCheckpoint &&
-                                 !checkpointShared(active) &&
-                                 cache_.checkpointPinned(active.latestCheckpoint);
-  if (result.buffers || predecessorPinned)
+  if (result.buffers)
     return result;
-  if (kind == StateClass::InUse && handOff()) {
-    result.buffers = model_.reserveState(id, tokens);
-    if (result.buffers)
-      return result;
-  }
+  // The lane's checkpoint is its recovery point until a state that retires
+  // it is published, after a command that completed: one cancelled, expired
+  // or failed leaves it to a retry. So no state takes its buffers before the
+  // command, nor room a reclaim could make of it, since checkpoints go
+  // first. Refused the pool and the admission while the lane holds one, the
+  // state ends its command, and apply takes it from the lane after the
+  // command: a junction or a checkpoint in the buffers of the checkpoint it
+  // retires (publishReachedStateBoundaries). A checkpoint whose predecessor
+  // a reader pins takes no room either: apply publishes it, from the lane,
+  // only once the pin has gone, which keeps the predecessor the lane's
+  // recovery point until then.
+  const bool predecessorPinned =
+      kind == StateClass::Checkpoint && followsCheckpoint && checkpointPinned(active);
+  result.fromLane = predecessorPinned || checkpointReclaimable(active);
+  if (result.fromLane)
+    return result;
   // Room comes from what this state's class may take: cached KV unless it
   // is an optional checkpoint, and states in use only for the prompt's
-  // replay point, which is in use itself. No command is in flight, so KV
-  // that empties an extent releases it now. A recycled state hands over its
-  // buffers; an extent may hold less than a state, so room is made until
-  // the buffers fit, nothing more of the class goes, or the extents given
-  // cover one state: a refusal after that is not the budget's.
+  // replay point, which is in use itself. A pin keeps the lane's
+  // checkpoint, if any, out of it.
+  result.recycled = makeStateRoom(kind, [&] {
+    result.buffers = model_.reserveState(id, tokens);
+    return result.buffers != nullptr;
+  });
+  return result;
+}
+
+template <class Take> bool Engine::makeStateRoom(StateClass kind, Take &&take) {
+  // No command is in flight, so KV that empties an extent releases it now.
+  // A recycled state hands over its buffers; an extent may hold less than a
+  // state, so room is made until the buffers fit, nothing more of the class
+  // goes, or the extents given cover one state: a refusal after that is not
+  // the budget's.
   const bool growth = !config_.growthPaused();
   const uint64_t needed = model_.snapshotBytes();
   uint64_t released = 0;
@@ -1464,11 +1509,10 @@ Engine::Reservation Engine::reserveCapture(Request &active, StateClass kind, uin
   do {
     room = cache_.reclaimOneState(kind, growth);
     released += room.extentBytes;
-    if (room)
-      result.buffers = model_.reserveState(id, tokens);
-  } while (!result.buffers && room.extentBytes && released < needed);
-  result.recycled = result.buffers != nullptr;
-  return result;
+    if (room && take())
+      return true;
+  } while (room.extentBytes && released < needed);
+  return false;
 }
 
 uint64_t Engine::completedTokens(const Request &active) const {
@@ -1838,7 +1882,10 @@ void Engine::apply(const BatchPlan &plan, std::span<const std::vector<Capture>> 
         counters_.resourceReplayTokens += result.consumedPromptTokens;
       if (promptProcessed == active.replayTokens)
         active.replaying = false;
-      if (result.capturedStates.size() != captures[index].size())
+      // The model captured every state but one taken from the lane, last.
+      const std::vector<Capture> &reached = captures[index];
+      const bool fromLane = !reached.empty() && reached.back().fromLane;
+      if (result.capturedStates.size() + fromLane != reached.size())
         throw std::logic_error("model returned mismatched captured states");
       publishCommittedBlocks(active, promptProcessed);
       publishReachedStateBoundaries(active, promptProcessed, captures[index],

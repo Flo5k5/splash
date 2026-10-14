@@ -599,6 +599,12 @@ public:
   // release a cached state and retry.
   [[nodiscard]] virtual std::shared_ptr<StateReservation>
   reserveState(uint64_t requestId, uint32_t tokens) = 0;
+  // Copies the request's committed state at its current page-aligned
+  // boundary into the buffers of a cached state, taken as reserveState()
+  // takes them: the state of a boundary its prefill command ended at without
+  // buffers. Null when the governor refuses; the caller may release a cached
+  // state and retry.
+  [[nodiscard]] virtual std::shared_ptr<const CompositeState> snapshot(uint64_t requestId) = 0;
   // The bytes one cached state's buffers take.
   [[nodiscard]] virtual uint64_t snapshotBytes() const noexcept = 0;
   // Whether the disk tier takes a state written from a lane now, for a

@@ -504,6 +504,16 @@ public:
     ++reservations;
     return std::make_shared<Reservation>(evictedStateBytes);
   }
+  // The production model copies the lane's state at its position into
+  // buffers it takes as reserveState() does; so does the fake, refusing as
+  // reserveState() refuses.
+  std::shared_ptr<const CompositeState> snapshot(uint64_t id) override {
+    const std::shared_ptr<StateReservation> buffers = reserveState(id, requests.at(id).position);
+    if (!buffers)
+      return nullptr;
+    ++snapshots;
+    return seal(static_cast<Reservation &>(*buffers));
+  }
   // Without a cache slot the production model writes the lane's state to
   // the disk tier; the fake has one when `stateTier` is set, with quota for
   // every state.
@@ -622,6 +632,8 @@ public:
     uint64_t end = 0;
   };
   std::vector<Capture> captures;
+  // States taken from a lane after its command (snapshot).
+  uint32_t snapshots = 0;
   uint32_t diskSnapshots = 0;
   std::shared_ptr<OffloadControl> stateTier;
   // With it, captured states are KeptStates whose copies land when it says
