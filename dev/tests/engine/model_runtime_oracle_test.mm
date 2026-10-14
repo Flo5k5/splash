@@ -155,10 +155,12 @@ Similarity compareFloat(const metal::MetalBuffer &left,
 // commit identical state. Both use the same target arithmetic; compare bytes.
 // The GDN state a decode step leaves is its lane's cell, which holds the state
 // before the step's rows, and the rows it retained, which wait on its tape for
-// the next step to fold in: the retained counts must match, and lanes that go
-// on for another step must then hold the same cell. The GDN kernel tests
-// independently check the fold of each retained count against FP64.
-void requireCommittedStateIdentical(const model::QwenStateStorage &states,
+// the next step to fold in: the cells, the retained counts and the retained
+// rows must match, so that the next step of either lane folds the same state.
+// The GDN kernel tests independently check the fold of each retained count
+// against FP64.
+void requireCommittedStateIdentical(const model::Runtime &executor,
+                                    const model::QwenStateStorage &states,
                                     uint32_t budgetLane, uint32_t maskedLane,
                                     const std::string &label) {
   const auto &budget = states.metadata(budgetLane);
@@ -172,6 +174,11 @@ void requireCommittedStateIdentical(const model::QwenStateStorage &states,
                 std::memcmp(a.contents(), b.contents(), a.sizeBytes()) == 0,
             label + " " + part + " differs between budget and mask commits");
   };
+  identical(states.current(budgetLane).stateBase, states.current(maskedLane).stateBase,
+            "GDN cell");
+  const std::vector<uint8_t> retained = executor.pendingGdnRows(budget.requestId);
+  require(!retained.empty() && retained == executor.pendingGdnRows(masked.requestId),
+          label + " retained GDN rows differ between budget and mask commits");
   const auto &left = states.draft(budgetLane);
   const auto &right = states.draft(maskedLane);
   for (uint32_t layer = 0; layer < states.layout().draft.layers; ++layer) {
@@ -2635,10 +2642,11 @@ int main(int argc, char **argv) {
     // budgeted commit with a constrained cycle that retains the same prefix,
     // rejecting the next proposal unless all eight rows are retained. The
     // constrained request has a larger budget, so both acceptance paths agree on
-    // the retained rows and the exact draft ring. Kernel tests cover the
-    // recurrence's FP64 accuracy; this check does not mix prefill and decode
-    // summation orders, whose tiny differences can amplify through the full
-    // model.
+    // the GDN cell, the retained rows and the exact draft ring. Kernel tests
+    // cover the recurrence's FP64 accuracy; this check does not mix prefill and
+    // decode summation orders, whose tiny differences can amplify through the
+    // full model.
+    std::string comparedCounts;
     for (uint32_t outputLimit = 2; outputLimit <= 8; ++outputLimit) {
       uint64_t id = 10 + outputLimit;
       EngineRequest variant = makeRequest(id, prompt129, outputLimit);
@@ -2707,10 +2715,12 @@ int main(int argc, char **argv) {
                   states.metadata(1).lengths.targetTokens == 129 + stored,
               "replay did not commit exactly the supplied prefix");
       requireCommittedStateIdentical(
-          states, 0, 1, "fixed DFlash-8 retained=" + std::to_string(stored));
+          executor, states, 0, 1, "fixed DFlash-8 retained=" + std::to_string(stored));
+      comparedCounts += (comparedCounts.empty() ? "" : ",") + std::to_string(stored);
       executor.end(replayId);
       executor.end(id);
     }
+    std::cout << "budget_mask_commits=PASS retained=" << comparedCounts << '\n';
 
     // The next cycle folds the rows a cycle retained into the cell it writes:
     // a budgeted lane and a masked lane that retain the same rows in two
@@ -2792,18 +2802,12 @@ int main(int argc, char **argv) {
       };
       replayCycle(129, first, second.outputTokens.front());
       replayCycle(firstEnd, second, std::nullopt);
-      requireCommittedStateIdentical(states, 0, 1, "continued second cycle");
+      requireCommittedStateIdentical(executor, states, 0, 1, "continued second cycle");
       const metal::MetalBuffer &foldedCell = states.current(0).stateBase;
-      const metal::MetalBuffer &maskedCell = states.current(1).stateBase;
       require(foldedCell.sizeBytes() == beforeFold.size() &&
                   std::memcmp(foldedCell.contents(), beforeFold.data(),
                               beforeFold.size()) != 0,
               "the second cycle did not fold the first one's rows in");
-      require(maskedCell.sizeBytes() == foldedCell.sizeBytes() &&
-                  maskedCell.contents() &&
-                  std::memcmp(foldedCell.contents(), maskedCell.contents(),
-                              foldedCell.sizeBytes()) == 0,
-              "a folded GDN cell differs between budget and mask commits");
       executor.end(replayId);
       executor.end(id);
     }

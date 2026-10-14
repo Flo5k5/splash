@@ -5,6 +5,7 @@
 #include "model/RuntimeArenas.hpp"
 
 #include "metal/CommandGraph.hpp"
+#include "metal/abi/GDN.h"
 #include "ops/AneFfn.hpp"
 #include "ops/Linear.hpp"
 #include "ops/PagedAttention.hpp"
@@ -2118,6 +2119,35 @@ void Runtime::beginColdRequest(const ModelRequest &request,
     end(request.id);
     throw;
   }
+}
+
+std::vector<uint8_t> Runtime::pendingGdnRows(uint64_t requestId) const {
+  const Impl::Request &entry = impl_->request(requestId);
+  if (!entry.resident)
+    throw std::logic_error("request is not resident");
+  const QwenLaneMetadata &metadata = impl_->states.metadata(entry.stateLane);
+  const ops::GdnShape shape = impl_->geometry.target.gdnShape();
+  const uint32_t kvWidth = (shape.keyHeads + shape.valueHeads) * shape.headDimension;
+  // Each field holds one row after another; the offset and row bytes of each.
+  const std::array<std::pair<uint64_t, uint64_t>, 4> fields{{
+      {0, uint64_t{shape.convolutionDimension} * 2},
+      {gdn_tape_kv_offset(shape.convolutionDimension), uint64_t{kvWidth} * 2},
+      {gdn_tape_decay_offset(shape.convolutionDimension, kvWidth), uint64_t{shape.valueHeads} * 4},
+      {gdn_tape_beta_offset(shape.convolutionDimension, kvWidth, shape.valueHeads),
+       uint64_t{shape.valueHeads} * 2},
+  }};
+  // The latest step's slot is the one the lane's next step folds from.
+  const uint8_t *slot =
+      contents<const uint8_t>(impl_->decodeArena->batchSlice(DecodeTensor::GdnTape, kLaneCount),
+                              "GDN tape") +
+      impl_->decodeArena->gdnTapeSlot(entry.stateLane, metadata.activeParity);
+  std::vector<uint8_t> rows;
+  for (uint32_t layer = 0; layer < impl_->geometry.target.stateLayout.layers; ++layer) {
+    const uint8_t *tape = slot + layer * ops::gdnTapeLayerBytes(shape);
+    for (const auto &[offset, rowBytes] : fields)
+      rows.insert(rows.end(), tape + offset, tape + offset + metadata.pendingRows * rowBytes);
+  }
+  return rows;
 }
 
 StateAdmission Runtime::begin(const ModelRequest &request) {
