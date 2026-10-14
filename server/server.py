@@ -43,7 +43,13 @@ from .api_shapes import (
     text_completion_chunk,
     text_completion_response,
 )
-from .backend import NativeBackend, NativeResult, remaining_request_time
+from .backend import (
+    NativeBackend,
+    NativeResult,
+    ThinkingEndError,
+    remaining_request_time,
+    thinking_end_tokens,
+)
 from .chat_templates import ChatTemplateError, ChatTemplates
 from .connections import ConnectionSlots, HttpAdmission, RequestBodyReservation
 from .constraints import ConstraintFactory, validate_tokenizer
@@ -1728,6 +1734,7 @@ def main():
             args.tokenizer, local_files_only=True, trust_remote_code=False
         )
         validate_tokenizer(tokenizer)
+        thinking_end = thinking_end_tokens(tokenizer, args.thinking_end_text)
         chat_templates = ChatTemplates(tokenizer)
         print_status(f"Chat template · {chat_templates.describe()}")
         runtime = engine_runtime.MultiplexedRuntime(
@@ -1739,6 +1746,7 @@ def main():
             runtime,
             tokenizer,
             request_logger=print_request,
+            thinking_end=thinking_end,
         )
         if not runtime.wait_ready():
             raise engine_runtime.EngineUnhealthy("native runtime did not become ready")
@@ -1790,6 +1798,7 @@ def main():
         engine_runtime.EngineRuntimeError,
         ThinkingKeyError,
         ChatTemplateError,
+        ThinkingEndError,
     ) as error:
         print_status(f"Error · {error}", error=True)
         raise SystemExit(1) from None

@@ -100,6 +100,7 @@ access.
 | `--announce-served-name` | Off | Report the first `--served-model-name` in responses; needs `--served-model-name`. |
 | `--default-reasoning-effort` | `SPLASH_DEFAULT_REASONING_EFFORT` or the template's | Effort of Chat and Responses requests that set none. See [default reasoning effort](#default-reasoning-effort). |
 | `--thinking-token-budget` | `SPLASH_THINKING_TOKEN_BUDGET` or none | Thinking tokens of a request that sets no budget. See [thinking token budget](#thinking-token-budget). |
+| `--thinking-end-text` | `SPLASH_THINKING_END_TEXT` or `</think>` | Text that ends thinking where a budget runs out, `</think>` its last token. See [thinking token budget](#thinking-token-budget). |
 | `--max-request-size` | `128M` | Largest HTTP request body. See [request limits](#request-limits-and-timeouts). |
 | `--max-image-pixels` | `4194304` | Maximum resized pixels per image. An image's vision scratch grows with its patches (pixels / 256), to about 600 MiB at the default. |
 | `--request-timeout` | None | Time a request may take from its arrival; a request's own `timeout` can only shorten it. |
@@ -389,9 +390,10 @@ passes itself, such as `tools` or `add_generation_prompt`.
 
 A reasoning model can spend its whole output limit thinking and return no
 answer. A thinking token budget caps the thinking: once a request has selected
-that many tokens in its thinking block, the engine selects the block's close,
-`</think>`, and the model answers within the output limit that remains. Its `reasoning_tokens` then
-equal the budget.
+that many tokens in its thinking block, the engine selects the thinking end,
+which closes the block with `</think>`, and the model answers within the output
+limit that remains. Its `reasoning_tokens` then equal the budget plus the end's
+tokens before `</think>`.
 
 - Chat Completions and Responses take `thinking_token_budget`, a non-negative
   integer; `-1` sets no cap, and an absent or null value takes the server's.
@@ -400,17 +402,29 @@ equal the budget.
   adaptive thinking takes the server's budget.
 - `--thinking-token-budget N` (or `SPLASH_THINKING_TOKEN_BUDGET`) is the
   server's budget; unset, thinking has no cap.
+- `--thinking-end-text TEXT` (or `SPLASH_THINKING_END_TEXT`) is the server's
+  thinking end: text without the template's special tokens, then `</think>` as
+  its own token, at most 64 tokens in all. Unset, the end is `</think>` alone.
+  The server checks the text with the model's tokenizer when it starts, and
+  stops with an error on one that breaks these rules.
 
-A budget applies only where generation starts in a thinking block, and one the
-output limit reaches first changes nothing. Where the output may call a tool, a
-call's opening ends thinking too, so the close never lands inside a call. Only
-the close is forced, with no transition text, and a close the model selects
-itself before the budget ends the count. Text completions have no reasoning
-split and refuse a budget with 400.
+A model whose thinking is cut mid-thought may go on planning in its answer. An
+end text that turns to the answer first helps it answer at once, such as this
+one adapted from the sentence Qwen suggests for its models: a blank line sets
+it apart from the cut thought, and the model writes the one after `</think>`
+itself.
 
 ```sh
-splash serve --model mlx-community/Qwen3.8-27B-4bit --thinking-token-budget 12000
+splash serve --model mlx-community/Qwen3.8-27B-4bit --thinking-token-budget 12000 \
+  --thinking-end-text $'\n\nConsidering the limited time, I have to give the solution based on the thinking directly now.\n</think>'
 ```
+
+A budget applies only where generation starts in a thinking block, and one the
+output limit reaches first changes nothing; the output limit can also cut the
+end short. Where the output may call a tool, a call's opening ends thinking
+too, so the end never lands inside a call. Only the end is forced, and a close
+the model selects itself before the budget ends the count. Text completions
+have no reasoning split and refuse a budget with 400.
 
 ## Agent launchers
 
@@ -747,9 +761,13 @@ measured interval, not the full counts. An unavailable rate is zero, including
 responses completed in one emission. A request that drafted adds
 llama-server's `draft_n` and `draft_n_accepted`: the tokens its draft proposed
 and those verification accepted, including any a stop or the output limit then
-cut. They count that request alone, so they hold under concurrency.
-`metrics.speculation` carries them with the request's speculative `cycles`, and
-the Done line shows the tokens each cycle yielded, `1 + accepted / cycles`.
+cut; the end tokens a [thinking token budget](#thinking-token-budget) puts in
+place of the draft's proposals are neither. They count that request alone, so
+they hold under concurrency. `metrics.speculation` carries them with the
+request's speculative `cycles`, the decode cycles in which its draft proposed
+tokens, and the Done line shows what the draft yields per cycle,
+`1 + accepted / cycles`; a request whose thinking budget ran out also took the
+end's tokens in its cycles.
 
 ### Tool calls
 
@@ -2189,14 +2207,19 @@ The engine receives `ignore_eos` as bit 0 of the request frame's flags word and
 `return_progress` as bit 1; the word rejects undefined bits.
 
 A request that generates in a thinking block may carry a thinking budget: its
-tokens, the token that closes thinking, and a second token that also ends it,
-a call's opening where the output may call a tool. The engine counts the
-thinking tokens it selects. In the selection where the budget runs out, one
-small dispatch gives that row the close, unless a draft token before the row
-ended thinking, and gives a sampled lane's drafted row the target probability 1
-for a drafted close and 0 otherwise, so acceptance keeps the draft only where
-it drafted the close. A selection where no budget runs out dispatches nothing
-more.
+tokens, the end tokens the engine selects where it runs out, the last of which
+closes thinking, and a second token that also ends it, a call's opening where
+the output may call a tool. The engine counts the thinking tokens it selects,
+and then the end tokens. In the selection where the budget runs out, one small
+dispatch gives that row and those after it the end's tokens, unless a draft
+token before the row ended thinking, and gives a sampled lane's drafted row the
+target probability 1 for a drafted end token and 0 otherwise, so acceptance
+keeps the draft only where it drafted the end. Once no thinking token is left,
+the end starts at a selection's row 0, before which no draft token can end
+thinking, and a second small dispatch replaces the lane's draft proposals with
+the end tokens left before the verify, so a decode cycle accepts as many of
+them as it verifies; the request's speculation counts leave those proposals
+out. A selection where no budget runs out dispatches nothing more.
 
 Requests carry the score-token IDs and Done events the selected f32 logits; the
 server and the engine must speak the same native wire version. Scoring requires

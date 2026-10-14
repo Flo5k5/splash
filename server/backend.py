@@ -20,6 +20,7 @@ from .metrics import metrics_dict
 from .output import hold_partial
 from .tool_schema import (
     CALL_OPEN,
+    THINK_END,
     THINK_END_TOKEN_ID,
     TOOL_CALL_OPEN_TOKEN_ID,
     ToolPolicy,
@@ -36,6 +37,41 @@ RESTART_BACKOFF_SECONDS = 5.0
 
 # Control requests use a short live probe and explicitly label stale snapshots.
 STATUS_REFRESH_TIMEOUT_SECONDS = 0.05
+
+
+# What the engine selects where a thinking budget runs out without
+# --thinking-end-text: the close of thinking alone.
+DEFAULT_THINKING_END = (THINK_END_TOKEN_ID,)
+
+
+class ThinkingEndError(ValueError):
+    """A --thinking-end-text the model's tokenizer cannot end thinking with."""
+
+
+def thinking_end_tokens(tokenizer, text):
+    """The tokens the engine selects where a thinking budget runs out:
+    DEFAULT_THINKING_END, or --thinking-end-text, which must encode as text
+    then the close of thinking as its own token, at most
+    wire.MAX_THINKING_END_TOKENS tokens. The text holds none of the
+    tokenizer's added tokens, the template's special tokens."""
+    if text is None:
+        return DEFAULT_THINKING_END
+    tokens = tuple(tokenizer.encode(text, add_special_tokens=False))
+    if (
+        not tokens
+        or tokens[-1] != THINK_END_TOKEN_ID
+        or not tokenizer.added_tokens_decoder.keys().isdisjoint(tokens[:-1])
+    ):
+        raise ThinkingEndError(
+            f"--thinking-end-text must end with {THINK_END} and hold no other "
+            "special token"
+        )
+    if len(tokens) > wire.MAX_THINKING_END_TOKENS:
+        raise ThinkingEndError(
+            f"--thinking-end-text takes {len(tokens)} tokens; the most is "
+            f"{wire.MAX_THINKING_END_TOKENS}"
+        )
+    return tokens
 
 
 def remaining_request_time(deadline):
@@ -296,10 +332,15 @@ class NativeBackend:
         wire.FinishReason.CANCELLED: "cancelled",
     }
 
-    def __init__(self, runtime, tokenizer, request_logger):
+    def __init__(
+        self, runtime, tokenizer, request_logger, thinking_end=DEFAULT_THINKING_END
+    ):
         self.runtime = runtime
         self.tokenizer = tokenizer
         self.request_logger = request_logger
+        # What the engine selects where a thinking budget runs out
+        # (thinking_end_tokens).
+        self.thinking_end = thinking_end
         self.active = {}
         self.closing = False
         self.lock = threading.RLock()
@@ -638,16 +679,16 @@ class NativeBackend:
             frame, job.deadline, self._mask_provider(job), job.image_owner
         )
 
-    @staticmethod
-    def _thinking_budget(job):
-        """The engine's cutoff of the thinking a job generates in: thinking
-        ends where count_reasoning_tokens ends it, at its close or, where a
-        call may follow, at a call's opening token."""
+    def _thinking_budget(self, job):
+        """The engine's cutoff of the thinking a job generates in, which it
+        ends with the server's thinking end: thinking ends where
+        count_reasoning_tokens ends it, at its close or, where a call may
+        follow, at a call's opening token."""
         if job.thinking_token_budget is None:
             return None
         return wire.ThinkingBudget(
             job.thinking_token_budget,
-            THINK_END_TOKEN_ID,
+            self.thinking_end,
             TOOL_CALL_OPEN_TOKEN_ID if job.may_call_tools else THINK_END_TOKEN_ID,
         )
 

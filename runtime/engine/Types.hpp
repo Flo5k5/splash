@@ -79,8 +79,9 @@ struct EngineRequest final {
   CacheSalt cacheSalt;
 
   [[nodiscard]] ModelRequest modelView() const noexcept {
-    return {id,       prompt,     images,      imagePixels, maxNewTokens,
-            sampling, constraint, scoreTokens, flags,       thinkingBudget};
+    return {id,           prompt,   images,     imagePixels,
+            maxNewTokens, sampling, constraint, scoreTokens,
+            flags,        thinkingBudget ? &*thinkingBudget : nullptr};
   }
 };
 

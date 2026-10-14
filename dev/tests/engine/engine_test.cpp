@@ -274,6 +274,29 @@ void testBlocksFoundCachedAfterTheLastCommandAreNotReported() {
           "a request reported cached blocks no command of it read");
 }
 
+// The engine refuses a thinking budget the target could not end, as the
+// protocol does: one without end tokens, and one with an end token before the
+// last that would end thinking itself.
+void testUnusableThinkingBudgetIsRefused() {
+  test::TestKvStorage storage(16, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, nullptr, nullptr);
+  Executor executor(1);
+  Events events;
+  engine::Engine engine(test::engineConfig(), resources, executor, events);
+  EngineRequest empty = request(1, std::vector<uint32_t>(8, 7));
+  empty.thinkingBudget = ThinkingBudget{4, {}, 9};
+  rejects([&] { engine.submit(std::move(empty)); }, "needs end tokens",
+          "a thinking budget without end tokens was accepted");
+  EngineRequest early = request(2, std::vector<uint32_t>(8, 7));
+  early.thinkingBudget = ThinkingBudget{4, {11, 12, 11}, 9};
+  rejects([&] { engine.submit(std::move(early)); }, "only the last thinking end token",
+          "a thinking budget whose end closes thinking early was accepted");
+  EngineRequest usable = request(3, std::vector<uint32_t>(8, 7));
+  usable.thinkingBudget = ThinkingBudget{4, {12, 11}, 9};
+  engine.submit(std::move(usable));
+}
+
 void testSharedPrefillRebuildsTheMissingJunctionOnce() {
   test::TestKvStorage storage(512, 4096, 4);
   KvPool pool(storage, 0);
@@ -9227,6 +9250,7 @@ int main() {
   try {
     testSpeculativeCountsStayWithEachConcurrentRequest();
     testImpossibleSpeculativeCountsFailOnlyTheirOwnLane();
+    testUnusableThinkingBudgetIsRefused();
     testRunningRequestKeepsItsReplayPoint();
     testSuspendedRequestKeepsItsReplayPoint();
     testResumedLaneKeepsThePromptReplayPoint();

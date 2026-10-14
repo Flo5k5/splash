@@ -4,6 +4,7 @@
 #include "ops/Vision.hpp"
 #include "model/StateTransfer.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -101,13 +102,25 @@ struct SamplingParameters final {
 };
 
 // A request that generates inside a thinking block may select at most
-// `tokens` thinking tokens; the target then selects `end`, which closes the
-// block. Thinking also ends where the request selects `end` or `alsoEnds`
-// first, such as a tool call's opening that follows thinking directly.
+// `tokens` thinking tokens; the target then selects the `end` tokens in
+// order, the last of which closes the block. Thinking also ends where the
+// request selects that close or `alsoEnds` first, such as a tool call's
+// opening that follows thinking directly; no other end token is either.
 struct ThinkingBudget final {
   uint32_t tokens = 0;
-  uint32_t end = 0;
+  std::vector<uint32_t> end;
   uint32_t alsoEnds = 0;
+
+  // Why the target cannot end thinking with this budget: no end tokens, or
+  // one before the last that would end thinking itself. Null when it can.
+  [[nodiscard]] const char *unusable() const noexcept {
+    if (end.empty())
+      return "a thinking budget needs end tokens";
+    if (std::any_of(end.begin(), end.end() - 1,
+                    [&](uint32_t token) { return token == end.back() || token == alsoEnds; }))
+      return "only the last thinking end token may end thinking";
+    return nullptr;
+  }
 
   bool operator==(const ThinkingBudget &) const = default;
 };
@@ -128,8 +141,8 @@ struct ModelRequest final {
   std::span<const uint32_t> scoreTokens{};
   // RequestFlag bits.
   uint32_t flags = 0;
-  // None for a request without a thinking budget.
-  std::optional<ThinkingBudget> thinkingBudget;
+  // The engine request's thinking budget; null for a request without one.
+  const ThinkingBudget *thinkingBudget = nullptr;
   // Prompt tokens the lane takes from a cached state. Images that end at or
   // before it are neither staged nor encoded; their spans still place
   // rotary positions.
