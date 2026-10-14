@@ -505,7 +505,9 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   // The automatic tier keeps its staging only where the plan holds the model
   // and the requested context beside it. The split wins over it: where the
   // plan refuses the split beside the staging but not without it, the tier
-  // turns off before the split is decided.
+  // turns off before the split is decided. A relaunch decides it as its first
+  // engine, an automatic start, did, so that it keeps the staging that engine
+  // kept; only its split leaves that engine's context (below).
   if (stateStagingBytes && automaticDisk) {
     const auto withoutStaging = [&](uint64_t aneFfnBytes) { return planWith(0, aneFfnBytes); };
     if (!planResult.plan ||
@@ -558,8 +560,13 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
       memoryGovernor->setPressure(config.memoryPressure());
     logLine("Kernel policy for GPU family ", device.appleGpuFamily,
             " with ", device.gpuCoreCount, " cores.");
+    // The split leaves the context asked for, else a relaunch's.
+    const RequestedContext splitContext =
+        requestedContextTokens ? RequestedContext{.tokens = requestedContextTokens}
+                               : RequestedContext{.tokens = config.relaunchContext,
+                                                  .relaunch = config.relaunchContext != 0};
     AneFfnStart aneFfn =
-        startAneFfn(splitModel, config.aneFfn, requestedContextTokens, planMemory, config.cancelled);
+        startAneFfn(splitModel, config.aneFfn, splitContext, planMemory, config.cancelled);
     if (aneFfn.plan)
       memoryPlan = std::move(*aneFfn.plan);
     const EngineMemoryBreakdown &budget = memoryPlan.breakdown();

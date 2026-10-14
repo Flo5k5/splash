@@ -3,6 +3,7 @@
 #include <charconv>
 #include <cmath>
 #include <limits>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -26,13 +27,20 @@ uint64_t parseMaxMemory(std::string_view value) {
   return result;
 }
 
+// Whether `value` is a context of 1 to the model's own tokens, which
+// `result` then holds.
+bool parseContext(std::string_view value,
+                  const model::ModelCapabilities &capabilities, uint32_t &result) {
+  return parsePositive(value, result) &&
+         result <= capabilities.maximumContextTokens;
+}
+
 uint32_t parseMaxContext(std::string_view value,
                          const model::ModelCapabilities &capabilities) {
   if (value == "auto")
     return 0;
   uint32_t result = 0;
-  if (!parsePositive(value, result) ||
-      result > capabilities.maximumContextTokens) {
+  if (!parseContext(value, capabilities, result)) {
     throw UsageError("MAX_CONTEXT must be auto or an integer in [1, " +
                      std::to_string(capabilities.maximumContextTokens) + "]");
   }
@@ -91,6 +99,8 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
     throw UsageError("expected the serve-native command");
   }
   NativeArguments result;
+  // Read once the model's own context is known.
+  std::optional<std::string_view> relaunchContext;
   int next = 5;
   if (next < argc && !std::string_view(argv[next]).starts_with("--")) {
     const std::string_view quota(argv[next++]);
@@ -136,6 +146,8 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
       if (value != "on" && value != "off")
         throw UsageError("--ane requires on or off");
       result.neuralEngine = value == "on";
+    } else if (option == "--relaunch-context") {
+      relaunchContext = value;
     } else {
       throw UsageError("unexpected argument " + std::string(option));
     }
@@ -149,6 +161,13 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
   result.modelRoot = requireModelRoot(argv[2]);
   result.model = model::inspectModelRoot(result.modelRoot);
   result.maxContext = parseMaxContext(argv[3], result.model.capabilities);
+  if (relaunchContext) {
+    if (result.maxContext)
+      throw UsageError("--relaunch-context requires MAX_CONTEXT auto");
+    if (!parseContext(*relaunchContext, result.model.capabilities, result.relaunchContext))
+      throw UsageError("--relaunch-context requires an integer in [1, " +
+                       std::to_string(result.model.capabilities.maximumContextTokens) + "]");
+  }
   result.maxMemoryBytes = parseMaxMemory(argv[4]);
   return result;
 }

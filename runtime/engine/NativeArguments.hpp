@@ -24,6 +24,10 @@ struct NativeArguments final {
   model::ModelDescriptor model;
   // Zero for auto.
   uint32_t maxContext = 0;
+  // --relaunch-context TOKENS, with MAX_CONTEXT auto: the context the
+  // server's first engine served, which the server passes to every relaunch
+  // (RuntimeResourcesConfig::relaunchContext); zero for none.
+  uint32_t relaunchContext = 0;
   uint64_t maxMemoryBytes = 0;
   // Automatic without MAX_CACHE_DISK_BYTES, as the server's default.
   CacheDiskQuota maxCacheDisk{.automatic = true};
