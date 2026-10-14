@@ -250,8 +250,9 @@ class Collected:
     def cut(self):
         """Whether the output's end cut its last block short: the token limit
         cuts any block, a stop sequence only a call, as text may end where
-        the client asks."""
-        return self.result.reason == "length" or self.cut_in_call
+        the client asks. A call cut at its name has no block, and a stop
+        sequence there leaves the block before it whole."""
+        return self.result.reason == "length" or self.cut_call is not None
 
     @property
     def called(self):
