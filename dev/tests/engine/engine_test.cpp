@@ -6829,6 +6829,65 @@ void testPinnedPredecessorTakesNoRoomFromOtherStates() {
   runUntilIdle(engine);
 }
 
+// A checkpoint whose predecessor a reader pins takes no room before its
+// command, which ends at it. When the pin goes while the command runs, the
+// checkpoint is taken from the lane after the command in its predecessor's
+// buffers, so the lane keeps a recovery point; a pin that holds keeps the
+// predecessor, and the checkpoint is not published.
+void testPinnedPredecessorReleasedDuringTheCommand() {
+  test::TestKvStorage storage(1024, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, nullptr, nullptr);
+  Executor executor(1);
+  Events events;
+  engine::Engine engine(test::engineConfig(), resources, executor, events);
+  guardReleases(storage, engine);
+  bool memoryFull = false;
+  executor.reservationRoom = [&] {
+    if (*executor.evictedStateBytes >= 64) {
+      *executor.evictedStateBytes -= 64;
+      return true;
+    }
+    return !memoryFull;
+  };
+  // Checkpoints at 4096 and 8192: the command [6144, 8192) ends at the
+  // second.
+  const std::vector<uint32_t> prompt(3 * kPrefillCheckpointTokens + 1, 43);
+  engine.submit(request(1, prompt));
+  double now = 1;
+  tickUntil(engine, now,
+            [&] {
+              return executor.requests.contains(1) &&
+                     executor.requests.at(1).position == 6144 && !engine.commandInFlight();
+            },
+            "the request did not reach the command before its next checkpoint");
+  CacheLookup pinned = resources.lookup(prompt, {});
+  require(pinned.resumeBoundary() == kPrefillCheckpointTokens,
+          "fixture did not pin the lane's checkpoint");
+  // Memory is full: buffers come only from a state the cache lets go.
+  memoryFull = true;
+  *executor.evictedStateBytes = 0;
+  executor.holdPrefillUntil = std::make_shared<std::atomic<bool>>(false);
+  require(engine.tick(now++) && engine.commandInFlight() &&
+              executor.requests.at(1).position == 2 * kPrefillCheckpointTokens,
+          "the command did not run to the next checkpoint");
+  pinned = {};
+  *executor.holdPrefillUntil = true;
+  tickUntil(engine, now, [&] { return !engine.commandInFlight(); },
+            "the command did not complete");
+  const auto counters = engine.snapshot();
+  require(counters.checkpointPublications == 2 && counters.checkpointPublicationFailures == 0 &&
+              executor.snapshots == 1 &&
+              counters.resources.stateCache.checkpointRetirements == 1 &&
+              counters.resources.stateCache.evictions == 0 &&
+              resources.probe(prompt, {}).cachedTokens() == 2 * kPrefillCheckpointTokens,
+          "the checkpoint was not taken in its predecessor's buffers once the pin went");
+  executor.holdPrefillUntil.reset();
+  memoryFull = false;
+  tickUntil(engine, now, [&] { return idle(engine); }, "the request did not finish");
+  require(events.completedCount == 1 && events.failedCount == 0, "the request failed");
+}
+
 void testFailedReplacementContinuesWithoutRecoveryPoint() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
@@ -6907,7 +6966,10 @@ void testCheckpointDenialPreservesUnrelatedHotState() {
   runUntilIdle(engine);
 }
 
-void testCheckpointRecyclesItsBufferBeforeReplacement() {
+// With room for it, the next checkpoint takes buffers of its own before its
+// command, beside the lane's checkpoint, and its command captures it; the
+// lane's checkpoint retires once the next one is published.
+void testCheckpointRetiresOnceItsSuccessorIsPublished() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
   engine::Cache resources(pool, nullptr, nullptr);
@@ -6918,15 +6980,20 @@ void testCheckpointRecyclesItsBufferBeforeReplacement() {
   engine.submit(request(430, std::vector<uint32_t>(25001, 23)));
   runUntilCheckpoint(engine, 1);
   executor.reservationObserver = [&] {
-    require(resources.snapshot().stateCache.entries == 0,
-            "checkpoint replacement allocated before retiring its old state");
+    require(resources.snapshot().stateCache.checkpointEntries == 1 &&
+                resources.snapshot().stateCache.checkpointRetirements == 0,
+            "the next checkpoint's buffers retired the lane's checkpoint before its command");
   };
   runUntilCheckpoint(engine, 2);
+  require(capturedStates(executor, 430) ==
+                  std::vector<std::pair<uint32_t, uint64_t>>{{4096, 4096}, {8192, 8192}} &&
+              executor.snapshots == 0 && engine.snapshot().captureCuts == 0,
+          "the next checkpoint was not captured in its command");
   require(resources.snapshot().stateCache.entries == 1 &&
               resources.snapshot().stateCache.evictions == 0 &&
               resources.snapshot().stateCache.checkpointRetirements == 1 &&
               engine.snapshot().checkpointPublicationFailures == 0,
-          "progress could not replace its old state within the allocation budget");
+          "the lane's checkpoint did not retire once the next one was published");
   engine.cancel(430);
   runUntilIdle(engine);
 }
@@ -6961,44 +7028,201 @@ void testCancelAtCheckpointDoesNotPublishDrainingCommand() {
           "cancellation published a checkpoint from the draining command");
 }
 
-// The final state is captured beside the lane's last checkpoint, which stays.
-// Without room for it, the final state takes the buffers of the lane's own
-// checkpoint, not those of an unrelated hot state.
-void testFinalStateRecyclesItsCheckpointBeforeUnrelatedHotState() {
-  test::TestKvStorage storage(1024, 4096, 4);
-  KvPool pool(storage, 0);
-  engine::Cache resources(pool, nullptr, nullptr);
-  Executor executor(1);
-  Events events;
-  bool paused = false;
-  EngineConfig config = test::engineConfig();
-  config.growthPaused = [&] { return paused; };
-  engine::Engine engine(config, resources, executor, events);
-  guardReleases(storage, engine);
-  const std::vector<uint32_t> hot(65, 27);
-  engine.submit(request(460, hot));
-  runUntilIdle(engine);
-  const std::vector<uint32_t> prompt(18001, 28);
-  engine.submit(request(461, prompt));
-  // The last checkpoint is at 12288: 16384 lies within one prefill chunk of
-  // the replay boundary at 17984.
-  runUntilCheckpoint(engine, 3);
-  // While the engine may not grow, a state's buffers take no free pages: the
-  // final state, refused them once, takes the checkpoint's, and no state is
-  // evicted for it.
-  paused = true;
-  executor.deniedReservations = 1;
-  runUntilIdle(engine);
-  const auto snapshot = engine.snapshot();
-  require(snapshot.recycledStatePublications == 0 &&
-              snapshot.replayStatePublicationFailures == 0 &&
-              snapshot.resources.stateCache.evictions == 0 &&
-              snapshot.resources.stateCache.checkpointRetirements == 3 &&
-              snapshot.resources.stateCache.checkpointEntries == 0 &&
-              snapshot.resources.stateCache.entries == 2 &&
-              resources.lookup(hot, {}).resumeBoundary() == 64 &&
-              resources.lookup(prompt, {}).resumeBoundary() == 17984,
-          "final state evicted unrelated hot state before its own checkpoint");
+// A command that captures the lane's next checkpoint and is cancelled,
+// expires or fails publishes nothing and leaves the lane's checkpoint: no
+// state takes its buffers before its command, nor, with memory full, room a
+// reclaim could make of it, though it is the only checkpoint cached. A retry
+// resumes there.
+void testInterruptedCommandKeepsTheLanesCheckpoint() {
+  enum class End { Cancelled, Expired, Failed };
+  for (const bool full : {false, true}) {
+    for (const End end : {End::Cancelled, End::Expired, End::Failed}) {
+      test::TestKvStorage storage(1024, 4096, 4);
+      KvPool pool(storage, 0);
+      engine::Cache resources(pool, nullptr, nullptr);
+      Executor executor(1);
+      Events events;
+      engine::Engine engine(test::engineConfig(), resources, executor, events);
+      guardReleases(storage, engine);
+      bool memoryFull = false;
+      executor.reservationRoom = [&] {
+        if (*executor.evictedStateBytes >= 64) {
+          *executor.evictedStateBytes -= 64;
+          return true;
+        }
+        return !memoryFull;
+      };
+      // Checkpoints at 4096, 8192 and 12288: the command [6144, 8192)
+      // captures the one at 8192.
+      const std::vector<uint32_t> prompt(18001, 24);
+      auto first = request(1, prompt);
+      first.deadlineMilliseconds = 1'000;
+      engine.submit(std::move(first));
+      double now = 1;
+      tickUntil(engine, now,
+                [&] {
+                  return executor.requests.contains(1) &&
+                         executor.requests.at(1).position == 6144 && !engine.commandInFlight();
+                },
+                "the request did not reach the command before its next checkpoint");
+      memoryFull = full;
+      if (full)
+        *executor.evictedStateBytes = 0;
+      executor.holdPrefillUntil = std::make_shared<std::atomic<bool>>(false);
+      if (end == End::Failed)
+        executor.nonFinitePrefills.insert(1);
+      require(engine.tick(now++) && engine.commandInFlight() &&
+                  engine.snapshot().checkpointPublications == 1 &&
+                  resources.snapshot().stateCache.checkpointEntries == 1,
+              "the command took the lane's checkpoint before it ran");
+      if (end == End::Cancelled)
+        engine.cancel(1);
+      if (end == End::Expired)
+        static_cast<void>(engine.tick(now = 1'000));
+      *executor.holdPrefillUntil = true;
+      tickUntil(engine, now, [&] { return idle(engine); }, "the request did not end");
+      require(end == End::Cancelled
+                  ? engine.snapshot().cancelled == 1
+                  : events.failures == std::vector<std::string>{end == End::Expired
+                                                                    ? "deadline_exceeded"
+                                                                    : "model_result_invalid"},
+              "the request did not end as its command did");
+      require(engine.snapshot().checkpointPublications == 1 &&
+                  resources.snapshot().stateCache.checkpointRetirements == 0 &&
+                  resources.snapshot().stateCache.evictions == 0 &&
+                  resources.lookup(prompt, {}).resumeBoundary() == 4096,
+              "an interrupted command cost the lane its checkpoint");
+      executor.holdPrefillUntil.reset();
+      executor.nonFinitePrefills.clear();
+      const uint32_t completed = events.completedCount;
+      engine.submit(request(2, prompt));
+      tickUntil(engine, now, [&] { return idle(engine); }, "the retry did not finish");
+      require(events.starts.back() == 4096 && events.completedCount == completed + 1,
+              "the retry did not resume from the lane's checkpoint");
+    }
+  }
+}
+
+// Memory is full, and the lane holds its checkpoint at 4096. A junction, a
+// checkpoint or the prompt's replay point refused buffers before its command
+// takes no room there, since a reclaim could take that checkpoint: the
+// command ends at its boundary, and once it has completed the state is taken
+// from the lane in the checkpoint's buffers, which a junction or a checkpoint
+// retires first and the replay point when refused again. No other state goes,
+// and a command that ends there and is cancelled leaves the checkpoint.
+void testRefusedStateTakesTheCheckpointAfterItsCommand() {
+  enum class Kind { Junction, Checkpoint, ReplayPoint };
+  for (const Kind kind : {Kind::Junction, Kind::Checkpoint, Kind::ReplayPoint}) {
+    for (const bool cancelled : {false, true}) {
+      test::TestKvStorage storage(1024, 4096, 4);
+      KvPool pool(storage, 0);
+      engine::Cache resources(pool, nullptr, nullptr);
+      Executor executor(1);
+      Events events;
+      engine::Engine engine(test::engineConfig(), resources, executor, events);
+      guardReleases(storage, engine);
+      bool memoryFull = false;
+      executor.reservationRoom = [&] {
+        if (*executor.evictedStateBytes >= 64) {
+          *executor.evictedStateBytes -= 64;
+          return true;
+        }
+        return !memoryFull;
+      };
+      // States a reclaim could take: another conversation's checkpoint, the
+      // state the prompt resumes from at 64 and, for the junction, the state
+      // of the conversation that leaves the prompt at 6016.
+      const std::vector<uint32_t> other(25001, 41);
+      engine.submit(request(1, other));
+      runUntilCheckpoint(engine, 1);
+      engine.cancel(1);
+      runUntilIdle(engine);
+      // Resuming at 64, the prompt's commands end at 2112, 4160, 6208 and
+      // 8256: the checkpoint at 4096 lies in the second, and the junction at
+      // 6016, the checkpoint at 8192 or the replay point at 6976 in the next.
+      const uint32_t length =
+          kind == Kind::Junction ? 8001 : kind == Kind::Checkpoint ? 12001 : 7001;
+      const uint32_t boundary =
+          kind == Kind::Junction ? 6016 : kind == Kind::Checkpoint ? 8192 : 6976;
+      const uint32_t start = kind == Kind::Junction ? 4160 : 6208;
+      std::vector<uint32_t> prompt(length);
+      std::iota(prompt.begin(), prompt.end(), 1);
+      const std::vector<uint32_t> resumed(prompt.begin(), prompt.begin() + 65);
+      engine.submit(request(2, resumed));
+      runUntilIdle(engine);
+      std::vector<uint32_t> branch(prompt.begin(), prompt.begin() + 6016);
+      branch.resize(6016 + KvCache::pageTokens, 0);
+      if (kind == Kind::Junction) {
+        resources.beginRequest(999);
+        require(resources.ensureTokens(999, branch.size()).granted(),
+                "junction fixture could not allocate its KV prefix");
+        resources.publishCompositeState(
+            test::publishBlocks(resources, 999, branch, static_cast<uint32_t>(branch.size())),
+            std::make_shared<State>(), false);
+        resources.endRequest(999);
+      }
+      engine.submit(request(3, prompt));
+      double now = 100;
+      tickUntil(engine, now,
+                [&] {
+                  return executor.requests.contains(3) &&
+                         executor.requests.at(3).position == start &&
+                         !engine.commandInFlight();
+                },
+                "the prompt did not reach the command of its state");
+      require(events.starts.back() == 64 &&
+                  capturedStates(executor, 3) ==
+                      std::vector<std::pair<uint32_t, uint64_t>>{{4096, 4160}} &&
+                  resources.probe(prompt, {}).cachedTokens() == 4096,
+              "fixture did not leave the lane its checkpoint at 4096");
+      // Memory fills: the idle buffers in the pool went back to the host.
+      memoryFull = true;
+      *executor.evictedStateBytes = 0;
+      if (cancelled)
+        executor.holdPrefillUntil = std::make_shared<std::atomic<bool>>(false);
+      require(engine.tick(now++) && executor.requests.at(3).position == boundary &&
+                  engine.snapshot().captureCuts == 1 &&
+                  capturedStates(executor, 3).size() == 1 &&
+                  resources.snapshot().stateCache.checkpointRetirements == 0 &&
+                  resources.probe(prompt, {}).cachedTokens() == 4096,
+              "the refused state did not end its command, or took the lane's checkpoint");
+      std::vector<uint32_t> pastBranch = branch;
+      pastBranch.push_back(0);
+      const auto cached = [&] {
+        return resources.probe(other, {}).cachedTokens() == 4096 &&
+               resources.probe(resumed, {}).cachedTokens() == 64 &&
+               (kind != Kind::Junction ||
+                resources.probe(pastBranch, {}).cachedTokens() == branch.size()) &&
+               resources.snapshot().stateCache.evictions == 0;
+      };
+      if (cancelled) {
+        engine.cancel(3);
+        *executor.holdPrefillUntil = true;
+        tickUntil(engine, now, [&] { return idle(engine); }, "the request did not end");
+        require(executor.snapshots == 0 &&
+                    resources.snapshot().stateCache.checkpointRetirements == 0 &&
+                    resources.probe(prompt, {}).cachedTokens() == 4096 && cached(),
+                "a cancelled command cost the lane its checkpoint or another state");
+        continue;
+      }
+      tickUntil(engine, now, [&] { return !engine.commandInFlight(); },
+                "the command did not complete");
+      require(executor.snapshots == 1 &&
+                  resources.snapshot().stateCache.checkpointRetirements == 1 &&
+                  resources.probe(prompt, {}).cachedTokens() == boundary && cached(),
+              "the state was not taken in the lane's checkpoint's buffers after its command");
+      const auto counters = engine.snapshot();
+      require((kind == Kind::Junction ? counters.junctionMaterializations
+               : kind == Kind::Checkpoint ? counters.checkpointPublications - 2
+                                          : counters.replayStatePublications - 1) == 1 &&
+                  counters.recycledStatePublications == 0,
+              "the state was not published");
+      memoryFull = false;
+      tickUntil(engine, now, [&] { return idle(engine); }, "the request did not finish");
+      // Reported complete: the cancelled conversation and both prompts.
+      require(events.completedCount == 3 && events.failedCount == 0, "a request failed");
+    }
+  }
 }
 
 // A junction is an ordinary state: publishing one retires the lane's
@@ -7438,10 +7662,11 @@ void testReplayPointWithoutRoomTakesTheCheckpointItsCommandCaptures() {
   tickUntil(engine, now, [&] { return events.usage.contains(2); },
             "the Normal request did not finish");
   // Memory fills: a state's buffers come only from a state the cache lets
-  // go, and while the engine may not grow, from no free pages. The
-  // checkpoint takes the buffers of the one the lane resumed from.
+  // go, and while the engine may not grow, from no free pages. One state's
+  // buffers are idle in the pool, and the checkpoint takes them.
   paused = true;
   memoryFull = true;
+  *executor.evictedStateBytes = 64;
   const uint64_t evictions = resources.snapshot().stateCache.evictions;
   tickUntil(engine, now,
             [&] { return executor.prefillChunks.at(1) == 6 && !engine.commandInFlight(); },
@@ -7857,6 +8082,61 @@ void testFailedFinalStateKeepsTheDiskCheckpoint() {
                 counters.resources.stateCache.checkpointRetirements == 0,
             "the next turn did not resume from the disk checkpoint and keep it");
   }
+}
+
+// A checkpoint only on disk gives its successor no buffers, so it stays the
+// lane's recovery point until that state is published. Memory is full and
+// another lane's write holds the staging buffer when the lane reaches its
+// next checkpoint, which is then not published: the checkpoint on disk stays,
+// and once the request is cancelled its retry resumes from it.
+void testDiskCheckpointStaysUntilItsSuccessorIsPublished() {
+  test::TestKvStorage storage(512, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor executor;
+  executor.deniedReservations = 1000;
+  executor.stateTier = std::make_shared<OffloadControl>();
+  executor.stateTier->ready = true;
+  executor.restoreControl->promotionDenied = true;
+  Events events;
+  engine::Engine engine(test::engineConfig(), cache, executor, events);
+  guardReleases(storage, engine);
+  // Checkpoints at 4096 and 8192, the replay point at 12288.
+  const std::vector<uint32_t> prompt(3 * kPrefillCheckpointTokens + 1, 67);
+  engine.submit(request(620, prompt));
+  for (uint32_t step = 0; step < 128; ++step) {
+    static_cast<void>(engine.tick(step + 1));
+    if (!engine.commandInFlight() && executor.requests.at(620).position == 6144)
+      break;
+  }
+  auto counters = engine.snapshot();
+  require(!engine.commandInFlight() && executor.requests.at(620).position == 6144 &&
+              counters.checkpointPublications == 1 && counters.diskStatePublications == 1 &&
+              counters.resources.stateCache.checkpointEntries == 1 &&
+              counters.resources.stateCache.bytes == 0,
+          "the checkpoint did not go to disk");
+  executor.stateTier->ready = false;
+  engine.submit(request(621, std::vector<uint32_t>(65, 68)));
+  for (uint32_t step = 0; step < 128 && !engine.snapshot().checkpointPublicationFailures; ++step)
+    static_cast<void>(engine.tick(1000 + step));
+  counters = engine.snapshot();
+  require(counters.checkpointPublicationFailures == 1 && counters.diskStatePublications == 2 &&
+              counters.checkpointPublications == 1 && events.failedCount == 0,
+          "the next checkpoint was not refused beside the other lane's write");
+  require(counters.resources.stateCache.checkpointEntries == 1 &&
+              counters.resources.stateCache.checkpointRetirements == 0 &&
+              cache.probe(prompt, {}).cachedTokens() == kPrefillCheckpointTokens,
+          "a checkpoint that was not published retired the one on disk");
+  engine.cancel(620);
+  executor.stateTier->ready = true;
+  runUntilIdle(engine);
+  engine.submit(request(622, prompt));
+  static_cast<void>(engine.tick(2000));
+  executor.restoreControl->ready = true;
+  runUntilIdle(engine);
+  require(events.starts.back() == kPrefillCheckpointTokens &&
+              executor.restored == kPrefillCheckpointTokens && events.failedCount == 0,
+          "the retry did not resume from the checkpoint on disk");
 }
 
 // No checkpoint is planned within one prefill chunk of the replay boundary,
@@ -10097,12 +10377,14 @@ int main() {
     testRetryRetiresCheckpointAtDeeperJunction();
     testPinnedCheckpointSkipsReplacementButNotOrdinaryState();
     testPinnedPredecessorTakesNoRoomFromOtherStates();
+    testPinnedPredecessorReleasedDuringTheCommand();
     testFailedReplacementContinuesWithoutRecoveryPoint();
     testRollingHandleCannotRetirePromotedState();
     testCheckpointDenialPreservesUnrelatedHotState();
-    testCheckpointRecyclesItsBufferBeforeReplacement();
+    testCheckpointRetiresOnceItsSuccessorIsPublished();
     testCancelAtCheckpointDoesNotPublishDrainingCommand();
-    testFinalStateRecyclesItsCheckpointBeforeUnrelatedHotState();
+    testInterruptedCommandKeepsTheLanesCheckpoint();
+    testRefusedStateTakesTheCheckpointAfterItsCommand();
     testJunctionRetiresEarlierProgressPoint();
     testSecondConversationResumesFromTheLastCheckpoint();
     testShortSharedPrefixFindsAndKeepsNoCheckpoint();
@@ -10137,6 +10419,7 @@ int main() {
     testStateAlreadyOnDiskIsDeduplicated();
     testCancelledPrefillRecoversFromItsDiskCheckpoint();
     testFailedFinalStateKeepsTheDiskCheckpoint();
+    testDiskCheckpointStaysUntilItsSuccessorIsPublished();
     testNoCheckpointWithinAChunkOfTheReplayBoundary();
     testSkippedCheckpointKeepsPreviousRecoveryPoint();
     testLongSuffixSkipsDraftRestore();

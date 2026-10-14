@@ -144,6 +144,7 @@ public:
   std::shared_ptr<StateReservation> reserveState(uint64_t, uint32_t) override {
     return {};
   }
+  std::shared_ptr<const CompositeState> snapshot(uint64_t) override { return {}; }
   uint64_t reclaimIdleState(bool, model::IdleMemory) noexcept override { return 0; }
   std::optional<std::string> provideMask(uint64_t,
                                          std::span<const uint32_t>) override {

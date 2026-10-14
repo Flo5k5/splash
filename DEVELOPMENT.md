@@ -2166,17 +2166,27 @@ when no lane's growth fits, the lane that yields first, such as one just started
 beside a decoding lane, pays for the memory with its own suspension; while other
 lanes fit, it waits for them, resident. A prefill command captures the state of
 each boundary it reaches, in buffers reserved before it runs. A junction or a
-checkpoint retires its lane's checkpoint once published and takes that
-checkpoint's buffers first; a checkpoint the same command would capture before
-it is not captured at all. The prompt's replay point keeps the lane's
-checkpoint cached and takes its buffers only when refused memory. Refused, the
-replay point, which is in use, takes cached KV and states in the same order,
-then the oldest state in use; of the KV it takes only leaves whose page frees
-at once, and only while an extent can be emptied, which is released at once;
-it drops a state whose write must wait for the write in flight. A junction
-makes room the same way short of what is in use, and an optional checkpoint
-takes only checkpoints; neither drops a state whose write must wait. A state
-still refused ends its command at its boundary; with the SSD cache it is then
+checkpoint retires its lane's checkpoint once published, and a checkpoint the
+same command would capture before it is not captured at all; the prompt's
+replay point keeps the lane's checkpoint cached. Until a state retires it, that
+checkpoint is the lane's recovery point, which a command that is cancelled,
+expires or fails leaves to a retry, so no state takes its buffers, or room a
+reclaim could make of it, before its command. Refused the pool and an admission
+while its lane holds a checkpoint no reader pins, a state ends its command at
+its boundary and is taken from the lane once the command has completed: a
+junction or a checkpoint in that checkpoint's buffers, which it takes first,
+the replay point in them only when refused again. A checkpoint only on disk
+gives no buffers, and stays until the state is published. A checkpoint whose
+predecessor a reader pins ends its command too, and is published only once the
+pin has gone. Refused, the replay point, which is in use, takes cached KV and
+states in the same order, then the oldest state in use; of the KV it takes only
+leaves whose page frees at once, and only while an extent can be emptied, which
+is released at once; it drops a state whose write must wait for the write in
+flight. A junction makes room the same way short of what is in use, and an
+optional checkpoint takes only checkpoints; neither drops a state whose write
+must wait. A state whose lane holds no such checkpoint makes that room before
+its command, and still refused ends its command at its boundary. With the SSD
+cache, a state its command could not capture and memory still refuses is
 written from the lane unless another write is in flight. A disk copy in use may
 displace the oldest copy in use, and ordinary or optional work never displaces anything in use. Nothing
 in use is pinned, so running work that needs the memory still takes it once
@@ -2205,9 +2215,11 @@ batch's command.
 
 Long prefill uses disposable rolling checkpoints every 4096 tokens; none is
 planned within one prefill chunk (2048 tokens) of where the request resumes or
-of its replay boundary. Each retires when the next one or a junction takes its
-buffers, before the command that captures that state runs, so a command that is
-cancelled or fails loses it; one only on the SSD retires when that state lands.
+of its replay boundary. Each retires only once the next one or a junction is
+published, which takes its buffers, when memory refuses others, only after its
+command has completed: a request whose command is cancelled, expires or fails
+keeps it, and a retry resumes there. One only on the SSD retires when that
+state lands.
 The last stays cached once the replay point is published: a later request that
 shares the prompt up to it, such as another conversation with the same long
 system prompt, resumes there instead of from the start. It stays only if the
