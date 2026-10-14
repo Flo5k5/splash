@@ -970,9 +970,13 @@ uint64_t requireCapturedWindow(const std::vector<uint8_t> &captured, const std::
 // the lane's. A restore from a captured state, whose first command computes the
 // rings again from the window and captures a state of its own, continues within
 // the partition tolerance of a restore from commands that ended where the
-// states were captured. Commands compare only where their FFNs ran alike: on
-// the GPU alone, or each split with the Neural Engine, which an armed fault
-// (--ane-ffn-fault) can stop inside the command that captures the states.
+// states were captured. Commands compare only where the partition left their
+// arithmetic alike, the ended commands' KV of the rows both computed equal to
+// the capturing command's bit for bit: a Neural Engine split that ran in one
+// and not the other (an armed fault, --ane-ffn-fault, can stop it inside the
+// command that captures the states), or a kernel a command's row count picks,
+// such as a GGUF float projection's tile, leaves them only as close as any
+// two partitions.
 void requireStatesCapturedInsideCommands(model::Runtime &executor, const metal::MetalBackend &backend,
                                      const kv::PageStorage &pages, const model::QwenStateStorage &states,
                                      const ops::AneFfn *aneFfn, std::span<const uint32_t> chat) {
@@ -1084,7 +1088,13 @@ void requireStatesCapturedInsideCommands(model::Runtime &executor, const metal::
   const bool teacherSplit = prefill(404, split, tokens.subspan(split, firstCaptured - split), teacherPages).second;
   const bool laterSplit =
       prefill(404, firstCaptured, tokens.subspan(firstCaptured, secondCaptured - firstCaptured), teacherPages).second;
-  const bool alike = teacherSplit == capturingSplit && laterSplit == capturingSplit;
+  bool alike = true;
+  for (uint32_t page = 0; page < 50 && alike; ++page) {
+    const auto left = pages.spans(15 + page), right = pages.spans(66 + page);
+    for (size_t tensor = 0; tensor < left.size() && alike; ++tensor)
+      alike = left[tensor].size() == right[tensor].size() &&
+              std::memcmp(left[tensor].data(), right[tensor].data(), left[tensor].size()) == 0;
+  }
   std::shared_ptr<const CompositeState> ended = executor.snapshot(404);
   require(ended != nullptr, "the snapshot of commands that ended at the captured boundaries failed");
   executor.end(404);
@@ -1114,7 +1124,7 @@ void requireStatesCapturedInsideCommands(model::Runtime &executor, const metal::
   std::cout << "captured_state_partition captured_conv_cos=" << capturedConvolution << " captured_recurrent_cos=" << capturedRecurrent
             << " continued_conv_cos=" << convolution << " continued_recurrent_cos=" << recurrent
             << " logits_cos=" << logits.result().cosine << " split=" << capturingSplit << '/' << plainSplit << '/'
-            << teacherSplit << '/' << laterSplit << " ffns_alike=" << alike << '\n';
+            << teacherSplit << '/' << laterSplit << " kv_alike=" << alike << '\n';
   const double bound = bfloatState ? 0.99 : 0.999;
   require(!alike || (capturedConvolution > bound && capturedRecurrent > bound && convolution > bound &&
                      recurrent > bound && logits.result().cosine > bound),
