@@ -992,7 +992,7 @@ def run_protocol_extensions(port: int, model: str, vision: bool = True) -> None:
             "model": model,
             "messages": messages,
             "max_tokens": 256,
-            "thinking": {"type": "enabled", "display": "omitted"},
+            "thinking": {"type": "adaptive", "display": "omitted"},
             "output_config": {"effort": "low"},
         },
     )
@@ -1097,6 +1097,7 @@ def run_protocol_extensions(port: int, model: str, vision: bool = True) -> None:
                     "type": "function",
                     "function": {
                         "name": "lookup",
+                        "strict": True,
                         "parameters": {
                             "type": "object",
                             "properties": {},
@@ -1119,7 +1120,7 @@ def run_protocol_extensions(port: int, model: str, vision: bool = True) -> None:
     )
     require(
         json.loads(calls[0]["function"]["arguments"]) == {},
-        "combined tools/schema changed tool arguments",
+        f"combined tools/schema changed strict tool arguments: {calls!r}",
     )
 
     code, high = request(
