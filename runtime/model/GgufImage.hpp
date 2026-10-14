@@ -101,7 +101,7 @@ struct Fill {
 // (a safetensors MoE router and shared-expert gate, GDN alpha and beta of two
 // types or of BF16 or F16), or as the F32 1 + w of a BF16 RMSNorm
 // weight w, which transformers stores 1 below the weight the norm multiplies
-// by (exact but for |w| < 2^-16, which it rounds once).
+// by (exact but where |w| < 2^-16 or |w| >= 2^24, which it may round once).
 enum class Conversion : uint8_t { None, NarrowToBfloat16, WidenToFloat32, Decay, DequantizeToFloat32, CenteredNorm };
 // Rows written back to back, each value converted as `conversion` says.
 struct Copy {
