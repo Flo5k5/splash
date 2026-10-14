@@ -81,8 +81,11 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
   QwenTargetGeometry() = default;
   explicit QwenTargetGeometry(const QwenTargetDimensions &dimensions) : QwenTargetDimensions(dimensions) {}
 
-  // The format of most of the sparse MoE blocks' routed expert weights.
+  // The format of most of the sparse MoE blocks' routed expert weights, and
+  // whether every routed and shared expert weight is in a format the register
+  // tile takes (ops::MoeShape).
   uint32_t moeExpertFormat = GGUF_FMT_COUNT;
+  bool moeRegisterFormats = true;
   std::array<uint32_t, maximumCaptureLayers> captureLayerValues{};
   uint32_t captureLayerCount = 0;
   // The target's KV layout in the format the runtime stores KV in, and its
@@ -101,7 +104,7 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
     return hiddenSize * captureLayerCount;
   }
   [[nodiscard]] constexpr ops::MoeShape moeShape() const noexcept {
-    return {hiddenSize, experts, expertsPerToken, expertIntermediateSize, moeExpertFormat};
+    return {hiddenSize, experts, expertsPerToken, expertIntermediateSize, moeExpertFormat, moeRegisterFormats};
   }
   [[nodiscard]] constexpr std::span<const uint32_t>
   captureLayers() const noexcept {
