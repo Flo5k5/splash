@@ -311,8 +311,9 @@ when the engine exits.
 
 `--persistent-cache` keeps the SSD cache across restarts of the same model, so a
 restart, an upgrade or a crash keeps conversations' prefixes. It follows
-`--max-cache-disk`, which sizes it as it does the SSD cache; `0` turns both
-off.
+`--max-cache-disk`, which sizes it as it does the SSD cache; it needs the SSD
+cache, so a start with `--persistent-cache` and `--max-cache-disk 0` is
+refused.
 
 Files live in `~/Library/Caches/Splash/prefix-cache/<namespace>/` (mode 0700;
 `--cache-dir` sets the root, which the engine keeps out of Time Machine when it
@@ -328,9 +329,11 @@ caches are removed, the least recently used first, before this one gives up a
 copy of its own. A cache nobody holds when a running server removes it may be
 the one another server is starting to open; that start then begins cold.
 Every start, with `--persistent-cache` or without it, removes the namespaces
-under its root (`--cache-dir`, else the default) that nobody used for 14 days,
-so a cache left behind when it is turned off goes too. Only a directory named
-as a namespace is, 32 hex digits, counts as a cache: nothing else under the
+under its root (`--cache-dir`, which needs `--persistent-cache`, else the
+default) that nobody used for 14 days, so a cache left behind in the default
+root when the persistent cache is turned off goes too; one under another
+`--cache-dir` goes at the next start that names that root. Only a directory
+named as a namespace, 32 hex digits, counts as a cache: nothing else under the
 root is touched.
 
 Each conversation's newest restore point at least 2048 tokens deep is written
@@ -504,9 +507,13 @@ splash serve --model mlx-community/Qwen3.8-27B-4bit --thinking-token-budget 1200
 A budget applies only where generation starts in a thinking block, and one the
 output limit reaches first changes nothing; the output limit can also cut the
 end short. Where the output may call a tool, a call's opening ends thinking
-too, so the end never lands inside a call. Only the end is forced, and a close
-the model selects itself before the budget ends the count. Text completions
-have no reasoning split and refuse a budget with 400.
+too, so the end never lands inside a call. The engine takes any `<tool_call>`
+token for that opening, while the reply's reasoning ends only where
+`<tool_call>` is followed by `\n<function=`: a stray `<tool_call>` in the
+thinking ends the budget's count while the reasoning goes on, and the
+request's `reasoning_tokens` can then exceed the budget. Only the end is
+forced, and a close the model selects itself before the budget ends the count.
+Text completions have no reasoning split and refuse a budget with 400.
 
 ## Agent launchers
 
@@ -860,9 +867,11 @@ contain multiple speculative tokens). Thus rates use tokens processed in the
 measured interval, not the full counts. An unavailable rate is zero, including
 responses completed in one emission. A request that drafted adds
 llama-server's `draft_n` and `draft_n_accepted`: the tokens its draft proposed
-and those verification accepted, including any a stop or the output limit then
-cut; the end tokens a [thinking token budget](#thinking-token-budget) puts in
-place of the draft's proposals are neither. They count that request alone, so
+and those verification accepted, but for accepted proposals past the output
+limit or from one of the model's stop tokens on; those a `stop` string then
+cuts still count. The end tokens a [thinking token
+budget](#thinking-token-budget) puts in place of the draft's proposals are
+neither. They count that request alone, so
 they hold under concurrency. `metrics.speculation` carries them with the
 request's speculative `cycles`, the decode cycles in which its draft proposed
 tokens, and the Done line shows what the draft yields per cycle,
@@ -1121,7 +1130,7 @@ Proxy consumers can use these fields; additional fields may be added:
 | Field | Meaning |
 | --- | --- |
 | `requests.submitted`, `completed`, `cancelled`, `failed` | Native request counters since engine start |
-| `active_requests` | Each request the engine holds, in arrival order: its `id`, `phase` (`queued`, `waiting_resources`, `waiting_prefix`, `prefill`, `decode` or `waiting_mask`), `priority`, `prompt_tokens` and how many of them are encoded (`prompt_processed`, cached ones included), `generated_tokens` of `max_new_tokens`, and `age_ms` since it arrived |
+| `active_requests` | Each request the engine holds, ordered by `id`: its `id`, `phase` (`queued`, `waiting_resources`, `waiting_prefix`, `prefill`, `decode` or `waiting_mask`, and `failed` for one whose deadline passed while a cached state it restores was being read from disk, until that read drains), `priority`, `prompt_tokens` and how many of them are encoded (`prompt_processed`, cached ones included), `generated_tokens` of `max_new_tokens`, and `age_ms` since it arrived |
 | `memory_actual.current_bytes`, `peak_bytes` | Metal allocations, not process RSS |
 | `weights.idle_release_seconds`, `released`, `restoring`, `restores`, `restore_failures` | `--idle-release` in seconds (`null` for `off`), whether the weights' memory is released now, whether a request's restore of it is under way (it stays `released` until the last image is back), the times it was restored for a request since engine start, and the restores that gave up for want of memory |
 | `ane_ffn.state`, `share`, `minimum_rows`, `reason` | The prefill FFN's [Neural Engine split](#neural-engine-prefill): `split` while it serves, at `share` of the FFN's channels over chunks of `minimum_rows` rows or more; `off` when the start left the GPU alone (`share` and `minimum_rows` 0); `stopped` once it stopped while serving, until the engine restarts. `reason` is the start's outcome, or why the split stopped |
@@ -1673,13 +1682,22 @@ without requantization, quantizes the draft's BF16 projections
 `float(-exp(double(A_log)))`, which may differ by one float ULP from MLX's float
 exponential.
 
-Loading never rounds a target or vision weight but in the F32 values of an MLX
-target's quantized router, shared-expert gate or GDN alpha and beta ([MLX
-targets](#mlx-targets)) and of a GGUF's quantized alpha or beta beside one of
-another type, which the GPU decodes as GGML does, and rounds the draft's
-projections only as MLX's affine quantization does ([Drafts](#drafts)). A tensor it converts to
-BF16 (vision tensors stored as F32 or F16, a GGUF's convolution taps and
-time-step bias) must be exactly representable in BF16; otherwise loading fails,
+Loading never rounds a target or vision weight but in the F32 values of
+quantized tensors the kernels read unquantized, and in two conversions: the
+GDN decay above and the RMSNorm weights below. The first are a safetensors
+target's quantized router and shared-expert gate, and its quantized GDN alpha
+or beta beside one of another format or an unquantized one, an MLX target's
+([MLX targets](#mlx-targets)) or a Model Optimizer or compressed-tensors
+target's in NVFP4 or FP8, and a GGUF's quantized alpha or beta beside one of
+another type, which the GPU decodes as GGML does. In the second conversion, a
+Model Optimizer or compressed-tensors target's RMSNorm weight `w`, stored 1
+below the weight the norm multiplies by, loads as
+the F32 `1 + w` ([Model Optimizer targets](#model-optimizer-targets)), which
+can round where `|w| < 2^-16` or `|w| >= 2^24`. Loading rounds the draft's
+projections only as MLX's affine quantization does ([Drafts](#drafts)). A
+tensor it converts to BF16 (vision tensors stored as F32 or F16, a GGUF's
+convolution taps and time-step bias) must be exactly representable in BF16;
+otherwise loading fails,
 naming the tensor and, for a vision tensor, its file. The hashes of the images
 written from the test fixtures, in
 `dev/tests/fixtures/weight-goldens/goldens.json`, fail the tests on any change

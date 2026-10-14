@@ -709,6 +709,15 @@ void testSyntheticBlockModel(MetalBackend &backend, const std::filesystem::path 
     unquantized("language_model.lm_head");
     rejects([&] { static_cast<void>(loadModel(backend, root, descriptor)); }, "language_model.lm_head is unquantized",
             "an unquantized language_model.lm_head was accepted");
+    // A module the checkpoint lacks altogether is missing, not unquantized.
+    std::vector<splash::test::SyntheticTensor> lacking;
+    for (splash::test::SyntheticTensor &tensor : splash::test::mlxTargetTensors(target, bitsAndGroup))
+        if (!tensor.name.starts_with("language_model.lm_head."))
+            lacking.push_back(std::move(tensor));
+    splash::test::writeSyntheticShard(root / "target" / "model.safetensors", lacking);
+    rejects([&] { static_cast<void>(loadModel(backend, root, descriptor)); },
+            "missing source tensor: language_model.lm_head.weight",
+            "a checkpoint without language_model.lm_head was accepted");
     unquantized("language_model.model.embed_tokens");
     require(std::get<Qwen3_8Weights>(loadModel(backend, root, descriptor).target).tokenEmbedding.blocks().formatId ==
                 GGUF_FMT_BF16,

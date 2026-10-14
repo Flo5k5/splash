@@ -683,9 +683,11 @@ class NativeBackend:
 
     def _thinking_budget(self, job):
         """The engine's cutoff of the thinking a job generates in, which it
-        ends with the server's thinking end: thinking ends where
-        count_reasoning_tokens ends it, at its close or, where a call may
-        follow, at a call's opening token."""
+        ends with the server's thinking end. The engine's thinking ends at its
+        close or, where a call may follow, at any call-open token, while
+        count_reasoning_tokens ends the reasoning at a call-open token only
+        where it begins CALL_OPEN: a stray call-open token in the thinking ends
+        the engine's count, and the reasoning can then run past the budget."""
         if job.thinking_token_budget is None:
             return None
         return wire.ThinkingBudget(
