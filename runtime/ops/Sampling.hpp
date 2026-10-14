@@ -32,16 +32,22 @@ struct SamplingPenalties final {
 // closes thinking, or `alsoEnds`, either of which ended thinking first. A row
 // past the selection's rows cuts nothing in it. At row 0 no draft token comes
 // before the cut, so the end replaces the draft's proposals there too
-// (Sampling::addThinkingDrafts).
+// (Sampling::addThinkingDrafts). An end that waits for the mask of a
+// constrained lane starts instead at the first of those rows whose mask
+// admits its first token, the rows before it keeping their own selections;
+// as that is known only at the verify, it replaces no proposals.
 struct ThinkingCutoff final {
   uint32_t row = 0;
   std::span<const uint32_t> end{};
   uint32_t alsoEnds = 0;
+  bool waitsForMask = false;
 
   // How many of the draft's proposals, from the first, the end replaces:
   // tokens the draft did not propose.
   [[nodiscard]] uint32_t replacedProposals() const noexcept {
-    return row ? 0 : static_cast<uint32_t>(std::min<size_t>(end.size(), SPLASH_DRAFT_PROPOSAL_TOKENS));
+    return row || waitsForMask
+               ? 0
+               : static_cast<uint32_t>(std::min<size_t>(end.size(), SPLASH_DRAFT_PROPOSAL_TOKENS));
   }
 };
 
@@ -184,9 +190,10 @@ public:
       std::span<const SamplingPolicy> policies, uint32_t stopToken0,
       uint32_t stopToken1) const;
   // After the draft's selection and before the verify reads its proposals,
-  // the proposals of each lane whose thinking cutoff is at row 0 take the end
-  // tokens its verify rows will select, so acceptance keeps them all. A batch
-  // without such a lane dispatches nothing.
+  // the proposals of each lane whose thinking cutoff is at row 0, and whose
+  // end does not wait for its mask, take the end tokens its verify rows will
+  // select, so acceptance keeps them all. A batch without such a lane
+  // dispatches nothing.
   void addThinkingDrafts(metal::CommandGraph &graph,
                          std::span<const SamplingPolicy> policies,
                          metal::MetalBuffer proposedTokens) const;
