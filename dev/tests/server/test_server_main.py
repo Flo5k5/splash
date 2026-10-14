@@ -79,16 +79,18 @@ class ServerMainTests(unittest.TestCase):
         runtime.kill.assert_not_called()
         closing[signal.SIGINT](signal.SIGINT, None)
         runtime.kill.assert_called_once_with()
+        command = ["splash", "serve-native", "model", "auto", "auto"]
         runtime_type.assert_called_once_with(
-            [
-                "splash",
-                "serve-native",
-                "model",
-                "auto",
-                "auto",
-            ],
+            command,
+            relaunch_command=mock.ANY,
             startup_timeout=api.NATIVE_START_TIMEOUT,
             pending_limit=1,
+        )
+        # Every relaunch keeps the context the first engine served.
+        relaunch_command = runtime_type.call_args.kwargs["relaunch_command"]
+        self.assertEqual(
+            relaunch_command(native_wire.ReadyEvent(4, 61433, False)),
+            [*command, "--relaunch-context", "61433"],
         )
         backend_type.assert_called_once_with(
             runtime,

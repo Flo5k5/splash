@@ -156,7 +156,8 @@ void printUsage(std::string_view executable) {
       " [--kv-format int8|bf16] [--state-format fp32|bf16] [--decode-share SHARE]"
       " [--max-image-patches PATCHES] [--persistent-cache on|off] [--cache-dir DIRECTORY]"
       " [--max-cache-disk-writes BYTES]"
-      " [--idle-release SECONDS|off] [--idle-sleep prevent|allow] [--ane on|off]");
+      " [--idle-release SECONDS|off] [--idle-sleep prevent|allow] [--ane on|off]"
+      " [--relaunch-context TOKENS]");
   writeStderrLine("       " + command + " model-check mlx-affine none|safetensors CONFIG [DRAFT_CONFIG]");
   writeStderrLine("       " + command + " model-check gguf none|gguf CONFIG GGUF_METADATA [DRAFT_CONFIG]");
   writeStderrLine("       " + command + " device-check");
@@ -208,6 +209,7 @@ bootstrapConfig(const engine::NativeArguments &arguments) {
   config.resources.maximumImagePatches = arguments.maxImagePatches;
   config.resources.idleReleaseSeconds = arguments.idleReleaseSeconds;
   config.resources.aneFfn.enabled = arguments.neuralEngine;
+  config.resources.relaunchContext = arguments.relaunchContext;
   config.nativeLoop.engine.maxContext = arguments.maxContext;
   config.nativeLoop.engine.decodeShare = arguments.decodeShare;
   return config;

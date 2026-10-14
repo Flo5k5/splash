@@ -267,9 +267,20 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
     fail(std::move(base), RuntimeBootstrapStage::ModelCreation,
          "memory plan cannot hold one model token");
   }
-  if (!config.nativeLoop.engine.maxContext) {
+  const uint32_t relaunchContext = config.resources.relaunchContext;
+  if (!config.nativeLoop.engine.maxContext && relaunchContext) {
+    // A relaunch serves the context of the server's first engine, which its
+    // split left. A plan that holds less, as once this Mac's memory budget
+    // shrank, has the relaunch serve that, and the server, which serves the
+    // first engine's context, stops relaunching (server/runtime.py).
+    if (relaunchContext > planContext)
+      logLine("The memory plan holds ", planContext, " tokens of context, less than the ",
+              relaunchContext, " the server's first engine served.");
+    config.nativeLoop.engine.maxContext = std::min(relaunchContext, planContext);
+  } else if (!config.nativeLoop.engine.maxContext) {
     // The automatic context, which the plan holds and every start of the
-    // model on this Mac serves alike (AneFfnOutcome::context).
+    // model on this Mac that takes its calibration serves alike
+    // (AneFfnOutcome::context).
     config.nativeLoop.engine.maxContext = resources->aneFfnOutcome().context;
   } else if (config.nativeLoop.engine.maxContext > planContext) {
     // --max-memory sets the budget only below this Mac's own.

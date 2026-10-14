@@ -152,10 +152,19 @@ void testServerCommandLines(const char *path) {
        [](NativeArguments &read) { read.maxImagePatches = 16384; }},
       {"idle_sleep", [](NativeArguments &read) { read.preventIdleSleep = false; }},
       {"disable_ane", [](NativeArguments &read) { read.neuralEngine = false; }},
+      // A relaunch keeps the first engine's context; with --max-context,
+      // which every start holds, its command is the first one's.
+      {"relaunch", [](NativeArguments &read) { read.relaunchContext = 61433; }},
+      {"relaunch_limits",
+       [](NativeArguments &read) {
+         read.maxContext = 102400;
+         read.maxMemoryBytes = 32 * kGiB;
+       }},
   };
   // Every field but the model inspected from the directory.
   const auto same = [](const NativeArguments &read, const NativeArguments &meant) {
     return read.modelRoot == meant.modelRoot && read.maxContext == meant.maxContext &&
+           read.relaunchContext == meant.relaunchContext &&
            read.maxMemoryBytes == meant.maxMemoryBytes &&
            read.maxCacheDisk.automatic == meant.maxCacheDisk.automatic &&
            read.maxCacheDisk.bytes == meant.maxCacheDisk.bytes &&
@@ -250,6 +259,19 @@ void testRefusals() {
             "MAX_CONTEXT must be auto or an integer in [1, " + maximum + "]");
   require(parse(model, {maximum, "auto"}).maxContext == std::stoul(maximum),
           "the model's whole context was refused");
+  // A relaunch's context is one the model holds, and only without
+  // MAX_CONTEXT, which every start holds.
+  for (const std::string &context : {std::string("0"), std::string("auto"), std::string("100K"),
+                                     std::to_string(std::stoull(maximum) + 1), std::string()})
+    refuses({"auto", "auto", "--relaunch-context", context},
+            "--relaunch-context requires an integer in [1, " + maximum + "]");
+  refuses({"auto", "auto", "--relaunch-context"},
+          "--relaunch-context requires an integer in [1, " + maximum + "]");
+  refuses({"102400", "auto", "--relaunch-context", "102400"},
+          "--relaunch-context requires MAX_CONTEXT auto");
+  require(parse(model, {"auto", "auto", "--relaunch-context", maximum}).relaunchContext ==
+              std::stoul(maximum),
+          "the model's whole context was refused a relaunch");
 
   const auto commandRefused = [](const std::vector<std::string> &command,
                                  std::string_view expected) {

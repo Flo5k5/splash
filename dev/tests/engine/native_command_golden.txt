@@ -1,5 +1,7 @@
 # serve-native command lines both sides must agree on, as
 # "<name> | <splash serve options> | <arguments after MODEL_DIRECTORY>" lines.
+# A line whose name starts with relaunch is a relaunch's, after a first engine
+# that served 61433 tokens of context.
 #
 # server/server.py's _native_command writes the arguments for the options
 # (dev/tests/server/test_serve_options.py checks it), and
@@ -26,3 +28,5 @@ image_patches_rounded | --max-image-pixels 1000000 | auto auto --max-image-patch
 image_patches_default | --max-image-pixels 4194304 | auto auto
 idle_sleep | --allow-idle-sleep | auto auto --idle-sleep allow
 disable_ane | --disable-ane | auto auto --ane off
+relaunch |  | auto auto --relaunch-context 61433
+relaunch_limits | --max-context 100K --max-memory 32G | 102400 34359738368

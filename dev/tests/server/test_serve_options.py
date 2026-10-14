@@ -390,11 +390,15 @@ class ServeOptionsTests(unittest.TestCase):
         # the server means it (native_arguments_test.cpp). The engine keeps
         # its own default of an option the server does not pass, and the
         # per-image patch limit is the most patches a resized image within
-        # the pixel cap can have, a whole number of merge units.
+        # the pixel cap can have, a whole number of merge units. A relaunch's
+        # line follows a first engine that served 61433 tokens.
         for name, options, arguments in native_command_lines():
             with self.subTest(name=name):
                 self.assertEqual(
-                    api._native_command(api.parse_args([*required, *options])),
+                    api._native_command(
+                        api.parse_args([*required, *options]),
+                        61433 if name.startswith("relaunch") else None,
+                    ),
                     [args.binary, "serve-native", args.model_root, *arguments],
                 )
 

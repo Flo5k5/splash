@@ -133,6 +133,14 @@ struct RuntimeResourcesConfig {
   // --disable-ane, and a benchmark round runs the split of the first so that
   // rounds repeat one another.
   AneFfnSetting aneFfn;
+  // A relaunch's context (--relaunch-context): the context the server's
+  // first engine served without --max-context, which the server passes to
+  // every relaunch. The relaunch decides the rest as an automatic start, as
+  // that engine did, the SSD cache's staging among it, but its split takes at
+  // most the units whose plan holds this context, the GPU alone where none
+  // does (startAneFfn), and it serves this context where its plan holds it
+  // (RuntimeBootstrap::start). Zero for none.
+  uint32_t relaunchContext = 0;
   // The process's existing pressure observer runs before resource assembly;
   // it only publishes a level. Bootstrap checks it at Metal operation
   // boundaries; after Ready the transport control handler keeps it current.
@@ -198,7 +206,8 @@ class RuntimeResources final {
 public:
   // `requestedContextTokens` is the context the engine is asked to hold
   // (--max-context), zero for the automatic context (AneFfnOutcome::context),
-  // which the Neural Engine split must leave. A persistent tier takes back
+  // which the Neural Engine split must leave, as it must a relaunch's
+  // (RuntimeResourcesConfig::relaunchContext). A persistent tier takes back
   // what the last process left before create() returns.
   [[nodiscard]] static std::unique_ptr<RuntimeResources>
   create(const RuntimeResourcesConfig &config, uint32_t requestedContextTokens);

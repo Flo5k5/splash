@@ -1643,7 +1643,10 @@ def parse_args(argv=None):
     return args
 
 
-def _native_command(args):
+def _native_command(args, relaunch_context=None):
+    """The engine's command line, a relaunch's with `relaunch_context`, the
+    context the first engine served: without --max-context the relaunch keeps
+    it, where its own would follow a Neural Engine split calibrated anew."""
     command = [
         args.binary,
         "serve-native",
@@ -1677,6 +1680,8 @@ def _native_command(args):
         )
     if args.allow_idle_sleep:
         command.extend(("--idle-sleep", "allow"))
+    if relaunch_context is not None and args.max_context is None:
+        command.extend(("--relaunch-context", str(relaunch_context)))
     return command
 
 
@@ -1742,6 +1747,9 @@ def main():
         print_status(f"Chat template · {chat_templates.describe()}")
         runtime = engine_runtime.MultiplexedRuntime(
             _native_command(args),
+            relaunch_command=lambda first: _native_command(
+                args, first.max_context_tokens
+            ),
             startup_timeout=NATIVE_START_TIMEOUT,
             pending_limit=args.queue_size,
         )

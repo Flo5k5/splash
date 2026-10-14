@@ -2355,8 +2355,8 @@ int main(int argc, char **argv) {
     }
     const engine::AneFfnModel aneFfnModel =
         engine::aneFfnModel(backend, model, operators, format, "model-runtime-oracle " SPLASH_BUILD_ID, {});
-    engine::AneFfnStart aneFfnStart =
-        engine::startAneFfn(aneFfnModel, aneFfnSetting, pageCount * kv::kPageTokens, planMemory, {});
+    engine::AneFfnStart aneFfnStart = engine::startAneFfn(
+        aneFfnModel, aneFfnSetting, {.tokens = pageCount * kv::kPageTokens}, planMemory, {});
     std::cout << "ane_ffn_outcome=" << engine::aneFfnOutcomeName(aneFfnStart.outcome.kind) << ' '
               << aneFfnStart.outcome.reason << '\n';
     require(aneFfnStart.outcome.kind != engine::AneFfnOutcome::Kind::Unavailable,

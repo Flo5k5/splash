@@ -48,7 +48,12 @@ until the server is restarted; its message names the crash trace when
 503 `engine_recovering`, whose message names the last failure. An engine whose
 loop leaves a status request unanswered for 30 seconds, while requests are
 pending or during a background status refresh, is failed and restarted by the
-same rules.
+same rules. A restarted engine serves what the first one announced: the same
+options give it the same concurrency and image input, and without
+`--max-context` the server passes it the first engine's context to keep
+([Neural Engine prefill](#neural-engine-prefill)). One that announces other
+limits, as once the Mac's memory budget shrank below that context, stops the
+restarts at once.
 
 Timeouts and keep-alives count only time the Mac is awake: a request in flight
 when the Mac sleeps continues when it wakes. While requests run, Splash keeps
@@ -1939,8 +1944,19 @@ may run is what the plan holds with the split this Mac's calibration of the
 model takes (below), the GPU alone's if it found no gain, whatever the start
 then makes of it: a split that failed leaves the GPU alone at the same context,
 and the memory the split would hold stays with the KV cache. Every start of a
-model on a Mac, the server's relaunch of the engine after a failure among them,
-so serves the same context.
+model on a Mac that takes one calibration so serves the same context; one
+calibrated anew may serve another, after the split lost to the GPU alone, which
+forgets the calibration (below), after a start whose calibration failed and
+left none, or once macOS cleared the directory that keeps it. The server's
+relaunch of the engine after a failure keeps the first engine's context
+whatever it calibrates: the server passes that context
+(`serve-native --relaunch-context`), the relaunch decides the rest as the first
+engine did, the SSD cache's staging among it, and its split takes at most the
+channels whose plan holds the context, calibrated within them and remembered
+for them, or leaves the GPU alone with a line, not the warning a refused
+`--max-context` gets. A relaunch whose plan holds less, as once the Mac's
+memory budget shrank, serves that, and the server stops relaunching
+([engine restarts](#engine-restarts-and-sleep)).
 Until a calibration is remembered, a start that fails assumes the largest split
 the model could take (all its channel units but one, or the most whose plan
 holds any context). The log line names it beside the context without the split
@@ -2054,8 +2070,10 @@ on Qwen3.8-27B); `splash serve --disable-ane` keeps the FFN on the GPU, and
 `ane-ffn-calibration`, the fit, the choice, the least chunk, a calibration's
 line of text and the breaker on timings it is given, also under the sanitizers,
 and `ane-ffn-startup`, each outcome of a start on a model it plays, a
-remembered calibration among them, and the automatic context, the same in each
-where the split may run. `make test-engine-metal` runs `ane-ffn`: its kernels
+remembered calibration among them, the automatic context, the same in each
+where the split may run, and a relaunch's, which holds the first engine's
+context where a calibration made anew would serve another.
+`make test-engine-metal` runs `ane-ffn`: its kernels
 against CPU references for every image format under shader
 validation, then, without it, the split's memory and its output against the GPU
 alone, the same output once its program is unloaded and loaded again, a chunk's
@@ -2286,16 +2304,16 @@ does the automatic quota where the plan has no room for the staging beside the
 model and the requested context, so a start the staging would fail goes on
 without the tier, and where the plan refuses the Neural Engine split beside the
 staging but not without it (`aneFfnRefused`): the split wins. The disk plays no
-part in the plan, so every start of a model on a Mac serves the same context,
-the server's relaunch of the engine among them (`server/runtime.py` stops
-relaunching an engine whose context changed). The tier's files open after the
-plan, where the disk takes them; where none open, the tier turns off and the
-staging the plan set aside stays unused. The automatic quota opens them only
-on a volume with room for the tier (`automaticDiskRefusal`, reading volumes
-through `RuntimeResourcesConfig::diskVolume`): the temporary files', where it
-goes without a persistent cache or whenever the root cannot be used, and a
-persistent tier's root, with the root's caches nobody holds counted as the
-tier's, since the tier may take their place. A root that refuses, or whose
+part in the plan, so it changes no start's context; the server's relaunch of
+the engine decides the staging as its first engine did and keeps that engine's
+context ([Neural Engine prefill](#neural-engine-prefill)). The tier's files
+open after the plan, where the disk takes them; where none open, the tier turns
+off and the staging the plan set aside stays unused. The automatic quota opens
+them only on a volume with room for the tier (`automaticDiskRefusal`, reading
+volumes through `RuntimeResourcesConfig::diskVolume`): the temporary files',
+where it goes without a persistent cache or whenever the root cannot be used,
+and a persistent tier's root, with the root's caches nobody holds counted as
+the tier's, since the tier may take their place. A root that refuses, or whose
 open fails, leaves the tier temporary files if their volume takes it.
 
 The volume sizes the tier only once its files are open, before a persistent
