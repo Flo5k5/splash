@@ -1046,7 +1046,8 @@ curl http://127.0.0.1:8000/v1/judgments \
 ```
 
 `POST /v1/judgments` preserves SemIf's `direct-options-v1` JSON serialization,
-system prompt and A–P option order. It returns the exact rendered prompt's SHA-256,
+system prompt and A–P option order. It returns the exact rendered prompt's SHA-256
+(each lone surrogate read as U+FFFD, as every prompt is tokenized),
 answer token IDs, raw option logits, normalized probabilities and zero completion
 tokens. Every answer label must round-trip as one token, including at the actual
 assistant prompt boundary. Besides the row it takes `model`, `timeout`,
