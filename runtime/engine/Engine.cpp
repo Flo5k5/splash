@@ -283,9 +283,9 @@ bool Engine::tick(double now) {
       }
       scheduler_.commit(*plan, excluded);
       // The command reads the cached pages its lanes' blocks were swapped
-      // for. Selecting a constrained request's first token reads none, but
-      // the cycle after it does; only a first token that stops the request
-      // counts pages nothing read.
+      // for, and those a resume restored. Selecting a constrained request's
+      // first token reads none, but the cycle after it does; only a first
+      // token that stops the request counts pages nothing read.
       for (const BatchItem &item : plan->items) {
         Request &lane = request(item.requestId);
         lane.deduplicatedKvTokens += lane.unreadDeduplicatedKvTokens;
@@ -849,7 +849,12 @@ void Engine::completeAdmission(Request &active, CacheLookup &lookup,
   active.skipCache = false;
   active.admissionProbe.reset();
   const uint32_t resumeBoundary = lookup.resumeBoundary();
-  // The restored chain is the request's from the start of this residency.
+  // The blocks a resume restores past those the request published are blocks
+  // another request computed, which its replay reads; the chain a start
+  // restores is its cached prefix instead. Either way the restored chain is
+  // the request's from the start of this residency.
+  if (resuming && resumeBoundary > active.publishedTokens)
+    active.unreadDeduplicatedKvTokens += resumeBoundary - active.publishedTokens;
   active.publishedTokens = std::max(active.publishedTokens, resumeBoundary);
   if (resuming)
     scheduler_.resumeFromResources(active.request.id, resumeBoundary, active.replayTokens);

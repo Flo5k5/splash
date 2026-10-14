@@ -88,8 +88,8 @@ class CacheInfo:
     status: str = "unknown"
     matched_tokens: int = 0
     lane: int = -1
-    # Of the tokens the request computed, those whose KV it then read from a
-    # cached block's page; known once it is done.
+    # Tokens whose KV the request read from cached blocks another request
+    # computed, past its cached prefix; known once it is done.
     deduplicated_tokens: int = 0
 
 

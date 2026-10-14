@@ -293,8 +293,9 @@ struct DoneEvent {
   // Raw final-prompt-position logits at the request's scoreTokens, in
   // requested order. Empty for generation and for cancelled/failed scoring.
   std::vector<float> optionLogits{};
-  // Of the tokens the request computed, those whose KV it then read from a
-  // cached block's page (engine::Cache::publishCommittedBlocks).
+  // Tokens whose KV the request read from cached blocks another request
+  // computed, past the cached prefix it started from
+  // (engine::EngineEventSink::completed).
   uint32_t deduplicatedTokens = 0;
   // Its speculative decoding; zero without a draft and for scoring.
   engine::SpeculativeCounts speculation{};

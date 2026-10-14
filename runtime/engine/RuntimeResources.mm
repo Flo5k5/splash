@@ -76,7 +76,8 @@ void requireStartupHeadroom(
 }
 
 // The format of a persistent cache's files and of what its copies hold. A
-// change to either, such as a fix to a kernel that writes KV or state, bumps
+// change to either, such as a fix to a kernel that writes KV or state or a
+// change to the block identities its labels record (blockIdentity), bumps
 // it, so that no start takes back copies of the old one.
 constexpr uint32_t kPersistentCacheFormat = 2;
 // How long a start waits for the cache directory another process holds: one
