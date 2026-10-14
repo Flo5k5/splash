@@ -610,7 +610,9 @@ Completions, text completions, Responses and Messages share these fields:
 - `cache_salt`: a nonempty string. A request shares cached prompts, their KV and
   states, only with requests of the same salt, and a request without one only
   with others without one, as vLLM's field does. A salt no other request uses
-  makes it compute its whole prompt itself.
+  makes it compute its whole prompt itself, except its images' encoded rows,
+  which it may take from one cache the runtime keeps for every request, keyed
+  by the image and not the salt.
 
 Chat Completions also takes `messages`, `tools`, `tool_choice` and
 `parallel_tool_calls` ([tool calls](#tool-calls)), `response_format`
@@ -783,13 +785,25 @@ requests, or with other prefixes cached, it can differ. A request that restores
 nothing can still read cached KV: once a command completes, each block it
 filled whose prefix, tokens and identity (images and cache salt) match a
 cached block is swapped for that block's page, which another command
-computed, and its later commands read it. The Done line of the request log
-counts those tokens, as does
-`metrics.cache.deduplicated_tokens` in Chat Completions and text completions
-responses (in a stream, its usage chunk), and `/status` sums them in
-`cache.deduplicated_kv_tokens`. A request with a `cache_salt` no other
-request uses reads no cached KV: alone, it computes what it would on a server
-that served nothing before.
+computed, and its later commands read it. A request suspended for memory or
+for a higher priority can also resume from a state another request cached past
+the blocks it had computed, and its replay then reads the KV of the blocks it
+restores there. The Done line of the request log counts the tokens of both, as
+does `metrics.cache.deduplicated_tokens` in Chat Completions and text
+completions responses (in a stream, its usage chunk), and `/status` sums them
+in `cache.deduplicated_kv_tokens`. One case goes uncounted: while a request is
+suspended, blocks it computed can be evicted and computed again by another
+request, and when it resumes it reads those as its own. A request with a
+`cache_salt` no other request uses reads no cached KV, though its images'
+encoded rows may come from another request's encoding of the same image, which
+gives the same rows. Alone, it computes what it would on a server that served
+nothing before, with two exceptions. The [Neural Engine
+split](#neural-engine-prefill) may have stopped: the split stays off for the
+life of the process, so such a server prefills on the GPU alone the chunks a
+fresh one splits. And where other requests' cache leaves its states no free
+memory, a state's prefill command can end at the state's boundary instead of
+capturing it inside a longer command, which changes the chunks. Either way the
+logits differ slightly.
 
 ### Output limits and streaming
 

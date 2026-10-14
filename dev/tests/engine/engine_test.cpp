@@ -6303,6 +6303,54 @@ void testReplayFindsItsOwnBlocks() {
           "a replay counted the request's own block as another's");
 }
 
+// A lane suspended in its prefill resumes from a state another request
+// cached past the blocks it published: it reads the KV of the blocks it
+// restores there, which the other request computed, and counts it though it
+// started cold.
+void testResumePastItsBlocksCountsAnotherRequestsKv() {
+  test::TestKvStorage storage(1024, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, nullptr, nullptr);
+  Executor executor;
+  executor.beginGrowthBlocked = [&] {
+    return executor.lastBeginId == 2 && executor.requests.at(1).resident;
+  };
+  Events events;
+  engine::Engine engine(test::engineConfig(), resources, executor, events);
+  guardReleases(storage, engine);
+
+  std::vector<uint32_t> prompt(8000);
+  std::iota(prompt.begin(), prompt.end(), 1);
+  auto background = request(1, prompt);
+  background.priority = RequestPriority::Background;
+  engine.submit(std::move(background));
+  double now = 1;
+  tickUntil(engine, now,
+            [&] { return !engine.commandInFlight() && executor.prefillRows == 2048; },
+            "the lane did not prefill its first chunk");
+  // A Normal request of the same prompt suspends the lane, which resumes
+  // only once that request has computed the prompt and completed.
+  executor.resumeDenied = true;
+  engine.submit(request(2, prompt));
+  tickUntil(engine, now, [&] { return events.usage.contains(2); },
+            "the Normal request did not complete");
+  executor.resumeDenied = false;
+  tickUntil(engine, now, [&] { return idle(engine); }, "the lane did not complete");
+  const uint32_t replayPoint = (8000 - 1) / KvCache::pageTokens * KvCache::pageTokens;
+  require(executor.suspensions == 1 && executor.resumptions == 1 &&
+              executor.lastRestoredTokens == replayPoint &&
+              events.starts == std::vector<uint32_t>{0, 0} && events.completedCount == 2 &&
+              events.failedCount == 0,
+          "the lane did not resume from the Normal request's replay point");
+  // The Normal request read the lane's first chunk. The lane read the blocks
+  // the Normal request computed past it: those it restored, and the last
+  // one, which it computed and then found cached.
+  require(events.deduplicatedTokens.at(2) == 2048 &&
+              events.deduplicatedTokens.at(1) == prompt.size() - 2048 &&
+              engine.snapshot().deduplicatedKvTokens == prompt.size(),
+          "a resume did not count the blocks another request computed");
+}
+
 void testPrefillCanCompleteTheRequest() {
   for (bool stop : {false, true}) {
     test::TestKvStorage storage(8, 4096, 4);
@@ -10208,6 +10256,7 @@ int main() {
     testFirstTokenSentBeforeASuspensionIsNotSentAgain();
     testResumedLaneClearsThePagesPastItsRestoredChain();
     testReplayFindsItsOwnBlocks();
+    testResumePastItsBlocksCountsAnotherRequestsKv();
     testOutOfVocabularyOutputFailsLaneOnly();
     testNonFiniteFirstStepAfterARestoreInvalidatesTheState();
     testNonFiniteLaterStepKeepsTheRestoredState();

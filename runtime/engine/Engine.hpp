@@ -152,7 +152,8 @@ struct EngineSnapshot final {
   uint64_t cacheHits = 0;
   uint64_t coldMisses = 0;
   uint64_t reusedTokens = 0;
-  // Tokens requests computed and then read from cached blocks' pages.
+  // Tokens whose KV requests read from cached blocks other requests
+  // computed, past the cached prefixes they started from.
   uint64_t deduplicatedKvTokens = 0;
   uint64_t replayStatePublications = 0;
   uint64_t deduplicatedStatePublications = 0;
@@ -298,14 +299,17 @@ private:
     uint32_t reportedPromptTokens = 0;
     uint32_t replayTokens = 0;
     // The blocks it restored or published in any residency end at this
-    // token. A replay after a suspension finds them cached as its own, so
-    // it counts none of them, though one evicted meanwhile may hold KV
-    // another request computed again; nor does it count blocks past them
-    // that a state another request published there lets it restore.
+    // token. A resume after a suspension counts the blocks it restores past
+    // them as KV another request computed (completeAdmission). The blocks
+    // below, which it restores or its replay finds cached, count as its own,
+    // though one evicted while it was suspended may hold KV another request
+    // computed again.
     uint32_t publishedTokens = 0;
-    // Tokens of blocks it computed and then found cached
-    // (Cache::publishCommittedBlocks), whose pages its next command reads,
-    // and of those its commands read, which it reports when it completes.
+    // Tokens of blocks another request computed whose pages its next command
+    // reads: blocks it computed and then found cached
+    // (Cache::publishCommittedBlocks), and those a resume restored past
+    // publishedTokens. Then those its commands read, which it reports when
+    // it completes.
     uint32_t unreadDeduplicatedKvTokens = 0;
     uint32_t deduplicatedKvTokens = 0;
     // Its speculative decoding so far, which it reports when it completes.
