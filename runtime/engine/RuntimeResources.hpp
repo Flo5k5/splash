@@ -127,8 +127,7 @@ struct RuntimeResourcesConfig {
   double idleReleaseSeconds = metal::kResidencyKeepAliveSeconds;
   // Reclaimable host memory, sampled at every Metal operation during startup
   // and by the governor afterwards.
-  MemoryGovernor::HostAvailableMemoryProvider hostAvailableMemory =
-      queryHostAvailableMemory;
+  MemoryGovernor::HostMemoryProvider hostMemory = queryHostMemory;
   // The prefill FFN's Neural Engine split (startAneFfn): off with
   // --disable-ane, and a benchmark round runs the split of the first so that
   // rounds repeat one another.
@@ -216,9 +215,10 @@ public:
   RuntimeResources &operator=(const RuntimeResources &) = delete;
   ~RuntimeResources();
 
-  // The engine is Ready: a persistent tier's directory marks this process
-  // serving, on probation for its first minute after an unclean end
-  // (CacheDirectory::beginServing).
+  // The engine is Ready: what the start allocated as memory a request in
+  // service needs is in place, so the governor's mark for it ends, and a
+  // persistent tier's directory marks this process serving, on probation for
+  // its first minute after an unclean end (CacheDirectory::beginServing).
   void beginServing();
   // At a clean stop, after the engine's flush (Engine::flushRestorePoints):
   // each state copy's label takes its state's current recency, both files

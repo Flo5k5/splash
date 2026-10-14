@@ -86,12 +86,15 @@ prompt is about 33K, and at 64K it compacted repeatedly and stopped), so serve
 the 27B with `--language-only` for them; with `--disable-ane` and
 `--max-cache-disk 0` as well it advertises 102,393 tokens.
 
-Splash grows its caches only while macOS has 3 GiB free and gives cached memory
-back when it runs short, but a request in service still takes the memory it
-needs within `--max-memory`, so these models leave other applications little
-room. A request that cannot get memory waits for it, then fails with
-`resource_timeout`: close memory-heavy applications, or serve with
-`--language-only`. Critical memory pressure can suspend a long request; the
+Splash grows its caches only while macOS reports no memory pressure and its
+spare memory, the free, file-backed and purgeable pages and half of what
+compressing other applications would free, keeps a reserve of 7% of the Mac's
+memory (2 to 7 GiB) and a 1 GiB margin, 3 GiB on these Macs. It gives cached
+memory back when that memory runs short or macOS warns, but a request in service
+still takes the memory it needs within `--max-memory`, so these models leave
+other applications little room. A request that cannot get memory waits for it,
+then fails with `resource_timeout`: close memory-heavy applications, or serve
+with `--language-only`. Critical memory pressure can suspend a long request; the
 [SSD cache](../DEVELOPMENT.md#ssd-cache), on by default, keeps its progress and
 cached prefixes, and writes whenever memory runs short: serving
 Ternary-Bonsai-2-27B PQ2_0 to six clients' mixed traffic for 30 minutes, a

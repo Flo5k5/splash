@@ -91,6 +91,15 @@ struct EngineMemoryPolicy {
   hostAvailableReserveBytes(uint64_t physicalMemoryBytes) noexcept {
     return std::min<uint64_t>(physicalMemoryBytes / 10, 2 * kGiB);
   }
+  // What growth no request in service needs, the cache, leaves of the host's
+  // spare memory to other applications: 7% of the Mac's memory, from 2 to
+  // 7 GiB. With the warning margin above it, such growth stops 3 GiB short of
+  // a 24 GB Mac's spare memory, about 5.5 GiB short of 64 GB and 8 GiB short
+  // of 128 GB or more.
+  [[nodiscard]] static constexpr uint64_t
+  hostSpareReserveBytes(uint64_t physicalMemoryBytes) noexcept {
+    return std::clamp<uint64_t>(physicalMemoryBytes / 100 * 7, 2 * kGiB, 7 * kGiB);
+  }
 };
 
 enum class BudgetErrorCode {

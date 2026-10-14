@@ -105,7 +105,7 @@ RuntimeResourcesConfig loadableConfig(const char *metallibPath, const std::files
                                             model::VisionSource::Safetensors);
   config.model.sourceIdentity = "synthetic";
   config.buildId = name;
-  config.hostAvailableMemory = [] { return std::optional<uint64_t>(64 * kGiB); };
+  config.hostMemory = [] { return std::optional<HostMemory>(HostMemory{64 * kGiB, 64 * kGiB}); };
   return config;
 }
 
@@ -314,7 +314,7 @@ void testHostMemoryProbeIsRequired(const char *metallibPath) {
   for (const bool memory : {true, false}) {
     RuntimeResourcesConfig config = budgetConfig(metallibPath, root.path());
     if (memory)
-      config.hostAvailableMemory = {};
+      config.hostMemory = {};
     else
       config.diskVolume = {};
     try {
@@ -366,7 +366,7 @@ void testStartupAdmissionIgnoresModelSize(const char *metallibPath) {
                                             model::VisionSource::Safetensors);
   writeCheckpoints(root.path(), config.model);
   require(model::modelWeightBytes(root.path(), config.model) > 3 * kGiB, "the model must exceed the sample");
-  config.hostAvailableMemory = [] { return std::optional<uint64_t>(3 * kGiB); };
+  config.hostMemory = [] { return std::optional<HostMemory>(HostMemory{3 * kGiB, 3 * kGiB}); };
   requireReachesModelLoader(config, root.path(),
                             "a model larger than reclaimable host memory "
                             "refused to start");
@@ -375,7 +375,9 @@ void testStartupAdmissionIgnoresModelSize(const char *metallibPath) {
   // Unmeasurable telemetry waits the same way.
   for (std::optional<uint64_t> available :
        {std::optional<uint64_t>(64 * kMiB), std::optional<uint64_t>()}) {
-    config.hostAvailableMemory = [available] { return available; };
+    config.hostMemory = [available] {
+      return available ? std::optional<HostMemory>(HostMemory{*available, *available}) : std::nullopt;
+    };
     try {
       auto resources = RuntimeResources::create(config, 0);
       throw std::runtime_error("model load ignored the macOS reserve");
@@ -414,17 +416,16 @@ void testLoadedVisionIsRequiredOnlyWithVision() {
   requireLoadedModel(loaded);
 }
 
-// Resource assembly names the step it fails at, at its real throw sites on
-// either side of the weight load: a host with less than its reserve refuses
-// the start before the weights are opened, and one with its reserve but not
-// the warning margin beyond it refuses the KV runway once the weights have
-// loaded. The startup retry window counts the later step as progress.
+// Resource assembly names the step it fails at, at its real throw site: a
+// host with less than its reserve refuses the start before the weights are
+// opened, and the startup retry window retries it. Past the weights the host
+// refuses only what loading would (testStartGrowsThroughHostPressure).
 void testFailedStepIsNamed(const char *metallibPath) {
   using namespace std::chrono_literals;
   const test::TemporaryDirectory root("splash-assembly");
   RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "assembly-test");
   const auto host = [&](uint64_t available) {
-    config.hostAvailableMemory = [available] { return std::optional<uint64_t>(available); };
+    config.hostMemory = [available] { return std::optional<HostMemory>(HostMemory{available, available}); };
   };
   // Nothing but the host refuses this model. The suite's one complete start
   // also reports the SSD cache a disk quota gives it, by that name.
@@ -454,16 +455,56 @@ void testFailedStepIsNamed(const char *metallibPath) {
               before.resourceFailure == RuntimeResourceFailure::HostCapacity &&
               before.message.find("not enough free memory to start") != std::string::npos,
           "a start the host refused before the weights loaded named another step");
-  const RuntimeBootstrapReport after = failure(reserve + kHostWarningMarginBytes / 2);
-  require(after.resourceStage == RuntimeResourceStage::StorageAllocation &&
-              after.resourceFailure == RuntimeResourceFailure::HostCapacity &&
-              after.message.find("unable to allocate the KV runway") != std::string::npos,
-          "a KV runway the host refused after the weights loaded named another step");
-  StartupRetryWindow window(30s);
   const auto first = StartupRetryWindow::Clock::time_point{};
-  require(window.retryUntil(before, first) == first + 30s &&
-              window.retryUntil(after, first + 20s) == first + 50s,
-          "a failure after the weights loaded did not count as progress");
+  require(StartupRetryWindow(30s).retryUntil(before, first) == first + 30s,
+          "a start the host refused was not retried");
+}
+
+// What a start allocates, the KV runway and then the arenas and the warmup as
+// RuntimeBootstrap::start allocates them, is memory a request in service
+// needs: neither the warning margin above the spare reserve nor macOS's
+// warning refuses it, only what refuses loading, and an allocation the
+// engine marks meanwhile leaves the start's mark in place. Once serving
+// begins, growth that no request in service needs keeps to both again.
+void testStartGrowsThroughHostPressure(const char *metallibPath) {
+  const test::TemporaryDirectory root("splash-start-pressure");
+  RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "start-pressure-test");
+  const uint64_t reserve = EngineMemoryPolicy::hostAvailableReserveBytes(
+      metal::probeDeviceCapabilities().physicalMemoryBytes);
+  // A host with its reserve but not the warning margin beyond it, then one
+  // with ample room while macOS warns.
+  for (const bool warning : {false, true}) {
+    const uint64_t available = warning ? 64 * kGiB : reserve + kHostWarningMarginBytes / 2;
+    config.hostMemory = [available] {
+      return std::optional<HostMemory>(HostMemory{available, available});
+    };
+    config.memoryPressure = [warning] {
+      return warning ? MemoryPressure::Warning : MemoryPressure::Normal;
+    };
+    const std::string host = warning ? "under macOS's warning" : "short of the warning margin";
+    std::unique_ptr<RuntimeResources> resources;
+    static_cast<void>(
+        test::capturedStderr([&] { resources = RuntimeResources::create(config, 0); }));
+    const metal::AllocationAdmission admit = resources->memoryGovernor().allocationAdmission();
+    const EngineMemoryBreakdown &budget = resources->memoryPlan().breakdown();
+    std::unique_ptr<model::RuntimeModel> runtime;
+    require(static_cast<bool>(admit(budget.sharedPrefillBytes + budget.sharedDecodeBytes, [&] {
+              runtime = model::createRuntime(resources->modelContext());
+            })),
+            "the start's arenas waited " + host);
+    EngineConfig engine;
+    connectToGovernor(engine, resources->memoryGovernor());
+    {
+      const Serving allocation(engine.serving, true);
+    }
+    // The warmup's lane state; it throws if refused.
+    static_cast<void>(runtime->warmupPrefill(model::ExecutionLimits::prefillTokenBudget));
+    static_cast<void>(runtime->warmupDecodeBatch(1));
+    resources->beginServing();
+    const metal::AllocationResult grown = admit(kMiB, [] {});
+    require(!grown && grown.failure == metal::AllocationFailure::HostPressure,
+            "growth that no request in service needs went on " + host + " once serving began");
+  }
 }
 
 // The SSD cache holds no write back unless a write budget is set; one that
@@ -665,7 +706,8 @@ void testEngineFollowsTheGovernor(const char *metallibPath) {
   const metal::MetalMemoryStats memory = backend.memoryStats();
   MemoryGovernor governor(
       backend, std::max(memory.allocatedBytes, memory.deviceCurrentAllocatedBytes) + kGiB,
-      hostReserve, [&available] { return available; }, 0);
+      hostReserve, hostReserve,
+      [&available] { return std::optional<HostMemory>(HostMemory{*available, *available}); }, 0);
   EngineConfig config;
   connectToGovernor(config, governor);
   require(config.growthPaused && config.serving && !config.growthPaused(),
@@ -698,6 +740,7 @@ int main(int argc, char **argv) {
       testModelBeyondBudgetIsRefusedBeforeLoading(argv[1]);
       testStartupAdmissionIgnoresModelSize(argv[1]);
       testFailedStepIsNamed(argv[1]);
+      testStartGrowsThroughHostPressure(argv[1]);
       testWriteBudgetOnlyWhenSet(argv[1]);
       testStaleCachesGoAtEveryStart(argv[1]);
       testMadeCacheRootStaysOutOfBackups(argv[1]);

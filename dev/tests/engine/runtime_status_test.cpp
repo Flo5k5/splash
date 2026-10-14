@@ -172,6 +172,8 @@ void testCleanRuntimeStatus(const char *goldenPath) {
   governor.hostMeasurementValid = true;
   governor.hostAvailableBytes = 8 * kGiB;
   governor.hostReserveBytes = 2 * kGiB;
+  governor.hostSpareBytes = 8 * kGiB;
+  governor.hostSpareReserveBytes = 2 * kGiB;
   governor.hostHeadroomBytes = 6 * kGiB;
   governor.hostGrowthAllowed = true;
 

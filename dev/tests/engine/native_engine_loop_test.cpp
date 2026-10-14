@@ -34,6 +34,13 @@ using splash::test::rejects;
 using splash::test::require;
 using splash::test::Weights;
 
+// A host whose spare memory is all its available memory.
+std::optional<HostMemory> hostMemory(std::optional<uint64_t> bytes) {
+  if (!bytes)
+    return std::nullopt;
+  return HostMemory{*bytes, *bytes};
+}
+
 // Every submitted request has ended and no command is in flight.
 bool idle(const engine::NativeRuntime &loop) {
   const EngineSnapshot counts = loop.snapshot();
@@ -1351,8 +1358,8 @@ void testControlPassReclaimsUnderHostPressure() {
   metal::MetalBackend backend("unused");
   constexpr uint64_t hostReserve = 2ULL << 30;
   std::optional<uint64_t> available = hostReserve + kHostWarningMarginBytes / 2;
-  MemoryGovernor governor(backend, 40ULL << 30, hostReserve,
-                          [&available] { return available; }, 0);
+  MemoryGovernor governor(backend, 40ULL << 30, hostReserve, hostReserve,
+                          [&available] { return hostMemory(available); }, 0);
   MemoryControl control(governor, backend, loop);
   require(!control.run(MemoryPressure::Normal), "a paced pass waited for a transfer");
   const auto paced = resources.snapshot();
@@ -1393,6 +1400,88 @@ void testControlPassReclaimsUnderHostPressure() {
           "critical pressure did not empty the cache and release every extent");
 }
 
+// macOS's warning asks caches to give memory back: however much room the
+// host has, a control pass under it returns cache, keeping the resume point
+// and the runway extent while nothing waits, and pauses growth. Once the
+// level is normal again growth resumes and no pass runs: the state a later
+// request caches stays beside the resume point.
+void testControlPassGivesCacheBackUnderSystemWarning() {
+  engine::NativeLoopConfig config;
+  config.engine.maxContext = 1024;
+  LoopFixture fixture(config);
+  engine::NativeRuntime &loop = fixture.loop;
+  const engine::Cache &resources = fixture.cache;
+  const KvPool &pool = fixture.pool;
+  loop.announceReady();
+  // Finished requests with different prompts leave a replay state each.
+  const auto finish = [&](uint64_t id) {
+    auto input = request(id);
+    for (uint32_t &token : input.promptTokens)
+      token += static_cast<uint32_t>(100 * id);
+    require(loop.receive(protocol::peer::serialize(input)), "control pass request failed");
+    runUntilIdle(loop);
+  };
+  finish(1);
+  finish(2);
+  require(resources.snapshot().stateCache.entries == 2,
+          "the fixture did not cache two replay states");
+
+  test::metalStatistics() = {};
+  metal::MetalBackend backend("unused");
+  constexpr uint64_t hostReserve = 2ULL << 30;
+  const std::optional<uint64_t> available = hostReserve + (16ULL << 30);
+  MemoryGovernor governor(backend, 40ULL << 30, hostReserve, hostReserve,
+                          [&available] { return hostMemory(available); }, 0);
+  MemoryControl control(governor, backend, loop);
+  require(!control.run(MemoryPressure::Warning), "a pass under macOS's warning waited for a transfer");
+  const auto warned = resources.snapshot();
+  require(warned.stateCache.entries == 1 && warned.stateCache.evictions == 1 &&
+              warned.pool.reclaimableBytes == 4 * 4096 && !governor.snapshot().hostGrowthAllowed,
+          "macOS's warning did not give cache back, keeping the resume point and the runway "
+          "extent, or left growth open");
+
+  finish(3);
+  fixture.monotonic += 1000.0;
+  const uint64_t releases = pool.snapshot().extentReleases;
+  require(!control.run(MemoryPressure::Normal) && governor.snapshot().hostGrowthAllowed &&
+              resources.snapshot().stateCache.entries == 2 &&
+              pool.snapshot().extentReleases == releases,
+          "a pass ran once macOS's level was normal again");
+}
+
+// A start marks what it allocates as memory a request in service needs until
+// serving begins. An allocation the engine marks meanwhile restores the mark
+// it found, so the start's mark outlives it, and once serving begins the
+// engine's marks still end with their allocations.
+void testServingMarkRestoresTheMarkItFound() {
+  test::metalStatistics() = {};
+  metal::MetalBackend backend("unused");
+  constexpr uint64_t hostReserve = 2ULL << 30;
+  const std::optional<uint64_t> available = hostReserve + (16ULL << 30);
+  MemoryGovernor governor(backend, 40ULL << 30, hostReserve, hostReserve,
+                          [&available] { return hostMemory(available); }, 0);
+  // Under macOS's warning only the mark admits growth.
+  governor.setPressure(MemoryPressure::Warning);
+  const auto admits = [&governor] {
+    return static_cast<bool>(governor.allocationAdmission()(4096, [] {}));
+  };
+  const std::function<bool(bool)> mark = [&governor](bool serving) {
+    return governor.setServing(serving);
+  };
+  static_cast<void>(governor.setServing(true));
+  {
+    const Serving allocation(mark, true);
+    require(admits(), "an allocation the engine marked was refused");
+  }
+  require(admits(), "an allocation the engine marked ended the start's mark");
+  static_cast<void>(governor.setServing(false));
+  {
+    const Serving allocation(mark, true);
+    require(admits(), "an allocation the engine marked was refused once serving began");
+  }
+  require(!admits(), "an allocation the engine marked left its mark behind");
+}
+
 // The control pass tells the governor whether a request waits for memory:
 // only for one does growth wait for the recovery margin while the host's
 // headroom sits between the margins.
@@ -1408,8 +1497,8 @@ void testControlPassHoldsGrowthForAWaitingRequest() {
   constexpr uint64_t hostReserve = 2ULL << 30;
   // A page short of the recovery margin, after growth the host refused.
   std::optional<uint64_t> available = hostReserve + kHostRecoveryMarginBytes - 4096;
-  MemoryGovernor governor(backend, 40ULL << 30, hostReserve,
-                          [&available] { return available; }, 0);
+  MemoryGovernor governor(backend, 40ULL << 30, hostReserve, hostReserve,
+                          [&available] { return hostMemory(available); }, 0);
   require(!governor.allocationAdmission()(kHostWarningMarginBytes, [] {}),
           "growth past the warning margin was admitted");
   MemoryControl control(governor, backend, loop);
@@ -1470,8 +1559,8 @@ void testIdleWeightsAreReleasedAndRestored(bool releasable) {
   };
   test::metalStatistics() = {};
   metal::MetalBackend backend("unused");
-  MemoryGovernor governor(backend, 40ULL << 30, 2ULL << 30,
-                          [] { return std::optional<uint64_t>{64ULL << 30}; }, 0);
+  MemoryGovernor governor(backend, 40ULL << 30, 2ULL << 30, 2ULL << 30,
+                          [] { return hostMemory(64ULL << 30); }, 0);
   MemoryControl control(governor, backend, loop);
   const auto idlePass = [&](double elapsed) {
     fixture.monotonic += elapsed;
@@ -1586,8 +1675,8 @@ void testIdleReleaseRestoresTheSplitLast() {
   };
   test::metalStatistics() = {};
   metal::MetalBackend backend("unused");
-  MemoryGovernor governor(backend, 40ULL << 30, 2ULL << 30,
-                          [] { return std::optional<uint64_t>{64ULL << 30}; }, 0);
+  MemoryGovernor governor(backend, 40ULL << 30, 2ULL << 30, 2ULL << 30,
+                          [] { return hostMemory(64ULL << 30); }, 0);
   MemoryControl control(governor, backend, loop);
   const auto idlePass = [&] {
     fixture.monotonic += idleRelease;
@@ -1655,8 +1744,8 @@ void testRefusedRestoreWaitsForMemory() {
   test::metalStatistics() = {};
   metal::MetalBackend backend("unused");
   uint64_t hostAvailable = kHostMemory;
-  MemoryGovernor governor(backend, 40ULL << 30, kReserve,
-                          [&] { return std::optional<uint64_t>{hostAvailable}; }, 0);
+  MemoryGovernor governor(backend, 40ULL << 30, kReserve, kReserve,
+                          [&] { return hostMemory(hostAvailable); }, 0);
   Weights weights;
   uint32_t programReleases = 0, programLoads = 0;
   ReleasableMemory memory(weights, ReleasableMemory::Split{[&] {
@@ -1667,7 +1756,7 @@ void testRefusedRestoreWaitsForMemory() {
   engine::NativeLoopConfig config;
   config.engine.maxContext = 1024;
   config.engine.resourceWaitTimeoutMilliseconds = kWaitLimit;
-  config.engine.serving = [&](bool serving) { governor.setServing(serving); };
+  config.engine.serving = [&](bool serving) { return governor.setServing(serving); };
   config.weights = &memory;
   config.weightAdmission = governor.allocationAdmission();
   LoopFixture fixture(config, {}, {}, kIdleReleaseSeconds);
@@ -1940,6 +2029,8 @@ int main() {
     testInvalidScoreFailsOneRequestAndKeepsTheBatch();
     testConstrainedMaskExchange();
     testControlPassReclaimsUnderHostPressure();
+    testControlPassGivesCacheBackUnderSystemWarning();
+    testServingMarkRestoresTheMarkItFound();
     testControlPassHoldsGrowthForAWaitingRequest();
     testIdleWeightsAreReleasedAndRestored(false);
     testIdleWeightsAreReleasedAndRestored(true);

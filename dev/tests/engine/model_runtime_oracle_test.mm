@@ -66,10 +66,11 @@ std::string mebibytes(uint64_t bytes) {
 // A refusal of the memory governor for host memory, with what it measured.
 [[noreturn]] void stopForHostMemory(const MemoryGovernor &governor,
                                     const std::string &need, uint64_t bytes) {
+  // Its allocations are no request's in service: they keep the spare reserve.
   const MemoryGovernorSnapshot host = governor.snapshot();
   stopForHostMemory("the memory governor refused " + mebibytes(bytes) +
                         " for " + need,
-                    host.hostAvailableBytes, host.hostReserveBytes);
+                    host.hostSpareBytes, host.hostSpareReserveBytes);
 }
 
 constexpr uint32_t kVocabulary = 248320;
@@ -2299,7 +2300,9 @@ int main(int argc, char **argv) {
       fail(*error);
     const uint64_t hostReserveBytes =
         EngineMemoryPolicy::hostAvailableReserveBytes(device.physicalMemoryBytes);
-    const auto hostAvailableBytes = queryHostAvailableMemory();
+    const std::optional<HostMemory> host = queryHostMemory();
+    const std::optional<uint64_t> hostAvailableBytes =
+        host ? std::optional<uint64_t>(host->available) : std::nullopt;
     require(hostAvailableBytes.has_value(),
             "cannot measure available host memory before loading the oracle model");
     const std::filesystem::path modelRoot(argv[2]);
@@ -2391,7 +2394,8 @@ int main(int argc, char **argv) {
     const uint64_t elasticGrowthCeiling = budget.hardBudgetBytes -
         budget.pipelineReserveBytes - budget.runtimeOverheadReserveBytes;
     MemoryGovernor governor(backend, elasticGrowthCeiling, hostReserveBytes,
-                            queryHostAvailableMemory, 0);
+                            EngineMemoryPolicy::hostSpareReserveBytes(device.physicalMemoryBytes),
+                            queryHostMemory, 0);
     std::cout << "ane_ffn_share=" << (aneFfn ? aneFfn->share() : 0.0)
               << " ane_ffn_minimum_rows=" << (aneFfn ? aneFfn->minimumRows() : 0) << '\n';
     const metal::AllocationAdmission governed =
