@@ -435,7 +435,8 @@ SERVE_OPTIONS = (
             metavar="DURATION",
             help="time without a request before the engine unwires its memory and "
             "frees the weights: seconds, or with an s, m or h suffix, e.g. 30m "
-            "(default: 10m); off keeps both",
+            "(default: 10m); off keeps both, though POST /v1/memory/release "
+            "still frees the weights",
         ),
         text=idle_release_text,
     ),

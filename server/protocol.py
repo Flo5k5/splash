@@ -308,8 +308,9 @@ class StatusRequestFrame:
 
 @dataclass(slots=True, frozen=True)
 class ReleaseRequestFrame:
-    """Give the weights back now when the engine holds no request; answered
-    by a status JSON with the same correlation id."""
+    """Give the weights back now, as the idle release does, when the engine
+    holds no request and restores none, with the idle release on or off;
+    answered by a status JSON with the same correlation id."""
 
     correlation_id: int
 

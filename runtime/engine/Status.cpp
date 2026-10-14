@@ -15,7 +15,7 @@ namespace {
 
 const char *boolean(bool value) noexcept { return value ? "true" : "false"; }
 
-// idle_release_seconds is null while the engine keeps them (--idle-release off).
+// idle_release_seconds is null with --idle-release off.
 void appendWeights(std::ostringstream &out, const WeightsSnapshot &weights) {
   out << "{\"idle_release_seconds\":";
   if (std::isinf(weights.idleReleaseSeconds))
@@ -23,6 +23,7 @@ void appendWeights(std::ostringstream &out, const WeightsSnapshot &weights) {
   else
     out << weights.idleReleaseSeconds;
   out << ",\"released\":" << boolean(weights.released)
+      << ",\"restoring\":" << boolean(weights.restoring)
       << ",\"restores\":" << weights.restores
       << ",\"restore_failures\":" << weights.restoreFailures << '}';
 }

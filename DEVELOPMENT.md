@@ -97,7 +97,7 @@ access.
 | `--max-context` | Auto | Set the context limit, e.g. `100K`. See [memory and context](#memory-and-context). |
 | `--kv-format` | `int8` | Target KV storage: `int8` or `bf16`. See [KV cache precision](#kv-cache-precision). |
 | `--state-format` | `fp32` | Recurrent state storage: `fp32` or `bf16`. See [state precision](#state-precision). |
-| `--idle-release` | `10m` | Time without a request before the engine unwires its memory and frees the weights; the next request restores them. `off` keeps both. See [weight loading](#weight-loading). |
+| `--idle-release` | `10m` | Time without a request before the engine unwires its memory and frees the weights; the next request restores them. `off` keeps both, though `POST /v1/memory/release` still frees the weights. See [weight loading](#weight-loading). |
 | `--max-cache-disk` | `auto` | SSD quota for cached KV pages and states: `auto` follows the volume's free space up to 32 GiB, a size such as `16G` sets the quota, `0` turns the cache off. Kept for the session, or across restarts with `--persistent-cache`. See [SSD cache](#ssd-cache). |
 | `--max-cache-disk-writes` | `0` (no limit) | The most the SSD cache writes a day, e.g. `200G`. See [SSD cache](#ssd-cache). |
 | `--persistent-cache` | Off | Keep the SSD cache across restarts. See [persistent cache](#persistent-cache). |
@@ -123,8 +123,8 @@ suffix of 1024 tokens: `100K` is 102,400 tokens. `--max-memory`, `--max-context`
 also take `auto`, their default, `--max-cache-disk 0` turns the SSD cache off,
 and `--max-cache-disk-writes 0`, its default, sets no write budget. Durations
 (`--idle-release`, `--request-timeout`) are seconds, or a number with an `s`,
-`m` or `h` suffix, such as `90s`, `30m` or `1.5h`; `--idle-release off` never
-releases.
+`m` or `h` suffix, such as `90s`, `30m` or `1.5h`; `--idle-release off` turns
+the timer off, and only `POST /v1/memory/release` then frees the weights.
 
 ### Network and authentication
 
@@ -585,7 +585,7 @@ Messages requires it.
 | `GET /v1/models`, `/v1/models/{id}` | The served model and its aliases, with the context limit |
 | `POST /tokenize`, `/apply-template` | A text's tokens, or a conversation's rendered prompt, without inference |
 | `POST /v1/judgments`, `/v1/systemone` | Scores over fixed answers ([judgment contracts](#judgment-contracts)) |
-| `POST /v1/memory/release` | Gives the weights back now, as the idle release does, when no request is in service; the next request restores them ([explicit release](#explicit-weights-release)). It takes no body (or `{}`); `200` with `{"released": true, "weights": …}`, or `409 engine_busy` while the engine serves a request or restores its weights |
+| `POST /v1/memory/release` | Gives the weights back now, as the idle release does, when no request is in service; the next request restores them ([explicit release](#explicit-weights-release)). It takes no body (or `{}`); `200` with `{"released": true, "weights": …}`, `409 engine_busy` while the engine serves a request or restores its weights, `503 engine_busy` when the engine does not answer within 5 s, and `503 engine_recovering` or `server_shutdown` while the engine restarts or the server stops |
 | `GET /status`, `/metrics` | JSON status and Prometheus metrics ([status](#status-readiness-and-metrics)) |
 | `GET /health` | 200 while the server answers; public |
 | `GET /ready` | 200 while the engine is ready, else 503; public |
@@ -1123,7 +1123,7 @@ Proxy consumers can use these fields; additional fields may be added:
 | `requests.submitted`, `completed`, `cancelled`, `failed` | Native request counters since engine start |
 | `active_requests` | Each request the engine holds, in arrival order: its `id`, `phase` (`queued`, `waiting_resources`, `waiting_prefix`, `prefill`, `decode` or `waiting_mask`), `priority`, `prompt_tokens` and how many of them are encoded (`prompt_processed`, cached ones included), `generated_tokens` of `max_new_tokens`, and `age_ms` since it arrived |
 | `memory_actual.current_bytes`, `peak_bytes` | Metal allocations, not process RSS |
-| `weights.idle_release_seconds`, `released`, `restores`, `restore_failures` | `--idle-release` in seconds (`null` for `off`), whether the weights' memory is released now, the times it was restored for a request since engine start, and the restores that gave up for want of memory |
+| `weights.idle_release_seconds`, `released`, `restoring`, `restores`, `restore_failures` | `--idle-release` in seconds (`null` for `off`), whether the weights' memory is released now, whether a request's restore of it is under way (it stays `released` until the last image is back), the times it was restored for a request since engine start, and the restores that gave up for want of memory |
 | `ane_ffn.state`, `share`, `minimum_rows`, `reason` | The prefill FFN's [Neural Engine split](#neural-engine-prefill): `split` while it serves, at `share` of the FFN's channels over chunks of `minimum_rows` rows or more; `off` when the start left the GPU alone (`share` and `minimum_rows` 0); `stopped` once it stopped while serving, until the engine restarts. `reason` is the start's outcome, or why the split stopped |
 | `ane_ffn.split_commands`, `evaluations`, `ane_ms`, `reruns` | Prefill commands the split ran since engine start, the Neural Engine's evaluations in them and its milliseconds over them (each evaluation's from the GPU's signal to start it to its report); and the chunks the GPU ran again alone after the split's work for them failed |
 | `model_timing.prefill.last_gpu_ms`, `total_gpu_ms` | GPU time of the last prefill command, and of all since engine start, warmup included: each from its first Metal command buffer's start to its last one's end, so with the Neural Engine split it spans the GPU's waits on the Neural Engine; a chunk run again adds the rerun's |
@@ -1756,16 +1756,23 @@ images, and the restore loads it again in one tick more, after the last image
 #### Explicit weights release
 
 `POST /v1/memory/release` asks the engine for the same release without waiting
-for the timer: the server sends a `ReleaseRequest` frame (protocol 9), and the
-engine, between commands, releases the weights when it holds no request and no
-restore is under way, then answers with its status document, whose
-`weights.released` tells whether it did (`NativeRuntime::handleRelease`). Nothing
-else changes: the next request restores the weights as after the idle release
-(`Weights restored in N s`), the prefix cache and the other caches stay as they
-are, and `--idle-release off` does not stop it, so a host that shares the Mac
-with other memory-heavy work can take the weights' memory back on demand instead
-of on a timer. A busy engine, serving a request or restoring its weights, answers
-`409 engine_busy` and keeps them. The request takes no body:
+for the timer: the server sends a `ReleaseRequest` frame, and the engine,
+between commands, releases the weights when it holds no request and no restore
+is under way, then answers with its status document
+(`NativeRuntime::handleRelease`). Nothing else changes: the next request
+restores the weights as after the idle release (`Weights restored in N s`), the
+prefix cache and the other caches stay as they are, and `--idle-release off`
+does not stop it, so a host that shares the Mac with other memory-heavy work can
+take the weights' memory back on demand instead of on a timer. The server
+answers `200` when the document says the weights are released and not being
+restored (`weights.released` and not `weights.restoring`, as a restore leaves
+them released until its last image is back), whether this request released
+them or they already were. An engine serving a request or restoring its weights
+keeps them, and the server answers `409 engine_busy`. An engine that does not
+answer within 5 s, as while it runs a long command, gets `503 engine_busy`, and
+while the engine restarts or the server stops the release gets
+`503 engine_recovering` or `server_shutdown`, as other requests do. The request
+takes no body:
 
 ```sh
 curl -X POST http://127.0.0.1:8000/v1/memory/release
@@ -2099,11 +2106,12 @@ command queue (`MetalBackend::allocateBuffer`): weights, KV extents, state
 buffers and scratch alike stay wired between requests until the idle
 release (`--idle-release`, 10 minutes by default) passes without a command, and
 the next command wires them again. `--idle-release off` keeps every buffer
-wired, and the weight images allocated, while the engine runs; KV extents return
-only through the reclaims below, memory pressure among them. Memory returns to
-macOS when the engine releases it, never because macOS compressed or dropped an
-idle buffer. macOS page cache, driver allocations and other applications still
-affect memory pressure and swap.
+wired, and the weight images allocated unless an
+[explicit release](#explicit-weights-release) gives them back, while the engine
+runs; KV extents return only through the reclaims below, memory pressure among
+them. Memory returns to macOS when the engine releases it, never because macOS
+compressed or dropped an idle buffer. macOS page cache, driver allocations and
+other applications still affect memory pressure and swap.
 
 KV pages live in extents: ordinary shared Metal buffers of one size per pool,
 between half and one and a half times 128 MiB, in which every tensor region of

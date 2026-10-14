@@ -42,6 +42,15 @@ FOREVER = math.inf
 READY = wire.ReadyEvent(4, 131_072, False)
 # The generation APIs: Chat Completions, Responses and Messages.
 PATHS = ("/v1/chat/completions", "/v1/responses", "/v1/messages")
+# The weights section of the status document an engine answers a release
+# request with once it gave the weights back (NativeRuntime::handleRelease).
+RELEASED_WEIGHTS = {
+    "idle_release_seconds": 600,
+    "released": True,
+    "restoring": False,
+    "restores": 0,
+    "restore_failures": 0,
+}
 
 
 def stays_connected():
@@ -400,9 +409,7 @@ class FakeRuntime:
         self.restart_count = 0
         self.last_crash_trace = None
         self.status_event = native_peer.status_event()
-        self.release_event = native_peer.status_event(
-            weights={"released": True, "restores": 0, "restore_failures": 0}
-        )
+        self.release_event = native_peer.status_event(weights=RELEASED_WEIGHTS)
         self.release_calls = 0
         self.threads = []
 
