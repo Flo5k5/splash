@@ -219,7 +219,6 @@ class ThinkingTokenBudgetTests(unittest.TestCase):
             (None, "thinking.budget_tokens must be an integer of at least 1024"),
             (1023, "thinking.budget_tokens must be an integer of at least 1024"),
             (True, "thinking.budget_tokens must be an integer of at least 1024"),
-            (2048, "thinking.budget_tokens must be less than max_tokens"),
         ):
             with self.subTest(budget_tokens=budget_tokens):
                 thinking = {"type": "enabled"}
@@ -232,6 +231,22 @@ class ThinkingTokenBudgetTests(unittest.TestCase):
                     message,
                 )
         self.assertEqual(runtime.requests, [])
+
+    def test_messages_budget_tokens_at_or_above_max_tokens_set_no_cap(self):
+        # Messages allows such a budget with interleaved thinking, and one the
+        # output limit reaches first closes nothing.
+        harness, runtime = self.harness(
+            default_thinking_token_budget=5, max_context=4096
+        )
+        for budget_tokens in (2047, 2048, 4096):
+            body = fixtures.anthropic_body(
+                max_tokens=2048,
+                thinking={"type": "enabled", "budget_tokens": budget_tokens},
+            )
+            for path in ("/v1/messages", "/v1/messages/count_tokens"):
+                with self.subTest(budget_tokens=budget_tokens, path=path):
+                    self.post(harness, path, body)
+        self.assertEqual(self.frames(runtime), [budget(2047), None, None])
 
 
 class ThinkingEndTextTests(unittest.TestCase):

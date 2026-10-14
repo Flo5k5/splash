@@ -468,9 +468,10 @@ tokens before `</think>`.
 
 - Chat Completions and Responses take `thinking_token_budget`, a non-negative
   integer; `-1` sets no cap, and an absent or null value takes the server's.
-- Messages caps `{"type": "enabled"}` thinking at its `budget_tokens`, which
-  must be at least 1024 and less than `max_tokens`, as in Anthropic's API;
-  adaptive thinking takes the server's budget.
+- Messages caps `{"type": "enabled"}` thinking at its required `budget_tokens`,
+  an integer of at least 1024, as in Anthropic's API; one at or above
+  `max_tokens`, which Anthropic's API allows with interleaved thinking, sets no
+  cap. Adaptive thinking takes the server's budget.
 - `--thinking-token-budget N` (or `SPLASH_THINKING_TOKEN_BUDGET`) is the
   server's budget; unset, thinking has no cap.
 - `--thinking-end-text TEXT` (or `SPLASH_THINKING_END_TEXT`) is the server's
@@ -660,10 +661,11 @@ and a removed tool is left out until a later block adds it again),
 `disable_parallel_tool_use`), `stop_sequences`, `temperature`, `top_p`, `top_k`,
 `thinking`, `output_config` and Chat's `chat_template_kwargs`, whose
 `enable_thinking` outranks `thinking`. Otherwise a request reasons only when
-`thinking` sets it: `{"type": "enabled"}` and `{"type": "adaptive"}` reason at
-`output_config.effort`, one of `low`, `medium`, `high` (the default), `xhigh`
-and `max`, while `{"type": "disabled"}` and an omitted `thinking` do not;
-enabled thinking's `budget_tokens` caps it ([thinking token
+`thinking` sets it: `{"type": "enabled", "budget_tokens": N}` and
+`{"type": "adaptive"}` reason at `output_config.effort`, one of `low`, `medium`,
+`high` (the default), `xhigh` and `max`, while `{"type": "disabled"}` and an
+omitted `thinking` do not. Enabled thinking requires `budget_tokens`, an integer
+of at least 1024, which caps it ([thinking token
 budget](#thinking-token-budget)). Reasoning comes back in `thinking` blocks.
 With `thinking.display` `omitted` (or `updates`) a block carries no text, and its
 reasoning travels encrypted in its `signature` under the key in `thinking.key`
