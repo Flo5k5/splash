@@ -4108,6 +4108,74 @@ void testPrefillGrowthPreservesAnActiveDecodePeer() {
           "mixed-phase pressure failed to finish both requests");
 }
 
+// A decoding lane refused a page while the lane beside it fits is left out
+// of their command, which runs: the lanes grow too, and are refused in
+// turn. The prompt's lane outside that command, which yields first, keeps
+// its memory, and yields only once its own command is refused.
+void testARefusedDecodeLeavesThePromptOutsideItsCommand() {
+  test::TestKvStorage storage(1024, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, nullptr, nullptr);
+  Executor executor;
+  executor.decodeFinishes = false;
+  Events events;
+  engine::Engine engine(test::engineConfig(), resources, executor, events);
+  guardReleases(storage, engine);
+  // Each command's kind and lanes.
+  std::vector<std::pair<WorkKind, std::vector<uint64_t>>> commands;
+  executor.commandTimes = [&](const BatchPlan &plan, std::span<const ModelBatchItem> items) {
+    std::vector<uint64_t> lanes;
+    for (const ModelBatchItem &item : items)
+      lanes.push_back(item.requestId);
+    commands.emplace_back(plan.kind, std::move(lanes));
+    return test::CommandTimes{};
+  };
+  // Lane 1's decode needs a fourth page two tokens in, lane 2's 24 tokens in.
+  const auto promptTokens = [](uint64_t id) { return id == 1 ? 87U : 65U; };
+  for (const uint32_t id : {1U, 2U}) {
+    auto decoding = request(id, std::vector<uint32_t>(promptTokens(id), id));
+    decoding.maxNewTokens = 1000;
+    engine.submit(std::move(decoding));
+  }
+  double now = 1;
+  tickUntil(engine, now, [&] { return events.outputs.contains(1) && events.outputs.contains(2); },
+            "the lanes did not decode");
+  // A long prompt's commands run between theirs.
+  engine.submit(request(3, std::vector<uint32_t>(8 * model::ExecutionLimits::prefillTokenBudget, 3)));
+  const auto needsPage = [&](uint64_t id) {
+    return promptTokens(id) + events.outputs[id].size() + model::ExecutionLimits::targetVerifyRows >
+           uint64_t{resources.pageTable(id).pages.size()} * KvCache::pageTokens;
+  };
+  tickUntil(
+      engine, now,
+      [&] {
+        return !engine.commandInFlight() && !commands.empty() &&
+               commands.back().first == WorkKind::Prefill && needsPage(1) && !needsPage(2);
+      },
+      "lane 1 did not come to need a page that lane 2 does not");
+  // At the wall, with nothing in flight: no free page, and no growth.
+  storage.growthBlocked = true;
+  const KvPageAcquisition held = pool.acquirePages(pool.freePageCount());
+  static_cast<void>(engine.tick(now++));
+  require(held.granted() && engine.commandInFlight() &&
+              commands.back() == std::pair{WorkKind::Decode, std::vector<uint64_t>{2}} &&
+              executor.suspensions == 0 && executor.requests.at(3).resident,
+          "a lane refused its KV beside a lane that fit suspended the prompt outside their command");
+  // The prompt's own command, refused next, suspends its lane.
+  const size_t submitted = commands.size();
+  tickUntil(engine, now, [&] { return executor.suspensions != 0 || commands.size() != submitted; },
+            "nothing ran or yielded after the decode");
+  require(executor.suspensions == 1 && !executor.requests.at(3).resident &&
+              commands.size() == submitted,
+          "the prompt's lane did not yield once its own command was refused");
+  for (const uint32_t page : held.pages)
+    pool.releasePage(page, false);
+  storage.growthBlocked = false;
+  executor.decodeFinishes = true;
+  tickUntil(engine, now, [&] { return idle(engine); }, "the lanes did not finish");
+  require(events.completedCount == 3 && events.failedCount == 0, "the lanes did not all complete");
+}
+
 void testKvPressureSuspendsInsteadOfKillingActiveWork() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
@@ -4672,6 +4740,37 @@ void testSharedJunctionPublishesFromCachedKv() {
               snapshot.junctionMaterializationFailures == 0 && executor.restored == 160 &&
               executor.prefillRows == 193 + 33 && events.completedCount == 2,
           "the shared junction did not make room from cached KV");
+}
+
+// A lane's state is memory the governor funds, on a target whose KV stays in
+// memory too: cached KV gives it memory only as the extent its pages leave
+// empty. Refused its state at the engine's limit, a start takes another
+// conversation's leaves until an extent has left memory, and asks for the
+// state again once then, not after each leaf.
+void testRefusedStateAsksAgainOnceAnExtentLeft() {
+  test::TestKvStorage storage(64, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, nullptr, nullptr);
+  Executor executor;
+  Events events;
+  engine::Engine engine(test::engineConfig(), resources, executor, events);
+  guardReleases(storage, engine);
+  // Another conversation's KV, with no state, fills two whole extents.
+  const std::vector<uint32_t> other(257, 6);
+  resources.beginRequest(900);
+  require(resources.ensureTokens(900, 256).granted(), "the other conversation got no pages");
+  resources.publishCommittedBlocks(900, other, 256, {});
+  resources.endRequest(900);
+  // The start's state fits only once an extent has left memory.
+  const uint32_t releases = storage.releasedExtents;
+  executor.beginGrowthBlocked = [&] { return storage.releasedExtents == releases; };
+  const uint32_t attempts = executor.beginAttempts;
+  engine.submit(request(1, std::vector<uint32_t>(65, 7)));
+  runUntilIdle(engine);
+  require(events.completedCount == 1 && events.failedCount == 0 &&
+              executor.beginAttempts == attempts + 2 && storage.releasedExtents == releases + 1 &&
+              resources.lookup(other, {}).kvBoundary == 128,
+          "a refused state was asked for again after each leaf, or took more than an extent");
 }
 
 // While growth is paused a released extent gives a state's buffers nothing,
@@ -10467,11 +10566,10 @@ void testLimitOutlivedByProgressDoesNotWakeTheLoop() {
 }
 
 // A lane waits to grow into pages whose demotion is in flight, and a request
-// admitted meanwhile starts and decodes. Once the pages still in flight
-// cannot cover what the waiting lane lacks, it is suspended. The later lane
-// was resident at its suspension and holds memory its resume waits for:
-// while it works, the wait's limit restarts, and once it finishes, and the
-// last page has landed, the suspended lane resumes.
+// admitted meanwhile starts and decodes. Once the pages land the waiting
+// lane still lacks one and is suspended. The later lane was resident at its
+// suspension and holds memory its resume waits for: while it works, the
+// wait's limit restarts, and once it finishes the suspended lane resumes.
 void testLaneAdmittedBeforeASuspensionHoldsTheWaitOpen() {
   test::TestKvStorage storage(16, 4096, 4);
   storage.budgetPages = 8;
@@ -10515,18 +10613,15 @@ void testLaneAdmittedBeforeASuspensionHoldsTheWaitOpen() {
     static_cast<void>(engine.tick(now++));
   }
   require(executor.suspensions == 1 && executor.prefillRows == 40,
-          "the waiting lane was not suspended once the pages in flight fell short");
+          "the waiting lane was not suspended once the pages landed");
   for (const double end = now + 400; now < end;) {
     static_cast<void>(engine.tick(now += 10));
     require(events.failedCount == 0 && engine.snapshot().resourceResumptions == 0,
             "a lane resident at a suspension did not hold the wait open");
   }
   executor.decodeFinishes = true;
-  for (uint32_t step = 0; step < 1000 && !idle(engine); ++step) {
-    tier.complete();
-    static_cast<void>(engine.tick(now++));
-  }
-  require(idle(engine) && events.completedCount == 2 && events.failedCount == 0 &&
+  tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
+  require(events.completedCount == 2 && events.failedCount == 0 &&
               engine.snapshot().resourceResumptions == 1,
           "the suspended lane did not resume once the lane beside it finished");
 }
@@ -11506,6 +11601,7 @@ int main() {
     testGrowthKeepsPrefillProgressWhenAnUnstartedPeerCanYield();
     testGrowthYieldsLowerPriorityResidentOutsideBatch();
     testPrefillGrowthPreservesAnActiveDecodePeer();
+    testARefusedDecodeLeavesThePromptOutsideItsCommand();
     testKvPressureSuspendsInsteadOfKillingActiveWork();
     testRecoveryDrainDoesNotConsumeResourceWaitBudget();
     testRecoveryDrainEndsWithItsCause();
@@ -11524,6 +11620,7 @@ int main() {
     testResumedLaneRebuildsItsPointFromCachedKv(2);
     testRefusedBuffersTakeAtMostOneStateOfExtents();
     testSharedJunctionPublishesFromCachedKv();
+    testRefusedStateAsksAgainOnceAnExtentLeft();
     testPausedPublicationInUseTakesNoKv();
     testPreemptedDecodeRestoresItsResidentCompositeState();
     testPreemptedDecodeReplayBoundaryIgnoresTheGenerationPrompt();

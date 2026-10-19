@@ -4287,6 +4287,27 @@ void testPublicationReleasesTheExtentItEmpties() {
   cache.endRequest(1);
 }
 
+// The reclaim for memory the governor funds makes progress only once memory
+// has come back, and reports the KV it evicts before then apart: its pages
+// are free for other KV. Here another conversation's chain fills the extent
+// that, emptied, stays as the runway, and nothing else can go.
+void testMemoryReclaimReportsTheKvItEvicts() {
+  test::TestKvStorage storage(8, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  // A running request holds the first extent, the chain fills the second.
+  static_cast<void>(cacheChain(cache, 1, 4, true));
+  static_cast<void>(cacheChain(cache, 2, 4));
+  require(storage.allocatedPages() == 8 && pool.freePageCount() == 0, "fixture geometry changed");
+  const CacheReclaimResult reclaimed = cache.reclaimForMemory(ReclaimClass::Ordinary, true);
+  require(!reclaimed.madeProgress && !reclaimed.pending && reclaimed.evictedKv &&
+              pool.freePageCount() == 4 && storage.releasedExtents == 0,
+          "a reclaim for memory did not report the KV it evicted without giving memory back");
+  require(!cache.reclaimForMemory(ReclaimClass::Ordinary, true).evictedKv,
+          "a reclaim for memory that evicted nothing reported KV");
+  cache.endRequest(1);
+}
+
 // Spilling. A cache whose requests may spill: its pool's extents hold four
 // pages, 100 bytes a Full page and 10 an Index page, one extent of each form
 // allocated from the start (the Index one the runway spilling draws on, as
@@ -4653,6 +4674,46 @@ void testWritesThatFreeNothingHoldNothingBack() {
          spill.cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress) {
   }
   require(!spill.cache.stateResident(block), "a state in use waited for writes that free nothing");
+  spill.tier.complete();
+  static_cast<void>(spill.cache.pollTransfers());
+  spill.cache.endRequest(1);
+}
+
+// A refused page allocation waits for the pages written through only where
+// they and the free pages cover what it lacks (admitPages). Writes that free
+// fewer pages return nothing it can wait for: its reclaim takes what is in
+// use, a state in use and the KV it restores through, while they are in
+// flight, until they cover the rest.
+void testWritesShortOfARefusalHoldNothingBack() {
+  Spilling spill;
+  spill.start(1, Spilling::prompt(1000, 6), 6);
+  spill.start(2, Spilling::prompt(5000, 2), 2, KvMode::Resident);
+  const uint64_t block = spill.block(2, 1);
+  StateUse use = spill.cache.useState(block);
+  spill.cache.publishCompositeState(block, std::make_shared<TestState>(100), false);
+  spill.cache.endRequest(2);
+  require(spill.cache.writeThrough() == 6 && spill.cache.pendingPages(kv::PageForm::Full) == 4,
+          "the writes of pages that will spill were not pending");
+  // The pool cannot grow: a page more than the free ones and those the
+  // writes free.
+  spill.storage.growthBlocked = true;
+  spill.cache.beginRequest(3);
+  const uint64_t tokens =
+      uint64_t{spill.pool.freePageCount() + spill.cache.pendingPages(kv::PageForm::Full) + 1} *
+      KvCache::pageTokens;
+  TokenAdmission admission = spill.cache.ensureTokens(3, tokens);
+  require(admission.failure == TokenAdmissionFailure::Denied,
+          "the writes through covered more than they free");
+  while (admission.failure == TokenAdmissionFailure::Denied) {
+    const CacheReclaimResult reclaimed = spill.cache.reclaimForPages(
+        admission.additionalPages, CacheReclaimMode::KeepExtents, ReclaimClass::InUse);
+    require(reclaimed.madeProgress && !reclaimed.pending,
+            "a refused page allocation waited for writes through that cannot cover it");
+    admission = spill.cache.ensureTokens(3, tokens);
+  }
+  require(admission.failure == TokenAdmissionFailure::Pending && !spill.cache.stateResident(block),
+          "the reclaim did not take what is in use until the writes through covered the rest");
+  spill.cache.endRequest(3);
   spill.tier.complete();
   static_cast<void>(spill.cache.pollTransfers());
   spill.cache.endRequest(1);
@@ -5215,6 +5276,7 @@ int main() {
     testInUsePublicationStartsNoDemotion();
     testInUsePublicationTakesNoKvWhenNoExtentCanEmpty();
     testPublicationReleasesTheExtentItEmpties();
+    testMemoryReclaimReportsTheKvItEvicts();
     testLargeSharedDiskRestore();
     testRefusedRestoresStopAtTheFirstRefusal();
     testReclaimForPagesCoversTheShortfall();
@@ -5312,6 +5374,7 @@ int main() {
     testReusablePagesCountTheirForm();
     testPendingPagesCountWritesThatSpill();
     testWritesThatFreeNothingHoldNothingBack();
+    testWritesShortOfARefusalHoldNothingBack();
     testMemoryReclaimEmptiesAnExtentBesideWritesThatSpill();
     testConversionWaitsForItsPagesToSpill();
     testConversionAtTheWallFindsTheRunway();

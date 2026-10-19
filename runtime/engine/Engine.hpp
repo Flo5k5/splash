@@ -669,8 +669,9 @@ private:
   struct Denial {
     metal::AllocationFailure allocationFailure = metal::AllocationFailure::None;
     // On its way back: pages whose copies are being written, or a reclaim
-    // that waits for a transfer in flight that returns what was refused
-    // (Cache::reclaimOne's `refused`). The lane waits; nobody yields.
+    // that waits for a transfer in flight that can still cover what was
+    // refused (Cache::reclaimForPages, reclaimForMemory). The lane waits;
+    // nobody yields.
     bool pending = false;
     // Not memory but the SSD cache's quota of active KV (ResourceWait).
     bool diskQuota = false;

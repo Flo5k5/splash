@@ -1621,17 +1621,19 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
     // A lane that runs is waiting for nothing.
     active.resourceWait = {};
   }
-  // A lane refused memory that no transfer in flight returns takes it from
-  // the lane that yields first, as when no lane fits, if that lane holds its
-  // memory outside this command and yields before the refused one. Run
-  // without it, the others would leave it refused for as long as they fit,
-  // and a refusal they do not share, as of the model's memory for a lane's
-  // reads of spilled KV, lasts as long as they run.
+  // A lane refused the model's memory for its reads of spilled KV, which no
+  // transfer in flight returns, takes it from the lane that yields first, as
+  // when no lane fits, if that lane holds its memory outside this command
+  // and yields before the refused one. The other lanes do not share that
+  // refusal: run without the lane while they fit, they would leave it
+  // refused for as long as they run. A lane refused its KV waits while they
+  // fit, since they grow too and are refused in turn.
   if (yielding && std::ranges::none_of(plan.items, [&](const BatchItem &item) {
         return item.requestId == yielding->request.id;
       })) {
     const auto refused = std::ranges::find_if(denied, [&](const Denied &entry) {
-      return !entry.denial.pending && yieldsBefore(*yielding, request(entry.requestId));
+      return !entry.kv && !entry.denial.pending &&
+             yieldsBefore(*yielding, request(entry.requestId));
     });
     if (refused != denied.end()) {
       suspendForGrowth(*yielding, kvCapacity(yielding->request.id),
@@ -2013,10 +2015,13 @@ auto Engine::allocate(Attempt &&attempt, bool inService, ReclaimClass upTo,
 // buffers a lane starts from stay for its activation to take: idle model
 // memory beyond them goes first (a pooled buffer, else the idle vision
 // arena, else one rebuildable cache entry), then the cache gives up what
-// gives memory back: an extent, or a state (Cache::reclaimForMemory). Memory
-// for later (the hot block cache's growth toward its planned size) takes no
-// rebuildable cache entry, among which that very cache's slots past its
-// floor are, nor the empty extent kept for the next request.
+// gives memory back: an extent, or a state (Cache::reclaimForMemory), which
+// makes progress, and the allocation is asked for again, only once memory
+// has come back. The KV it evicts before then frees pages other KV may
+// take, so it wakes the requests waiting for memory as progress does.
+// Memory for later (the hot block cache's growth toward its planned size)
+// takes no rebuildable cache entry, among which that very cache's slots past
+// its floor are, nor the empty extent kept for the next request.
 // A host refusal comes to neither step but to the reuse path (allocate()):
 // the pressure controller owns that shrink, and evicting for an allocator
 // that refuses all the same would drain the cache before macOS can
@@ -2025,12 +2030,9 @@ CacheReclaimResult Engine::reclaimForState(ReclaimClass upTo, bool forLater) {
   if (reclaimIdleState(true, forLater ? model::IdleMemory::Buffers
                                       : model::IdleMemory::BuffersThenCaches))
     return {true, 0};
-  CacheReclaimResult reclaimed = cache_.reclaimForMemory(upTo, forLater);
-  if (reclaimed.madeProgress)
+  const CacheReclaimResult reclaimed = cache_.reclaimForMemory(upTo, forLater);
+  if (reclaimed.madeProgress || reclaimed.evictedKv)
     signalResourceProgress();
-  // KV gone from an extent that stays gives the governor nothing: the
-  // allocation is asked for again only once memory has come back.
-  reclaimed.madeProgress = reclaimed.reclaimedBytes || reclaimed.evictedState;
   return reclaimed;
 }
 

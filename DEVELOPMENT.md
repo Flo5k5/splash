@@ -2542,10 +2542,12 @@ requests takes what is in use after everything else. Two kinds of work take
 nothing in use. A start that a resident lane holds back waits for that lane. And
 when no lane's growth fits, the lane that yields first, such as one just started
 beside a decoding lane, pays for the memory with its own suspension; while other
-lanes fit, it waits for them, resident. It pays the same way when it holds its
-memory outside the command of a lane that would yield after it and was refused
-memory no transfer in flight returns, such as a decoding lane's share of the hot
-block cache beside a prompt's staging. A prefill command captures the state of
+lanes fit, it waits for them, resident, as any lane refused its KV does, since
+they grow too and are refused in turn. Where KV spills, a refusal they do not
+share, of the model's memory for reading KV from the SSD cache (a decoding
+lane's share of the hot block cache, a prompt's staging), which no transfer in
+flight returns, suspends the lane that yields first if that lane yields before
+it and is resident outside its command. A prefill command captures the state of
 each boundary it reaches, in buffers reserved before it runs. A junction or a
 checkpoint retires its lane's checkpoint once published, and a checkpoint the
 same command would capture before it is not captured at all; the prompt's
@@ -2743,7 +2745,7 @@ on them or below them are written straight from their extents and released
 after the write succeeds; only then is the block above such a leaf a leaf. A
 chain whose newest blocks have no copy, as a finished request's prompt past the
 chain it restored, so leaves RAM one write at a time, and an allocation refused
-meanwhile waits for each write while that chain holds more to take. Unneeded
+meanwhile waits for each write. Unneeded
 tails are dropped without writing, before any state, together with any disk
 copies below them. A restored page is read
 straight into its extent. Either way the transfer runs on the file's IO worker
