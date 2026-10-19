@@ -26,8 +26,8 @@ namespace {
 
 using splash::test::require;
 
-// A state the tier takes whenever reclaim writes it, as long as `slots`
-// leave room: the restore points requests resume from.
+// A state the tier takes whenever reclaim or persist writes it, as long as
+// `slots` leave room: the restore points requests resume from.
 struct Shelf final {
   uint32_t used = 0;
   uint32_t slots = 64;
@@ -44,7 +44,11 @@ public:
   uint64_t bytes() const noexcept override { return 100; }
   uint64_t residentBytes() const noexcept override { return disk_ ? 0 : bytes(); }
   bool canOffload(bool) const noexcept override { return !disk_; }
-  std::unique_ptr<StateOffload> offload(std::function<void()>) const override {
+  std::unique_ptr<StateOffload> offload(std::function<void()>) const override { return shelve(); }
+  std::unique_ptr<StateOffload> persist(std::function<void()>) const override { return shelve(); }
+
+private:
+  std::unique_ptr<StateOffload> shelve() const {
     if (shelf_->used >= shelf_->slots) return {};
     struct Written final : StateOffload {
       std::shared_ptr<const CompositeState> disk;
@@ -57,7 +61,6 @@ public:
     return written;
   }
 
-private:
   std::shared_ptr<Shelf> shelf_;
   bool disk_;
 };
@@ -65,14 +68,15 @@ private:
 // One randomized run of the tiered block store. Requests of both modes on
 // prompts that share prefixes publish, spill, restore, convert, read
 // unreadable copies and end; RAM reclaim and the disk quota take what they
-// may, the pool's growth and the tier's writes fail now and then, and the
-// tier's transfers land at random. The cache checks every invariant
-// spilling relies on after each step (Cache::checkInvariants), and active
-// KV never stays past its limit after the quota was kept.
+// may, a persistent tier keeps restore points, the pool's growth and the
+// tier's writes of every class fail now and then, and the tier's transfers
+// land at random. The cache checks every invariant spilling relies on after
+// each step (Cache::checkInvariants), and active KV never stays past its
+// limit after the quota was kept.
 class Run final {
 public:
   explicit Run(uint32_t seed)
-      : random_(seed), budget_(std::make_shared<model::DiskBudget>(kSlots * 100)),
+      : random_(seed), tier_(chance(50)), budget_(std::make_shared<model::DiskBudget>(kSlots * 100)),
         cache_(pool_, &tier_, budget_, CacheSpillPolicy{pick(0, 2), pick(1, 2)}) {
     tier_.budget = budget_;
     tier_.transferLimit = 64;
@@ -86,7 +90,7 @@ public:
   }
 
   void step() {
-    switch (pick(0, 11)) {
+    switch (pick(0, 13)) {
     case 0: start(); break;
     case 1: case 2: grow(); break;
     case 3: static_cast<void>(cache_.writeThrough()); break;
@@ -98,6 +102,8 @@ public:
     case 9: failRead(); break;
     case 10: finish(); break;
     case 11: command(); break;
+    case 12: persist(); break;
+    case 13: failWrites(); break;
     }
     cache_.checkInvariants();
   }
@@ -213,6 +219,20 @@ private:
       cache_.endRequest(entry->first);
       entry = requests_.erase(entry);
     }
+  }
+
+  // Write-behind keeps a restore point at a request's newest block.
+  void persist() {
+    Request *request = anyRequest();
+    if (!cache_.persistent() || !request || !request->pages) return;
+    static_cast<void>(cache_.persist(cache_.blockAt(idOf(*request), request->pages * KvCache::pageTokens)));
+  }
+
+  // The writes of one class in flight fail, whichever requests hold their
+  // blocks.
+  void failWrites() {
+    tier_.fail(std::array{WriteClass::Reclaim, WriteClass::Persist, WriteClass::Spill}[pick(0, 2)]);
+    static_cast<void>(cache_.pollTransfers());
   }
 
   void reclaim() {

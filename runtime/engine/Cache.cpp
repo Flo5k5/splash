@@ -1174,6 +1174,16 @@ void Cache::checkInvariants() const {
     }
     check(active.mode == KvMode::Spill || (!active.committedPages && active.owedCopies.empty()),
           "only a Spill request commits quota or owes copies");
+    // Its pages spill only up to the first block on its own page whose copy
+    // has not landed.
+    if (active.mode == KvMode::Spill) {
+      const std::unordered_set<uint64_t> owed(active.owedCopies.begin(), active.owedCopies.end());
+      for (uint32_t index = 0; index < active.cachedBlocks.size(); ++index) {
+        const uint64_t block = active.cachedBlocks[index];
+        check(kv_.page(block) != active.pages[index] || kv_.slot(block) || owed.contains(block),
+              "a Spill request owes the copy of each block on its pages without one");
+      }
+    }
     committed += active.committedPages;
   }
   if (spill_)
@@ -1549,9 +1559,27 @@ bool Cache::pollTierTransfers() {
     entry = writes_.erase(entry);
     kv_.setTransfer(block, KvCache::Transfer::None);
     progressed = true;
-    // A write that failed leaves its page as it was, without a copy.
-    if (!written)
+    // A write that failed leaves its page as it was, without a copy. Whatever
+    // the write was for, each Spill request that holds the block on its page
+    // owes the copy again, first: it took the copy in flight as landed, or
+    // drew the slot on its commitment. It commits a slot for it once more,
+    // which the copy it writes draws or the copy another writes returns, as
+    // when it published the block; one that still owes it keeps the slot it
+    // committed. The pages past the block spill once its copy has landed. A
+    // writer that kept a page of its own beside the block never spills that
+    // page, and owes nothing.
+    if (!written) {
       kv_.setSlot(block, nullptr);
+      const uint32_t index = kv_.chainLength(block) - 1;
+      for (auto &[_, holder] : requests_) {
+        if (holder.mode != KvMode::Spill || index >= holder.cachedBlocks.size() ||
+            holder.cachedBlocks[index] != block || holder.pages[index] != kv_.page(block) ||
+            std::ranges::find(holder.owedCopies, block) != holder.owedCopies.end())
+          continue;
+        recommit(holder);
+        holder.owedCopies.push_front(block);
+      }
+    }
     switch (write) {
     case WriteClass::Reclaim:
       ++(written ? kvTier_.demotions : kvTier_.demotionFailures);
@@ -1565,7 +1593,7 @@ bool Cache::pollTierTransfers() {
       // The page stays: the copy is for the next process.
       ++(written ? kvTier_.copies : kvTier_.copyFailures);
       break;
-    case WriteClass::Spill: {
+    case WriteClass::Spill:
       // The page stays Full until spillWritten moves it.
       if (written) {
         ++spilled_.writeThroughPages;
@@ -1574,23 +1602,9 @@ bool Cache::pollTierTransfers() {
       }
       ++spilled_.writeThroughFailures;
       // A volume that filled holds write-through back until it has room; a
-      // file that stopped taking writes stops it for good. The Spill
-      // requests that hold the block owe its copy again, first: its slot
-      // went back, and each of them commits one for it once more, which
-      // the copy they write draws or the copy another writes returns, as
-      // when they published it. The pages past it spill once it has
-      // landed.
+      // file that stopped taking writes stops it for good.
       writeThroughPaused_ = kvTierWritable();
-      const uint32_t index = kv_.chainLength(block) - 1;
-      for (auto &[_, holder] : requests_) {
-        if (holder.mode != KvMode::Spill || index >= holder.cachedBlocks.size() ||
-            holder.cachedBlocks[index] != block)
-          continue;
-        recommit(holder);
-        holder.owedCopies.push_front(block);
-      }
       break;
-    }
     }
   }
   return progressed;

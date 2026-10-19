@@ -83,6 +83,8 @@ public:
     bool success = true;
     bool finished = false;
     bool submitted = true;
+    // A write's class; none for a restore.
+    std::optional<engine::WriteClass> write;
   };
 
   TestKvTier() = default;
@@ -142,6 +144,14 @@ public:
       if (transfer->finished || transfer->ready || !transfer->submitted) continue;
       transfer->ready = true;
       transfer->success = success;
+    }
+  }
+  // Fails every write of the class still in flight.
+  void fail(engine::WriteClass write) {
+    for (auto &transfer : transfers) {
+      if (transfer->finished || transfer->ready || transfer->write != write) continue;
+      transfer->ready = true;
+      transfer->success = false;
     }
   }
   [[nodiscard]] uint32_t inFlight() const noexcept { return inFlight_; }
@@ -220,6 +230,7 @@ private:
   // A write of its class, or a restore.
   std::unique_ptr<engine::KvTransfer> start(std::optional<engine::WriteClass> write) {
     auto transfer = std::make_shared<Transfer>();
+    transfer->write = write;
     transfers.push_back(transfer);
     ++inFlight_;
     if (write) ++writesInFlight_[static_cast<size_t>(*write)];
