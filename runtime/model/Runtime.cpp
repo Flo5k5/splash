@@ -114,15 +114,6 @@ private:
 
 using kv::ChunkedPrefillParams;
 
-// Whether a target's decode cycles choose how many rows of its block each
-// lane verifies by expected tokens per cost (model::VerifyBudget,
-// ops::DraftSelector::addVerifyRows). Every row a MoE target verifies routes
-// its own experts, which a rejected row reads for nothing; a dense target
-// reads its weights once for all its rows and verifies every row.
-bool budgetsVerifyRows(const RuntimeGeometry &geometry) noexcept {
-  return geometry.target.ffnKind == QwenFfnKind::SparseMoe;
-}
-
 bool isStopToken(const RuntimeGeometry &geometry, uint32_t token) noexcept {
   return token == geometry.target.stopTokens[0] ||
          token == geometry.target.stopTokens[1];
@@ -414,11 +405,10 @@ struct Runtime::Impl {
   ops::Sampling sampling;
   std::unique_ptr<QwenTarget> targetModel;
   DFlashDraft draftModel;
-  // The acceptance model and cycle costs a MoE target's verify rows follow,
-  // unless the native oracle or the backend benchmark has every row verified
-  // (verifyEveryRow).
-  VerifyBudget verifyBudget;
-  bool everyVerifyRow = false;
+  // The acceptance model and cycle costs the decode cycles' verify rows
+  // follow where the budget chooses them (budgetsVerifyRows); none where
+  // the cycles verify every row.
+  std::optional<VerifyBudget> verifyBudget;
   ops::AneFfn *aneFfn;
   // The readers of spilled K/V, when the target's K/V spills.
   KvBlockCache *blockCache;
@@ -453,6 +443,8 @@ struct Runtime::Impl {
     decodeArena = std::make_unique<DecodeArena>(backend, geometry, operators);
     penaltyTable =
         decodeArena->batchSlice(DecodeTensor::PenaltyState, kLaneCount);
+    if (budgetsVerifyRows(model, value.verifyRows))
+      verifyBudget.emplace();
     preparePolicyPipelines();
   }
 
@@ -1940,9 +1932,9 @@ struct Runtime::Impl {
          d(DecodeTensor::ProposalProbs), d(DecodeTensor::VerifyConfidence)},
         std::span(anchors).first(lanes), std::span(policies).first(lanes));
     ops::VerifyRowsModel verify;
-    if (budgetsVerifyRows(geometry) && !everyVerifyRow && !verifyBudget.explores(lanes, constrained)) {
-      const VerifyBudget::Acceptance &acceptance = verifyBudget.acceptance();
-      verify = {acceptance.slope, acceptance.intercepts, verifyBudget.costs(lanes, constrained), false};
+    if (verifyBudget && !verifyBudget->explores(lanes, constrained)) {
+      const VerifyBudget::Acceptance &acceptance = verifyBudget->acceptance();
+      verify = {acceptance.slope, acceptance.intercepts, verifyBudget->costs(lanes, constrained), false};
     }
     ops::DraftSelector::addVerifyRows(graph, d(DecodeTensor::VerifyConfidence), d(DecodeTensor::VerifyRows),
                                       verify, maximumRows);
@@ -2202,10 +2194,12 @@ struct Runtime::Impl {
       laneResult.failure =
           invalidSelection({targetTokens, laneResult.retained}, lane);
     }
-    // The cycle teaches the verify budget its lanes' labels and its cost.
-    if (budgetsVerifyRows(geometry) &&
-        std::all_of(lanes.begin(), lanes.begin() + static_cast<std::ptrdiff_t>(items.size()),
-                    [](const DecodeLaneResult &laneResult) { return laneResult.failure.empty(); })) {
+    // A cycle whose every lane commits teaches the verify budget its lanes'
+    // labels and its cost.
+    bool commits = true;
+    for (uint32_t lane = 0; lane < items.size(); ++lane)
+      commits = commits && lanes[lane].failure.empty() && unreadable[lane].empty();
+    if (verifyBudget && commits) {
       std::array<VerifyBudget::Lane, kLaneCount> observed{};
       for (uint32_t lane = 0; lane < items.size(); ++lane) {
         const float *confidence = contents<float>(
@@ -2215,9 +2209,9 @@ struct Runtime::Impl {
         observed[lane].accepted = lanes[lane].accepted;
         observed[lane].labels = lanes[lane].endDrafts == 0;
       }
-      verifyBudget.observe(std::span(observed).first(items.size()),
-                           lanes[0].request->constraint == ConstraintMode::TokenMask,
-                           timing.wallSeconds * 1000.0);
+      verifyBudget->observe(std::span(observed).first(items.size()),
+                            lanes[0].request->constraint == ConstraintMode::TokenMask,
+                            timing.wallSeconds * 1000.0);
     }
 
     std::vector<ModelStepResult> results;
@@ -3056,8 +3050,6 @@ uint32_t Runtime::residentLane(uint64_t requestId) {
   return entry.stateLane;
 }
 
-void Runtime::verifyEveryRow(bool every) noexcept { impl_->everyVerifyRow = every; }
-
 std::shared_ptr<StateReservation> Runtime::reserveState(uint64_t requestId, uint32_t tokens,
                                                         metal::AllocationFailure &refusal) {
   static_cast<void>(residentLane(requestId));
@@ -3447,6 +3439,7 @@ ModelTelemetry Runtime::telemetry() const noexcept {
   result.idleContextWindows = impl_->states.idleWindows();
   result.visionArenaBytes = impl_->vision ? impl_->vision->arenaBytes() : 0;
   result.embeddingCacheBytes = impl_->embeddingCacheBytes;
+  result.verifyBudget = impl_->verifyBudget.has_value();
   result.stateHeldImageBytes = impl_->heldRowsBytes(false);
   for (const auto &[_, held] : impl_->imageRows) {
     if (const std::shared_ptr<const Impl::ImageRows> rows = held.lock())
@@ -3484,6 +3477,12 @@ ModelMemoryPlan plannedRuntimeMemory(const LoadedModel &model,
           plannedDecodeBytes(geometry, operators)};
 }
 
+bool budgetsVerifyRows(const LoadedModel &model, VerifyRows rows) noexcept {
+  const bool moe =
+      std::visit([](const auto &layout) { return layout.ffnKind == QwenFfnKind::SparseMoe; }, model.descriptor.target);
+  return moe && rows == VerifyRows::Auto;
+}
+
 std::unique_ptr<RuntimeModel> createRuntime(RuntimeContext context) {
   return std::make_unique<Runtime>(std::move(context));
 }
@@ -3497,6 +3496,10 @@ std::span<const float> RuntimeInstrumentation::lastLogits(const Runtime &runtime
   const Runtime::Impl &impl = *runtime.impl_;
   return {contents<float>(impl.decodeArena->get(lane, DecodeTensor::Logits), "logits"),
           uint64_t{ExecutionLimits::targetVerifyRows} * impl.geometry.target.vocabularySize};
+}
+
+uint32_t RuntimeInstrumentation::lastVerifyRows(const Runtime &runtime, uint32_t lane) {
+  return *contents<uint32_t>(runtime.impl_->decodeArena->get(lane, DecodeTensor::VerifyRows), "verify rows");
 }
 
 RuntimeInstrumentation::LaneTables RuntimeInstrumentation::laneTables(const Runtime &runtime, uint64_t requestId) {

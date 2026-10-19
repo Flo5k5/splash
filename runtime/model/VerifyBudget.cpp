@@ -169,8 +169,10 @@ void VerifyBudget::observe(std::span<const Lane> lanes, bool constrained, double
       continue;
     const uint32_t last = std::min({lane.accepted, lane.verifyRows - 1, kPositions - 1});
     for (uint32_t position = 0; position <= last; ++position) {
-      const Label label{position, static_cast<float>(logit(lane.confidence[position])),
-                        position < lane.accepted};
+      const float confidence = lane.confidence[position];
+      if (!(confidence >= 0.0F && confidence <= 1.0F))
+        continue;
+      const Label label{position, static_cast<float>(logit(confidence)), position < lane.accepted};
       if (labels_.size() < kLabels) {
         labels_.push_back(label);
       } else {

@@ -1,13 +1,15 @@
 // The verify budget's online estimates (model::VerifyBudget). Its acceptance
 // model is the prior before any label; a cycle labels each lane's proposals
-// up to its verify rows, to the first rejection, and keeps the last kLabels;
-// every kRefitCycles-th cycle refits the model, which must equal an
-// independent undamped Newton solution of the same posterior over the labels
-// kept, from the online warm start and from the prior alike, and recover the
-// model the labels were drawn from. The costs are the seed's shape before any
-// cycle, then the affine fit of the latest cycles of each lane count and
-// kind, positive and nondecreasing, the seed's slope where their rows do not
-// spread; every kExploreCycles-th cycle of a lane count explores.
+// up to its verify rows, to the first rejection, but for those whose
+// confidence is not a probability, and keeps the last kLabels; every
+// kRefitCycles-th cycle refits the model, which must equal an independent
+// undamped Newton solution of the same posterior over the labels kept, from
+// the online warm start and from the prior alike, and recover the model the
+// labels were drawn from; a refit from the model a fit reached keeps it. The
+// costs are the seed's shape before any cycle, then the affine fit of the
+// latest cycles of each lane count and kind, positive and nondecreasing, the
+// seed's slope where their rows do not spread; every kExploreCycles-th cycle
+// of a lane count explores.
 #include "TestChecks.hpp"
 #include "model/VerifyBudget.hpp"
 
@@ -97,6 +99,15 @@ double distance(const VerifyBudget::Acceptance &a, const Parameters &b) {
   for (uint32_t i = 0; i < kParameters; ++i)
     largest = std::max(largest, std::fabs(p[i] - b[i]));
   return largest;
+}
+
+// A refit of `labels` from the model `fitted` a fit of them reached keeps
+// it, to its parameters' float rounding: there a Newton step changes the
+// objective by no more than its rounding, and one that no halving lets lower
+// it ends the fit where it stands.
+void refitKeeps(const std::vector<VerifyBudget::Label> &labels, const VerifyBudget::Acceptance &fitted) {
+  const double moved = distance(VerifyBudget::fit(labels, fitted), parametersOf(fitted));
+  require(moved < 1e-6, "a refit from the model a fit reached moved it by " + std::to_string(moved));
 }
 
 // Lanes drawn from a known model: confidences spread over (0, 1), every row
@@ -201,6 +212,7 @@ void fitsTheLabels() {
   const VerifyBudget::Acceptance cold = VerifyBudget::fit(labels, VerifyBudget::kPrior);
   require(distance(cold, reference) < 2e-4,
           "the fit from the prior differs from the reference by " + std::to_string(distance(cold, reference)));
+  refitKeeps(labels, cold);
   require(std::fabs(budget.acceptance().slope - generator.truth[0]) < 0.1, "the fit missed the slope");
   // Each intercept within three standard errors of its labels (whose p(1 - p)
   // is at least about 0.2), from at least 100 of them.
@@ -216,6 +228,35 @@ void fitsTheLabels() {
   const VerifyBudget::Acceptance shrunk = VerifyBudget::fit(few, VerifyBudget::kPrior);
   require(distance(shrunk, referenceFit(few)) < 2e-4, "the fit of a few labels differs from the reference");
   require(std::fabs(shrunk.slope - VerifyBudget::kPrior.slope) < 0.3, "a few labels moved the slope far");
+  refitKeeps(few, shrunk);
+}
+
+// A confidence that is not a probability, which a draft row that is not
+// finite gives, labels nothing: the cycle's other proposals label as ever,
+// and the refit over them fits what a fit of the labels kept fits.
+void confidencesThatAreNotProbabilities() {
+  VerifyBudget budget;
+  VerifyBudget::Lane lane;
+  lane.verifyRows = 8;
+  lane.accepted = 4;
+  for (uint32_t j = 0; j < kPositions; ++j)
+    lane.confidence[j] = 0.1F * float(j + 1);
+  lane.confidence[1] = NAN;
+  lane.confidence[2] = INFINITY;
+  lane.confidence[3] = -INFINITY;
+  for (uint32_t cycle = 0; cycle < VerifyBudget::kRefitCycles; ++cycle)
+    budget.observe(std::array{lane, lane}, cycle % 2 == 0, 10.0);
+  // Of proposals 0-4, accepted through 3 and rejected at 4, only 0 and 4.
+  const auto labels = budget.labels();
+  require(labels.size() == 4 * VerifyBudget::kRefitCycles, "the cycles kept " + std::to_string(labels.size()) +
+                                                              " labels");
+  for (const auto &label : labels)
+    require(std::isfinite(label.feature) && (label.position == 0 || label.position == 4) &&
+                label.accepted == (label.position == 0),
+            "a confidence that is not a probability labeled its proposal");
+  require(budget.acceptance() == VerifyBudget::fit(labels, VerifyBudget::kPrior) &&
+              budget.acceptance() != VerifyBudget::kPrior,
+          "the refit over the labels kept did not fit them");
 }
 
 void learnsTheCosts() {
@@ -319,6 +360,7 @@ int main() {
     priorAndExploration();
     labelsOfLanes();
     fitsTheLabels();
+    confidencesThatAreNotProbabilities();
     learnsTheCosts();
     invalidInputs();
   } catch (const std::exception &error) {

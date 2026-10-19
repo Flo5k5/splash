@@ -154,6 +154,10 @@ struct RuntimeResourcesConfig {
   // --kv-spill always: every request of a spill-capable target spills, for
   // validation (EngineSpillConfig::always).
   bool kvSpillAlways = false;
+  // --verify-rows: the rows of the draft's block a decode cycle verifies
+  // (model::budgetsVerifyRows); a benchmark round verifies every row so that
+  // rounds repeat one another.
+  model::VerifyRows verifyRows = model::VerifyRows::Auto;
   // The prefill FFN's Neural Engine split (startAneFfn): off with
   // --disable-ane, and a benchmark round runs the split of the first so that
   // rounds repeat one another.
@@ -312,7 +316,8 @@ private:
                    std::unique_ptr<engine::Cache> cache,
                    std::unique_ptr<ops::AneFfn> aneFfn, AneFfnOutcome aneFfnOutcome,
                    std::unique_ptr<model::KvBlockCache> blockCache,
-                   std::unique_ptr<model::KvHistoryStream> historyStream, bool spillAlways);
+                   std::unique_ptr<model::KvHistoryStream> historyStream, bool spillAlways,
+                   model::VerifyRows verifyRows);
   // Takes back the restore points the last process left in a persistent
   // tier (Cache::adopt) and opens its files for this one.
   void adoptPersistentCache();
@@ -344,6 +349,8 @@ private:
   AneFfnOutcome aneFfnOutcome_;
   // --kv-spill always.
   bool spillAlways_ = false;
+  // --verify-rows, which modelContext() passes on.
+  model::VerifyRows verifyRows_ = model::VerifyRows::Auto;
   // Ends a probation once it has lasted, unless the process stops first.
   std::thread probation_;
   std::mutex probationMutex_;

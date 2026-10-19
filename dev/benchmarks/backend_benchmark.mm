@@ -948,6 +948,11 @@ int main(int argc, char **argv) {
     config.model = model::inspectModelRoot(config.modelRoot);
     config.buildId = SPLASH_BUILD_ID;
     config.aneFfn = engine::AneFfnSetting::fromGiven(aneFfnShare, aneFfnMinimumRows);
+    // The verify budget's rows follow the wall times and acceptance of the
+    // cycles before them, so a MoE target's outputs would not repeat from
+    // round to round: every cycle verifies every row (--verify-rows all), and
+    // the times measure the backend, not the budget.
+    config.verifyRows = model::VerifyRows::All;
     bootstrapConfig.nativeLoop.engine.maxContext = maxContext;
     const std::string modelRoot = config.modelRoot.string();
     const auto &capabilities = config.model.capabilities;
@@ -989,11 +994,6 @@ int main(int argc, char **argv) {
     const double ranAneFfnShare = resources->aneFfnShare();
     const uint32_t ranAneFfnMinimumRows = resources->aneFfnMinimumRows();
     auto *executor = &bootstrap->modelRuntime();
-    // A MoE target's verify rows follow the wall times and acceptance of the
-    // cycles before them (model::VerifyBudget), so its outputs would not
-    // repeat from round to round: every cycle here verifies every row, as a
-    // dense target's does, and the times measure the backend, not the budget.
-    dynamic_cast<model::Runtime &>(*executor).verifyEveryRow(true);
     const auto &cacheIdentity = resources->cacheIdentity();
     const std::string identity =
         "{\"model_root\":" + json::quote(modelRoot) +

@@ -10,9 +10,10 @@
 // logit(confidence) + intercepts[position], the confidence being the largest
 // candidate probability the selector saw at its position. Each completed
 // cycle labels the proposals it verified, up to the first the target
-// rejected; the model is refit every kRefitCycles cycles over the last kLabels
-// labels by damped Newton steps (IRLS) on their log-likelihood with a
-// Gaussian prior around kPrior, which also stands before any label.
+// rejected, but for those whose confidence is not a probability (a draft row
+// that is not finite); the model is refit every kRefitCycles cycles over the
+// last kLabels labels by damped Newton steps (IRLS) on their log-likelihood
+// with a Gaussian prior around kPrior, which also stands before any label.
 //
 // The costs: a cycle of L lanes that verify R rows in all takes about
 // a + b * R milliseconds, fit to the wall times of the latest cycles of L

@@ -301,6 +301,51 @@ void testAutomaticExpertMemory(RuntimeResourcesConfig config) {
   }
 }
 
+// --verify-rows: by default a MoE target's decode cycles verify the rows the
+// verify budget chooses, whether its routed experts load with their layers or
+// stream from the SSD, and a dense target's every row; `all` verifies every
+// row. The start says which, and the runtime built on what it assembled runs
+// it.
+void testVerifyRows(const char *metallibPath, RuntimeResourcesConfig moe) {
+  struct Started final {
+    std::string log;
+    bool budget = false;
+  };
+  const auto start = [](const RuntimeResourcesConfig &config) {
+    Started started;
+    started.log = test::capturedStderr([&] {
+      const auto resources = RuntimeResources::create(config, 0);
+      const EngineMemoryBreakdown &budget = resources->memoryPlan().breakdown();
+      std::unique_ptr<model::RuntimeModel> runtime;
+      require(static_cast<bool>(resources->memoryGovernor().allocationAdmission()(
+                  budget.sharedPrefillBytes + budget.sharedDecodeBytes,
+                  [&] { runtime = model::createRuntime(resources->modelContext()); })),
+              "a runtime's arenas were refused");
+      started.budget = runtime->telemetry().verifyBudget;
+    });
+    return started;
+  };
+  const auto requireStart = [&](const RuntimeResourcesConfig &config, std::string_view line, bool budget,
+                                const char *message) {
+    const Started started = start(config);
+    require(started.log.find(line) != std::string::npos && started.budget == budget, message);
+  };
+  const std::string_view budgeted = "Decode cycles verify the rows the verify budget chooses (--verify-rows auto, as "
+                                    "moe-test is a MoE target): greedy and seeded outputs can differ from run to run.";
+  requireStart(moe, budgeted, true, "a MoE target with resident experts did not budget its rows");
+  moe.expertMemory = {StreamedSetting::Mode::Size,
+                      model::streamableWeights(moe.modelRoot, moe.model, {.streamExperts = true}).expertFloorBytes};
+  requireStart(moe, budgeted, true, "a MoE target whose experts stream did not budget its rows");
+  moe.verifyRows = model::VerifyRows::All;
+  requireStart(moe, "Decode cycles verify every row of the draft's block (--verify-rows all).", false,
+               "--verify-rows all did not verify every row of a MoE target");
+  const test::TemporaryDirectory root("splash-verify-rows");
+  requireStart(loadableConfig(metallibPath, root.path(), "verify-rows-test"),
+               "Decode cycles verify every row of the draft's block (--verify-rows auto, as verify-rows-test is "
+               "dense).",
+               false, "a dense target did not verify every row");
+}
+
 // Startup fails at the loader, whose vision weight files are deliberately
 // absent. Reaching it is the assertion: everything the engine checks before
 // loading the weights let this configuration through.
@@ -1003,6 +1048,7 @@ int main(int argc, char **argv) {
         const RuntimeResourcesConfig moe = moeConfig(argv[1], root.path());
         testStreamableWeightsAreWhatLoads(moe);
         testAutomaticExpertMemory(moe);
+        testVerifyRows(argv[1], moe);
       }
       std::cout << "runtime resources tests passed\n";
       return EXIT_SUCCESS;

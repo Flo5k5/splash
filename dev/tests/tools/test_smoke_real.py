@@ -141,6 +141,7 @@ class SmokeRealTests(unittest.TestCase):
                         max_cache_disk=None,
                         ple_memory=None,
                         expert_memory=None,
+                        verify_rows=None,
                         yarn_factor=None,
                         max_image_pixels=None,
                         kv_format="bf16" if absolute else "int8",
@@ -188,6 +189,7 @@ class SmokeRealTests(unittest.TestCase):
             max_cache_disk="4G",
             ple_memory=None,
             expert_memory=None,
+            verify_rows=None,
             yarn_factor=None,
             max_image_pixels=None,
             kv_format="int8",
@@ -270,6 +272,33 @@ class SmokeRealTests(unittest.TestCase):
             try:
                 command = popen.call_args.args[0]
                 self.assertEqual(command[command.index("--yarn-factor") + 1], "4.0")
+            finally:
+                server.close()
+
+    def test_verify_rows_reach_the_server(self):
+        model = ["--model", "unsloth/Qwen3.8-Flash-Next-GGUF:UD-IQ4_XS"]
+        self.assertIsNone(smoke_real.parse_args(model).verify_rows)
+        for rows in ("auto", "all"):
+            self.assertEqual(
+                smoke_real.parse_args([*model, "--verify-rows", rows]).verify_rows,
+                rows,
+            )
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            smoke_real.parse_args([*model, "--verify-rows", "budget"])
+        with self.server():
+            command = smoke_real.subprocess.Popen.call_args.args[0]
+            self.assertNotIn("--verify-rows", command)
+        arguments = self.server_arguments()
+        arguments.verify_rows = "all"
+        with (
+            mock.patch.object(smoke_real, "available_port", return_value=8000),
+            mock.patch.object(smoke_real.subprocess, "Popen") as popen,
+        ):
+            popen.return_value.poll.return_value = 0
+            server = smoke_real.RealServer(arguments)
+            try:
+                command = popen.call_args.args[0]
+                self.assertEqual(command[command.index("--verify-rows") + 1], "all")
             finally:
                 server.close()
 
@@ -722,10 +751,19 @@ class SmokeRealTests(unittest.TestCase):
                 )
 
     def test_sampling_requires_repeats_the_tool_call_and_the_whole_budget(self):
-        def serve(repeat=True, arguments=None, ignored=32, heaviest="x", failing=None):
+        def serve(
+            repeat=True,
+            arguments=None,
+            ignored=32,
+            heaviest="x",
+            failing=None,
+            verify_rows="all",
+        ):
             answers = iter(("first", "second", "second" if repeat else "third"))
 
             def answer(port, method, path, body=None, **_kwargs):
+                if path == "/status":
+                    return 200, {"verify_rows": verify_rows}
                 if body.get("min_p") == 0.1 and failing == "min_p":
                     raise TimeoutError("timed out")
                 if body.get("tools"):
@@ -755,6 +793,19 @@ class SmokeRealTests(unittest.TestCase):
             contextlib.redirect_stdout(io.StringIO()),
         ):
             smoke_real.run_sampling(8000, "test-model")
+        # Where the verify budget chooses the rows, greedy answers need not
+        # repeat.
+        output = io.StringIO()
+        with (
+            mock.patch.object(
+                smoke_real,
+                "request",
+                serve(repeat=False, heaviest="y", verify_rows="auto"),
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            smoke_real.run_sampling(8000, "test-model")
+        self.assertIn("greedy answers not compared", output.getvalue())
         for failure, server in (
             ("did not repeat", serve(repeat=False)),
             ("min_p 1 did not answer", serve(heaviest="y")),

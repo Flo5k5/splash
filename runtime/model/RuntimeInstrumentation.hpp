@@ -23,6 +23,9 @@ public:
   // verify rows, or in row 0 the final position of the prefill chunk that
   // ended a prompt.
   [[nodiscard]] static std::span<const float> lastLogits(const Runtime &runtime, uint32_t lane);
+  // The rows of its block batch lane `lane` of the last decode step verified
+  // (ops::DraftSelector::addVerifyRows), until the next decode step.
+  [[nodiscard]] static uint32_t lastVerifyRows(const Runtime &runtime, uint32_t lane);
   // The GPU tables of resident request `requestId`'s lane as its last
   // command left them, every entry the lane holds: its page table and, for
   // a layout with a block index, its index table (none without).

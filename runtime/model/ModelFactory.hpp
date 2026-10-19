@@ -96,6 +96,23 @@ struct LoadedModel final {
   }
 };
 
+// How a decode cycle chooses the rows of the draft's block the target
+// verifies for each lane (--verify-rows), never past the lane's retention
+// limit: the tokens its output budget leaves, at most the block's rows.
+enum class VerifyRows : uint8_t {
+  // The verify budget's rows on a MoE target, every row on a dense one.
+  Auto,
+  // Every row, so that a greedy or seeded request repeats its output.
+  All,
+};
+
+// Whether the decode cycles of `model` verify the rows the verify budget
+// chooses (model::VerifyBudget, ops::DraftSelector::addVerifyRows) under
+// `rows`. Each row a MoE target verifies routes its own experts, which a
+// rejected row reads for nothing; a dense target reads its weights once for
+// all of a cycle's rows.
+[[nodiscard]] bool budgetsVerifyRows(const LoadedModel &model, VerifyRows rows) noexcept;
+
 // Model execution resources, which the engine assembles. What a request's
 // start allocates is admitted through the state storage.
 struct RuntimeContext final {
@@ -111,6 +128,7 @@ struct RuntimeContext final {
   // prefills' history (StreamedParts::kv).
   KvBlockCache *blockCache = nullptr;
   KvHistoryStream *historyStream = nullptr;
+  VerifyRows verifyRows = VerifyRows::Auto;
 };
 
 // Validates only the interface between independently defined target and draft

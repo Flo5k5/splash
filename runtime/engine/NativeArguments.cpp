@@ -173,6 +173,10 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
       if (value != "on" && value != "off")
         throw UsageError("--ane requires on or off");
       result.neuralEngine = value == "on";
+    } else if (option == "--verify-rows") {
+      if (value != "auto" && value != "all")
+        throw UsageError("--verify-rows requires auto or all");
+      result.verifyRows = value == "all" ? model::VerifyRows::All : model::VerifyRows::Auto;
     } else if (option == "--relaunch-context") {
       relaunchContext = value;
     } else if (option == "--yarn-factor") {
