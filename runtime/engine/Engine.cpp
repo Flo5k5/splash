@@ -1576,13 +1576,10 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
     return &active == yielding && anotherResident(active.request.id) ? ReclaimClass::Ordinary
                                                                      : ReclaimClass::InUse;
   };
-  for (const BatchItem &scheduled : plan.items) {
-    Request &active = request(scheduled.requestId);
-    if (!active.lane)
-      throw std::logic_error("scheduled request is not resident");
-    // A prefill command's KV reaches its first state boundary first; what
-    // lies past it follows once that state has its buffers
-    // (reserveCaptures).
+  // A prefill command's KV reaches its first state boundary first; what
+  // lies past it follows once that state has its buffers
+  // (reserveCaptures).
+  const auto workEndOf = [&](const Request &active, const BatchItem &scheduled) {
     uint64_t workEnd = active.exactTokens.size() + model::ExecutionLimits::targetVerifyRows;
     if (prefill) {
       workEnd = scheduled.promptOffset + scheduled.tokenCount;
@@ -1590,37 +1587,72 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
         workEnd = std::min<uint64_t>(
             workEnd, active.stateBoundaries[active.stateBoundaryCursor].tokens);
     }
+    return workEnd;
+  };
+  for (const BatchItem &scheduled : plan.items) {
+    Request &active = request(scheduled.requestId);
+    if (!active.lane)
+      throw std::logic_error("scheduled request is not resident");
     const uint64_t id = active.request.id;
+    const uint64_t workEnd = workEndOf(active, scheduled);
     const auto kv = allocate([&] { return cache_.ensureTokens(id, workEnd); }, true,
                              growthClass(active), spillFallback(active));
-    if (!kv.admission.granted()) {
+    if (kv.admission.granted())
+      admitted.push_back(scheduled);
+    else
       denied.push_back(Denied{id, workEnd, kv.denial, kv.admission, {}});
-      continue;
-    }
-    // The model's memory for reads of the KV only the SSD cache holds: a
-    // decoding lane's floor of the hot block cache, or the staging of a
-    // prefill's history up to the command's end.
-    if (spill && cache_.holdsIndexPages(id)) {
-      const auto pages = static_cast<uint32_t>(
-          (uint64_t{scheduled.promptOffset} + scheduled.tokenCount + KvCache::pageTokens - 1) /
-          KvCache::pageTokens);
-      const auto memory = allocate(
-          [&] {
-            return prefill ? model_.reserveHistoryStaging(id, pages)
-                           : model_.reserveSpilledReads(id);
-          },
-          true, growthClass(active));
-      if (!memory.admission.granted()) {
-        denied.push_back(Denied{id, workEnd, memory.denial, std::nullopt,
-                                prefill ? "prefill history staging" : "hot KV cache"});
-        continue;
-      }
-      spilledReads = spilledReads || !prefill;
-    }
-    admitted.push_back(scheduled);
-    // A lane that runs is waiting for nothing.
-    active.resourceWait = {};
   }
+  // The model's memory for reads of the KV only the SSD cache holds: a
+  // decoding lane's floor of the hot block cache, or the staging of a
+  // prefill's history up to the command's end. It is reserved once every
+  // lane has its KV, since a lane that converts to Spill moves the landed
+  // pages of lanes admitted before it to the index form too
+  // (Cache::convertToSpill), and only for the lanes the command keeps, in
+  // the plan's order. A prefill lane that streams its history
+  // (streamsHistory) runs alone and whole, as the scheduler runs one
+  // (planPrefill, passesFor): kept first, it is the command, in one pass;
+  // after a lane kept, it leaves for a command of its own. Admission may
+  // have made it stream, converting it at once where its restored chain's
+  // copies had landed, which the plan, made before, did not know. A lane
+  // refused its memory leaves the command, and the lanes after it take that
+  // shape without it.
+  if (spill) {
+    std::vector<BatchItem> kept;
+    kept.reserve(admitted.size());
+    for (const BatchItem &scheduled : admitted) {
+      Request &active = request(scheduled.requestId);
+      const uint64_t id = active.request.id;
+      const bool streams = prefill && streamsHistory(active);
+      if (streams && !kept.empty())
+        continue;
+      if (cache_.holdsIndexPages(id)) {
+        const auto pages = static_cast<uint32_t>(
+            (uint64_t{scheduled.promptOffset} + scheduled.tokenCount + KvCache::pageTokens - 1) /
+            KvCache::pageTokens);
+        const auto memory = allocate(
+            [&] {
+              return prefill ? model_.reserveHistoryStaging(id, pages)
+                             : model_.reserveSpilledReads(id);
+            },
+            true, growthClass(active));
+        if (!memory.admission.granted()) {
+          denied.push_back(Denied{id, workEndOf(active, scheduled), memory.denial, std::nullopt,
+                                  prefill ? "prefill history staging" : "hot KV cache"});
+          continue;
+        }
+        spilledReads = spilledReads || !prefill;
+      }
+      kept.push_back(scheduled);
+      if (streams) {
+        plan.passes = 1;
+        break;
+      }
+    }
+    admitted = std::move(kept);
+  }
+  // A lane that runs is waiting for nothing.
+  for (const BatchItem &scheduled : admitted)
+    request(scheduled.requestId).resourceWait = {};
   // A lane refused the model's memory for its reads of spilled KV, which no
   // transfer in flight returns, takes it from the lane that yields first, as
   // when no lane fits, if that lane holds its memory outside this command
@@ -1639,21 +1671,6 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
       suspendForGrowth(*yielding, kvCapacity(yielding->request.id),
                        refused->denial.allocationFailure, now);
       return Prepared::Yielded;
-    }
-  }
-  // Admission may have converted a lane to Spill, whose history then
-  // streams (streamsHistory), at once where its restored chain's copies had
-  // landed: the plan, made before, did not know. The command takes the
-  // shape the scheduler gives a lane that streams, alone and whole
-  // (planPrefill, passesFor): a command streams one lane's history, and
-  // only whole.
-  if (prefill && spill && !admitted.empty()) {
-    const auto streams = [&](const BatchItem &item) { return streamsHistory(request(item.requestId)); };
-    if (streams(admitted.front())) {
-      admitted.resize(1);
-      plan.passes = 1;
-    } else {
-      std::erase_if(admitted, streams);
     }
   }
   // The hot block cache they read through grows toward its planned size,

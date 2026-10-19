@@ -264,6 +264,8 @@ public:
     if (!entry.resident)
       throw std::logic_error("request is already suspended");
     pageTables.erase(id);
+    spilledReadFloors.erase(id);
+    historyStaging.erase(id);
     entry.resident = false;
     entry.position = 0;
     ++suspensions;
@@ -470,6 +472,23 @@ public:
       if (streams && plan.passes > 1)
         throw std::invalid_argument("a prefill command's passes are not ones the runtime runs");
     }
+    // A lane reads the K/V only a copy holds through memory reserved for it
+    // before its command, as the production runtime's readers require: a
+    // decoding lane's floor of the hot block cache, a prefill's staging of
+    // the pages its command reads.
+    for (const ModelBatchItem &item : items) {
+      if (!item.pageSources || !item.pageSources->indexPages())
+        continue;
+      const auto staged = historyStaging.find(item.requestId);
+      const bool reserved =
+          plan.kind == WorkKind::Decode
+              ? spilledReadFloors.contains(item.requestId)
+              : staged != historyStaging.end() &&
+                    uint64_t{staged->second} * engine::KvCache::pageTokens >=
+                        item.logicalPosition + item.tokenCount;
+      if (!reserved)
+        throw std::logic_error("a lane reads spilled K/V without memory reserved for its reads");
+    }
     std::unique_ptr<ModelBatchTicket> ticket;
     if (plan.kind == WorkKind::Decode && plan.constrained &&
         plan.decodeStage == DecodeStage::Regular) {
@@ -555,10 +574,23 @@ public:
   }
   // The production model reserves a decoding lane's floor of the hot block
   // cache, which the fake refuses for the requests in refusedSpilledReads,
-  // and while spilledReadsRoom reports no memory for the request's.
+  // and while spilledReadsRoom reports no memory for the request's. The lane
+  // holds it until it is suspended or ends.
   model::ModelMemoryAdmission reserveSpilledReads(uint64_t id) override {
     if (refusedSpilledReads.contains(id) || (spilledReadsRoom && !spilledReadsRoom(id)))
       return {.allocationFailure = metal::AllocationFailure::EngineBudget};
+    spilledReadFloors.insert(id);
+    return {.ok = true};
+  }
+  // It stages the history a prefill command streams, as many pages as the
+  // command reads, which the fake refuses for the requests in
+  // refusedStaging.
+  model::ModelMemoryAdmission reserveHistoryStaging(uint64_t id, uint32_t pages) override {
+    if (refusedStaging.contains(id))
+      return {.allocationFailure = metal::AllocationFailure::EngineBudget};
+    uint32_t &staged = historyStaging[id];
+    staged = std::max(staged, pages);
+    stagings.push_back(id);
     return {.ok = true};
   }
   // It grows that cache toward its planned size, which the fake refuses
@@ -613,6 +645,8 @@ public:
   void end(uint64_t id) override {
     requests.erase(id);
     pageTables.erase(id);
+    spilledReadFloors.erase(id);
+    historyStaging.erase(id);
   }
 
   // What a page holds once prefill has written a block's first row to it.
@@ -780,9 +814,17 @@ public:
   // The masks the model took.
   uint32_t providedMasks = 0;
   // Requests whose floor of the hot block cache is refused
-  // (reserveSpilledReads).
+  // (reserveSpilledReads), and those whose history's staging is
+  // (reserveHistoryStaging).
   std::unordered_set<uint64_t> refusedSpilledReads;
   std::function<bool(uint64_t)> spilledReadsRoom;
+  std::unordered_set<uint64_t> refusedStaging;
+  // The requests that hold their floor of the hot block cache, and the
+  // pages of history staged for each; the requests the staging was reserved
+  // for, in order.
+  std::unordered_set<uint64_t> spilledReadFloors;
+  std::unordered_map<uint64_t, uint32_t> historyStaging;
+  std::vector<uint64_t> stagings;
   std::optional<metal::AllocationFailure> refusedGrowth;
   uint32_t growthAttempts = 0;
   // Blocks of KV the SSD cache holds that each request's next step reports

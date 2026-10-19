@@ -17,6 +17,7 @@
 #include <numeric>
 #include <optional>
 #include <stdexcept>
+#include <tuple>
 #include <utility>
 
 using namespace splash;
@@ -8410,17 +8411,21 @@ void testOnlySpillingLanesRunPrefillGroups() {
 // not know. The command runs it as the scheduler runs a lane that streams,
 // alone and whole: in one pass where the model runs a command in passes
 // over its layers, and without a lane planned beside it, which it leads or
-// follows.
+// follows. Only a command that streams the history reserves its staging.
+// Refused it, the lane leaves the command it leads, and the peer planned
+// beside it runs there: nothing yields.
 void testALaneThatConvertsAtItsPrefillRunsItAloneAndWhole() {
-  // The model's passes, and the rows of a peer whose prompt has run a
-  // chunk, beside which the lane's command is planned: none, more than the
-  // lane's, or fewer.
-  for (const auto &[passes, peerRows] : {std::pair{4u, 0u}, {1u, 300u}, {1u, 40u}}) {
+  // The model's passes; the rows of a peer whose prompt has run a chunk,
+  // beside which the lane's command is planned: none, more than the lane's,
+  // or fewer; and whether the model refuses the lane its staging there.
+  for (const auto &[passes, peerRows, refused] :
+       {std::tuple{4u, 0u, false}, {1u, 300u, false}, {1u, 40u, false}, {1u, 300u, true}}) {
     Spilling spill(64, false);
-    // Each prefill command: its width, its passes, and the lane whose
+    // Each prefill command: its lanes, its passes, and the lane whose
     // history it streams, if any (one at most, as the model checks).
     struct Command final {
-      uint32_t width, passes;
+      std::vector<uint64_t> lanes;
+      uint32_t passes;
       uint64_t streamed;
     };
     std::vector<Command> prefills;
@@ -8429,7 +8434,11 @@ void testALaneThatConvertsAtItsPrefillRunsItAloneAndWhole() {
         const auto streamed = std::ranges::find_if(items, [](const ModelBatchItem &item) {
           return item.pageSources != nullptr;
         });
-        prefills.push_back({plan.width(), plan.passes, streamed == items.end() ? 0 : streamed->requestId});
+        std::vector<uint64_t> lanes;
+        for (const ModelBatchItem &item : items)
+          lanes.push_back(item.requestId);
+        prefills.push_back(
+            {std::move(lanes), plan.passes, streamed == items.end() ? 0 : streamed->requestId});
       }
       return test::CommandTimes{};
     };
@@ -8466,6 +8475,17 @@ void testALaneThatConvertsAtItsPrefillRunsItAloneAndWhole() {
     // The host refuses growth until the chain spills again: the lane's
     // command converts it, and its pages move into free Index pages.
     spill.storage.growthAllowed = [&](uint32_t) { return spill.cache.spillSnapshot().spilledPages != 0; };
+    if (refused) {
+      spill.model.refusedStaging = {3};
+      spill.runUntil([&] { return spill.engine.snapshot().spill.converted == 2; },
+                     "the lane did not convert at its prefill");
+      // The command in flight, beside which no lane decodes, is the one the
+      // lane converted at: its peer's.
+      require(spill.engine.commandInFlight() && prefills.back().lanes == std::vector<uint64_t>{4} &&
+                  spill.engine.snapshot().resourceSuspensions == 0,
+              "a lane refused its staging held back the peer it leads, or a lane yielded");
+      spill.model.refusedStaging.clear();
+    }
     spill.runUntilIdle();
     require(spill.events.failedCount == 0 && spill.events.completedCount == (peerRows ? 4u : 3u) &&
                 spill.engine.snapshot().spill.converted == 2 &&
@@ -8473,9 +8493,16 @@ void testALaneThatConvertsAtItsPrefillRunsItAloneAndWhole() {
             "the lane did not convert at its prefill and stream its history");
     require(std::ranges::all_of(prefills,
                                 [](const Command &command) {
-                                  return !command.streamed || (command.width == 1 && command.passes == 1);
+                                  return !command.streamed ||
+                                         (command.lanes.size() == 1 && command.passes == 1);
                                 }),
             "a command streamed a lane's history beside another lane or in passes");
+    std::vector<uint64_t> streamed;
+    for (const Command &command : prefills)
+      if (command.streamed)
+        streamed.push_back(command.streamed);
+    require(spill.model.stagings == streamed,
+            "a lane reserved the history's staging for a command that did not stream it");
   }
 }
 
@@ -8768,6 +8795,61 @@ void testALoneLaneWaitsForTheChainANeighbourLeft() {
                                   }) > 1,
             "the neighbour's chain left memory without writes one after another");
   }
+}
+
+// A lane's memory for its reads of spilled KV is reserved once every lane of
+// the command has its KV: a lane that converts to Spill moves the landed
+// pages of the blocks it shares with Spill lanes to the index form, those
+// of a lane admitted before it in the command too. Here a Spill lane and a
+// Resident one decode on the same prompt, whose copies the Spill lane
+// wrote: those pages stay Full while the Resident lane holds them, so the
+// Spill lane reads no Index page. Refused a page at the wall, the Resident
+// lane, after it in the command, converts and its pages spill: both lanes
+// read them through their floors of the hot block cache.
+void testAConversionLeavesNoLaneWithoutItsFloor() {
+  Spilling spill(1024);
+  // The Spill lane writes its copies only once the Resident lane holds them.
+  spill.allowSpillWrites(false);
+  spill.engine.submit(Spilling::prompt(1, 1, 4, 200));
+  spill.runUntil([&] { return spill.events.outputs.contains(1); }, "the Spill lane did not decode");
+  // The Resident lane starts while the SSD cache takes no writes.
+  spill.tier.writableFile = false;
+  spill.engine.submit(Spilling::prompt(2, 1, 4, 200));
+  spill.runUntil([&] { return spill.events.outputs.contains(2); }, "the Resident lane did not decode");
+  spill.tier.writableFile = true;
+  spill.allowSpillWrites(true);
+  // Lane 2's next command needs a page that lane 1's does not.
+  const auto needsPage = [&](uint64_t id) {
+    const uint64_t tokens = 4 * KvCache::pageTokens + 1 + spill.events.outputs[id].size() +
+                            model::ExecutionLimits::targetVerifyRows;
+    return tokens > uint64_t{spill.cache.pageTable(id).pages.size()} * KvCache::pageTokens;
+  };
+  spill.runUntil(
+      [&] {
+        return !spill.engine.commandInFlight() &&
+               spill.cache.copiedBlocks(spill.cache.blockAt(1, 4 * KvCache::pageTokens)) == 4 &&
+               needsPage(2) && !needsPage(1);
+      },
+      "lane 2 did not come to need a page that lane 1 does not");
+  require(spill.engine.snapshot().spill.spill == 1 && spill.engine.snapshot().spill.resident == 1 &&
+              !spill.cache.holdsIndexPages(1) &&
+              spill.cache.pageTable(1).pages.front() == spill.cache.pageTable(2).pages.front(),
+          "the lanes did not share the prompt, its pages Full beside their copies");
+  // At the wall: no free Full page, and no growth.
+  spill.storage.growthBlocked = true;
+  const KvPageAcquisition held = spill.pool.acquirePages(spill.pool.freePageCount());
+  static_cast<void>(spill.engine.tick(spill.now++));
+  require(held.granted() && spill.engine.commandInFlight() &&
+              spill.engine.snapshot().spill.converted == 1 && spill.cache.holdsIndexPages(1) &&
+              spill.model.spilledReadFloors.contains(1) && spill.model.spilledReadFloors.contains(2),
+          "a lane whose pages a later lane's conversion spilled read them without its floor");
+  for (const uint32_t page : held.pages)
+    spill.pool.releasePage(page, false);
+  spill.storage.growthBlocked = false;
+  spill.model.decodeFinishes = true;
+  spill.runUntilIdle();
+  require(spill.events.completedCount == 2 && spill.events.failedCount == 0,
+          "the lanes did not complete after the conversion");
 }
 
 // A Spill lane whose pages the SSD cache takes no more of keeps them Full.
@@ -11506,6 +11588,7 @@ int main() {
     testARefusedDecodeTakesThePrefillLanesMemory();
     testRefusedModelMemoryTakesWhatGivesMemoryBack();
     testALoneLaneWaitsForTheChainANeighbourLeft();
+    testAConversionLeavesNoLaneWithoutItsFloor();
     testLoneSpillLaneEndsAtTheWall();
     testHotCacheGrowthTakesNoModelCache();
     testStreamingLaneSizesItsCommandsByItsReads();
