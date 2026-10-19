@@ -180,6 +180,110 @@ void testDeepPrefillKeepsANativeChunksAttention() {
           "a second deep lane overran the command's attention");
 }
 
+// Every lane but a prefill command's last lies within its first chunk, so
+// that at most one lane's rows run past a chunk however the engine cuts or
+// drops lanes, and a command holds at most each lane's group rows: a deep
+// group leader whose rows halve to more than a chunk runs alone, one halved
+// to at most a chunk leaves the rest of its group to a peer, a lane without
+// groups (a prompt with images) joins only a command of at most a chunk, and
+// no estimate, depth or peer breaks either.
+void testPrefillGroupHasOneSpanningLane() {
+  constexpr uint32_t chunk = model::ExecutionLimits::prefillTokenBudget;
+  const uint64_t native = Scheduler::attentionPairs(262'144 - 2048, 2048);
+  // A command whose 2048 rows took wallMilliseconds, hostMilliseconds of
+  // it waiting on expert reads; none before the first command.
+  struct Sample final {
+    double wallMilliseconds = 0.0;
+    double hostMilliseconds = 0.0;
+  };
+  // A lane with `remaining` rows after `position`, of 8192-row groups or,
+  // like a prompt with images, of chunks.
+  struct Lane final {
+    uint32_t position = 0;
+    uint32_t remaining = 0;
+    uint32_t groupRows = 4 * chunk;
+  };
+  using Rows = std::vector<uint32_t>;
+  // The rows of the first command's lanes, and their group rows.
+  struct Planned final {
+    Rows rows;
+    Rows groupRows;
+  };
+  const auto plan = [&](Sample sample, std::initializer_list<Lane> lanes) {
+    Scheduler scheduler(0.0, native);
+    if (sample.wallMilliseconds > 0.0)
+      scheduler.observePrefill(chunk, sample.wallMilliseconds, sample.hostMilliseconds);
+    uint64_t id = 0;
+    for (const Lane &lane : lanes) {
+      RequestSpec spec = request(++id, lane.position + lane.remaining);
+      spec.prefillGroupRows = lane.groupRows;
+      scheduler.submit(spec);
+      scheduler.resourcesReady(id, lane.position);
+    }
+    const BatchPlan command = *scheduler.next({});
+    Planned result;
+    for (const BatchItem &item : command.items) {
+      result.rows.push_back(item.tokenCount);
+      result.groupRows.push_back(lanes.begin()[item.requestId - 1].groupRows);
+    }
+    return result;
+  };
+  // The lanes whose rows run past a chunk as the runtime packs them.
+  const auto spanning = [&](const Rows &rows) {
+    uint32_t count = 0, offset = 0;
+    for (const uint32_t value : rows) {
+      count += value && offset / chunk != (offset + value - 1) / chunk;
+      offset += value;
+    }
+    return count;
+  };
+  const Sample streamed{4900.0, 3400.0};
+  // 70K deep, the leader's group of 8192 rows halves to 4096 for its
+  // attention; the long peer would have taken the other 4096.
+  require(plan(streamed, {{70'000, 20'000}, {0, 40'000}}).rows == Rows{4096},
+          "a leader past a chunk shared its command");
+  // From 128.5K deep it halves to a chunk, and the peer takes the rest of
+  // the group, past the chunk's end.
+  require(plan(streamed, {{130'000, 20'000}, {0, 40'000}}).rows == Rows({2048, 6144}),
+          "a peer of a leader of one chunk lost the rest of the group");
+  // 300K deep it halves to 1024: the peer takes the rest of the group, and
+  // the next lane none.
+  require(plan(streamed, {{300'000, 20'000}, {0, 40'000}, {0, 50'000}}).rows == Rows({1024, 7168}),
+          "a lane joined after one ran past a chunk");
+  // A peer of chunks takes only the chunk's other 1024 rows, and keeps the
+  // next lane to them too.
+  require(plan(streamed, {{300'000, 20'000}, {0, 40'000, chunk}, {0, 50'000}}).rows == Rows({1024, 1024}),
+          "a lane without prefill groups ran in a group");
+  require(plan(streamed, {{130'000, 20'000}, {0, 40'000, chunk}, {0, 50'000}}).rows == Rows{2048},
+          "a lane without prefill groups ran in a group");
+  for (const Sample sample : {Sample{}, Sample{600.0}, streamed, Sample{20'000.0, 19'000.0}})
+    for (const uint32_t depth : {0u, 70'000u, 150'000u, 255'000u, 300'000u, 600'000u})
+      for (const uint32_t remaining : {300u, 3000u, 9000u, 20'000u})
+        for (const uint32_t peer : {0u, 100'000u})
+          for (const uint32_t peerGroupRows : {chunk, 4 * chunk})
+            for (const uint32_t shortest : {1000u, remaining + 1000}) {
+              const auto [rows, groupRows] = plan(sample, {{depth, remaining},
+                                                           {peer, shortest, peerGroupRows},
+                                                           {peer, remaining + 2000},
+                                                           {0, remaining + 3000, peerGroupRows}});
+              // The engine runs any of the lanes, in order, each with its rows
+              // or fewer: here all of them or half.
+              for (uint32_t kept = 1; kept < 1u << rows.size(); ++kept)
+                for (uint32_t halved = 0; halved < 1u << rows.size(); ++halved) {
+                  Rows run;
+                  for (uint32_t lane = 0; lane < rows.size(); ++lane)
+                    if (kept >> lane & 1)
+                      run.push_back(halved >> lane & 1 ? rows[lane] / 2 : rows[lane]);
+                  require(spanning(run) <= 1, "several lanes of a prefill command ran past a chunk");
+                }
+              uint32_t total = 0;
+              for (const uint32_t value : rows)
+                total += value;
+              require(total <= *std::min_element(groupRows.begin(), groupRows.end()),
+                      "a prefill command held more than a lane's group rows");
+            }
+}
+
 void testWarmupTimingSeedsFirstContendedCommand() {
   for (double sample : {0.0, -1.0, std::numeric_limits<double>::infinity(),
                         std::numeric_limits<double>::quiet_NaN(), 6144.0}) {
@@ -1143,6 +1247,7 @@ int main() {
     testQueuedPrefillCannotBeOvertakenIndefinitely();
     testWarmupTimingSeedsFirstContendedCommand();
     testFixedPrefillCostSizesContendedSlice();
+    testPrefillGroupHasOneSpanningLane();
     testPrefillGroupsRunUncontended();
     testDeepPrefillKeepsANativeChunksAttention();
     testShortestRemainingFirstUsesActualRows();

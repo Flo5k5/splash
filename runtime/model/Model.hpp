@@ -447,6 +447,14 @@ maskWordsPerToken(uint32_t vocabularySize) noexcept {
 // and attention-kernel geometry live with their operators.
 struct ExecutionLimits final {
   static constexpr uint32_t maximumBatchWidth = 4;
+  // The rows of a prefill chunk. A prefill command's lanes fill its chunks
+  // one after another, and the runtime lets at most one lane's rows run past
+  // a chunk: a prefill group has one scratch GDN cell for the state between
+  // a lane's parts. So every lane but a command's last lies within its first
+  // chunk, and a command holds at most each of its lanes' group rows
+  // (Model::prefillGroupRows; a chunk's for a lane that runs no groups). The
+  // rows the engine cuts, or a lane it drops, before the command runs keep
+  // both: the lanes before the last still lie within the first chunk.
   static constexpr uint32_t prefillTokenBudget = 2048;
   // KV pages startup warmup runs on, from page 0: the runway the engine's KV
   // pool allocates when it is built.
