@@ -750,16 +750,25 @@ void testFailedStepIsNamed(const char *metallibPath) {
     config.hostMemory = [available] { return std::optional<HostMemory>(HostMemory{available, available}); };
   };
   // Nothing but the host refuses this model. The suite's one complete start
-  // also reports the SSD cache a disk quota gives it, by that name.
+  // also reports the SSD cache a disk quota gives it, by that name: a size of
+  // its temporary files' whole volume, which the room the volume has beyond
+  // its floor always limits, as that room.
   host(64 * kGiB);
-  config.cacheDisk = {.bytes = kGiB};
+  const std::optional<DiskVolume> temporary = volumeOf(std::filesystem::temp_directory_path());
+  require(temporary && temporary->local, "the temporary files' volume is not a local volume measured");
+  config.cacheDisk = {.bytes = temporary->sizeBytes};
   const std::string started =
       test::capturedStderr([&] { static_cast<void>(RuntimeResources::create(config, 0)); });
-  require(started.find("SSD cache: up to ") != std::string::npos &&
-              started.find(" of temporary files in ") != std::string::npos &&
-              started.find("; KV pages of ") != std::string::npos &&
-              started.find("--max-cache-disk 0 turns it off.") != std::string::npos,
-          "a start did not report its SSD cache by that name");
+  const size_t at = started.find("SSD cache: up to ");
+  const std::string line =
+      at == std::string::npos ? std::string() : started.substr(at, started.find('\n', at) - at);
+  require(line.find(" of temporary files in ") != std::string::npos &&
+              line.find(" (the ") != std::string::npos &&
+              line.find(" its volume has beyond the ") != std::string::npos &&
+              line.find("; KV pages of ") != std::string::npos &&
+              line.find("--max-cache-disk 0 turns it off.") != std::string::npos,
+          "a start did not report its SSD cache by that name, or a size its volume limits as the "
+          "volume's room");
   config.cacheDisk = {};
   const auto failure = [&](uint64_t available) {
     host(available);

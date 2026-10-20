@@ -967,7 +967,7 @@ private:
   // for (pendingPages); copies persist() keeps hold only their blocks.
   std::vector<Write> writes_;
   // Write-through waits after a write found the volume full, until the
-  // active limit holds another slot.
+  // active limit holds another slot beside the blocks requests hold.
   bool writeThroughPaused_ = false;
   // The order requests began to spill in (Request::spillOrder).
   uint64_t spillSequence_ = 0;

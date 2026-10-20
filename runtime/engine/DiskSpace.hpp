@@ -48,20 +48,28 @@ inline constexpr uint64_t kAutomaticCacheDiskBytes = uint64_t{32} << 30;
 [[nodiscard]] uint64_t diskRoomBytes(uint64_t availableBytes, uint64_t heldBytes,
                                      uint64_t floorBytes) noexcept;
 
-// The most a disk tier may hold on a local volume: a quarter of its room
-// there (diskRoomBytes), and at most the quota:
+// The most a disk tier with the automatic quota may hold on a local volume:
+// a quarter of its room there (diskRoomBytes), and at most the quota:
 //   min(quota, max(0, available + held - floor) / 4).
 // The tier's own writes and punches move bytes between available and held,
 // so they leave the limit where it is; space anything else takes or frees
-// moves it by a quarter. Several tiers on one volume each settle at
+// moves it by a quarter. Several such tiers on one volume each settle at
 // (available - floor) / (tiers + 3) of what was available before them, so
 // free space stays above the floor, and blocks a snapshot keeps when the tier
 // frees them cost it at most a third more than it freed.
 [[nodiscard]] uint64_t diskLimitBytes(uint64_t quotaBytes, uint64_t availableBytes,
                                       uint64_t heldBytes, uint64_t floorBytes) noexcept;
-// The most active KV may take there (model::DiskBudget::activeLimitBytes):
-// all of its room, and at most the quota:
+// The most active KV may take there (model::DiskBudget::activeLimitBytes),
+// and a tier whose quota is a size: all of its room, and at most the quota:
 //   min(quota, max(0, available + held - floor)).
+// The tier's own writes and punches leave it where it is; space anything
+// else takes or frees moves it byte for byte, so tiers with sizes on one
+// volume take its room in turn, down to the floor, with no margin above it:
+// while a local snapshot keeps the blocks such a tier frees, each copy it
+// writes in place of another takes a slot of free space, and the copies a
+// measure then has it give up free nothing, so free space can fall below the
+// floor, as far as a full volume, before the tier has given up every copy it
+// holds or the snapshot goes.
 [[nodiscard]] uint64_t diskActiveLimitBytes(uint64_t quotaBytes, uint64_t availableBytes,
                                             uint64_t heldBytes, uint64_t floorBytes) noexcept;
 // That limit on `volume`, where the tier's files hold `heldBytes`; the quota
@@ -84,7 +92,8 @@ automaticDiskRefusal(const std::optional<DiskVolume> &volume, uint64_t heldBytes
 // control pass and when a write found the volume full, reads the volume
 // through the first file's descriptor, which names the right volume however
 // the file was made, adds the blocks the tier's files hold, and sets the
-// budget's limit (diskLimitBytes) and active limit (diskActiveLimitBytes);
+// budget's active limit (diskActiveLimitBytes) and limit, the active one for
+// a size and a quarter of the room for the automatic quota (diskLimitBytes);
 // off a local volume the quota is both. In a persistent cache's root one
 // limit bounds every namespace together, and the tier may use all of it: the
 // others nobody holds count among what the tier holds, and while the root
@@ -99,10 +108,11 @@ automaticDiskRefusal(const std::optional<DiskVolume> &volume, uint64_t heldBytes
 // replacing its copies within that, and a later such write lowers it again.
 class DiskSpace final {
 public:
-  // The files live on one volume; `others` are the root's namespaces nobody
-  // holds (CacheDirectory::idle), oldest first, none for temporary files.
-  // Measures the volume.
-  DiskSpace(std::shared_ptr<model::DiskBudget> budget,
+  // The budget's quota is the automatic one (--max-cache-disk auto) or, not
+  // `automatic`, a size. The files live on one volume; `others` are the
+  // root's namespaces nobody holds (CacheDirectory::idle), oldest first, none
+  // for temporary files. Measures the volume.
+  DiskSpace(std::shared_ptr<model::DiskBudget> budget, bool automatic,
             std::vector<std::shared_ptr<model::SlotFile>> files,
             std::vector<CacheDirectory::Idle> others = {});
   DiskSpace(const DiskSpace &) = delete;
@@ -121,9 +131,12 @@ public:
   [[nodiscard]] uint64_t othersBytes() const noexcept { return othersBytes_; }
   // The volume's free space sets the limit: it is measured and local.
   [[nodiscard]] bool followed() const noexcept { return volume_ && volume_->local; }
+  // The quota is the automatic one, not a size.
+  [[nodiscard]] bool automatic() const noexcept { return automatic_; }
 
 private:
   std::shared_ptr<model::DiskBudget> budget_;
+  bool automatic_;
   std::vector<std::shared_ptr<model::SlotFile>> files_;
   std::deque<CacheDirectory::Idle> others_;
   uint64_t othersBytes_ = 0;

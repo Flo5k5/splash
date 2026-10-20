@@ -999,9 +999,12 @@ uint32_t Cache::writeThrough() {
   if (!spill_ || !kvTierWritable())
     return started;
   // After a write found the volume full, until the volume, measured again,
-  // leaves active KV room for another slot.
+  // leaves the blocks requests hold room for another slot. A write draws its
+  // request's commitment, or commits its slot, within the active limit, and
+  // gives up cached copies for it (acquireDiskSlot), which a size's quota
+  // lets fill all of that room.
   if (writeThroughPaused_) {
-    if (diskBudget_->usedBytes() + tier_->slotBytes() > diskBudget_->activeLimitBytes())
+    if (heldSlotBytes() + tier_->slotBytes() > diskBudget_->activeLimitBytes())
       return started;
     writeThroughPaused_ = false;
   }

@@ -116,7 +116,7 @@ window. To set your own limits or cache options, add these to `splash serve`:
 | `--kv-format bf16` | Use BF16 KV cache. Default: 8-bit (INT8). |
 | `--state-format bf16` | Use BF16 recurrent states, half the size. Default: FP32. |
 | `--disable-ane` | Prefill on the GPU alone. Default: the 27B also uses the Neural Engine. |
-| `--max-cache-disk 16G` | Cap the SSD cache (default: auto, up to 32 GiB; `0` turns it off). |
+| `--max-cache-disk 16G` | Size the SSD cache, held as given while its volume keeps 10 GiB free, or 5% of a volume under 200 GiB (default: auto, a quarter of the free space beyond that, up to 32 GiB; `0` turns it off). |
 | `--persistent-cache` | Keep the SSD cache across restarts. Off by default. |
 | `--ple-memory 2G` | Qwen3.8-Flash-Next: read its PLE n-gram table (28.8 GB in IQ4_NL) from the SSD through a 2 GiB RAM cache (default: auto, streamed where memory cannot hold it; `off` holds it all). |
 | `--expert-memory 16G` | MoE models: hold routed experts in 16 GiB and read the others from the SSD when a token routes them (default: auto, all loaded where memory holds them; `off` loads them all). |

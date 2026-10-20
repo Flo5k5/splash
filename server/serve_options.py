@@ -562,8 +562,9 @@ SERVE_OPTIONS = (
             default=None,
             metavar="SIZE",
             help="SSD quota for cached KV pages and states: auto follows the "
-            "volume's free space up to 32G, 0 disables, or a size such as 16G "
-            "(default: auto)",
+            "volume, a quarter of its free space beyond a floor of 10G (5%% of "
+            "a volume under 200G), at most 32G; a size such as 16G is held as "
+            "given while the volume keeps that floor; 0 disables (default: auto)",
         ),
     ),
     ServeOption(

@@ -102,7 +102,7 @@ access.
 | `--expert-memory` | Auto | MoE targets: hold routed experts in this much memory, e.g. `16G`, and read the others from the SSD when a step routes them; `off` loads every expert. Auto loads them all where memory holds them, else gives them what the context leaves. See [streamed experts](#streamed-experts). |
 | `--sparse-kv-memory` | Auto | Qwen3.8-Flash-Next: memory for the KV blocks read back from the SSD for requests whose KV is there, e.g. `1200M`; never below its floor, which auto keeps. See [KV on the SSD](#kv-on-the-ssd). |
 | `--idle-release` | `10m` | Time without a request before the engine unwires its memory and frees the weights; the next request restores them. `off` keeps both, though `POST /v1/memory/release` still frees the weights. See [weight loading](#weight-loading). |
-| `--max-cache-disk` | `auto` | SSD quota for cached KV pages and states: `auto` follows the volume's free space up to 32 GiB, a size such as `16G` sets the quota, `0` turns the cache off. Kept for the session, or across restarts with `--persistent-cache`. See [SSD cache](#ssd-cache). |
+| `--max-cache-disk` | `auto` | SSD quota for cached KV pages and states: `auto` follows the volume, a quarter of its free space beyond a floor of 10 GiB (5% of a volume under 200 GiB), at most 32 GiB; a size such as `16G` is held as given while the volume keeps that floor; `0` turns the cache off. Kept for the session, or across restarts with `--persistent-cache`. See [SSD cache](#ssd-cache). |
 | `--max-cache-disk-writes` | `0` (no limit) | The most the SSD cache writes a day, e.g. `200G`. See [SSD cache](#ssd-cache). |
 | `--persistent-cache` | Off | Keep the SSD cache across restarts. See [persistent cache](#persistent-cache). |
 | `--cache-dir` | `~/Library/Caches/Splash/prefix-cache` | Where `--persistent-cache` keeps its files; needs `--persistent-cache`. |
@@ -451,15 +451,20 @@ target keeps the KV of its long requests there ([KV on the SSD](#kv-on-the-ssd))
 
 `--max-cache-disk` sizes it. The default, `auto`, holds at most a quarter of
 what its volume has beyond the space it keeps free (10 GiB, or 5% of a volume
-smaller than 200 GiB), its own files counted, and at most 32 GiB. Free space is
-what `df` reports, without the purgeable space the Finder counts. The engine
-measures it twice a second and whenever a write finds the volume full: as other
-files fill the volume the cache shrinks, giving up its oldest copies the way a
-full quota does, and it grows back as they go, so several servers on one volume
-each settle at a share that leaves the free space above the floor. A size such
-as `16G` is a quota the same rule keeps within a local volume's free space; off
-a local volume, such as a network share, the quota alone is the limit. `0`
-turns the cache off.
+smaller than 200 GiB), its own files counted, and at most 32 GiB. A size such
+as `16G` is held as given while the volume keeps that space free, so on a
+volume of its own the cache may take all but that. Free space is what `df`
+reports, without the purgeable space the Finder counts. The engine measures it
+twice a second and whenever a write finds the volume full: as other files fill
+the volume the cache shrinks, giving up its oldest copies the way a full quota
+does, and it grows back as they go. Several servers on one volume each settle
+under `auto` at a share that leaves the free space above the floor, and with
+sizes take its room in turn, down to the floor. A size keeps no margin above
+the floor: while a local snapshot, such as Time Machine's on the startup disk,
+keeps the blocks the cache frees, the copies it rewrites can take free space
+below the floor, as far as a full volume, before the snapshot goes. Off a local
+volume, such as a network share, the quota alone is the limit. `0` turns the
+cache off.
 
 State writes stage through a buffer of one state (64 MiB for 35B, 153 MiB for
 27B) that the memory plan sets aside within `--max-memory`; on a 24 GB Mac
@@ -607,8 +612,9 @@ what memory holds, as a dense target's is.
   `--persistent-cache`, after a restart too.
 - The `--max-cache-disk` quota holds spilled KV beside the cached copies.
   Spilled KV of requests in service may take all of the room its volume has
-  beyond the floor, cached copies a quarter of it as before: a request of
-  1,010,000 tokens takes 13.5 GB of slots, about 24 GiB free with the floor.
+  beyond the floor, while `auto` keeps cached copies to a quarter of it: a
+  request of 1,010,000 tokens takes 13.5 GB of slots, about 24 GiB free with
+  the floor.
   A spilling request commits slots for its KV when admitted; one the cache
   cannot hold even alone is refused, one that other requests' commitments
   keep out waits, and one whose prompt fits but not its output ends at the
@@ -686,7 +692,7 @@ are not moved.
 | `~/Library/Application Support/Splash` | The data directory of a packaged install: `models/`, the installed models' links into the Hugging Face cache and the metadata derived from GGUFs; `runtime/`, the locks of running servers; and `thinking.key`, which encrypts the Messages reasoning a response hides. A source checkout keeps the first two in `install/models` and `build/runtime`. |
 | Hugging Face cache (`HF_HUB_CACHE`, by default `~/.cache/huggingface/hub`) | Model and draft downloads, with Splash's pins under `refs/splash` ([revisions](#revisions)). |
 | `~/Library/Caches/Splash/prefix-cache` (`--cache-dir`) | The [persistent cache](#persistent-cache), with `--persistent-cache` only, within the [SSD cache](#ssd-cache)'s limit. Every start removes the caches there that nobody used for 14 days. |
-| `$TMPDIR/splash-cache-*` | The [SSD cache](#ssd-cache)'s files, on by default, without `--persistent-cache`, or when another process holds the persistent cache's directory or it cannot be used: one of KV pages and one of states, together at most about the SSD cache's limit, which follows the volume's free space up to 32 GiB unless `--max-cache-disk` sets it. Each is unlinked as it is created, so no directory lists it and macOS's storage settings count it as System Data, and its space returns when the engine exits, even after a crash. `--cache-dir` does not move them; they follow `TMPDIR`. |
+| `$TMPDIR/splash-cache-*` | The [SSD cache](#ssd-cache)'s files, on by default, without `--persistent-cache`, or when another process holds the persistent cache's directory or it cannot be used: one of KV pages and one of states, together at most about the SSD cache's limit: under `auto` a quarter of the volume's free space beyond its floor, up to 32 GiB, or the size `--max-cache-disk` sets while the volume keeps its floor. Each is unlinked as it is created, so no directory lists it and macOS's storage settings count it as System Data, and its space returns when the engine exits, even after a crash. `--cache-dir` does not move them; they follow `TMPDIR`. |
 | `~/Library/Logs/Splash/crash` | [Crash traces](#failures-and-crash-traces), with `SPLASH_CRASH_TRACE=1` only. |
 | Pi's `models.json` (`~/.pi/agent`, or `PI_CODING_AGENT_DIR`) and the Hermes profile (`~/.hermes/profiles/splash`, or `splash-<port>`) | The settings `splash pi` and `splash hermes` write ([agent launchers](#agent-launchers)). Every agent keeps its sessions in its own home; `splash claude`, `codex` and `opencode` pass their settings at launch and write none. |
 
@@ -3093,17 +3099,23 @@ The volume sizes the tier only once its files are open, before a persistent
 tier takes anything back, and again at every control pass and whenever a write
 finds the volume full. `DiskSpace` reads the volume with `fstatfs` on the first
 file's descriptor, which names the right volume however the file was made, and
-sets the budget's limit to min(quota, max(0, available + held - floor) / 4),
-held being the blocks the tier's files take (`st_blocks`). The KV of requests
-in service, the slots of the blocks they hold and the commitments of spilling
-requests, may use min(quota, max(0, available + held - floor)) instead
+sets the budget's limit to min(quota, max(0, available + held - floor) / 4) for
+the automatic quota and to min(quota, max(0, available + held - floor)) for a
+size, held being the blocks the tier's files take (`st_blocks`). The KV of
+requests in service, the slots of the blocks they hold and the commitments of
+spilling requests, may use the latter under either
 (`DiskBudget::activeLimitBytes`, [KV on the SSD](#kv-on-the-ssd)). The tier's
-own writes and punches move bytes between available and held, so they leave
-the limit where it is, while space anything else takes or frees moves it by a
-quarter.
-Several tiers on one volume each settle at (available - floor) / (tiers + 3) of
-what was available before them, and blocks a local snapshot keeps when the tier
-frees them cost it at most a third more than it freed. A limit below what the
+own writes and punches move bytes between available and held, so they leave the
+limit where it is, while space anything else takes or frees moves it by a
+quarter, or for a size by as much. Several automatic tiers on one volume each
+settle at (available - floor) / (tiers + 3) of what was available before them,
+and blocks a local snapshot keeps when such a tier frees them cost it at most a
+third more than it freed. Tiers with sizes on one volume take its room in turn,
+down to the floor, with no margin above it: while a local snapshot keeps the
+blocks such a tier frees, each copy it writes in place of another takes a slot
+of free space, and the copies a measure then has it give up free nothing, so
+free space can fall below the floor, as far as a full volume, before the tier
+has given up every copy it holds or the snapshot goes. A limit below what the
 tier holds is met at the next control pass by giving copies up in the order a
 full quota replaces them, never a copy in transfer or the only copy of a state
 in use, and a limit below one slot makes no room at all. Off a local volume, or

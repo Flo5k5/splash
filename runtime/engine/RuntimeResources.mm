@@ -157,9 +157,8 @@ PersistentCacheFiles openPersistentCache(const std::filesystem::path &root,
 // The disk tier's startup line: where its files are, its limit and why, its
 // write budget and what passes it when one is set, what it holds and stages
 // through, and how to turn it off.
-void reportDiskTier(const DiskSpace &space, const model::DiskBudget &budget, bool automatic,
-                    uint64_t writesPerDay, std::string_view files, uint64_t kvSlotBytes,
-                    uint64_t stateBytes) {
+void reportDiskTier(const DiskSpace &space, const model::DiskBudget &budget, uint64_t writesPerDay,
+                    std::string_view files, uint64_t kvSlotBytes, uint64_t stateBytes) {
   std::ostringstream line;
   line << "SSD cache: up to " << gibibytes(budget.limitBytes()) << " of " << files;
   if (space.othersBytes())
@@ -171,11 +170,11 @@ void reportDiskTier(const DiskSpace &space, const model::DiskBudget &budget, boo
   } else {
     const uint64_t floor = diskFloorBytes(volume->sizeBytes);
     if (budget.limitBytes() < budget.capacityBytes())
-      line << "a quarter of the "
+      line << (space.automatic() ? "a quarter of the " : "the ")
            << gibibytes(diskRoomBytes(volume->availableBytes, space.heldBytes(), floor))
            << " its volume has";
     else
-      line << (automatic ? "its automatic quota" : "its quota") << ", while its volume has room";
+      line << (space.automatic() ? "its automatic quota" : "its quota") << ", while its volume has room";
     line << " beyond the " << gibibytes(floor) << " it keeps free";
   }
   line << ")";
@@ -315,9 +314,9 @@ DiskTier openDiskTier(const RuntimeResourcesConfig &config, const std::string &c
   if (tier.kv)
     files.push_back(tier.kv);
   tier.space = std::make_unique<DiskSpace>(
-      tier.budget, std::move(files),
+      tier.budget, config.cacheDisk.automatic, std::move(files),
       tier.persistent.directory ? std::move(otherCaches) : std::vector<CacheDirectory::Idle>{});
-  reportDiskTier(*tier.space, *tier.budget, config.cacheDisk.automatic, config.cacheDiskWritesPerDay,
+  reportDiskTier(*tier.space, *tier.budget, config.cacheDiskWritesPerDay,
                  tier.persistent.directory
                      ? "persistent files in " + tier.persistent.directory->path().string()
                      : "temporary files in " + std::filesystem::temp_directory_path().string(),
