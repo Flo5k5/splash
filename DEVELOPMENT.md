@@ -1276,10 +1276,13 @@ the value, whose pattern, format and length go unenforced; otherwise one of the
 values each member of the value's union lists, as its text, or JSON of a member
 that lists none, leaving out array item bounds and `multipleOf` above 64 and
 patterns the grammar cannot compile (look-around, word boundaries,
-backreferences). The framed schemas of one request are limited to 16 MiB, and a
-strict tool's parameter names follow the rule for a tool's name (below). What a
-grammar writes reads back as written: raw text ends at its first
-`\n</parameter>\n`, and an enumerated value that holds one returns 400.
+backreferences). The framed schemas of a request's strict tools, whose grammars
+are built together, are limited to 16 MiB in all. Any other tool is framed when
+a call first names it, for its parameters' types alone, which take no copy of
+its root schema as a grammar does, and the request's such tools share another
+16 MiB. A strict tool's parameter names follow the rule for a tool's name
+(below). What a grammar writes reads back as written: raw text ends at its
+first `\n</parameter>\n`, and an enumerated value that holds one returns 400.
 
 A strict tool's schema must pass that check, nest at most 64 levels of JSON
 objects and arrays, in which an object's `properties` map is a level of its

@@ -198,9 +198,10 @@ class ToolSchemaCompositionTests(HarnessTestCase):
         self.assertIn('("a" | "b")', arguments)
         self.check_arguments(schema, {"value": "b"})
 
-    def test_framing_is_bounded_across_the_tools_of_a_request(self):
+    def test_framing_is_bounded_across_the_strict_tools_of_a_request(self):
         # Composition and root copies can make the framed schemas quadratic or
-        # exponential in the tool schemas; one budget covers all tools.
+        # exponential in the tool schemas; one budget covers the strict tools,
+        # whose grammars are built together.
         wide = {
             "anyOf": [
                 {
@@ -235,6 +236,55 @@ class ToolSchemaCompositionTests(HarnessTestCase):
                 ):
                     tool_schema.tool_grammar(strict_policy(*schemas), False)
                 self.assertEqual(caught.exception.status, 400)
+
+    def test_tools_that_are_not_strict_are_framed_for_their_types_alone(self):
+        # A tool that is not strict is framed when a call first names it, for
+        # its parameters' types alone: no copy of its root schema goes into
+        # the parameters that refer to it, as into a strict tool's, so twenty
+        # that refer to a 400-value enum keep their types under a budget their
+        # copies exceed. The request's tools that are not strict share one
+        # budget, apart from the strict tools', as its output's calls name
+        # them: one whose composition exceeds what it has left declares no
+        # types, so its values convert untyped, as do those of a tool a call
+        # names once it is spent, while a strict tool keeps its grammar and
+        # its types.
+        choice = {"enum": [f"choice-{index:03d}" for index in range(400)]}
+        referring = {
+            "$defs": {"choice": choice},
+            "properties": {
+                "n": {"type": "string"},
+                **{f"p{index}": {"$ref": "#/$defs/choice"} for index in range(20)},
+            },
+        }
+        composed = {
+            "properties": {"n": {"type": "string"}},
+            "allOf": [
+                {"properties": {f"p{index}": {} for index in range(150)}}
+                for _ in range(150)
+            ],
+        }
+        plain = {"properties": {"n": {"type": "string"}}}
+        call = (
+            "<tool_call>\n<function={}>\n<parameter=n>\n123\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        with mock.patch.object(tool_schema, "MAX_FRAMED_SCHEMA_BYTES", 20_000):
+            with self.assertRaisesRegex(APIError, "too complex"):
+                tool_schema.tool_grammar(strict_policy(referring), False)
+            tools = [
+                {"function": {"name": "referring", "parameters": referring}},
+                {"function": {"name": "composed", "parameters": composed}},
+                {"function": {"name": "plain", "parameters": plain}},
+                {"function": {"name": "strict", "parameters": plain, "strict": True}},
+            ]
+            policy = tool_schema.normalize_tools(tools, "auto", True)[1]
+            tool_schema.tool_grammar(policy, False)
+            names = ("referring", "composed", "plain", "strict")
+            _, calls, _ = project("".join(map(call.format, names)), policy)
+            self.assertEqual(
+                [json.loads(made["function"]["arguments"]) for made in calls],
+                [{"n": "123"}, {"n": 123}, {"n": 123}, {"n": "123"}],
+            )
 
     def test_framing_reads_keywords_of_any_kind(self):
         # A reference can reach data that is not a schema, an older dialect
@@ -280,7 +330,8 @@ class ToolSchemaCompositionTests(HarnessTestCase):
         ):
             with self.subTest(schema=schema):
                 self.check_arguments(schema, {"a": 7})
-                types, _ = tool_policy({"t0": schema}).parameter_types("t0")
+                policy = tool_policy({"t0": schema})
+                types, _ = tool_schema.ParameterTypes(policy).of("t0")
                 self.assertEqual(types, {"a": {"integer"}})
         for schema in (
             # Go writes a nil slice, map or pointer as null.
@@ -301,7 +352,8 @@ class ToolSchemaCompositionTests(HarnessTestCase):
             {"properties": a, "$ref": "https://example.com/arguments"},
         ):
             with self.subTest(schema=schema):
-                types, _ = tool_policy({"t0": schema}).parameter_types("t0")
+                policy = tool_policy({"t0": schema})
+                types, _ = tool_schema.ParameterTypes(policy).of("t0")
                 self.assertEqual(types, {"a": {"integer"}})
         for schema in (
             {"properties": a, "allOf": [{"$ref": "#"}]},
@@ -310,7 +362,8 @@ class ToolSchemaCompositionTests(HarnessTestCase):
             {"type": ["String", "NULL"], "properties": a},
         ):
             with self.subTest(schema=schema):
-                types = tool_policy({"t0": schema}).parameter_types("t0")
+                policy = tool_policy({"t0": schema})
+                types = tool_schema.ParameterTypes(policy).of("t0")
                 self.assertEqual(types, ({}, None))
 
     def test_a_strict_tool_generates_the_types_its_type_names_stand_for(self):

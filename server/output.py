@@ -20,6 +20,7 @@ from .tool_schema import (
     PARAMETER_OPEN,
     THINK_END,
     TOOL_CALL_CLOSE,
+    ParameterTypes,
 )
 
 TOOL_ARGUMENT_DELTA_CHARS = 16 * 1024
@@ -184,7 +185,8 @@ class StreamingToolCallProjector:
     """
 
     def __init__(self, policy, request_id, structured=False):
-        self.policy = policy
+        # The types of the tools its calls name, read as they name them.
+        self.tool_types = ParameterTypes(policy) if policy is not None else None
         self.request_id = request_id
         self.text_tags = _TEXT_TAGS if policy is not None else (THINK_END,)
         self.pending = ""
@@ -262,7 +264,7 @@ class StreamingToolCallProjector:
             self.content_fragments.clear()
         self.function_name = name
         self.call_id = f"call_{self.request_id}_{self.call_index}"
-        self.parameter_types, self.other_types = self.policy.parameter_types(name)
+        self.parameter_types, self.other_types = self.tool_types.of(name)
         events.append(
             (
                 "tool",

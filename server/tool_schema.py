@@ -73,10 +73,12 @@ def function_opening(name):
 # interpreter's stack: a schema nests objects and arrays at most this deep.
 MAX_SCHEMA_DEPTH = 64
 
-# Framing projects each tool's fields through schema composition and copies
-# the root schema into every field that refers to it. Pathological schemas
-# make that quadratic or exponential in their size, so framing all tools of
-# a request may produce about this many bytes of schemas.
+# Framing projects each tool's fields through schema composition, and for a
+# strict tool's grammar copies the root schema into every field that refers
+# to it. Pathological schemas make that quadratic or exponential in their
+# size, so framing may produce about this many bytes of schemas: for a
+# request's strict tools, whose grammars are built together, and as much for
+# its other tools, which are framed for their parameters' types alone.
 MAX_FRAMED_SCHEMA_BYTES = 16 * 1024 * 1024
 
 
@@ -99,39 +101,65 @@ class ToolPolicy:
 
     @cached_property
     def argument_schemas(self):
-        """The arguments of each tool, framed: a strict tool's as its grammar
-        generates them, any other's as declared. None for a tool whose schema
-        cannot be read or whose parameters cannot be framed, which only a
-        strict tool refuses."""
+        """The arguments of each strict tool, framed as its grammar generates
+        them. The grammars are built together, so one budget bounds them."""
         budget = [MAX_FRAMED_SCHEMA_BYTES]
-        framed = {}
-        for name, schema in self.schemas.items():
-            schema = _json_type_names(schema)
-            if name in self.strict:
-                framed[name] = tool_argument_schema(_strict_schema(schema), budget)
-                continue
-            try:
-                framed[name] = (
-                    None if schema is None else tool_argument_schema(schema, budget)
-                )
-            except APIError:
-                framed[name] = None
-        return framed
+        return {
+            name: tool_argument_schema(_strict_schema(_json_type_names(schema)), budget)
+            for name, schema in self.schemas.items()
+            if name in self.strict
+        }
 
-    def parameter_types(self, name):
-        """The JSON types by which the values of tool `name` convert: those
-        of each parameter it declares, and those of any other; None stands
-        for any type, as for a tool that was not offered."""
-        schema = self.argument_schemas.get(name)
-        if schema is None:
-            return {}, None
-        other = schema["additionalProperties"]
+
+class ParameterTypes:
+    """The JSON types by which the values of a request's tool calls convert,
+    which the projector of its output reads as a call first names a tool of
+    its ToolPolicy and keeps for its later calls: those of each parameter
+    the tool declares, and those of any other; None where its schema
+    constrains no type, as for a tool that was not offered. A strict tool's
+    are those of the arguments its grammar generates. Any other tool's
+    arguments are projected from its schema, within what the budget of the
+    request's tools that are not strict has left, and their types read
+    against that schema; one whose schema cannot be read or whose arguments
+    cannot be projected declares no types."""
+
+    def __init__(self, policy):
+        self._policy = policy
+        # The types of each tool a call has named, and what the budget of the
+        # tools that are not strict has left as calls name them.
+        self._types = {}
+        self._budget = [MAX_FRAMED_SCHEMA_BYTES]
+
+    def of(self, name):
+        """The types of tool `name`'s parameters, and those of any other."""
+        if name not in self._types:
+            self._types[name] = self._read(name)
+        return self._types[name]
+
+    def _read(self, name):
+        policy = self._policy
+        if name in policy.strict:
+            shape = policy.argument_schemas[name]
+
+            def read(value):
+                # A framed value is a schema of its own.
+                return schema_types(value, value)
+
+        else:
+            schema = _json_type_names(policy.schemas.get(name))
+            if schema is None:
+                return {}, None
+            try:
+                shape = _argument_shape(schema, self._budget)
+            except APIError:
+                return {}, None
+            read = _type_reader(schema)
         return (
             {
-                parameter: schema_types(value, value)
-                for parameter, value in schema["properties"].items()
+                parameter: read(value)
+                for parameter, value in shape["properties"].items()
             },
-            frozenset() if other is False else schema_types(other, other),
+            read(shape["additionalProperties"]),
         )
 
 
@@ -442,6 +470,13 @@ def schema_types(schema, root):
     its allOf members and the target of its local reference. A member that
     constrains no type, such as one met again inside its own reading,
     neither widens nor narrows the others'."""
+    return _type_reader(root)(schema)
+
+
+def _type_reader(root):
+    """What reads schema_types of schemas within `root`, each node once
+    whatever schema it is read for: the parameters of a tool read the
+    definitions they share once."""
     types = {}
 
     def read(node):
@@ -478,7 +513,7 @@ def schema_types(schema, root):
             result = _narrowed(result, read(member))
         return result
 
-    return read(schema)
+    return read
 
 
 def _literal_texts(schema, root):
@@ -606,8 +641,18 @@ def _keyword(node, key, kind, default):
     return value if isinstance(value, kind) else default
 
 
-def tool_argument_schema(root, budget):
-    """Project a tool's object fields for XML framing.
+def _charge(budget, size):
+    """Take `size` from what a framing budget has left, refusing what it
+    cannot hold."""
+    budget[0] -= size
+    if budget[0] < 0:
+        raise APIError(400, "tool parameter schemas are too complex")
+
+
+def _argument_shape(root, budget):
+    """Project a tool's object fields for XML framing: the properties, the
+    required names and the additionalProperties of its arguments, each value
+    a node of `root` or a combination of its nodes.
 
     The projection keeps every value a field may take rather than choosing a
     branch before the model has written the discriminator or dependent
@@ -622,11 +667,6 @@ def tool_argument_schema(root, budget):
     as Draft 3's "any", and a reference to nothing in the document.
     """
 
-    def charge(size):
-        budget[0] -= size
-        if budget[0] < 0:
-            raise APIError(400, "tool parameter schemas are too complex")
-
     def combine(shapes, union=False):
         if union:
             shapes = [shape for shape in shapes if shape is not None]
@@ -637,7 +677,7 @@ def tool_argument_schema(root, budget):
         if not shapes:
             return {"properties": {}, "required": [], "additionalProperties": True}
         names = dict.fromkeys(name for shape in shapes for name in shape["properties"])
-        charge(len(names) * len(shapes))
+        _charge(budget, len(names) * len(shapes))
         required = set(shapes[0]["required"])
         for shape in shapes[1:]:
             if union:
@@ -745,17 +785,26 @@ def tool_argument_schema(root, budget):
             )
         return combine(shapes)
 
-    def framed(value):
-        # Shared definitions repeat in the serialized grammar; count them all.
-        charge(_json_size(value, budget[0]))
-        framed_value = _schema_with_root(value, root)
-        if framed_value is not value:
-            charge(_json_size(root, budget[0]))
-        return framed_value
-
     shape = project(root, set())
     if shape is None:
         raise APIError(400, "tool parameters must allow a top-level JSON object")
+    return shape
+
+
+def tool_argument_schema(root, budget):
+    """A strict tool's arguments as its grammar generates them: their
+    projection (_argument_shape), each value made a schema of its own, with
+    a copy of the root schema where it refers to the root."""
+
+    def framed(value):
+        # Shared definitions repeat in the serialized grammar; count them all.
+        _charge(budget, _json_size(value, budget[0]))
+        framed_value = _schema_with_root(value, root)
+        if framed_value is not value:
+            _charge(budget, _json_size(root, budget[0]))
+        return framed_value
+
+    shape = _argument_shape(root, budget)
     shape["type"] = "object"
     shape["properties"] = {
         name: framed(value) for name, value in shape["properties"].items()
