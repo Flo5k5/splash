@@ -211,9 +211,11 @@ private:
 // prefill step that completes a prompt asks for a constrained request's first
 // mask, or returns a score request's option logits; every constrained decode
 // cycle after the first token waits for its verify mask inside its command
-// (MaskOverlapTicket); and provideMask throws for a request that waits for
-// no mask and refuses one that permits no token. Its other members are the
-// tests' knobs and records.
+// (MaskOverlapTicket); a decode step throws for a lane whose output limit,
+// lowered by a resume after its anchor was selected, leaves it only that
+// anchor, which the runtime emits only as it selects it; and provideMask
+// throws for a request that waits for no mask and refuses one that permits
+// no token. Its other members are the tests' knobs and records.
 class Executor final : public model::Model {
 public:
   explicit Executor(
@@ -367,6 +369,8 @@ public:
       const bool awaitsMask = state.constrained && last;
       // The wait outlives a suspension, as the host continuation keeps it.
       state.awaitingMask = state.awaitingMask || awaitsMask;
+      if (last && !awaitsMask)
+        state.anchorLimit = outputLimits.at(item.requestId);
       ModelStepResult step{item.requestId, item.tokenCount, {}, false,
                            awaitsMask ? DecodeStage::ApplyInitialMask
                                       : DecodeStage::Regular,
@@ -406,11 +410,20 @@ public:
           item.logicalPosition + model::ExecutionLimits::targetVerifyRows) {
         throw std::invalid_argument("page_table_too_short");
       }
+      Request &state = requests.at(item.requestId);
+      const uint32_t limit = outputLimits.at(item.requestId);
       if (plan.decodeStage == DecodeStage::ApplyInitialMask) {
         // Selects the first token under its mask and drafts nothing.
+        state.anchorLimit = limit;
         result.push_back({item.requestId, 0, {}, false, DecodeStage::Regular,
                           0, 0});
       } else {
+        // The fake's step at the last budgeted token stands for the
+        // runtime's emission of that anchor as it selects it, under the
+        // same limit; an anchor selected under a higher limit was not
+        // emitted, and the runtime decodes no lane left only that anchor.
+        if (limit < state.anchorLimit && limit < state.generated + 2)
+          throw std::logic_error("terminal anchor was not emitted on selection");
         const auto speculative = speculativeCounts.find(item.requestId);
         const uint32_t emitted = speculative == speculativeCounts.end()
             ? decodeTokens : speculative->second.second + 1;
@@ -426,6 +439,8 @@ public:
           step.acceptedDraftTokens = speculative->second.second;
         }
         step.unreadableKvBlocks = takeUnreadable(item.requestId);
+        state.generated += static_cast<uint32_t>(tokens.size());
+        state.anchorLimit = limit;
         result.push_back(std::move(step));
       }
     }
@@ -687,6 +702,11 @@ public:
     std::vector<uint32_t> scoreTokens;
     // Waits for its first token's mask.
     bool awaitingMask = false;
+    // The tokens its decode steps emitted, and the output limit under which
+    // its anchor was selected: by the step that completed its prompt, its
+    // first mask's or its latest decode step.
+    uint32_t generated = 0;
+    uint32_t anchorLimit = 0;
   };
   std::unordered_map<uint64_t, Request> requests;
   // The page list each request's last item named, at its revision.

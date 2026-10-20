@@ -850,7 +850,8 @@ private:
   [[nodiscard]] bool pollTierTransfers();
   // A slot for a new KV copy, replacing older copies while the tier is at its
   // limit for the draw, and none while that limit cannot hold one; inUse
-  // when a state in use needs the copy.
+  // when a state in use needs the copy. A committed page's draw replaces the
+  // spilled chain of a state in RAM too, once nothing else is left.
   [[nodiscard]] std::shared_ptr<KvDiskSlot> acquireDiskSlot(model::DiskBudget::Draw draw,
                                                             bool inUse);
   // Gives up one disk copy for a new copy, in use or not: the oldest
@@ -860,6 +861,10 @@ private:
   // it restores through, go only for a copy in use, and after every other.
   // False when the disk holds nothing the new copy may displace.
   [[nodiscard]] bool freeDiskSpace(bool inUse);
+  // Evicts the state in RAM, not in use, of the oldest disk leaf holding
+  // one, as a spilled leaf can: the leaf and the chain above it become
+  // copies freeDiskSpace gives up. False when no disk leaf holds one.
+  [[nodiscard]] bool evictStateOnDiskLeaf();
   // Revokes commitments, newest Spill request first, while active KV
   // exceeds its limit, then gives up copies not in use while cached copies
   // exceed what active KV leaves of the limit; returns how many copies went.

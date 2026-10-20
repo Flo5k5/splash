@@ -859,14 +859,19 @@ bool Engine::admit(Request &active, double now) {
       lookup.state && (!lookup.state->state()->residentBytes() ||
                        cache_.kvRestoreStatus(requestId) == KvRestoreStatus::Pending);
   if (kv.admission.granted() && (resuming || restoring)) {
-    // A lane that resumes holds the chain it restored and takes new pages
-    // past it, which its replay writes in chunks that may end inside any
-    // of them: they all come cleared.
-    const uint64_t workEnd =
-        resuming ? active.resumeKvTargetTokens : uint64_t{resumeBoundary} + 1;
-    const uint64_t written = resuming ? uint64_t{resumeBoundary} : workEnd;
-    kv = allocate([&] { return cache_.ensureTokens(requestId, workEnd, written); }, inService,
-                  upTo, convert);
+    // Its new pages past the chain it restored come cleared: a resume's
+    // replay writes them in chunks that may end inside any of them. A
+    // Resident lane that resumes takes the KV target it was suspended with
+    // at once. A Spill lane, a Resident one that converts here included,
+    // takes the first work's page, as a start that waits for its restore
+    // does: its replay takes Full pages a command at a time (prepare), which
+    // spill as their copies land, as its output's did.
+    const auto workEnd = [&] {
+      return resuming && active.kvMode == KvMode::Resident ? active.resumeKvTargetTokens
+                                                           : uint64_t{resumeBoundary} + 1;
+    };
+    kv = allocate([&] { return cache_.ensureTokens(requestId, workEnd(), resumeBoundary); },
+                  inService, upTo, convert);
   }
   if (!kv.admission.granted()) {
     // The host continuation survives this failed admission. No recurrent
@@ -999,10 +1004,14 @@ Engine::SpillAdmission Engine::admitSpill(Request &active, bool resuming, uint64
   if (!resuming && !config_.spill.always && residentInstead())
     return SpillAdmission::Resident;
   // Otherwise the quota bounds its output to the pages it holds, if they
-  // leave a page of output past what the request holds; those of the chain
-  // it restores that have copies need none.
+  // hold a token past the tokens the request holds; those of the chain it
+  // restores that have copies need none. A resume counts among them the
+  // anchor its model holds once it selected the request's first token
+  // (Request::suspendedWithAnchor), which the model decodes only with
+  // output left past it: it emits a last budgeted anchor as it selects it.
+  const uint64_t held = active.exactTokens.size() + (active.suspendedWithAnchor ? 1 : 0);
   const uint64_t copied = cache_.copiedBlocks(chainEnd);
-  const uint64_t needed = active.exactTokens.size() / KvCache::pageTokens + 1 - copied;
+  const uint64_t needed = held / KvCache::pageTokens + 1 - copied;
   if (room >= needed) {
     active.outputLimit = static_cast<uint32_t>(std::min<uint64_t>(
         active.outputLimit, (copied + room) * KvCache::pageTokens - active.promptTokens));
@@ -2142,6 +2151,11 @@ void Engine::suspendLane(Request &active, uint64_t workEnd, metal::AllocationFai
   if (!active.lane || scheduler_.suspended(active.request.id)) {
     throw std::logic_error("request cannot be suspended");
   }
+  // A decoding lane holds an anchor unless its first mask has yet to select
+  // one; a lane in prefill holds what it held when its replay began.
+  if (scheduler_.phase(active.request.id) == Phase::Decode)
+    active.suspendedWithAnchor =
+        scheduler_.decodeStage(active.request.id) == DecodeStage::Regular;
   vacateLane(active, true);
   active.resumeKvTargetTokens = workEnd;
   active.replayTokens = static_cast<uint32_t>(active.exactTokens.size());

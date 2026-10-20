@@ -741,7 +741,11 @@ public:
   // only its host-side sampling/constraint continuation. Resume replays the
   // supplied committed history through the ordinary prefill path, and takes
   // the output limit it is given (maxNewTokens), which the engine sets anew
-  // at each start of a request (the SSD cache's quota may bound it).
+  // at each start of a request (the SSD cache's quota may bound it). That
+  // limit must leave output past the anchor the request holds once its
+  // first token is selected, which the suspension keeps: the model emits a
+  // last budgeted anchor as it selects it, and decodes no lane left only
+  // that anchor.
   virtual void suspend(uint64_t requestId) = 0;
   [[nodiscard]] virtual StateAdmission resume(const ModelRequest &request) = 0;
   // Restores a cached state into the request's lane at `boundary`. A RAM

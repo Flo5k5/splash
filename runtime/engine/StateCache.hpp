@@ -313,9 +313,10 @@ private:
   [[nodiscard]] Entry &entry(uint64_t kvBlock);
   // The block's entry, made when it has none.
   [[nodiscard]] Entry &entryFor(uint64_t kvBlock);
-  // The entry a new copy takes over, made when the block has none. A
-  // repeated checkpoint keeps its lifetime; an ordinary publication upgrades
-  // a checkpoint in either tier so rolling retirement cannot erase it.
+  // The entry a new copy takes over, made when the block has none; a
+  // condemned one gives up the copies it still holds. A repeated checkpoint
+  // keeps its lifetime; an ordinary publication upgrades a checkpoint in
+  // either tier so rolling retirement cannot erase it.
   [[nodiscard]] Entry &publicationEntry(uint64_t kvBlock, bool checkpoint);
   // Starts the write of the block's state, giving up quota through makeRoom
   // while the tier refuses one; null while the one write in flight holds the
@@ -337,6 +338,7 @@ private:
   acquireBlock(uint64_t kvBlock);
   // Places the entry in the orders its copies call for.
   void reindex(uint64_t kvBlock, Entry &entry) noexcept;
+  void discardRam(Entry &entry) noexcept;
   void discardDisk(Entry &entry) noexcept;
   // An ordinary publication or reuse: the block has held a reusable state,
   // and a checkpoint is upgraded.

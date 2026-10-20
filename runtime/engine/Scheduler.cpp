@@ -745,6 +745,8 @@ void Scheduler::observePrefill(uint32_t rows, double wallMilliseconds,
 
 Phase Scheduler::phase(uint64_t id) const { return get(id).phase; }
 
+DecodeStage Scheduler::decodeStage(uint64_t id) const { return get(id).decodeStage; }
+
 bool Scheduler::suspended(uint64_t id) const { return get(id).suspended; }
 
 uint64_t Scheduler::submissionOrder(uint64_t id) const { return get(id).order; }

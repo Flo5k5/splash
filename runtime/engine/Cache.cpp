@@ -1425,12 +1425,27 @@ std::shared_ptr<KvDiskSlot> Cache::acquireDiskSlot(model::DiskBudget::Draw draw,
       (draw == model::DiskBudget::Draw::Commitment ? diskBudget_->activeLimitBytes()
                                                    : diskBudget_->limitBytes()) < tier_->slotBytes())
     return {};
+  // A committed page is a request's KV, which comes before any cached copy:
+  // once nothing else is left, it takes the spilled chain of a state in RAM
+  // too, the state first. Only write-through draws on a commitment, and it
+  // holds no state.
+  const bool committed = draw == model::DiskBudget::Draw::Commitment;
   for (;;) {
     if (auto slot = tier_->acquireSlot(draw))
       return slot;
-    if (!freeDiskSpace(inUse))
+    if (!freeDiskSpace(inUse) && !(committed && evictStateOnDiskLeaf()))
       return {};
   }
+}
+
+bool Cache::evictStateOnDiskLeaf() {
+  for (auto leaf = kv_.diskCandidate(false); leaf; leaf = kv_.diskCandidate(false, leaf->id)) {
+    if (states_.stateResident(leaf->id) && !kvNeededByStateInUse(leaf->id)) {
+      states_.evict(leaf->id);
+      return true;
+    }
+  }
+  return false;
 }
 
 bool Cache::freeDiskSpace(bool inUse) {
@@ -1446,9 +1461,13 @@ bool Cache::freeDiskSpace(bool inUse) {
       kv_.setSlot(kvDuplicate->id, nullptr);
     return true;
   }
-  // A leaf holding a state in use stays with that state.
+  // A leaf holding a state in use stays with that state, and one holding a
+  // state in RAM, as a spilled leaf can, stays until reclaim takes the state
+  // or a committed page evicts it (evictStateOnDiskLeaf): a reclaim makes
+  // room here for that state's own write, or for a demotion beside the state
+  // it picked.
   auto kvLeaf = kv_.diskCandidate(false);
-  while (kvLeaf && kvNeededByStateInUse(kvLeaf->id))
+  while (kvLeaf && (kvNeededByStateInUse(kvLeaf->id) || states_.stateResident(kvLeaf->id)))
     kvLeaf = kv_.diskCandidate(false, kvLeaf->id);
   const auto stateOnly = states_.diskCandidate(false);
   if (!kvLeaf && !stateOnly) {

@@ -829,6 +829,42 @@ void testWriteThroughCopiesAreRestorePoints() {
           "the next process did not take the written-through point back whole");
 }
 
+// A full quota takes no copy a state needs, and a state in RAM has no disk
+// copy for it to give up, so the spilled chain of the ended request's replay
+// point outlasts every other copy. A committed page is a request's KV, which
+// comes before it: once nothing else is left, the page's slot takes that
+// chain, the state first.
+void testCommittedPagesTakeTheSpilledChainOfAStateInRam() {
+  const auto budget = std::make_shared<model::DiskBudget>(400);
+  Process process(true, budget, CacheSpillPolicy{1, 1});
+  process.tier.budget = budget;
+  // Room for an Index extent beside the eight Full pages.
+  process.storage.budgetPages = 9;
+  const std::vector<uint32_t> prompt = promptOf(1000, 4);
+  process.cache.beginRequest(1, KvMode::Spill);
+  require(process.cache.commitSpill(1, 4) && admitTokens(process.cache, 1, prompt.size()).granted(),
+          "the Spill request was not admitted");
+  process.cache.publishCommittedBlocks(1, prompt, static_cast<uint32_t>(prompt.size()), {});
+  static_cast<void>(test::spillRound(process.cache, process.tier));
+  const uint64_t point = process.cache.blockAt(1, 3 * KvCache::pageTokens);
+  process.publish(point);
+  process.cache.endRequest(1);
+  require(process.cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::Ordinary).madeProgress &&
+              process.tier.slots == 4 && process.cache.stateResident(point),
+          "the tail below the replay point did not leave RAM");
+  const std::vector<uint32_t> next = promptOf(5000, 2);
+  process.cache.beginRequest(2, KvMode::Spill);
+  require(process.cache.commitSpill(2, 2) && admitTokens(process.cache, 2, next.size()).granted(),
+          "the second Spill request was not admitted");
+  process.cache.publishCommittedBlocks(2, next, static_cast<uint32_t>(next.size()), {});
+  require(process.cache.writeThrough() == 2 && !process.cache.stateResident(point) &&
+              process.tier.slots == 4,
+          "a committed page did not take the spilled chain of a state in RAM");
+  process.tier.complete();
+  static_cast<void>(process.cache.pollTransfers());
+  process.cache.checkInvariants();
+}
+
 } // namespace
 
 int main() {
@@ -851,6 +887,7 @@ int main() {
     testWritesKeepToTheWriteBudget();
     testPointsWaitForTheTier();
     testWriteThroughCopiesAreRestorePoints();
+    testCommittedPagesTakeTheSpilledChainOfAStateInRam();
     std::cout << "Persistent cache tests passed\n";
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';

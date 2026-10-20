@@ -145,6 +145,8 @@ public:
                 std::optional<double> streamMilliseconds = std::nullopt);
 
   [[nodiscard]] Phase phase(uint64_t requestId) const;
+  // The stage of its decode commands, which a suspension keeps.
+  [[nodiscard]] DecodeStage decodeStage(uint64_t requestId) const;
   // Suspended by suspendForResources and not resumed since; a terminal
   // phase keeps it until remove(), so the engine can end the request's
   // continuation.

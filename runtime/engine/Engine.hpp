@@ -369,7 +369,10 @@ private:
     // quota bounds its output (admitSpill), which each attempt to start it
     // decides anew.
     uint32_t outputLimit = 0;
-    // A failed dispatch must fit before replay can consume any model work.
+    // The KV a Resident lane takes when it resumes, before its replay
+    // consumes any model work: what it held, or the work it was refused
+    // room for (suspendLane). A Spill lane takes its replay's pages a
+    // command at a time instead.
     uint64_t resumeKvTargetTokens = 0;
     ResourceWait resourceWait;
     // The latest attempt to start it was refused memory, or the SSD cache's
@@ -391,6 +394,12 @@ private:
     // (ModelStepResult::firstToken) and until the first decode cycle commits
     // it: that cycle emits it first, and its event leaves it out.
     std::optional<uint32_t> sentFirstToken;
+    // Its model held an anchor when its lane was last suspended: the token
+    // it selected last, which the suspension keeps (Model::suspend). A
+    // decoding lane holds one once its first token is selected, a
+    // constrained lane's under its first mask; a lane in prefill holds what
+    // it held when its replay began.
+    bool suspendedWithAnchor = false;
     // Made from exactTokens and the request's prompt identity, which do not
     // change while the request waits; refreshed each pass and dropped once it starts or
     // skips the cache.
@@ -519,10 +528,11 @@ private:
   // quota of active KV (Cache::spillRoom) must hold the pages it publishes
   // up to its projection. Short of that, a start that fits alone starts
   // Resident, unless every request spills; otherwise the quota bounds its
-  // output to what it holds, if that leaves at least a page of it; it waits
-  // while other requests' active KV (the copies of the blocks they hold,
-  // and their commitments) holds what it lacks; and otherwise a start is
-  // refused, and a resume ends at its length.
+  // output to what it holds, if that leaves a token of it past what the
+  // request holds, the anchor of a resume that holds one included; it
+  // waits while other requests' active KV (the copies of the blocks they
+  // hold, and their commitments) holds what it lacks; and otherwise a start
+  // is refused, and a resume ends at its length.
   enum class SpillAdmission : uint8_t {
     // The quota holds what it publishes: commit it once the lane is taken.
     Commit,
@@ -741,8 +751,9 @@ private:
                               bool optional = false)
       -> Allocation<std::invoke_result_t<Attempt &>>;
   // Takes a resident request's lane: its state and KV pages go back,
-  // and it waits, for `reason`, until admission resumes it with room for
-  // workEnd tokens of KV to replay its history from the cache.
+  // and it waits, for `reason`, until admission resumes it to replay its
+  // history from the cache, a Resident lane with room for workEnd tokens of
+  // KV (Request::resumeKvTargetTokens).
   void suspendLane(Request &request, uint64_t workEnd, metal::AllocationFailure failure,
                    StateFailure reason, double nowMilliseconds);
   // A lane that could not grow yields its memory: it waits for memory, and
@@ -754,8 +765,9 @@ private:
   [[nodiscard]] uint64_t kvCapacity(uint64_t requestId) const;
   // For a request of this priority that cannot start: suspends the lane that
   // yields first (laneToYield) if its priority is strictly lower, without a
-  // drain. The lane waits as for a free one, and resumes from its current KV
-  // capacity once admission reaches it again. True when one was suspended.
+  // drain. The lane waits as for a free one, and resumes once admission
+  // reaches it again, a Resident one with its current KV capacity. True when
+  // one was suspended.
   // Memory on its way back makes no lane yield, as in prepare(): a request
   // refused while it is pending waits for it instead.
   [[nodiscard]] bool preemptBelow(RequestPriority priority, double nowMilliseconds);

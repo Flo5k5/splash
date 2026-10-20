@@ -1,5 +1,6 @@
 #include "model/Runtime.hpp"
 #ifdef SPLASH_RUNTIME_INSTRUMENTATION
+#include "metal/abi/GDN.h"
 #include "model/RuntimeInstrumentation.hpp"
 #endif
 #include "AwakeClock.hpp"
@@ -12,7 +13,6 @@
 #include "model/VerifyBudget.hpp"
 
 #include "metal/CommandGraph.hpp"
-#include "metal/abi/GDN.h"
 #include "ops/AneFfn.hpp"
 #include "ops/Linear.hpp"
 #include "ops/PagedAttention.hpp"
@@ -379,8 +379,8 @@ struct Runtime::Impl {
   // vision arena.
   std::shared_ptr<ops::Vision> vision;
   // Every image's rows while anything holds them, so that a placement of
-  // the same image anywhere shares them. Entries of rows nothing holds any
-  // more go when a lookup or a walk finds them.
+  // the same image anywhere shares them. The entries of rows nothing holds
+  // any more go when the next start with images adds its own (activate).
   std::unordered_map<ImageKey, std::weak_ptr<ImageRows>, ImageKeyHash> imageRows;
   // Encoded rows kept for reuse once no placement has rows of them left to
   // inject, including prefix hits that land inside an image and still need
@@ -531,14 +531,8 @@ struct Runtime::Impl {
   // front of the embedding cache when it is there; null otherwise.
   std::shared_ptr<ImageRows> findRows(const ImageSpan &span) {
     const auto found = imageRows.find(imageKey(span));
-    if (found == imageRows.end())
-      return {};
-    std::shared_ptr<ImageRows> rows = found->second.lock();
-    if (!rows) {
-      imageRows.erase(found);
-      return {};
-    }
-    if (rows->cached)
+    std::shared_ptr<ImageRows> rows = found == imageRows.end() ? nullptr : found->second.lock();
+    if (rows && rows->cached)
       embeddingCache.splice(embeddingCache.begin(), embeddingCache, *rows->cached);
     return rows;
   }
@@ -730,6 +724,9 @@ struct Runtime::Impl {
     // The engine rejects image requests at submission when there is no vision.
     if (!model.descriptor.hasVision())
       throw std::logic_error("image request reached a model without vision");
+    // The entries of rows nothing holds any more go before this start adds
+    // its own.
+    std::erase_if(imageRows, [](const auto &entry) { return entry.second.expired(); });
     std::vector<ImageState> staged;
     staged.reserve(request.images.size());
     std::vector<std::shared_ptr<ImageRows>> shared;
@@ -796,18 +793,11 @@ struct Runtime::Impl {
   }
 
   // No image waits for its encode, so the vision arena can go.
-  [[nodiscard]] bool visionIdle() noexcept {
-    for (auto entry = imageRows.begin(); entry != imageRows.end();) {
-      const std::shared_ptr<ImageRows> rows = entry->second.lock();
-      if (!rows) {
-        entry = imageRows.erase(entry);
-        continue;
-      }
-      if (!rows->encoded)
-        return false;
-      ++entry;
-    }
-    return true;
+  [[nodiscard]] bool visionIdle() const noexcept {
+    return std::ranges::none_of(imageRows, [](const auto &entry) {
+      const std::shared_ptr<ImageRows> rows = entry.second.lock();
+      return rows && !rows->encoded;
+    });
   }
 
   // Encodes every image whose rows first appear in this chunk and overwrites
@@ -2499,35 +2489,6 @@ void Runtime::beginColdRequest(const ModelRequest &request,
   }
 }
 
-std::vector<uint8_t> Runtime::pendingGdnRows(uint64_t requestId) const {
-  const Impl::Request &entry = impl_->request(requestId);
-  if (!entry.resident)
-    throw std::logic_error("request is not resident");
-  const QwenLaneMetadata &metadata = impl_->states.metadata(entry.stateLane);
-  const ops::GdnShape shape = impl_->geometry.target.gdnShape();
-  const uint32_t kvWidth = (shape.keyHeads + shape.valueHeads) * shape.headDimension;
-  // Each field holds one row after another; the offset and row bytes of each.
-  const std::array<std::pair<uint64_t, uint64_t>, 4> fields{{
-      {0, uint64_t{shape.convolutionDimension} * 2},
-      {gdn_tape_kv_offset(shape.convolutionDimension), uint64_t{kvWidth} * 2},
-      {gdn_tape_decay_offset(shape.convolutionDimension, kvWidth), uint64_t{shape.valueHeads} * 4},
-      {gdn_tape_beta_offset(shape.convolutionDimension, kvWidth, shape.valueHeads),
-       uint64_t{shape.valueHeads} * 2},
-  }};
-  // The latest step's slot is the one the lane's next step folds from.
-  const uint8_t *slot =
-      contents<const uint8_t>(impl_->decodeArena->batchSlice(DecodeTensor::GdnTape, kLaneCount),
-                              "GDN tape") +
-      impl_->decodeArena->gdnTapeSlot(entry.stateLane, metadata.activeParity);
-  std::vector<uint8_t> rows;
-  for (uint32_t layer = 0; layer < impl_->geometry.target.stateLayout.layers; ++layer) {
-    const uint8_t *tape = slot + layer * ops::gdnTapeLayerBytes(shape);
-    for (const auto &[offset, rowBytes] : fields)
-      rows.insert(rows.end(), tape + offset, tape + offset + metadata.pendingRows * rowBytes);
-  }
-  return rows;
-}
-
 StateAdmission Runtime::begin(const ModelRequest &request) {
   Impl::VisionRollback rollback{*impl_, impl_->vision};
   StateAdmission admission = admitIdleLane(
@@ -3515,6 +3476,39 @@ RuntimeInstrumentation::LaneTables RuntimeInstrumentation::laneTables(const Runt
                  : std::span<const SplashKvPage>();
   };
   return {entries(tables.pages), entries(tables.index)};
+}
+
+std::vector<uint8_t> RuntimeInstrumentation::pendingGdnRows(const Runtime &runtime, uint64_t requestId) {
+  const Runtime::Impl &impl = *runtime.impl_;
+  const Runtime::Impl::Request &entry = impl.requests.at(requestId);
+  if (!entry.resident)
+    throw std::logic_error("request is not resident");
+  const QwenLaneMetadata &metadata = impl.states.metadata(entry.stateLane);
+  const ops::GdnShape shape = impl.geometry.target.gdnShape();
+  const uint32_t kvWidth = (shape.keyHeads + shape.valueHeads) * shape.headDimension;
+  // Each field holds one row after another; the offset and row bytes of each.
+  const std::array<std::pair<uint64_t, uint64_t>, 4> fields{{
+      {0, uint64_t{shape.convolutionDimension} * 2},
+      {gdn_tape_kv_offset(shape.convolutionDimension), uint64_t{kvWidth} * 2},
+      {gdn_tape_decay_offset(shape.convolutionDimension, kvWidth), uint64_t{shape.valueHeads} * 4},
+      {gdn_tape_beta_offset(shape.convolutionDimension, kvWidth, shape.valueHeads),
+       uint64_t{shape.valueHeads} * 2},
+  }};
+  // The latest step's slot is the one the lane's next step folds from.
+  const uint8_t *slot =
+      contents<const uint8_t>(impl.decodeArena->batchSlice(DecodeTensor::GdnTape, kLaneCount), "GDN tape") +
+      impl.decodeArena->gdnTapeSlot(entry.stateLane, metadata.activeParity);
+  std::vector<uint8_t> rows;
+  for (uint32_t layer = 0; layer < impl.geometry.target.stateLayout.layers; ++layer) {
+    const uint8_t *tape = slot + layer * ops::gdnTapeLayerBytes(shape);
+    for (const auto &[offset, rowBytes] : fields)
+      rows.insert(rows.end(), tape + offset, tape + offset + metadata.pendingRows * rowBytes);
+  }
+  return rows;
+}
+
+size_t RuntimeInstrumentation::imageEntries(const Runtime &runtime) {
+  return runtime.impl_->imageRows.size();
 }
 #endif
 

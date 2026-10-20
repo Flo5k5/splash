@@ -3,6 +3,7 @@
 #include "metal/abi/KvExtent.h"
 #include "model/Runtime.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -34,6 +35,15 @@ public:
     std::span<const SplashKvPage> index;
   };
   [[nodiscard]] static LaneTables laneTables(const Runtime &runtime, uint64_t requestId);
+  // The rows resident request `requestId`'s latest decode step retained,
+  // which its GDN cell holds only once its next step folds them in
+  // (QwenLaneMetadata::pendingRows): every GDN layer's tape rows
+  // (metal/abi/GDN.h) up to that count, field by field, layer by layer.
+  [[nodiscard]] static std::vector<uint8_t> pendingGdnRows(const Runtime &runtime, uint64_t requestId);
+  // The entries of the registry through which the placements of an image
+  // share its rows: an entry for each image whose rows something holds, and
+  // for each whose rows went since the last start with images.
+  [[nodiscard]] static size_t imageEntries(const Runtime &runtime);
 };
 
 } // namespace splash::model

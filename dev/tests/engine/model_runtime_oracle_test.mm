@@ -243,7 +243,7 @@ CommittedState committedState(const model::Runtime &executor, const model::QwenS
   require(static_cast<bool>(cell.contents()), "a committed GDN cell is not CPU-visible");
   const auto *cellBytes = static_cast<const uint8_t *>(cell.contents());
   CommittedState state{metadata.lengths, metadata.pendingRows, {cellBytes, cellBytes + cell.sizeBytes()},
-                       executor.pendingGdnRows(metadata.requestId), {}};
+                       model::RuntimeInstrumentation::pendingGdnRows(executor, metadata.requestId), {}};
   // A ring's keys are [head][slot][dimension] and its values [head][dimension]
   // [slot]; position p is slot p % window.
   const auto layout = states.layout().draft;
@@ -2675,6 +2675,26 @@ void requireCapturedStateKeepsItsImageRows(model::Runtime &executor,
   std::cout << "captured_state_keeps_its_image_rows=PASS\n";
 }
 
+// The registry through which the placements of an image share its rows
+// keeps no entry of rows nothing holds once the next start with images adds
+// its own: starts of distinct images that end before their prefill, as
+// cancelled requests do, leave it as large as the first did, however many
+// come.
+void requireImageRegistryKeepsOnlyHeldRows(model::Runtime &executor) {
+  size_t entries = 0;
+  for (uint64_t index = 0; index < 3; ++index) {
+    const EngineRequest request = imageRequest(440 + index, {16, 16, 8, 8, 251 + index, 557 + index});
+    require(executor.begin(request.modelView()).granted(), "an image registry request was not admitted");
+    const size_t held = model::RuntimeInstrumentation::imageEntries(executor);
+    require(!index || held == entries, "the image registry kept the entries of rows nothing holds");
+    entries = held;
+    executor.end(request.id);
+  }
+  while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
+  }
+  std::cout << "image_registry_keeps_only_held_rows=PASS\n";
+}
+
 // A batch of distinct requests packs its lanes' rows lane by lane: each
 // request must decode the same tokens and commit the same state, bit for bit,
 // in whichever lane and state lane it sits, two cycles on, as every row
@@ -3894,6 +3914,7 @@ int main(int argc, char **argv) {
       requireEncoderFitsItsImages(executor, backend, model, allocationFault);
       requireReplayPointKeepsItsImageRows(executor, backend);
       requireCapturedStateKeepsItsImageRows(executor, backend);
+      requireImageRegistryKeepsOnlyHeldRows(executor);
     } else {
       require(!imagesOnly, "--images-only needs a model that serves vision");
       std::cout << "image scenarios: skipped, the model serves text only\n";
@@ -3903,7 +3924,8 @@ int main(int argc, char **argv) {
                 << " (admission rollback, chunk reclaim, cache-only budget, mixed/repeated images,"
                    " shared, suspended and injected rows, rows a failed chunk encoded,"
                    " covered images, refused starts,"
-                   " one cache unit per reclaim, replay point and captured state rows)\n";
+                   " one cache unit per reclaim, replay point and captured state rows,"
+                   " registry entries of rows nothing holds)\n";
       return 0;
     }
 
