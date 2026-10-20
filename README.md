@@ -70,8 +70,6 @@ automatically:
 | Qwen3.6-35B-A3B | `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M` | `mlx-community/Qwen3.6-35B-A3B-4bit` |
 | Qwen3.8-Flash-Next | `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:Q2_0` | — |
 
-Unsloth's Qwen3.8-Flash-Next GGUFs load too.
-
 Unsloth GGUF variants span **1–8 bits**, including mixed-precision UD formats
 up to `UD-Q8_K_XL`, whose BF16 tensors load too. Whole-BF16 and F16 models are
 not supported: the installer refuses a GGUF whose projections and experts are
@@ -99,7 +97,7 @@ window. To set your own limits or cache options, add these to `splash serve`:
 | --- | --- |
 | `--max-memory 28G` | Cap Metal memory use. |
 | `--idle-release off` | Keep the model in memory while idle (default: release after 10m). |
-| `--max-context 100K` | Set the context limit. Up to `1M` tokens: past 256K, YaRN stretches the window, which changes answers at every length. |
+| `--max-context 100K` | Set the context limit. Up to `1M` tokens. |
 | `--language-only` | Skip vision; serve text only. |
 | `--kv-format bf16` | Use BF16 KV cache. Default: 8-bit (INT8). |
 | `--state-format bf16` | Use BF16 recurrent states, half the size. Default: FP32. |
@@ -123,7 +121,7 @@ packages and selected SPEED-Bench coding prompts over HTTP. Ratios compare
 with the next-fastest engine measured in that benchmark. Qwen3.8-Flash-Next
 (`ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:Q2_0`) was measured the same way
 with this release on an M5 Pro (20-core GPU, 64 GB); its ratios compare with
-another engine serving the same GGUF on that Mac.
+Strata serving the same GGUF on that Mac.
 
 | Metric | Qwen3.6-35B-A3B | Qwen3.8-27B | Qwen3.8-Flash-Next |
 | --- | ---: | ---: | ---: |
