@@ -58,6 +58,8 @@ TEST_SSD_READERS_ASAN := $(ENGINE_SANITIZER_BUILD)/ssd-readers-asan-ubsan
 TEST_SSD_READERS_TSAN := $(ENGINE_SANITIZER_BUILD)/ssd-readers-tsan
 TEST_ELASTIC_KV_ASAN := $(ENGINE_SANITIZER_BUILD)/elastic-kv-pool-asan-ubsan
 TEST_ELASTIC_KV_TSAN := $(ENGINE_SANITIZER_BUILD)/elastic-kv-pool-tsan
+TEST_SLOT_RECYCLER_ASAN := $(ENGINE_SANITIZER_BUILD)/slot-recycler-asan-ubsan
+TEST_SLOT_RECYCLER_TSAN := $(ENGINE_SANITIZER_BUILD)/slot-recycler-tsan
 TEST_MEMORY_TEST := $(ENGINE_TEST_BUILD)/engine-memory-plan
 TEST_VISION_PREPARATION := $(ENGINE_TEST_BUILD)/vision-preparation
 TEST_DRAFT_PREPARATION := $(ENGINE_TEST_BUILD)/draft-preparation
@@ -76,6 +78,8 @@ TEST_GGUF_ROTATION := $(ENGINE_TEST_BUILD)/gguf-rotation
 TEST_GGUF_MOE := $(ENGINE_TEST_BUILD)/gguf-moe
 TEST_GGUF_MOE_E512 := $(ENGINE_TEST_BUILD)/gguf-moe-e512
 TEST_EXPERT_STORE := $(ENGINE_TEST_BUILD)/expert-store
+TEST_KV_BLOCK_CACHE := $(ENGINE_TEST_BUILD)/kv-block-cache
+TEST_KV_HISTORY_STREAM := $(ENGINE_TEST_BUILD)/kv-history-stream
 TEST_QWEN4_KERNELS := $(ENGINE_TEST_BUILD)/qwen4-kernels
 TEST_GGUF_REFERENCE := $(ENGINE_TEST_BUILD)/gguf-reference
 TEST_GGUF_PLANNER := $(ENGINE_TEST_BUILD)/gguf-planner
@@ -87,6 +91,9 @@ WEIGHT_GOLDENS := dev/tests/fixtures/weight-goldens/goldens.json
 MLX_QUANTIZATION_FIXTURE := dev/tests/fixtures/mlx-quantization/fixture.json
 # An MLX config.json and a DFlash2 draft config built like each family's.
 MODEL_CONFIGS := dev/tests/fixtures/model-configs
+# Real decodes' block selections, which the hot block cache's replacement is
+# checked on (dev/tests/engine/slot_recycler_test.cpp reads them).
+KV_SELECTION_TRACES := dev/tests/fixtures/kv-selection-traces
 TEST_KV_PAGE_CACHE_TEST := $(ENGINE_TEST_BUILD)/kv-page-cache
 TEST_ENGINE_CACHE_TEST := $(ENGINE_TEST_BUILD)/engine-cache
 TEST_DRAFT_CONTEXT_PLAN_TEST := $(ENGINE_TEST_BUILD)/draft-context-plan
@@ -206,6 +213,8 @@ TEST_METAL_TARGETS := $(TEST_DRAFT_PREPARATION) \
 	$(TEST_GGUF_MOE) \
 	$(TEST_GGUF_MOE_E512) \
 	$(TEST_EXPERT_STORE) \
+	$(TEST_KV_BLOCK_CACHE) \
+	$(TEST_KV_HISTORY_STREAM) \
 	$(TEST_QWEN4_KERNELS) \
 	$(TEST_GGUF_PREPARATION) \
 	$(TEST_ATTENTION_PLAN) \
@@ -254,7 +263,8 @@ SANITIZER_CONFIG_TARGETS := $(TEST_SLOT_FILE_ASAN) $(TEST_SLOT_FILE_TSAN) \
 	$(TEST_ANE_FFN_CALIBRATION_ASAN) $(TEST_ANE_FFN_CALIBRATION_TSAN) \
 	$(TEST_SPARSE_ROW_STORE_ASAN) $(TEST_SPARSE_ROW_STORE_TSAN) \
 	$(TEST_SSD_READERS_ASAN) $(TEST_SSD_READERS_TSAN) \
-	$(TEST_ELASTIC_KV_ASAN) $(TEST_ELASTIC_KV_TSAN)
+	$(TEST_ELASTIC_KV_ASAN) $(TEST_ELASTIC_KV_TSAN) \
+	$(TEST_SLOT_RECYCLER_ASAN) $(TEST_SLOT_RECYCLER_TSAN)
 
 # Every native test, benchmark and tool depends on the engine's and the tests'
 # headers, and compiles and links its other prerequisites in the order it
@@ -273,7 +283,6 @@ $(ENGINE_TEST_BUILD) $(ENGINE_SANITIZER_BUILD):
 # library or a framework. Those that also run under the sanitizers list their
 # sources with the sanitizer builds.
 $(TEST_WEIGHT_SOURCE): dev/tests/engine/weight_source_test.cpp runtime/model/WeightSource.cpp
-$(TEST_SLOT_RECYCLER): dev/tests/engine/slot_recycler_test.cpp runtime/model/SlotRecycler.cpp
 $(TEST_GGUF_FILE): dev/tests/engine/gguf_file_test.cpp runtime/model/GgufFile.cpp \
 		runtime/model/WeightSource.cpp
 $(TEST_MEMORY_TEST): runtime/metal/DeviceCapabilities.cpp \
@@ -372,6 +381,10 @@ $(TEST_GGUF_MOE_E512): ENGINE_TEST_CXXFLAGS += -DGGUF_MOE_HIDDEN=256 -DGGUF_MOE_
 		-DGGUF_MOE_EXPERTS=512 -DGGUF_MOE_TOP_K=10
 $(TEST_EXPERT_STORE): dev/tests/engine/expert_store_test.mm \
 		$(ENGINE_LIBRARY) $(LIB)
+$(TEST_KV_BLOCK_CACHE): dev/tests/engine/kv_block_cache_test.mm \
+		$(ENGINE_LIBRARY) $(LIB)
+$(TEST_KV_HISTORY_STREAM): dev/tests/engine/kv_history_stream_test.mm \
+		$(ENGINE_LIBRARY) $(LIB)
 $(TEST_QWEN4_KERNELS): dev/tests/engine/qwen4_kernels_test.mm \
 		$(ENGINE_LIBRARY) $(LIB)
 $(TEST_GDN_METAL_TEST): dev/tests/engine/gdn_metal_test.mm \
@@ -423,7 +436,8 @@ $(TEST_DRAFT_PREPARATION) $(TEST_GGUF_PROJECTION) $(TEST_ANE_FFN) \
 		$(TEST_GGUF_REFERENCE) $(TEST_GGUF_PLANNER) $(TEST_GGUF_PREPARATION) \
 		$(TEST_BOOTSTRAP_TEST) $(TEST_RESOURCES_TEST) \
 		$(TEST_KV_PAGE_TIER_TEST) $(TEST_QWEN_STATE_TEST) $(TEST_Q8_ATTENTION_TEST) \
-		$(TEST_Q8_PREFILL_TEST) $(TEST_GGUF_MOE) $(TEST_GGUF_MOE_E512) $(TEST_EXPERT_STORE) $(TEST_QWEN4_KERNELS) \
+		$(TEST_Q8_PREFILL_TEST) $(TEST_GGUF_MOE) $(TEST_GGUF_MOE_E512) $(TEST_EXPERT_STORE) \
+		$(TEST_KV_BLOCK_CACHE) $(TEST_KV_HISTORY_STREAM) $(TEST_QWEN4_KERNELS) \
 		$(TEST_GDN_METAL_TEST) $(TEST_ATTENTION_PLAN) $(TEST_LINEAR_PLAN) \
 		$(TEST_DFLASH_BATCH_CONTROL_TEST) $(TEST_DRAFT_ATTENTION_TEST) \
 		$(TEST_GDN_DECODE_TEST) $(TEST_DRAFT_SELECTOR_TEST) \
@@ -505,7 +519,7 @@ test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP)
 	$(TEST_KV_SLOT_FORMAT)
 	$(TEST_SPARSE_ROW_STORE)
 	$(TEST_SSD_READERS)
-	$(TEST_SLOT_RECYCLER)
+	$(TEST_SLOT_RECYCLER) $(KV_SELECTION_TRACES)
 	$(TEST_CACHE_DIRECTORY)
 	$(TEST_DISK_SPACE)
 	$(TEST_LEGACY_WEIGHT_CACHE)
@@ -557,6 +571,8 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 	$(METAL_TEST_ENV) $(TEST_GGUF_MOE) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_GGUF_MOE_E512) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_EXPERT_STORE) $(LIB)
+	$(METAL_TEST_ENV) $(TEST_KV_BLOCK_CACHE) $(LIB)
+	$(METAL_TEST_ENV) $(TEST_KV_HISTORY_STREAM) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_QWEN4_KERNELS) $(LIB)
 	$(TEST_QWEN4_KERNELS) $(LIB) bitwise
 	$(METAL_TEST_ENV) $(TEST_ATTENTION_PLAN) $(LIB)
@@ -660,6 +676,8 @@ $(TEST_SSD_READERS) $(TEST_SSD_READERS_ASAN) $(TEST_SSD_READERS_TSAN): \
 		runtime/model/SsdReaders.cpp dev/tests/engine/ssd_readers_test.cpp
 $(TEST_ELASTIC_KV_TEST) $(TEST_ELASTIC_KV_ASAN) $(TEST_ELASTIC_KV_TSAN): \
 		runtime/engine/KvPool.cpp dev/tests/engine/elastic_kv_pool_test.cpp
+$(TEST_SLOT_RECYCLER) $(TEST_SLOT_RECYCLER_ASAN) $(TEST_SLOT_RECYCLER_TSAN): \
+		runtime/model/SlotRecycler.cpp dev/tests/engine/slot_recycler_test.cpp
 $(TEST_PERSISTENT_CACHE) $(TEST_PERSISTENT_CACHE_ASAN) $(TEST_PERSISTENT_CACHE_TSAN): \
 		$(CACHE_SOURCES) runtime/model/SlotFile.cpp dev/tests/engine/persistent_cache_test.cpp
 $(TEST_ENGINE_CACHE_TEST) $(TEST_ENGINE_CACHE_ASAN) $(TEST_ENGINE_CACHE_TSAN): \
@@ -715,3 +733,23 @@ test-sanitizers: $(SANITIZER_CONFIG_TARGETS)
 	$(TSAN_TEST_ENV) $(TEST_SSD_READERS_TSAN)
 	$(ASAN_TEST_ENV) $(TEST_ELASTIC_KV_ASAN)
 	$(TSAN_TEST_ENV) $(TEST_ELASTIC_KV_TSAN)
+	$(ASAN_TEST_ENV) $(TEST_SLOT_RECYCLER_ASAN) $(KV_SELECTION_TRACES)
+	$(TSAN_TEST_ENV) $(TEST_SLOT_RECYCLER_TSAN) $(KV_SELECTION_TRACES)
+
+# The Metal tests of the components whose host steps share their state with
+# the engine thread and the SSD readers, the hot block cache and the history
+# stream, under ThreadSanitizer on a Mac with a GPU: the engine library and
+# the tests built with it, and their metallibs, in a build of their own (the
+# builds above link no framework), and what it cannot see inside Metal
+# suppressed (metal_tsan_suppressions.txt).
+METAL_TSAN_BUILD := $(BUILD)/metal-tsan
+METAL_TSAN_CXXFLAGS := $(ENGINE_SANITIZER_CXXFLAGS) -fsanitize=thread
+METAL_TSAN_TEST_ENV := $(TSAN_TEST_ENV):suppressions=dev/tests/engine/metal_tsan_suppressions.txt
+.PHONY: test-sanitizers-metal
+test-sanitizers-metal:
+	$(MAKE) --no-print-directory -f "$(SPLASH_MAKEFILE)" BUILD=$(METAL_TSAN_BUILD) \
+		ENGINE_CXXFLAGS='$(METAL_TSAN_CXXFLAGS)' ENGINE_TEST_CXXFLAGS='$(METAL_TSAN_CXXFLAGS)' \
+		$(METAL_TSAN_BUILD)/splash.metallib $(METAL_TSAN_BUILD)/host-step.metallib \
+		$(METAL_TSAN_BUILD)/engine-tests/kv-block-cache $(METAL_TSAN_BUILD)/engine-tests/kv-history-stream
+	$(METAL_TSAN_TEST_ENV) $(METAL_TSAN_BUILD)/engine-tests/kv-block-cache $(METAL_TSAN_BUILD)/splash.metallib
+	$(METAL_TSAN_TEST_ENV) $(METAL_TSAN_BUILD)/engine-tests/kv-history-stream $(METAL_TSAN_BUILD)/splash.metallib
