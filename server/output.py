@@ -137,26 +137,25 @@ def _json_value(text):
 
 
 def convert_value(text, types):
-    """A parameter's text as the JSON types its schema declares read it, any
-    type where `types` is None: a string as the text, and another value as
-    the JSON the text spells when that is of a declared type or when no
-    declared type is a string. A boolean or null declared without a string
-    may also be spelled as Python spells it. Otherwise the text."""
+    """A parameter's text as the JSON types its schema gives for it read it,
+    `types` holding at least one; a value of none is its text, which
+    StreamingToolCallProjector streams as it is written. A string reads as
+    the text, and another value as the JSON the text spells when that is of
+    a declared type or when no declared type is a string. A boolean or null
+    declared without a string may also be spelled as Python spells it.
+    Otherwise the text."""
     value = _json_value(text)
     if value is _NOT_JSON:
         value = _PYTHON_LITERALS.get(text.strip(), _NOT_JSON)
         declared = (
             value is not _NOT_JSON
-            and types is not None
             and "string" not in types
             and JSON_TYPES[type(value)] in types
         )
         return value if declared else text
-    if types is None or "string" in types:
+    if "string" in types:
         kind = JSON_TYPES[type(value)]
-        declared = (
-            types is None or kind in types or (kind == "integer" and "number" in types)
-        )
+        declared = kind in types or (kind == "integer" and "number" in types)
         return value if declared and kind != "string" else text
     return value
 
@@ -173,11 +172,12 @@ class StreamingToolCallProjector:
     other order. </function> closes the call, and the </tool_call> after it
     may be left out. Names lose the space around them; a call that names no
     function is dropped, other text inside a call is dropped, and a repeated
-    parameter keeps its first value, which may have streamed. A value
-    converts by the types its tool declares for it (convert_value), and one
-    that may only be a string streams as it is written. Text outside calls
-    streams as it arrives, after a call as before one, and a </think> there
-    is dropped (_TEXT_TAGS).
+    parameter keeps its first value, which may have streamed. A value whose
+    schema gives it no type, or the type string alone, is its text and
+    streams as it is written; any other converts at its end by the types its
+    tool declares for it (convert_value). Text outside calls streams as it
+    arrives, after a call as before one, and a </think> there is dropped
+    (_TEXT_TAGS).
 
     Without a tool policy the output has no calls: a call's opening is text,
     and the projector only drops the </think>s, so that every answer reads
@@ -292,9 +292,10 @@ class StreamingToolCallProjector:
         self.parameter_names.add(name)
         self.parameter_name = name if kept else None
         self.value_types = self.parameter_types.get(name, self.other_types)
-        # A value that may only be a string streams as it is written; any
-        # other waits for its end to convert.
-        self.value_streams = self.value_types == {"string"}
+        # A value whose schema gives it no type, or the type string alone, is
+        # its text and streams as it is written; any other waits for its end
+        # to convert.
+        self.value_streams = not self.value_types or self.value_types == {"string"}
         self.value_started = False
         self.value_parts = []
         if self.value_streams and self.parameter_name is not None:

@@ -549,14 +549,14 @@ class StructuredToolGrammarTest(unittest.TestCase):
         # Its schema, which breaks its dialect's meta-schema, builds no
         # grammar: a grammar holds its calls to the tags alone, beside a
         # strict tool or a response format too. Its values still convert by
-        # the types it declares, n as a string.
+        # the types it declares, n as an integer.
         invalid = {
             "type": "function",
             "function": {
                 "name": "note",
                 "parameters": {
                     "type": "object",
-                    "properties": {"n": {"type": "string", "required": True}},
+                    "properties": {"n": {"type": "integer", "required": True}},
                 },
             },
         }
@@ -575,7 +575,7 @@ class StructuredToolGrammarTest(unittest.TestCase):
                 )
                 _, calls, _ = project(call, policy("required", tools=tools))
                 self.assertEqual(
-                    json.loads(calls[0]["function"]["arguments"]), {"n": "7"}
+                    json.loads(calls[0]["function"]["arguments"]), {"n": 7}
                 )
 
     def test_function_names_read_back_as_the_grammar_writes_them(self):

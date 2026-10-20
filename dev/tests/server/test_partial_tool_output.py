@@ -1035,7 +1035,9 @@ class PartialToolOutputTests(unittest.TestCase):
             if chunk["choices"]
         )
         self.assertEqual(chat_message["content"], expected)
-        self.assertEqual(chat_message["tool_calls"][0]["function"]["arguments"], "{")
+        self.assertEqual(
+            chat_message["tool_calls"][0]["function"]["arguments"], '{"city":"Par'
+        )
         self.assertEqual(chat_streamed, expected)
         self.assertEqual(chat_chunks[-1]["choices"][0]["finish_reason"], "length")
 

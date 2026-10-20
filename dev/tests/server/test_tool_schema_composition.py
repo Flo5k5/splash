@@ -245,25 +245,25 @@ class ToolSchemaCompositionTests(HarnessTestCase):
         # copies exceed. The request's tools that are not strict share one
         # budget, apart from the strict tools', as its output's calls name
         # them: one whose composition exceeds what it has left declares no
-        # types, so its values convert untyped, as do those of a tool a call
-        # names once it is spent, while a strict tool keeps its grammar and
-        # its types.
+        # types, so its values stay text, as do those of a tool a call names
+        # once it is spent, while a strict tool keeps its grammar and its
+        # types.
         choice = {"enum": [f"choice-{index:03d}" for index in range(400)]}
         referring = {
             "$defs": {"choice": choice},
             "properties": {
-                "n": {"type": "string"},
+                "n": {"type": "integer"},
                 **{f"p{index}": {"$ref": "#/$defs/choice"} for index in range(20)},
             },
         }
         composed = {
-            "properties": {"n": {"type": "string"}},
+            "properties": {"n": {"type": "integer"}},
             "allOf": [
                 {"properties": {f"p{index}": {} for index in range(150)}}
                 for _ in range(150)
             ],
         }
-        plain = {"properties": {"n": {"type": "string"}}}
+        plain = {"properties": {"n": {"type": "integer"}}}
         call = (
             "<tool_call>\n<function={}>\n<parameter=n>\n123\n</parameter>\n"
             "</function>\n</tool_call>"
@@ -283,7 +283,7 @@ class ToolSchemaCompositionTests(HarnessTestCase):
             _, calls, _ = project("".join(map(call.format, names)), policy)
             self.assertEqual(
                 [json.loads(made["function"]["arguments"]) for made in calls],
-                [{"n": "123"}, {"n": 123}, {"n": 123}, {"n": "123"}],
+                [{"n": 123}, {"n": "123"}, {"n": "123"}, {"n": 123}],
             )
 
     def test_framing_reads_keywords_of_any_kind(self):
@@ -452,7 +452,7 @@ class ToolSchemaCompositionTests(HarnessTestCase):
             },
             "$ref": "#/$defs/args",
         }
-        written = {"name": "123", "extra": True}
+        written = {"name": "123", "extra": "true"}
         self.check_arguments(schema, written)
         self.check_arguments(
             {
@@ -545,7 +545,7 @@ class ToolSchemaCompositionTests(HarnessTestCase):
         self.assertFalse(self.accepts(policy, xml.replace("</function>", extra)))
         self.check_arguments(
             {"type": "object", "not": {"required": ["forbidden"]}},
-            {"allowed": 123},
+            {"allowed": "123"},
         )
         self.check_arguments({"enum": [{"a": "123"}, {"b": 3}]}, {"a": "123"})
 
@@ -602,7 +602,7 @@ class ToolSchemaCompositionTests(HarnessTestCase):
                 "properties": {"a": {"type": "string", "const": "hello"}},
                 "additionalProperties": True,
             },
-            {"a": "hello", "ab": 3},
+            {"a": "hello", "ab": "3"},
         )
         bad = (
             '<tool_call>\n<function=t0>\n<parameter=a>\n"hello"\n'
@@ -627,7 +627,7 @@ class ToolSchemaCompositionTests(HarnessTestCase):
         self.assertFalse(self.accepts(policy, xml.replace("</function>", repeated)))
         policy, xml = self.check_arguments(
             {"properties": {"secret": False}, "additionalProperties": {}},
-            {"secrets": 1},
+            {"secrets": "1"},
         )
         self.assertFalse(self.accepts(policy, xml.replace("secrets", "secret")))
 

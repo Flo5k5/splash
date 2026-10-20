@@ -1215,6 +1215,10 @@ JSON type, and a type that holds one constrains none, as one the schema does
 not give: `["integer", "any"]` constrains no type, and
 `{"type": "integer", "allOf": [{"type": "any"}]}` is an integer.
 
+- A parameter whose type the schema does not give stays the text as written:
+  one declared without a type, or with a type that holds a name of no JSON
+  type; one the tool does not declare, unless `additionalProperties` gives its
+  type; and every parameter of a tool whose schema gives no types.
 - A parameter that cannot be a string takes the JSON its text spells, of
   whatever type; text that is not JSON stays text. Where the tool declares a
   boolean or null, `True`, `False` and `None` also read as `true`, `false` and
@@ -1223,9 +1227,6 @@ not give: `["integer", "any"]` constrains no type, and
 - A parameter that may be a string takes the JSON its text spells only when
   that is of another declared type (an integer counts as a number); otherwise
   it stays the text as written.
-- A parameter whose type is left open, or that the tool does not declare,
-  takes the JSON its text spells unless that is a string, which stays as
-  written.
 
 | Declared type | Text | Argument |
 | --- | --- | --- |
@@ -1236,8 +1237,8 @@ not give: `["integer", "any"]` constrains no type, and
 | `["string", "number"]` | `12:00` | `"12:00"` |
 | `["string", "integer"]` | `0800` | `"0800"` |
 | `str` | `42` | `"42"` |
-| `any` | `7` | `7` |
-| not declared | `7` | `7` |
+| `any` | `7` | `"7"` |
+| not declared | `7` | `"7"` |
 | not declared | `seven` | `"seven"` |
 
 Calls are not validated against their schemas; a client reports what its tool
@@ -1290,7 +1291,7 @@ own, and reference no remote document, or the request returns 400. Any other
 tool is declared as sent, and its parameters take the types its schema
 declares, valid or not; the arguments of one whose schema nests deeper or
 allows no object, whose references form a cycle, or whose framing exceeds the
-budget convert as those of a parameter it does not declare. In framing, a
+budget stay text, as those of a parameter it does not declare. In framing, a
 keyword that holds another kind of value than it takes, such as the `null` Go
 writes for a nil slice, constrains nothing, as one its dialect does not define,
 and so do a value that is not a schema where one belongs, a type name that

@@ -588,7 +588,7 @@ class ToolCallTests(HarnessTestCase):
         choice = chat(tools=tools, stop=["ris"])
         self.assertEqual(choice["finish_reason"], "stop")
         call = choice["message"]["tool_calls"][0]["function"]
-        self.assertEqual((call["name"], call["arguments"]), ("weather", "{"))
+        self.assertEqual((call["name"], call["arguments"]), ("weather", '{"city":"Pa'))
         choice = chat(tools=tools, stop=["answer"])
         self.assertEqual(choice["finish_reason"], "tool_calls")
         call = choice["message"]["tool_calls"][0]["function"]
@@ -802,18 +802,18 @@ class ToolCallTests(HarnessTestCase):
         # Only a strict tool's grammar is built from its schema, which must
         # pass the checks below. Any other tool is offered as sent, and its
         # values convert by the types its schema declares, valid or not:
-        # city says it is a string, which keeps "3" as text. A Draft 3
+        # city says it is an integer, which reads "3" as 3. A Draft 3
         # required, a Draft 4 boolean exclusiveMinimum on another parameter,
         # the null Go writes for a nil slice of required names, the type
         # "dict" BFCL's function format names an object by, at the root or in
         # an allOf member, and a remote reference break checks a grammar
         # needs; only a schema nested too deep to read declares no types, and
-        # "3" reads as 3. The parameters' object, properties map and city take
+        # "3" stays text. The parameters' object, properties map and city take
         # three levels.
         deep = {"type": "string"}
         for _ in range(tool_schema.MAX_SCHEMA_DEPTH - 3):
             deep = {"type": "array", "items": deep}
-        city = {"type": "string"}
+        city = {"type": "integer"}
         days = {"type": "integer", "minimum": 0, "exclusiveMinimum": True}
         invalid = "invalid tool schema for weather: "
 
@@ -821,20 +821,20 @@ class ToolCallTests(HarnessTestCase):
             return {"type": "object", "properties": properties}
 
         cases = (
-            (parameters(city={**city, "required": True}), invalid, "3"),
-            (parameters(city=city, days=days), invalid, "3"),
-            ({**parameters(city=city), "required": None}, invalid, "3"),
-            ({**parameters(city=city), "type": "dict"}, invalid, "3"),
-            ({**parameters(city=city), "allOf": [{"type": "dict"}]}, invalid, "3"),
+            (parameters(city={**city, "required": True}), invalid, 3),
+            (parameters(city=city, days=days), invalid, 3),
+            ({**parameters(city=city), "required": None}, invalid, 3),
+            ({**parameters(city=city), "type": "dict"}, invalid, 3),
+            ({**parameters(city=city), "allOf": [{"type": "dict"}]}, invalid, 3),
             (
                 parameters(city={**city, "$ref": "https://example.com/city"}),
                 "remote tool schema reference",
-                "3",
+                3,
             ),
             (
                 parameters(city={**city, "not": deep}),
                 f"{invalid}nested more than 64 levels",
-                3,
+                "3",
             ),
         )
         harness = self.harness(FakeRuntime(*(Plan([[28]]) for _ in cases)))
