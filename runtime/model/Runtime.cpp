@@ -379,8 +379,8 @@ struct Runtime::Impl {
   // vision arena.
   std::shared_ptr<ops::Vision> vision;
   // Every image's rows while anything holds them, so that a placement of
-  // the same image anywhere shares them. Entries of rows nothing holds any
-  // more go when a lookup or a walk finds them.
+  // the same image anywhere shares them. The entries of rows nothing holds
+  // any more go when the next start with images adds its own (activate).
   std::unordered_map<ImageKey, std::weak_ptr<ImageRows>, ImageKeyHash> imageRows;
   // Encoded rows kept for reuse once no placement has rows of them left to
   // inject, including prefix hits that land inside an image and still need
@@ -531,14 +531,8 @@ struct Runtime::Impl {
   // front of the embedding cache when it is there; null otherwise.
   std::shared_ptr<ImageRows> findRows(const ImageSpan &span) {
     const auto found = imageRows.find(imageKey(span));
-    if (found == imageRows.end())
-      return {};
-    std::shared_ptr<ImageRows> rows = found->second.lock();
-    if (!rows) {
-      imageRows.erase(found);
-      return {};
-    }
-    if (rows->cached)
+    std::shared_ptr<ImageRows> rows = found == imageRows.end() ? nullptr : found->second.lock();
+    if (rows && rows->cached)
       embeddingCache.splice(embeddingCache.begin(), embeddingCache, *rows->cached);
     return rows;
   }
@@ -730,6 +724,9 @@ struct Runtime::Impl {
     // The engine rejects image requests at submission when there is no vision.
     if (!model.descriptor.hasVision())
       throw std::logic_error("image request reached a model without vision");
+    // The entries of rows nothing holds any more go before this start adds
+    // its own.
+    std::erase_if(imageRows, [](const auto &entry) { return entry.second.expired(); });
     std::vector<ImageState> staged;
     staged.reserve(request.images.size());
     std::vector<std::shared_ptr<ImageRows>> shared;
@@ -796,18 +793,11 @@ struct Runtime::Impl {
   }
 
   // No image waits for its encode, so the vision arena can go.
-  [[nodiscard]] bool visionIdle() noexcept {
-    for (auto entry = imageRows.begin(); entry != imageRows.end();) {
-      const std::shared_ptr<ImageRows> rows = entry->second.lock();
-      if (!rows) {
-        entry = imageRows.erase(entry);
-        continue;
-      }
-      if (!rows->encoded)
-        return false;
-      ++entry;
-    }
-    return true;
+  [[nodiscard]] bool visionIdle() const noexcept {
+    return std::ranges::none_of(imageRows, [](const auto &entry) {
+      const std::shared_ptr<ImageRows> rows = entry.second.lock();
+      return rows && !rows->encoded;
+    });
   }
 
   // Encodes every image whose rows first appear in this chunk and overwrites
@@ -3515,6 +3505,10 @@ RuntimeInstrumentation::LaneTables RuntimeInstrumentation::laneTables(const Runt
                  : std::span<const SplashKvPage>();
   };
   return {entries(tables.pages), entries(tables.index)};
+}
+
+size_t RuntimeInstrumentation::imageEntries(const Runtime &runtime) {
+  return runtime.impl_->imageRows.size();
 }
 #endif
 
