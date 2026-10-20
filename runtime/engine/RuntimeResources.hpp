@@ -167,8 +167,9 @@ struct RuntimeResourcesConfig {
   // every relaunch. The relaunch decides the rest as an automatic start, as
   // that engine did, the SSD cache's staging among it, but its split takes at
   // most the units whose plan holds this context, the GPU alone where none
-  // does (startAneFfn), and it serves this context where its plan holds it
-  // (RuntimeBootstrap::start). Zero for none.
+  // does (startAneFfn), where its plan spills its SSD cache opens whatever
+  // room the volume has (RuntimeResources::create), and it serves this
+  // context where its plan holds it (RuntimeBootstrap::start). Zero for none.
   uint32_t relaunchContext = 0;
   // The process's existing pressure observer runs before resource assembly;
   // it only publishes a level. Bootstrap checks it at Metal operation

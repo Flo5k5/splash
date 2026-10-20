@@ -243,9 +243,10 @@ state (`disk`), and in `bound` which one sets the limit (`model`, `memory` or
 `disk`). Its context therefore follows the free space of the cache's volume
 at a first start; a dense target's never does, nor does a block-sparse one's
 with `--max-cache-disk 0`. A relaunch keeps its first engine's context
-whatever room the volume has left since: each request's commitment checks
-the room as it starts. The plans that size the streamed stores take the
-room the volume leaves when the start begins, before the weights load.
+whatever room the volume has left since: where its plan spills, the cache
+opens however little room the volume has, and each request's commitment
+checks the room as it starts. The plans that size the streamed stores take
+the room the volume leaves when the start begins, before the weights load.
 
 `--yarn-factor FACTOR` stretches the native window by FACTOR, above 1 and at
 most 4, with YaRN RoPE scaling, as Qwen describes for these models: `2` gives a
@@ -473,8 +474,10 @@ target's follows the room for its KV
 ([memory and context](#memory-and-context)). The disk decides only whether
 the cache's files open: `auto` opens them only where its limit, a quarter of
 what a local volume has beyond the floor, would hold two states and 1 GiB of
-KV, on the volume of every place the cache may keep its files. Where no files
-open, startup says why the cache is off, and the staging stays unused.
+KV, on the volume of every place the cache may keep its files. A relaunch
+whose plan spills opens temporary files whatever room their volume has, as
+the first engine's context it keeps may rest on them. Where no files open,
+startup says why the cache is off, and the staging stays unused.
 
 A write that finds the volume full while it shows room beyond the floor met a
 limit the engine cannot see, such as a volume quota, or a volume that filled
@@ -3055,7 +3058,11 @@ volumes through `RuntimeResourcesConfig::diskVolume`): the temporary files',
 where it goes without a persistent cache or whenever the root cannot be used,
 and a persistent tier's root, with the root's caches nobody holds counted as
 the tier's, since the tier may take their place. A root that refuses, or whose
-open fails, leaves the tier temporary files if their volume takes it.
+open fails, leaves the tier temporary files if their volume takes it. A
+relaunch whose plan spills takes temporary files on any local volume it can
+measure, whatever room it has: the first engine's context it keeps may rest
+on the tier, and each request's commitment checks the room
+(`Engine::admitSpill`).
 
 The volume sizes the tier only once its files are open, before a persistent
 tier takes anything back, and again at every control pass and whenever a write

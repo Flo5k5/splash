@@ -1,3 +1,4 @@
+#include "GgufFixtures.hpp"
 #include "TestChecks.hpp"
 #include "TestFiles.hpp"
 #include "TestCheckpoint.hpp"
@@ -144,6 +145,62 @@ RuntimeResourcesConfig moeConfig(const char *metallibPath, const std::filesystem
                                             model::TargetSource::Safetensors, model::VisionSource::Safetensors);
   config.model.sourceIdentity = "synthetic";
   config.buildId = "moe-test";
+  config.hostMemory = [] { return std::optional<HostMemory>(HostMemory{64 * kGiB, 64 * kGiB}); };
+  return config;
+}
+
+// A Qwen3.8-Flash-Next model under root whose weights load, a block-sparse
+// target whose KV spills: a GGUF of its family's tensors
+// (gguf_fixtures::targetTensors) with its attention, GDN, indexer and PLE
+// heads but a hidden state of 256 values, a vocabulary of 256 tokens, eight
+// layers, every second one full attention, and four routed experts a layer,
+// and a draft of one layer that reads four of them; no vision tower.
+RuntimeResourcesConfig flashNextConfig(const char *metallibPath, const std::filesystem::path &root) {
+  model::Qwen4ExpLayout target;
+  target.layers = 8;
+  target.hiddenSize = 256;
+  target.vocabularySize = 256;
+  target.fullAttentionPeriod = 2;
+  target.maskToken = 252;
+  target.stopTokens = {250, 251};
+  target.pleEosToken = 250;
+  target.pleImageToken = 253;
+  target.experts = 4;
+  target.expertsPerToken = 2;
+  target.expertIntermediateSize = 256;
+  target.pleLayer = 0;
+  gguf_fixtures::TensorTypes types = gguf_fixtures::qwen4ExpTypes();
+  for (const char *name : {"hc_attn_down.weight", "hc_attn_up.weight", "hc_ffn_down.weight", "hc_ffn_up.weight",
+                           "output_hc_down.weight", "output_hc_up.weight", "ffn_gate_exps.weight",
+                           "ffn_up_exps.weight", "ffn_down_exps.weight", "ffn_gate_shexp.weight",
+                           "ffn_up_shexp.weight", "ffn_down_shexp.weight"})
+    types[name] = gguf_fixtures::kQ8_0;
+  // The PLE hash, its heads an equal share of the table's rows each.
+  std::vector<test::gguf::Key> keys = gguf_fixtures::metadata(target);
+  const std::string ple = std::string(model::Qwen4ExpLayout::ggufArchitecture) + ".ple.";
+  const uint32_t heads = target.pleHeads(), headRows = gguf_fixtures::kPleTableRows / heads;
+  std::vector<int32_t> offsets, rows(heads, int32_t(headRows));
+  for (uint32_t head = 0; head < heads; ++head)
+    offsets.push_back(int32_t(head * headRows));
+  keys.push_back(test::gguf::int32ArrayKey(ple + "layer_multipliers", {1, 31, 961}));
+  keys.push_back(test::gguf::int32ArrayKey(ple + "head_offsets", offsets));
+  keys.push_back(test::gguf::int32ArrayKey(ple + "head_vocab_sizes", rows));
+  keys.push_back(test::gguf::uint32Key(ple + "eos_token_id", target.pleEosToken));
+  std::filesystem::create_directories(root / "target");
+  test::writeFile(root / "target" / "model.gguf",
+                  test::gguf::file(keys, gguf_fixtures::targetTensors(target, types)));
+  constexpr std::array<uint32_t, 4> draftReads{1, 3, 5, 7};
+  const model::DFlashDraftLayout draft =
+      model::draftLayout(target.hiddenSize, target.vocabularySize, 1, 512, 1'000'000.0F, draftReads);
+  test::writeSyntheticShard(root / "draft" / "model.safetensors", test::draftTensors(draft));
+  RuntimeResourcesConfig config;
+  config.metallibPath = metallibPath;
+  config.modelRoot = root;
+  config.model = model::makeModelDescriptor("flash-next-test", target, draft,
+                                            {.outputHiddenSize = target.hiddenSize}, model::TargetSource::Gguf,
+                                            model::VisionSource::None);
+  config.model.sourceIdentity = "synthetic";
+  config.buildId = "flash-next-test";
   config.hostMemory = [] { return std::optional<HostMemory>(HostMemory{64 * kGiB, 64 * kGiB}); };
   return config;
 }
@@ -991,6 +1048,31 @@ void testAutomaticContextIgnoresTheVolume(const char *metallibPath) {
           "a persistent cache with no room anywhere did not leave the tier off once");
 }
 
+// A block-sparse target's context past what memory holds spills to the SSD
+// cache, so where the automatic cache's volume has no room for it, a first
+// start serves only what memory holds. A relaunch keeps its first engine's
+// context whatever room the volume has left since: its spilling plan opens
+// the cache's temporary files however little room their volume has.
+void testRelaunchKeepsTheSpilledContext(const char *metallibPath) {
+  const test::TemporaryDirectory root("splash-relaunch");
+  RuntimeResourcesConfig config = flashNextConfig(metallibPath, root.path());
+  config.cacheDisk = {.automatic = true};
+  config.diskVolume = reading(localVolume(500 * kGiB));
+  // A budget whose memory holds less of the window than spilling does.
+  config.maximumMemoryBytes = startStreamed(config).minimumRequired + 512 * kMiB;
+  const StreamedStart first = startStreamed(config);
+  config.diskVolume = reading(localVolume(11 * kGiB));
+  const StreamedStart refused = startStreamed(config);
+  require(first.tier && !refused.tier && refused.context < first.context &&
+              refused.log.find("SSD cache off: 11.0 GiB available on /Volumes/Test") != std::string::npos,
+          "a block-sparse target did not spill past what its memory holds, or spilled to an SSD cache "
+          "whose volume has no room for it");
+  config.relaunchContext = first.context;
+  const StreamedStart relaunch = startStreamed(config);
+  require(relaunch.tier && relaunch.context >= first.context,
+          "a relaunch served less than its first engine's context for want of SSD room");
+}
+
 // The engine asks the governor whether the host pauses growth, and its
 // serving mark lets a request in service grow through that pause.
 void testEngineFollowsTheGovernor(const char *metallibPath) {
@@ -1042,6 +1124,7 @@ int main(int argc, char **argv) {
       testMadeCacheRootStaysOutOfBackups(argv[1]);
       testAutomaticTierYieldsToTheContext(argv[1]);
       testAutomaticContextIgnoresTheVolume(argv[1]);
+      testRelaunchKeepsTheSpilledContext(argv[1]);
       testEngineFollowsTheGovernor(argv[1]);
       {
         const test::TemporaryDirectory root("splash-moe");

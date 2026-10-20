@@ -228,11 +228,14 @@ struct DiskTier final {
 // holds it or it cannot be used, the tier keeps temporary files, as without
 // one. The automatic tier opens files only on a volume where its limit would
 // hold two states and 1 GiB of KV: a persistent tier's root, whose caches
-// nobody holds count as the tier's, else the temporary files'. Every start
-// removes the root's stale caches.
+// nobody holds count as the tier's, else the temporary files'. A relaunch
+// whose plan spills (`relaunchSpills`) opens temporary files whatever room
+// their volume has: the first engine's context it keeps may rest on the
+// tier's KV, and the room bounds each request's commitment instead
+// (Engine::admitSpill). Every start removes the root's stale caches.
 DiskTier openDiskTier(const RuntimeResourcesConfig &config, const std::string &cacheNamespace,
                       uint64_t quotaBytes, uint64_t kvSlotBytes, const model::SlotFile::Options &kvOptions,
-                      uint64_t stateBytes, const model::SlotFile::Options &stateOptions) {
+                      uint64_t stateBytes, const model::SlotFile::Options &stateOptions, bool relaunchSpills) {
   DiskTier tier;
   // The cache root's caches nobody holds, this start's own included, looked
   // at once: they are room an automatic persistent tier may take, the stale
@@ -254,7 +257,7 @@ DiskTier openDiskTier(const RuntimeResourcesConfig &config, const std::string &c
       const uint64_t minimumBytes = 2 * stateSlotBytes + (uint64_t{1} << 30);
       std::error_code ignored;
       temporaryRefusal = automaticDiskRefusal(
-          config.diskVolume(std::filesystem::temp_directory_path(ignored)), 0, minimumBytes);
+          config.diskVolume(std::filesystem::temp_directory_path(ignored)), 0, relaunchSpills ? 0 : minimumBytes);
       if (config.persistentCache && !config.cacheRoot.empty()) {
         uint64_t heldBytes = 0;
         for (const CacheDirectory::Idle &cache : rootCaches)
@@ -721,6 +724,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         config.diskVolume(root ? config.cacheRoot : std::filesystem::temp_directory_path(ignored)), heldBytes);
   }
   bool kvFileOpen = true;
+  // The context a relaunch keeps, which only an automatic context does.
+  const uint32_t relaunchContext = requestedContextTokens ? 0 : config.relaunchContext;
   // The plan with the parts set as `experts` and `table`, `stagingBytes` set
   // aside for the disk tier's state staging and `aneFfnBytes` for the
   // prefill FFN's Neural Engine split.
@@ -736,7 +741,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
          .kvLayout = kvLayout,
          .windowTokens = config.model.capabilities.maximumContextTokens,
          .requestedContextTokens = requestedContextTokens,
-         .relaunchContextTokens = requestedContextTokens ? 0 : config.relaunchContext,
+         .relaunchContextTokens = relaunchContext,
          .experts = {streamable.expertBytes, streamable.expertFloorBytes, experts},
          .table = {streamable.tableBytes, streamable.tableFloorBytes, table},
          .hotCacheBytes = config.sparseKvMemory,
@@ -1001,7 +1006,9 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     // the plan set the staging aside without asking it, and where they do
     // not open the staging stays unused. A plan that spills takes the room
     // the tier's volume leaves active KV, and spills only where its KV file
-    // opened: its floors can only shrink.
+    // opened: its floors can only shrink. A relaunch whose plan spills opens
+    // them whatever room the volume has, as the first engine's context it
+    // keeps may rest on them.
     const std::string cacheNamespace =
         persistentCacheNamespace(cacheIdentity, loaded.stateLayout(config.stateFormat));
     // The KV file's slots hold a page as the tier lays it out, checksummed by
@@ -1011,7 +1018,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
                                                  .deferWrites = readers->criticalBusyProbe()};
     const model::SlotFile::Options stateFileOptions{.deferWrites = readers->criticalBusyProbe()};
     DiskTier disk = openDiskTier(config, cacheNamespace, stateStagingBytes ? cacheDiskBytes : 0, kvSlotBytes,
-                                 kvFileOptions, stateBytes, stateFileOptions);
+                                 kvFileOptions, stateBytes, stateFileOptions,
+                                 relaunchContext && memoryPlan.breakdown().kvSpill.enabled);
     if (memoryPlan.breakdown().kvSpill.enabled) {
       kvFileOpen = disk.kv != nullptr;
       if (disk.budget)
