@@ -206,13 +206,14 @@ RuntimeResourcesConfig flashNextConfig(const char *metallibPath, const std::file
 }
 
 // What a start sized: its context, the least memory its plan needs and its
-// arenas, its routed experts' store, whether its SSD cache started, its log
-// and how many times it loaded the weights.
+// arenas, its routed experts' store, whether its SSD cache started, its
+// backend's memory, its log and how many times it loaded the weights.
 struct StreamedStart final {
   uint32_t context = 0;
   uint64_t minimumRequired = 0, arenaBytes = 0;
   std::optional<model::ExpertStoreStats> experts;
   bool tier = false;
+  metal::MetalMemoryStats memory;
   std::string log;
   size_t loads = 0;
 };
@@ -227,6 +228,7 @@ StreamedStart startStreamed(const RuntimeResourcesConfig &config) {
     started.arenaBytes = budget.sharedPrefillBytes + budget.sharedDecodeBytes;
     started.experts = resources->streamedExpertStats();
     started.tier = resources->cache().snapshot().kvTier.capacityBytes != 0;
+    started.memory = resources->backend().refreshMemoryStats();
   });
   for (size_t at = started.log.find("Weights loaded"); at != std::string::npos;
        at = started.log.find("Weights loaded", at + 1))
@@ -283,10 +285,12 @@ void testStreamableWeightsAreWhatLoads(const RuntimeResourcesConfig &config) {
 // holds them, in one load as main does. Where it does not, they stream
 // through a store of all that the first 64K tokens of KV leave, in two
 // loads: the first plans the arenas of either, and the second loads that
-// store. The automatic SSD cache gives its state staging up where it alone
-// would stream them. Off loads them whatever the budget, a budget without
-// room for their arenas stops the start with its breakdown, and a size below
-// the smallest store is refused by name before anything loads.
+// store; the backend's peaks, which the memory audit holds to the plan,
+// count only the second. The automatic SSD cache gives its state staging up
+// where it alone would stream them. Off loads them whatever the budget, a
+// budget without room for their arenas stops the start with its breakdown,
+// and a size below the smallest store is refused by name before anything
+// loads.
 void testAutomaticExpertMemory(RuntimeResourcesConfig config) {
   const model::StreamableWeights weights =
       model::streamableWeights(config.modelRoot, config.model, {.streamExperts = true});
@@ -302,10 +306,15 @@ void testAutomaticExpertMemory(RuntimeResourcesConfig config) {
             message);
   };
   // A byte short of the budget that holds every expert, which the plan
-  // without the arenas holds: whole, then through the store.
+  // without the arenas holds: whole, then through the store. The first
+  // load's experts do not count toward the peaks.
   config.maximumMemoryBytes = whole.minimumRequired - 1;
-  streams(startStreamed(config),
+  const StreamedStart reloaded = startStreamed(config);
+  streams(reloaded,
           "experts that fit beside everything but the arenas did not stream through the store the plan sizes");
+  const uint64_t firstLoad = weights.loadedBytes + weights.expertBytes;
+  require(reloaded.memory.peakAllocatedBytes < firstLoad && reloaded.memory.devicePeakAllocatedBytes < firstLoad,
+          "the backend's peaks counted the load the start discarded");
   // Short of that too: at the floor, then through the store.
   config.maximumMemoryBytes = whole.minimumRequired - whole.arenaBytes - 1;
   streams(startStreamed(config),

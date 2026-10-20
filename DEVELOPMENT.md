@@ -327,8 +327,9 @@ size with a warning.
 - The cache counts as fixed runtime memory in the plan
   (`streamed_table_bytes`): the governor charges it beside Metal's
   allocations, and the startup memory audit bounds it by the plan and counts
-  it toward the hard budget beside Metal's footprint. It is not released
-  while idle.
+  it toward the hard budget beside Metal's footprint since the weights that
+  serve began to load, not a first load that held the table whole before the
+  plan with the arenas streamed it. It is not released while idle.
 - `/status` reports it under `streamed_table`: the table and its bytes, the
   cache's size, capacity, rows and evictions; per use (`prefill`, `decode`)
   its stages, requested and distinct rows, hits, reads, hit rate and stage

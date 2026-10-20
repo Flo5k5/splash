@@ -48,7 +48,8 @@ struct ActualMemoryReport {
     uint64_t backendAllocatedBytes = 0;
     uint64_t deviceCurrentAllocatedBytes = 0;
     uint64_t devicePeakAllocatedBytes = 0;
-    // The backend's own high-water mark since startup.
+    // The backend's own high-water mark, and the device's above, since the
+    // weights that serve began to load (MetalBackend::restartPeaks).
     uint64_t backendPeakAllocatedBytes = 0;
 };
 

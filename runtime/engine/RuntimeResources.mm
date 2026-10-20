@@ -843,8 +843,13 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   const auto load = [&](bool again) {
     try {
       const auto started = AwakeClock::now();
-      // The images of the last load go before the next allocates its own.
+      // The images of the last load go before the next allocates its own,
+      // and the backend's peaks start again: the memory audit holds the load
+      // that serves to its plan, not one the plan with the arenas replaced,
+      // which may have held a PLE table whole that now streams through a
+      // row cache the audit's budget for Metal leaves out.
       loaded = {};
+      backend->restartPeaks();
       loaded = model::loadModel(*backend, config.modelRoot, config.model, loadOptions);
       requireLoadedModel(loaded);
       const std::chrono::duration<double> loading = AwakeClock::now() - started;
