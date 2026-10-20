@@ -2362,6 +2362,12 @@ void run(const std::string &metallibPath) {
     require(stats.devicePeakAllocatedBytes >=
                 stats.deviceCurrentAllocatedBytes,
             "device peak allocation accounting regressed");
+    // Restarted, both peaks are what is allocated now.
+    backend.restartPeaks();
+    stats = backend.memoryStats();
+    require(stats.peakAllocatedBytes == 0 &&
+                stats.devicePeakAllocatedBytes == stats.deviceCurrentAllocatedBytes,
+            "restarted peaks kept a released allocation");
 
     MetalBuffer privateBuffer = backend.allocateBuffer(
         16, BufferStorage::Private, "private-test");

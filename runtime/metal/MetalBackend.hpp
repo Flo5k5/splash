@@ -311,15 +311,17 @@ struct MetalMemoryStats {
   // Sum of MTLResource.allocatedSize for live base buffers created through
   // this backend. Views share their base allocation and add no bytes.
   uint64_t allocatedBytes = 0;
+  // Its highest value since the backend was made or its peaks restarted
+  // (MetalBackend::restartPeaks).
   uint64_t peakAllocatedBytes = 0;
 
   // Most recently sampled Metal device-wide process counter. Allocation and
   // command lifecycle boundaries refresh it; status reads never synchronize
   // with an in-flight GPU command.
   uint64_t deviceCurrentAllocatedBytes = 0;
-  // Highest sampled device.currentAllocatedSize. Sampled after allocations
-  // and pipeline creation, on host-side retirement and whenever admission
-  // refreshes the stats.
+  // Highest sampled device.currentAllocatedSize since then. Sampled after
+  // allocations and pipeline creation, on host-side retirement and whenever
+  // admission refreshes the stats.
   uint64_t devicePeakAllocatedBytes = 0;
 };
 
@@ -457,6 +459,10 @@ public:
   // control-plane status query must use memoryStats() so it can never wait
   // behind an active Metal command.
   [[nodiscard]] MetalMemoryStats refreshMemoryStats() const noexcept;
+  // Starts both peaks again from what is allocated now, sampling the device:
+  // what memory held before, such as a load the caller discarded, no longer
+  // counts. Called where nothing else allocates.
+  void restartPeaks() noexcept;
   // True from a submission until its ticket has been consumed: while memory
   // the command reaches through addresses must stay allocated.
   [[nodiscard]] bool commandInFlight() const noexcept;

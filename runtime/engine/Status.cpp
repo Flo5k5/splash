@@ -493,6 +493,7 @@ std::string runtimeStatusJson(
       << executorTelemetry.totalConstrainedMaskWaitSeconds * 1000.0 << "}"
       << ",\"images\":{\"encodes\":" << executorTelemetry.imageEncodes
       << ",\"embedding_reuses\":" << executorTelemetry.imageEmbeddingReuses
+      << ",\"embedding_evictions\":" << executorTelemetry.imageEmbeddingEvictions
       << ",\"arena_bytes\":" << executorTelemetry.visionArenaBytes
       << ",\"cached_bytes\":" << executorTelemetry.embeddingCacheBytes
       << ",\"state_held_bytes\":" << executorTelemetry.stateHeldImageBytes

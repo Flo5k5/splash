@@ -87,27 +87,32 @@ uint64_t parseBytes(std::string_view value) {
 }
 
 // The oracle loads and allocates without production's memory guard, and it
-// injects every refusal its checks expect. When other programs hold memory it
-// needs, the run stops here with the numbers: a check would otherwise fail
-// for the wrong reason, or catch the refusal as its own.
-[[noreturn]] void stopForHostMemory(const std::string &refusal,
-                                    uint64_t availableBytes,
-                                    uint64_t reserveBytes) {
-  std::cerr << "model_runtime_oracle_test: FAIL: " << refusal
-            << ", and macOS has " << mebibytes(availableBytes)
-            << " available and keeps " << mebibytes(reserveBytes)
-            << "; close other programs and retry\n";
+// injects every refusal its checks expect. When macOS cannot give it memory
+// it needs, or it cannot tell, the run stops here, saying why: a check would
+// otherwise fail for the wrong reason, or catch the refusal as its own.
+[[noreturn]] void stopForHostMemory(const std::string &reason) {
+  std::cerr << "model_runtime_oracle_test: FAIL: " << reason << '\n';
   std::exit(1);
 }
 
-// A refusal of the memory governor for host memory, with what it measured.
-[[noreturn]] void stopForHostMemory(const MemoryGovernor &governor,
-                                    const std::string &need, uint64_t bytes) {
-  // Its allocations are no request's in service: they keep the spare reserve.
-  const MemoryGovernorSnapshot host = governor.snapshot();
-  stopForHostMemory("the memory governor refused " + mebibytes(bytes) +
-                        " for " + need,
-                    host.hostSpareBytes, host.hostSpareReserveBytes);
+// The admission of what the oracle allocates for `need` through `governor`,
+// which the oracle marks serving, so that only its limit and macOS's critical
+// pressure refuse it. It reads macOS's level before each allocation, as the
+// engine's control pass reads it between commands, and stops the run at
+// critical pressure or when it cannot read the level.
+metal::AllocationAdmission governedFor(MemoryGovernor &governor, std::string need) {
+  return [admit = governor.allocationAdmission(), &governor, need = std::move(need)](
+             uint64_t bytes, const std::function<void()> &allocate) {
+    const std::optional<MemoryPressure> pressure = querySystemMemoryPressure();
+    if (!pressure)
+      stopForHostMemory("cannot read macOS's memory pressure to allocate " + mebibytes(bytes) + " for " + need);
+    governor.setPressure(*pressure);
+    const metal::AllocationResult result = admit(bytes, allocate);
+    if (result.failure == metal::AllocationFailure::HostPressure)
+      stopForHostMemory("the memory governor refused " + mebibytes(bytes) + " for " + need +
+                        " under macOS's critical memory pressure; close other programs and retry");
+    return result;
+  };
 }
 
 constexpr uint32_t kVocabulary = 248320;
@@ -2451,8 +2456,8 @@ void requireRefusedStartKeepsItsRows(model::Runtime &executor,
 
 // A reclaim step frees one unit: with two cached images and an idle encoder
 // three steps free the arena, which neither image needs again, then the
-// older entry and the newer, and a step limited to buffers frees none of
-// them.
+// older entry and the newer, which the telemetry counts as evictions, and a
+// step limited to buffers frees none of them.
 void requireReclaimTakesOneCacheUnit(model::Runtime &executor,
                                      metal::MetalBackend &backend,
                                      const model::LoadedModel &model) {
@@ -2492,6 +2497,8 @@ void requireReclaimTakesOneCacheUnit(model::Runtime &executor,
   require(executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches) == 0 &&
               backend.memoryStats().allocatedBytes == originalBytes,
           "cache units leaked resources");
+  require(executor.telemetry().imageEmbeddingEvictions == cached.imageEmbeddingEvictions + 2,
+          "the embedding cache did not count the two entries it let go of");
   std::cout << "reclaim_takes_one_cache_unit=PASS\n";
 }
 
@@ -3662,8 +3669,9 @@ int main(int argc, char **argv) {
                                  (streamable.tableBytes ? loadOptions.streamedTableBytes : 0);
     if (*hostAvailableBytes <= hostReserveBytes ||
         weightBytes > *hostAvailableBytes - hostReserveBytes)
-      stopForHostMemory("the weights need " + mebibytes(weightBytes),
-                        *hostAvailableBytes, hostReserveBytes);
+      stopForHostMemory("the weights need " + mebibytes(weightBytes) + ", and macOS has " +
+                        mebibytes(*hostAvailableBytes) + " available and keeps " + mebibytes(hostReserveBytes) +
+                        "; close other programs and retry");
     // Streamed weights read on a pool of SSD readers, as the engine's do.
     loadOptions.readers = std::make_shared<model::SsdReaders>(model::kSsdReaders);
     model::LoadedModel model =
@@ -3688,21 +3696,68 @@ int main(int argc, char **argv) {
       return evaluateEngineMemoryPlan(backend.capabilities(), profile, 0);
     };
 
+    // The plan's governor, as a start builds it before it sets up the split,
+    // which only moves bytes from KV to fixed memory: the same with the split
+    // or without. The checks can neither wait for memory nor yield it, so the
+    // governor admits all the oracle allocates, its runtime's arenas and the
+    // lanes, KV and cached states of the requests it runs together, as memory
+    // a request in service needs (MemoryGovernor::setServing): only the plan's
+    // limit and macOS's critical pressure refuse it. Production grants that
+    // only to its start, a request it serves alone and the KV of the requests
+    // it serves; a start beside a resident request, and the cache, are held
+    // to the host's margins and macOS's warning (Engine::allocate).
+    const EngineMemoryPlanResult gpuAlone = planMemory(0);
+    require(gpuAlone.plan.has_value(), "the oracle model has no memory plan: " + gpuAlone.status.describe());
+    MemoryGovernor governor(backend, gpuAlone.plan->breakdown(), queryHostMemory);
+    governor.setServing(true);
+    const metal::AllocationAdmission governed = governedFor(governor, "an allocation");
+    // A block-sparse target's spill check runs before the split is set up, on
+    // a pool and a runtime of its own that the context the oracle asks the
+    // split to leave does not count.
+    if (model.descriptor.capabilities.sparseKv && (spillOnly || !(imagesOnly || warmupEosOnly || prefillGroupsOnly)))
+      requireSpilledKvMatchesResident(backend, model, operators, governed, format, stateFormat, spill);
+    if (spillOnly) {
+      require(model.descriptor.capabilities.sparseKv.has_value(), "--spill-only needs a block-sparse target");
+      std::cout << "PASS model-runtime-oracle scope=spill-only model=" << model.name()
+                << " (K/V that spilled reads what its pages held)\n";
+      return 0;
+    }
+
     // A pool of 128 pages, or the smallest extent if larger, in whole extents
     // of the size the memory plan would pick for it.
     const kv::Layout kvLayout = model.targetKvLayout(format);
     const uint32_t budgetPages = std::max(128U, kvLayout.minimumExtentPages());
     const uint32_t extentPages = kvLayout.extentPagesFor(budgetPages);
     const uint32_t pageCount = budgetPages - budgetPages % extentPages;
+    // What the checks on this pool hold at once beside the plan's fixed
+    // memory: its pages, every lane's state and six cached states, as the
+    // captured-state check holds four lanes beside its five states and the
+    // prompt snapshot main keeps. No check holds more GDN cells, draft rings
+    // or context windows, the pool's idle ones included: the prefill-group
+    // check's nine states beside one lane hold fewer cells and rings and as
+    // many windows, and the image checks hold a few small images beside two
+    // cached states at most. A plan holds these bytes where it holds the
+    // context of one request whose lane's state and KV take them.
+    constexpr uint64_t kMostCachedStates = 6;
+    const model::CompositeStateLayout stateLayout = model.stateLayout(stateFormat);
+    const uint64_t pageBytes = kvLayout.bytesPerModelPage();
+    const uint64_t checksBytes = model::ExecutionLimits::maximumBatchWidth * stateLayout.laneBytes() +
+                                 kMostCachedStates * stateLayout.cachedBytes() + uint64_t{pageCount} * pageBytes;
+    const auto checksContext = static_cast<uint32_t>(
+        (checksBytes - stateLayout.laneBytes() + pageBytes - 1) / pageBytes * kv::kPageTokens);
     // A dense target's prefill FFN splits with the Neural Engine as a start
     // splits it (engine::startAneFfn), calibrated by the build's first run and
-    // remembered for the runs after it unless a share is given,
-    // within a plan that holds the oracle's pages. The split is allocated
-    // beside the weights, outside the governor's admissions, and its own
-    // category of the plan bounds it, as the memory audit requires. A split
-    // that fails fails the oracle; given share 0 runs the GPU alone. A fault
-    // is armed for the first program constructed, the split's with a share
-    // given, whose evaluations count from verify's.
+    // remembered for the runs after it unless a share is given, within a plan
+    // that holds what the checks hold: the oracle asks the split to leave
+    // their context, as a start asks it to leave --max-context, so that no
+    // split takes memory a check needs. The split is allocated beside the
+    // weights, outside the governor's admissions, and its own category of the
+    // plan bounds it, as the memory audit requires. A split that fails fails
+    // the oracle, and so does a given share the plan cannot hold beside the
+    // checks; given share 0 runs the GPU alone, as does a start whose least
+    // split the plan cannot hold beside them. A fault is armed for the first
+    // program constructed, the split's with a share given, whose evaluations
+    // count from verify's.
     const engine::AneFfnSetting aneFfnSetting = engine::AneFfnSetting::fromGiven(givenAneFfnShare, std::nullopt);
     if (aneFfnFault) {
       require(aneFfnSetting.given.has_value(), "--ane-ffn-fault takes a share given by --ane-ffn-share");
@@ -3710,15 +3765,19 @@ int main(int argc, char **argv) {
     }
     const engine::AneFfnModel aneFfnModel =
         engine::aneFfnModel(backend, model, operators, format, "model-runtime-oracle " SPLASH_BUILD_ID, {});
-    engine::AneFfnStart aneFfnStart = engine::startAneFfn(
-        aneFfnModel, aneFfnSetting, {.tokens = pageCount * kv::kPageTokens}, planMemory, {});
+    engine::AneFfnStart aneFfnStart =
+        engine::startAneFfn(aneFfnModel, aneFfnSetting, {.tokens = checksContext}, planMemory, {});
     std::cout << "ane_ffn_outcome=" << engine::aneFfnOutcomeName(aneFfnStart.outcome.kind) << ' '
               << aneFfnStart.outcome.reason << '\n';
     require(aneFfnStart.outcome.kind != engine::AneFfnOutcome::Kind::Unavailable,
             "the Neural Engine split is unavailable: " + aneFfnStart.outcome.reason);
+    require(!aneFfnSetting.given || aneFfnStart.outcome.kind != engine::AneFfnOutcome::Kind::Refused,
+            "the plan cannot hold the checks' context of " + std::to_string(checksContext) +
+                " tokens beside the given share");
     // The automatic context is what the plan holds with the split the start
     // runs, as this Mac's calibration of the model remembers it, and without
-    // the split otherwise.
+    // the split otherwise; a refused split names the most a split leaves
+    // instead (ane_ffn_startup_test).
     const auto contextOf = [&](uint64_t aneFfnBytes) {
       const EngineMemoryPlanResult result = planMemory(aneFfnBytes);
       return result.plan ? result.plan->maximumContextTokens() : 0u;
@@ -3728,36 +3787,17 @@ int main(int argc, char **argv) {
                                 std::lround(aneFfnStart.split->share() * aneFfnModel.units))))
                           : contextOf(0);
     std::cout << "ane_ffn_context=" << aneFfnStart.outcome.context
-              << " no_ane_context=" << aneFfnStart.outcome.contextWithout << '\n';
-    require(aneFfnStart.outcome.context == automaticContext && aneFfnStart.outcome.contextWithout == contextOf(0),
+              << " no_ane_context=" << aneFfnStart.outcome.contextWithout << " checks_context=" << checksContext
+              << '\n';
+    require((aneFfnStart.outcome.kind == engine::AneFfnOutcome::Kind::Refused ||
+             aneFfnStart.outcome.context == automaticContext) &&
+                aneFfnStart.outcome.contextWithout == contextOf(0),
             "the automatic context is not the plan's with the split the start runs");
     std::unique_ptr<ops::AneFfn> aneFfn = std::move(aneFfnStart.split);
-    EngineMemoryPlanResult planned = aneFfnStart.plan ? EngineMemoryPlanResult{std::move(aneFfnStart.plan), {}}
-                                                      : planMemory(0);
-    require(planned.plan.has_value(), "the oracle model has no memory plan: " + planned.status.describe());
-    EngineMemoryPlan memoryPlan = std::move(*planned.plan);
-    const EngineMemoryBreakdown &budget = memoryPlan.breakdown();
-    require(!aneFfn || aneFfn->allocatedBytes() <= budget.aneFfnBytes,
+    require(!aneFfn || aneFfn->allocatedBytes() <= aneFfnStart.plan->breakdown().aneFfnBytes,
             "the Neural Engine split allocated more than its plan");
-    require(budget.pipelineReserveBytes <= budget.hardBudgetBytes &&
-                budget.runtimeOverheadReserveBytes <
-                    budget.hardBudgetBytes - budget.pipelineReserveBytes,
-            "runtime reserves consume the oracle Metal budget");
-    const uint64_t elasticGrowthCeiling = budget.hardBudgetBytes -
-        budget.pipelineReserveBytes - budget.runtimeOverheadReserveBytes;
-    MemoryGovernor governor(backend, elasticGrowthCeiling, hostReserveBytes,
-                            EngineMemoryPolicy::hostSpareReserveBytes(device.physicalMemoryBytes),
-                            queryHostMemory, 0, budget.streamedTableBytes);
     std::cout << "ane_ffn_share=" << (aneFfn ? aneFfn->share() : 0.0)
               << " ane_ffn_minimum_rows=" << (aneFfn ? aneFfn->minimumRows() : 0) << '\n';
-    const metal::AllocationAdmission governed =
-        [admit = governor.allocationAdmission(), &governor](
-            uint64_t bytes, const std::function<void()> &allocate) {
-          const metal::AllocationResult result = admit(bytes, allocate);
-          if (result.failure == metal::AllocationFailure::HostPressure)
-            stopForHostMemory(governor, "an allocation", bytes);
-          return result;
-        };
     AllocationFault allocationFault;
     const metal::AllocationAdmission admission =
         [admit = governed, &allocationFault, &backend](
@@ -3783,14 +3823,6 @@ int main(int argc, char **argv) {
               backend.memoryStats().allocatedBytes - before;
           return {};
         };
-    if (model.descriptor.capabilities.sparseKv && (spillOnly || !(imagesOnly || warmupEosOnly || prefillGroupsOnly)))
-      requireSpilledKvMatchesResident(backend, model, operators, governed, format, stateFormat, spill);
-    if (spillOnly) {
-      require(model.descriptor.capabilities.sparseKv.has_value(), "--spill-only needs a block-sparse target");
-      std::cout << "PASS model-runtime-oracle scope=spill-only model=" << model.name()
-                << " (K/V that spilled reads what its pages held)\n";
-      return 0;
-    }
     kv::PageStorage pages(backend, governed, kvLayout, pageCount, extentPages);
     // The oracle's requests address pages directly, without a pool, so every
     // extent is allocated up front.
@@ -3815,10 +3847,8 @@ int main(int argc, char **argv) {
     const uint64_t arenaBytes = executorPlan.sharedPrefillPlannedAllocatedBytes +
                                 executorPlan.sharedDecodePlannedAllocatedBytes;
     std::optional<model::Runtime> runtime;
-    const metal::AllocationResult arenas = governor.allocationAdmission()(
-        arenaBytes, [&] { runtime.emplace(context); });
-    if (arenas.failure == metal::AllocationFailure::HostPressure)
-      stopForHostMemory(governor, "the runtime arenas", arenaBytes);
+    const metal::AllocationResult arenas =
+        governedFor(governor, "the runtime arenas")(arenaBytes, [&] { runtime.emplace(context); });
     require(static_cast<bool>(arenas),
             "oracle runtime arenas exceed the oracle Metal budget");
     if (warmupEosOnly) {
@@ -5983,9 +6013,7 @@ int main(int argc, char **argv) {
       runtime.reset();
       context.verifyRows = model::VerifyRows::Auto;
       const metal::AllocationResult budgetArenas =
-          governor.allocationAdmission()(arenaBytes, [&] { runtime.emplace(context); });
-      if (budgetArenas.failure == metal::AllocationFailure::HostPressure)
-        stopForHostMemory(governor, "the budgeted runtime's arenas", arenaBytes);
+          governedFor(governor, "the budgeted runtime's arenas")(arenaBytes, [&] { runtime.emplace(context); });
       require(static_cast<bool>(budgetArenas), "the budgeted runtime's arenas exceed the oracle Metal budget");
       requireBudgetedCyclesAreWellFormed(*runtime, states, samplingSeedTokens);
     } else {

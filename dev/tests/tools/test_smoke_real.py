@@ -556,7 +556,10 @@ class SmokeRealTests(unittest.TestCase):
             "content": [{"type": "output_text", "text": text}],
         }
 
-    def run_images(self, output):
+    def run_images(self, output, reused=None):
+        """run_images over canned answers: the red image encoded once, its
+        repeat a prefix hit and, behind another system prompt, its cached rows
+        reused, or the image telemetry `reused` after that request."""
         red = {"choices": [{"message": {"content": "red"}}]}
         repeat = {
             **red,
@@ -566,13 +569,15 @@ class SmokeRealTests(unittest.TestCase):
             "choices": [{"message": {"content": "blue"}}],
             "metrics": {"cache": {"matched_tokens": 0}},
         }
+        encoded = {"encodes": 1, "embedding_reuses": 0, "embedding_evictions": 0}
         documents = [
+            {"images": {**encoded, "encodes": 0}},
             red,
-            {"images": {"encodes": 1, "embedding_reuses": 0}},
+            {"images": encoded},
             repeat,
-            {"images": {"encodes": 1, "embedding_reuses": 0}},
+            {"images": encoded},
             red,
-            {"images": {"encodes": 1, "embedding_reuses": 1}},
+            {"images": reused or {**encoded, "embedding_reuses": 1}},
             blue,
             {"type": "message", "content": [{"type": "text", "text": "red"}]},
             {"object": "response", "output": output},
@@ -587,6 +592,35 @@ class SmokeRealTests(unittest.TestCase):
             contextlib.redirect_stdout(io.StringIO()),
         ):
             smoke_real.run_images(8000, "test-model", "test-request")
+
+    def test_image_rows_the_cache_let_go_are_encoded_again(self):
+        self.run_images(
+            [self.assistant_message("Blue.")],
+            reused={"encodes": 2, "embedding_reuses": 0, "embedding_evictions": 1},
+        )
+
+    def test_image_rows_the_cache_kept_are_reused(self):
+        cases = {
+            "encoded again": (2, 0, 0),
+            "neither": (1, 0, 0),
+            "evicted, then neither": (1, 0, 1),
+            "evicted, then both": (2, 1, 1),
+        }
+        for name, (encodes, reuses, evictions) in cases.items():
+            with (
+                self.subTest(name=name),
+                self.assertRaisesRegex(
+                    smoke_real.SmokeFailure, "re-ran the vision tower"
+                ),
+            ):
+                self.run_images(
+                    [self.assistant_message("Blue.")],
+                    reused={
+                        "encodes": encodes,
+                        "embedding_reuses": reuses,
+                        "embedding_evictions": evictions,
+                    },
+                )
 
     def test_responses_image_accepts_final_assistant_text(self):
         self.run_images(

@@ -1,5 +1,7 @@
 #include "engine/MemoryGovernor.hpp"
 
+#include "engine/MemoryPlan.hpp"
+
 #include <dispatch/dispatch.h>
 #include <mach/mach.h>
 #include <mach/mach_host.h>
@@ -126,6 +128,13 @@ MemoryGovernor::MemoryGovernor(metal::MetalBackend &backend, uint64_t limitBytes
         metal::AllocationFailure::HostPressure);
   }
 }
+
+MemoryGovernor::MemoryGovernor(metal::MetalBackend &backend, const EngineMemoryBreakdown &budget,
+                               HostMemoryProvider hostMemory)
+    : MemoryGovernor(backend, budget.hardBudgetBytes,
+                     EngineMemoryPolicy::hostAvailableReserveBytes(budget.physicalMemoryBytes),
+                     EngineMemoryPolicy::hostSpareReserveBytes(budget.physicalMemoryBytes), std::move(hostMemory),
+                     budget.pipelineReserveBytes + budget.runtimeOverheadReserveBytes, budget.streamedTableBytes) {}
 
 uint64_t
 MemoryGovernor::chargedBytes(bool refreshDevice) const noexcept {

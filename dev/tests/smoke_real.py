@@ -271,6 +271,8 @@ def run_images(port: int, model: str, nonce: str) -> None:
         "word naming the color, with no punctuation, explanation or other words. "
         f"Request {nonce}."
     )
+    code, start = request(port, "GET", "/status")
+    require(code == 200 and "images" in start, "status lacks image telemetry")
     code, red = request(
         port,
         "POST",
@@ -291,10 +293,15 @@ def run_images(port: int, model: str, nonce: str) -> None:
     # The same image and prompt reuse the image-aware prefix, which covers the
     # image: its rows are neither encoded nor looked up. Behind another system
     # prompt the same image comes from the embedding cache without the vision
-    # tower. A different image behind identical placeholder tokens must not
+    # tower, unless the cache let its rows go since the image was encoded
+    # (images.embedding_evictions), as it does to give memory back, under
+    # macOS's warning for one (DEVELOPMENT.md, Admission and eviction): the
+    # image is then encoded again, once. An eviction that should not have
+    # happened passes here too: the engine tests check which reclaims take the
+    # rows. A different image behind identical placeholder tokens must not
     # reuse KV.
     code, before = request(port, "GET", "/status")
-    require(code == 200 and "images" in before, "status lacks image telemetry")
+    require(code == 200, f"status failed with HTTP {code}")
     code, repeat = request(
         port,
         "POST",
@@ -328,13 +335,19 @@ def run_images(port: int, model: str, nonce: str) -> None:
         f"the image behind another system prompt failed: {other!r}",
     )
     code, reused = request(port, "GET", "/status")
+    require(code == 200, f"status failed with HTTP {code}")
+    rows = (
+        reused["images"]["encodes"] - after["images"]["encodes"],
+        reused["images"]["embedding_reuses"] - after["images"]["embedding_reuses"],
+    )
+    evicted = (
+        reused["images"]["embedding_evictions"] > start["images"]["embedding_evictions"]
+    )
     require(
-        code == 200
-        and reused["images"]["encodes"] == after["images"]["encodes"]
-        and reused["images"]["embedding_reuses"]
-        == after["images"]["embedding_reuses"] + 1,
-        f"a cached image re-ran the vision tower or was not reused: "
-        f"{after['images']} -> {reused['images']}",
+        rows == (0, 1) or (evicted and rows == (1, 0)),
+        "a cached image re-ran the vision tower while the cache kept its rows, "
+        f"or was not reused: {start['images']} -> {after['images']} -> "
+        f"{reused['images']}",
     )
     code, blue = request(
         port,
@@ -354,7 +367,8 @@ def run_images(port: int, model: str, nonce: str) -> None:
     print(
         "image prefix cache: PASS "
         f"(repeat matched={repeat_cache['matched_tokens']}, "
-        f"different image matched={blue_cache.get('matched_tokens')})",
+        f"different image matched={blue_cache.get('matched_tokens')}, "
+        f"cached rows {'reused' if rows == (0, 1) else 'evicted and encoded again'})",
         flush=True,
     )
 

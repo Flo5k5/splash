@@ -9,6 +9,8 @@
 
 namespace splash::engine {
 
+struct EngineMemoryBreakdown;
+
 struct HostMemoryPages {
   // Mach's free_count, which includes the speculative pages.
   uint64_t free = 0;
@@ -193,6 +195,12 @@ public:
   MemoryGovernor(metal::MetalBackend &backend, uint64_t limitBytes,
                  uint64_t hostReserveBytes, uint64_t hostSpareReserveBytes,
                  HostMemoryProvider hostMemory, uint64_t untrackedReserveBytes, uint64_t hostHeldBytes = 0);
+  // The governor of an engine that `budget` plans, as a start builds it: the
+  // hard budget is its limit, the plan's pipeline and runtime reserves are
+  // the untracked reserve, the host keeps the reserves EngineMemoryPolicy
+  // sets for the Mac's memory, and the streamed table's host memory is
+  // charged in full.
+  MemoryGovernor(metal::MetalBackend &backend, const EngineMemoryBreakdown &budget, HostMemoryProvider hostMemory);
 
   // The only way to reserve memory. Low-level storage/model components
   // receive only this transactional callback, so allocation stays governed

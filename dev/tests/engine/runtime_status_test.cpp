@@ -207,6 +207,7 @@ void testCleanRuntimeStatus(const char *goldenPath) {
   executorTelemetry.totalDecodeWallSeconds = 1.5;
   executorTelemetry.imageEncodes = 3;
   executorTelemetry.imageEmbeddingReuses = 4;
+  executorTelemetry.imageEmbeddingEvictions = 9;
   executorTelemetry.visionArenaBytes = 5;
   executorTelemetry.embeddingCacheBytes = 6;
   executorTelemetry.stateHeldImageBytes = 7;
@@ -296,8 +297,8 @@ void testCleanRuntimeStatus(const char *goldenPath) {
               std::string::npos,
           "status advertised model capacity instead of the active engine limit");
   require(json.find("\"images\":{\"encodes\":3,\"embedding_reuses\":4,"
-                    "\"arena_bytes\":5,\"cached_bytes\":6,\"state_held_bytes\":7,"
-                    "\"rows_bytes\":8}") !=
+                    "\"embedding_evictions\":9,\"arena_bytes\":5,\"cached_bytes\":6,"
+                    "\"state_held_bytes\":7,\"rows_bytes\":8}") !=
               std::string::npos,
           "image telemetry is missing from status");
   require(json.find("\"decode_wall_ms\":10,\"decode_cycle_ms\":12.5,") !=

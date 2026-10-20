@@ -579,11 +579,12 @@ public:
   }
   // The production model reserves a decoding lane's floor of the hot block
   // cache, which the fake refuses for the requests in refusedSpilledReads,
-  // and while spilledReadsRoom reports no memory for the request's. The lane
-  // holds it until it is suspended or ends.
+  // and while spilledReadsRoom reports no memory for the request's, with
+  // spilledReadsRefusal's cause. The lane holds it until it is suspended or
+  // ends.
   model::ModelMemoryAdmission reserveSpilledReads(uint64_t id) override {
     if (refusedSpilledReads.contains(id) || (spilledReadsRoom && !spilledReadsRoom(id)))
-      return {.allocationFailure = metal::AllocationFailure::EngineBudget};
+      return {.allocationFailure = spilledReadsRefusal};
     spilledReadFloors.insert(id);
     return {.ok = true};
   }
@@ -824,6 +825,7 @@ public:
   // (reserveHistoryStaging).
   std::unordered_set<uint64_t> refusedSpilledReads;
   std::function<bool(uint64_t)> spilledReadsRoom;
+  metal::AllocationFailure spilledReadsRefusal = metal::AllocationFailure::EngineBudget;
   std::unordered_set<uint64_t> refusedStaging;
   // The requests that hold their floor of the hot block cache, and the
   // pages of history staged for each; the requests the staging was reserved

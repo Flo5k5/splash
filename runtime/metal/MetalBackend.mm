@@ -1914,6 +1914,14 @@ MetalMemoryStats MetalBackend::refreshMemoryStats() const noexcept {
     return memoryStats();
 }
 
+void MetalBackend::restartPeaks() noexcept {
+    impl_->accounting->peakAllocatedBytes.store(
+        impl_->accounting->allocatedBytes.load(std::memory_order_relaxed),
+        std::memory_order_relaxed);
+    impl_->asyncState->devicePeakAllocatedBytes.store(0, std::memory_order_relaxed);
+    impl_->sampleDeviceMemory();
+}
+
 bool MetalBackend::commandInFlight() const noexcept {
     return impl_->asyncState->hasActiveSubmission();
 }

@@ -243,9 +243,10 @@ state (`disk`), and in `bound` which one sets the limit (`model`, `memory` or
 `disk`). Its context therefore follows the free space of the cache's volume
 at a first start; a dense target's never does, nor does a block-sparse one's
 with `--max-cache-disk 0`. A relaunch keeps its first engine's context
-whatever room the volume has left since: each request's commitment checks
-the room as it starts. The plans that size the streamed stores take the
-room the volume leaves when the start begins, before the weights load.
+whatever room the volume has left since: where its plan spills, the cache
+opens however little room the volume has, and each request's commitment
+checks the room as it starts. The plans that size the streamed stores take
+the room the volume leaves when the start begins, before the weights load.
 
 `--yarn-factor FACTOR` stretches the native window by FACTOR, above 1 and at
 most 4, with YaRN RoPE scaling, as Qwen describes for these models: `2` gives a
@@ -326,8 +327,9 @@ size with a warning.
 - The cache counts as fixed runtime memory in the plan
   (`streamed_table_bytes`): the governor charges it beside Metal's
   allocations, and the startup memory audit bounds it by the plan and counts
-  it toward the hard budget beside Metal's footprint. It is not released
-  while idle.
+  it toward the hard budget beside Metal's footprint since the weights that
+  serve began to load, not a first load that held the table whole before the
+  plan with the arenas streamed it. It is not released while idle.
 - `/status` reports it under `streamed_table`: the table and its bytes, the
   cache's size, capacity, rows and evictions; per use (`prefill`, `decode`)
   its stages, requested and distinct rows, hits, reads, hit rate and stage
@@ -473,8 +475,10 @@ target's follows the room for its KV
 ([memory and context](#memory-and-context)). The disk decides only whether
 the cache's files open: `auto` opens them only where its limit, a quarter of
 what a local volume has beyond the floor, would hold two states and 1 GiB of
-KV, on the volume of every place the cache may keep its files. Where no files
-open, startup says why the cache is off, and the staging stays unused.
+KV, on the volume of every place the cache may keep its files. A relaunch
+whose plan spills opens temporary files whatever room their volume has, as
+the first engine's context it keeps may rest on them. Where no files open,
+startup says why the cache is off, and the staging stays unused.
 
 A write that finds the volume full while it shows room beyond the floor met a
 limit the engine cannot see, such as a volume quota, or a volume that filled
@@ -2858,7 +2862,10 @@ and `host_headroom_bytes` is the room above them). A request in service keeps
 growing through host pressure and macOS's warning, short of critical pressure,
 within `--max-memory`, first into cached pages no request holds:
 it takes cached KV, and a cached state only where it sits on the KV that goes
-next, since a state's buffers give it no page. A new request waits while another
+next, since a state's buffers give it no page. An allocation the host refuses
+takes none of the caches the model can rebuild (the vision encoder's scratch,
+images' encoded rows, the readers of spilled KV), which would not get it past
+the host; the paced passes take them. A new request waits while another
 is in service unless it can start from what the engine already holds, and with
 none in service it starts. A request whose start was refused memory, under host
 pressure or at `--max-memory`, holds back the requests that arrived after it
@@ -3052,7 +3059,11 @@ volumes through `RuntimeResourcesConfig::diskVolume`): the temporary files',
 where it goes without a persistent cache or whenever the root cannot be used,
 and a persistent tier's root, with the root's caches nobody holds counted as
 the tier's, since the tier may take their place. A root that refuses, or whose
-open fails, leaves the tier temporary files if their volume takes it.
+open fails, leaves the tier temporary files if their volume takes it. A
+relaunch whose plan spills takes temporary files on any local volume it can
+measure, whatever room it has: the first engine's context it keeps may rest
+on the tier, and each request's commitment checks the room
+(`Engine::admitSpill`).
 
 The volume sizes the tier only once its files are open, before a persistent
 tier takes anything back, and again at every control pass and whenever a write
@@ -3363,11 +3374,19 @@ memory pressure, which the smaller GGUF variants such a Mac uses can reach under
 an agent's load; `SPLASH_TEST_PRESSURE_STOP=4` stops only at critical pressure,
 to observe how the engine sheds its cache. The runtime oracle in `test-real` has
 no production memory guard: the weights must fit in what macOS has available
-above its reserve, and what the runtime then allocates as it runs must leave
-the spare reserve and the 1 GiB margin of the spare memory free, as growth that
-no request in service needs does, so it stops, naming what it needs, while
-other programs hold that memory. With only desktop applications open, a 24 GB
-Mac runs it for those variants.
+above its reserve. Its checks can neither wait for memory nor yield it, so the
+governor a start builds admits all the runtime then allocates, its arenas and
+the lanes, KV and cached states of the requests the oracle runs together, as
+memory a request in service needs: only the memory plan's budget and macOS's
+critical pressure refuse it, and the run stops at critical pressure, naming
+what it asked for. Production grants that only to its start, a request it
+serves alone and the KV of the requests it serves; a start beside a resident
+request, and the cache, are held to the spare reserve, the 1 GiB margin above
+it and macOS's warning. A Neural Engine split leaves the plan room for what the
+checks hold at once (every lane's state, six cached states and the oracle's KV
+pages), as a start's split leaves `--max-context`, so the oracle's split may
+take fewer of the Neural Engine's units than a server's does. With only desktop
+applications open, a 24 GB Mac runs it for those variants.
 
 The engine's `--kv-spill always`, which `splash serve` never passes, keeps
 the KV of every request of a block-sparse target on the SSD cache
