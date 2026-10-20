@@ -243,7 +243,7 @@ CommittedState committedState(const model::Runtime &executor, const model::QwenS
   require(static_cast<bool>(cell.contents()), "a committed GDN cell is not CPU-visible");
   const auto *cellBytes = static_cast<const uint8_t *>(cell.contents());
   CommittedState state{metadata.lengths, metadata.pendingRows, {cellBytes, cellBytes + cell.sizeBytes()},
-                       executor.pendingGdnRows(metadata.requestId), {}};
+                       model::RuntimeInstrumentation::pendingGdnRows(executor, metadata.requestId), {}};
   // A ring's keys are [head][slot][dimension] and its values [head][dimension]
   // [slot]; position p is slot p % window.
   const auto layout = states.layout().draft;
