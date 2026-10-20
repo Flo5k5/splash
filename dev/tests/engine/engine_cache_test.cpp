@@ -1614,6 +1614,46 @@ void testFailedWriteUnderALookup() {
   }
 }
 
+// A state invalidated while a lookup holds it keeps its copies until the
+// reader lets go: here two lanes restore it from disk, the first read
+// promotes it, and that lane's step from it is not finite. A publication
+// there meanwhile, in RAM or on disk, takes the entry over, its copies
+// going, and outlives the reader.
+void testInvalidatedStateUnderALookup() {
+  for (bool onDisk : {false, true}) {
+    CacheFixture fixture;
+    auto control = std::make_shared<TransferControl>();
+    control->ready = true;
+    const auto block = fixture.blocks[3];
+    publishReusable(fixture, block, std::make_shared<TieredState>(control));
+    require(fixture.cache.reclaimOneState(StateClass::Ordinary, false) && fixture.cache.pollTransfers(),
+            "state was not written");
+    auto first = fixture.lookup(129);
+    auto reader = fixture.lookup(129);
+    PromotionTicket ticket;
+    fixture.cache.promoteState(first, ticket);
+    fixture.cache.invalidateState(block);
+    first = {};
+    auto stats = fixture.cache.snapshot().stateCache;
+    require(stats.entries == 1 && stats.pinned == 1 && stats.bytes == 100 && stats.diskBytes == 100 &&
+                !fixture.lookup(129).state,
+            "the invalidated state did not stay under its reader, or matched a lookup");
+    if (onDisk) {
+      const StateWriter write = [&](std::function<void()>) { return writeState(control); };
+      require(fixture.cache.publishStateToDisk(block, write, false) && fixture.cache.pollTransfers(),
+              "the disk publication at the invalidated state failed");
+    } else {
+      fixture.cache.publishCompositeState(block, std::make_shared<TestState>(100), false);
+    }
+    reader = {};
+    stats = fixture.cache.snapshot().stateCache;
+    require(stats.entries == 1 && stats.pinned == 0 && stats.bytes == (onDisk ? 0 : 100) &&
+                stats.diskBytes == (onDisk ? 100 : 0) && control->slots == (onDisk ? 1 : 0) &&
+                fixture.lookup(129).state,
+            "the publication did not take over the invalidated state");
+  }
+}
+
 // Every failed write is counted, also one whose entry left before it
 // landed: a checkpoint retired meanwhile, or a state a failed read
 // condemned and a new publication replaced.
@@ -5384,6 +5424,7 @@ int main() {
     testDiskPublicationLifecycle();
     testDiskPublicationFailure();
     testFailedWriteUnderALookup();
+    testInvalidatedStateUnderALookup();
     testFailedWriteIsCountedAfterItsEntryLeft();
     testDiskPublicationMakesRoom();
     testRollingCheckpointsUseTheTier();
