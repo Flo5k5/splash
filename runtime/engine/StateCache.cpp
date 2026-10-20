@@ -239,6 +239,10 @@ void StateCache::makeOrdinary(uint64_t kvBlock, Entry &entry) {
   --checkpointEntries_;
   checkpointBytes_ -= entry.ram ? entry.ram->bytes() : 0;
   entry.checkpoint = false;
+  // A crash before the next clean stop must not leave it a checkpoint the
+  // next process retires.
+  if (entry.disk && !entry.invalid)
+    labelDisk(kvBlock, entry);
 }
 
 std::vector<uint64_t> StateCache::usedStates() const {

@@ -343,7 +343,8 @@ private:
   void discardRam(Entry &entry) noexcept;
   void discardDisk(uint64_t kvBlock, Entry &entry) noexcept;
   // An ordinary publication or reuse: the block has held a reusable state,
-  // and a checkpoint is upgraded.
+  // and a checkpoint is upgraded, its disk copy labelled with its new class
+  // at once.
   void makeOrdinary(uint64_t kvBlock, Entry &entry);
   [[nodiscard]] bool writing(uint64_t kvBlock) const noexcept {
     return pending_ && pending_->kvBlock == kvBlock;

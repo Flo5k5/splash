@@ -537,6 +537,34 @@ void testCleanStopRecordsRecency() {
   require(labelled()[first] > labelled()[second], "the clean stop did not record the newest use");
 }
 
+// A checkpoint on disk that a request reuses as an ordinary state, or
+// resumes from, takes that class in its label at once: after a crash, which
+// leaves no clean stop to relabel it, the next process takes it back as an
+// ordinary state, not as a checkpoint a resuming lane retires.
+void testReusedCheckpointsComeBackOrdinary() {
+  Process process(true);
+  const uint64_t reused = process.cachePrompt(1, promptOf(1000, 2))[1];
+  process.publish(reused, true);
+  const uint64_t resumed = process.cachePrompt(2, promptOf(2000, 2))[1];
+  process.publish(resumed, true);
+  process.writeEverything();
+  const auto checkpoints = [&] {
+    std::set<uint64_t> labelled;
+    for (const auto &bytes : process.stateLabels())
+      if (const auto label = decodeLabel<StateLabel>(bytes); label->checkpoint)
+        labelled.insert(label->block);
+    return labelled;
+  };
+  require(checkpoints() == std::set<uint64_t>{reused, resumed}, "the checkpoints were not written as such");
+  require(process.cache.reuseStoredState(reused), "the checkpoint on disk was not reused");
+  const StateUse use = process.cache.useState(resumed);
+  require(checkpoints().empty(), "a checkpoint that became ordinary kept its label until a clean stop");
+  Process next(true);
+  require(next.adopt(process.kvLabels(), process.stateLabels()).states == 2 &&
+              !next.cache.checkpointState(reused) && !next.cache.checkpointState(resumed),
+          "the next process took a reused checkpoint back as a checkpoint");
+}
+
 // States of a slot file kept for the next process: each holds a slot of it.
 class SlotState final : public CompositeState {
 public:
@@ -1024,6 +1052,7 @@ int main() {
     testAdoptionTrimsToTheLimit();
     testLowerLimitKeepsCopiesInUse();
     testCleanStopRecordsRecency();
+    testReusedCheckpointsComeBackOrdinary();
     testPointGivenUpForItselfIsRefused();
     testPointLargerThanTheQuotaIsRefused();
     testPersistingStateStaysInRam();

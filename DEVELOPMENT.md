@@ -581,10 +581,11 @@ spill.
 A start takes back every recorded point whose chain is whole. A clean stop
 writes the waiting points (newest first, up to 6 s, whatever the write budget)
 and syncs the files. After a crash the next start takes back what reached the
-disk. Every start serves its first minute on probation: after two starts in a
-row fail within it, or one whose engine reports its own failure, the next
-start begins empty. `/status` reports all this under `disk` (`persistent`,
-`kv_copies`, `taken_back`, `write_behind`).
+disk, each state with the class it had last: a checkpoint a request went on to
+reuse as an ordinary state comes back as one. Every start serves its first
+minute on probation: after two starts in a row fail within it, or one whose
+engine reports its own failure, the next start begins empty. `/status` reports
+all this under `disk` (`persistent`, `kv_copies`, `taken_back`, `write_behind`).
 
 ### KV on the SSD
 

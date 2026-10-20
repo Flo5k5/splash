@@ -341,9 +341,10 @@ public:
   // is every point once a file stopped taking writes.
   [[nodiscard]] PersistStatus persist(uint64_t block);
   // At a clean stop: the label of each state copy a persistent tier keeps
-  // takes its state's current recency and class, which the next process
-  // keeps and orders them by. KV copies keep the labels of their writes: a
-  // chain goes with the states that need it (dropOldestPoint).
+  // takes its state's current recency, which the next process orders them
+  // by; a copy takes its state's class as soon as a checkpoint becomes
+  // ordinary, which a crash keeps too. KV copies keep the labels of their
+  // writes: a chain goes with the states that need it (dropOldestPoint).
   void relabelStates() const;
   // Measures the volume the disk tier lives on and sets the budget's limit
   // (DiskSpace::measure), for keepDiskLimit(); none without such a tier.
