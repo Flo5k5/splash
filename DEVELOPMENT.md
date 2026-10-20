@@ -190,10 +190,10 @@ that includes loopback when launching agents locally.
 Splash sizes memory and context when it starts. Its Metal budget is the GPU's
 recommended working set less a small margin; `--max-memory` can only lower it,
 such as `--max-memory 28G`. The automatic plan takes the whole budget, so on a
-Mac that also runs other applications, `--max-memory` (or `--expert-memory` for
-a model whose experts stream) leaves them room. The budget caps Metal
+Mac that also runs other applications, `--max-memory` leaves them room: the
+automatic expert store and PLE row cache shrink with it. The budget caps Metal
 allocations, not combined process RSS. The context limit is the
-model's native window, 256K tokens for both supported families, when the budget
+model's native window, 256K tokens for every supported family, when the budget
 holds it beside the weights and, unless `--disable-ane`, the
 [Neural Engine split](#neural-engine-prefill) this Mac's calibration of a dense
 model takes, and otherwise as much as the budget holds beside them.
