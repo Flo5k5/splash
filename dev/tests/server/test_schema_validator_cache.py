@@ -176,20 +176,22 @@ class SchemaCheckCacheTests(unittest.TestCase):
         ]
         return tool_schema.normalize_tools(tools, "auto", True)
 
-    def test_tool_schemas_are_checked_once_without_validators(self):
+    def test_strict_tool_schemas_are_checked_once_without_validators(self):
         schemas = [{"type": "object", "properties": {"x": {"type": "integer"}}}] * 2
-        self.tools(*schemas)
+        self.tools(*schemas, strict=True)
         self.assertEqual(len(validation._checked_schemas), 1)
         # Response formats keep the validators' slots to themselves.
         self.assertFalse(validation._validator_cache)
-        # The next turn's tools are not checked again.
+        # The next turn's tools are not checked again, and a tool that is
+        # not strict, whose schema builds no grammar, is not checked at all.
         with mock.patch.object(validation.validators, "validator_for") as check:
-            self.tools(*schemas)
+            self.tools(*schemas, strict=True)
+            self.tools({"type": "object", "properties": {"y": {}}})
         check.assert_not_called()
 
     def test_invalid_tool_schema_is_checked_once(self):
-        # A strict tool's is refused; any other tool's only goes untyped, and
-        # its client sends it again on every turn.
+        # A strict tool's is refused, as its client may send it again; any
+        # other tool keeps its schema unchecked.
         with self.assertRaises(APIError) as first:
             self.tools({"type": "invalid"}, strict=True)
         self.assertEqual(first.exception.status, 400)
@@ -203,7 +205,7 @@ class SchemaCheckCacheTests(unittest.TestCase):
             _, policy = self.tools({"type": "invalid"})
         check.assert_not_called()
         self.assertEqual(again.exception.message, first.exception.message)
-        self.assertEqual(policy.schemas, {"t0": None})
+        self.assertEqual(policy.schemas, {"t0": {"type": "invalid"}})
 
     def test_eviction_obeys_both_count_and_source_byte_limits(self):
         for count, budget in ((2, 10000), (1024, 180)):
@@ -221,11 +223,11 @@ class SchemaCheckCacheTests(unittest.TestCase):
                     self.assertEqual(checked.bytes, sum(len(key) for key in checked))
 
     def test_tools_take_schemas_only_a_validator_could_not_evaluate(self):
-        # Calls are not validated, so a tool's schema need only be valid; a
-        # response format is, and refuses what jsonschema would evaluate
-        # without bounds.
+        # Calls are not validated, so a strict tool's schema need only be
+        # valid; a response format is, and refuses what jsonschema would
+        # evaluate without bounds.
         schema = {"patternProperties": {"^a": {}}, "unevaluatedProperties": False}
-        self.tools(schema)
+        self.tools(schema, strict=True)
         with self.assertRaises(APIError):
             tool_schema.normalize_response_format(
                 {"type": "json_schema", "json_schema": {"schema": schema}}

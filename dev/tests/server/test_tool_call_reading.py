@@ -113,7 +113,9 @@ PARSES = {
 
 # The value a parameter's text converts to by its declared types: the JSON
 # the text spells, but a string where one may be the value and the JSON is
-# not of another declared type.
+# not of another declared type. A type name reads in any case and a common
+# alias names a JSON type; a type that holds any other name, or anything but
+# a name, constrains none, as one left open.
 CONVERSIONS = (
     ({"type": "string"}, "123", "123"),
     ({"type": "string"}, "true", "true"),
@@ -163,6 +165,23 @@ CONVERSIONS = (
     ({}, "7", 7),
     ({}, "seven", "seven"),
     ({}, "True", "True"),
+    ({"type": "str"}, "42", "42"),
+    ({"type": "text"}, "true", "true"),
+    ({"type": ["string", "int"]}, "12", 12),
+    ({"type": ["string", "float"]}, "4.5", 4.5),
+    ({"type": "bool"}, "True", True),
+    ({"type": ["string", "dict"]}, '{"a": 1}', {"a": 1}),
+    ({"type": ["string", "list"]}, "[1, 2]", [1, 2]),
+    ({"type": "STRING"}, "42", "42"),
+    ({"type": "Integer"}, "7", 7),
+    ({"type": " Boolean "}, "True", True),
+    ({"type": "any"}, "7", 7),
+    ({"type": "any"}, '"x"', '"x"'),
+    ({"type": "any"}, "seven", "seven"),
+    ({"type": ["string", "any"]}, "7", 7),
+    ({"type": ["null", {"type": "integer"}]}, "7", 7),
+    ({"type": "integer", "allOf": [{"type": "any"}]}, "7", 7),
+    ({"type": "any", "allOf": [{"type": "integer"}]}, "7", 7),
 )
 
 

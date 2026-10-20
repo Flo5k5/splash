@@ -1204,7 +1204,16 @@ later one cannot be placed. A Responses tool that omits `strict` is not
 strict.
 
 The model writes each argument as text, which converts by the JSON types the
-tool declares for that parameter:
+tool declares for that parameter. A type name reads whatever its case and the
+space around it, as `STRING` reads as `string`, and the common aliases count as
+the types they name: `str` and `text` as `string`, `int` as `integer`, `float`
+as `number`, `bool` as `boolean`, `dict` as `object` and `list` as `array`. A
+strict tool's grammar generates the type such a name stands for where its
+dialect takes the name, as Draft 3 takes any: a parameter typed `int` is
+written as an integer. Any other name, such as Draft 3's `any`, stands for no
+JSON type, and a type that holds one constrains none, as one the schema does
+not give: `["integer", "any"]` constrains no type, and
+`{"type": "integer", "allOf": [{"type": "any"}]}` is an integer.
 
 - A parameter that cannot be a string takes the JSON its text spells, of
   whatever type; text that is not JSON stays text. Where the tool declares a
@@ -1226,6 +1235,8 @@ tool declares for that parameter:
 | `["string", "number"]` | `12` | `12` |
 | `["string", "number"]` | `12:00` | `"12:00"` |
 | `["string", "integer"]` | `0800` | `"0800"` |
+| `str` | `42` | `"42"` |
+| `any` | `7` | `7` |
 | not declared | `7` | `7` |
 | not declared | `seven` | `"seven"` |
 
@@ -1256,8 +1267,8 @@ writes may. Tags written otherwise are text. Besides:
 `dev/tests/server/test_tool_call_reading.py` holds model outputs with the calls
 and content they read as.
 
-Every tool's schema is checked against its JSON Schema dialect as the request
-arrives, and its arguments are framed through schema composition and local
+A strict tool's schema is checked against its JSON Schema dialect on arrival,
+and every tool's arguments are framed through schema composition and local
 references, which give each parameter its types. A strict tool's framed
 arguments are closed, so that an object or an array takes nothing it does not
 declare. Its values are written in Qwen XML: raw text where any string may be
@@ -1273,8 +1284,15 @@ grammar writes reads back as written: raw text ends at its first
 A strict tool's schema must pass that check, nest at most 64 levels of JSON
 objects and arrays, in which an object's `properties` map is a level of its
 own, and reference no remote document, or the request returns 400. Any other
-tool whose schema does not is still declared as sent, and its arguments convert
-as those of a parameter it does not declare.
+tool is declared as sent, and its parameters take the types its schema
+declares, valid or not; the arguments of one whose schema nests deeper or
+allows no object, whose references form a cycle, or whose framing exceeds the
+budget convert as those of a parameter it does not declare. In framing, a
+keyword that holds another kind of value than it takes, such as the `null` Go
+writes for a nil slice, constrains nothing, as one its dialect does not define,
+and so do a value that is not a schema where one belongs, a type name that
+stands for no JSON type, such as Draft 3's `any`, and a reference to nothing in
+the document.
 
 A tool's name is written in its calls' tags and read back from them, so it
 holds 1 to 256 characters in Unicode NFC, which a tokenizer such as Qwen's

@@ -236,6 +236,115 @@ class ToolSchemaCompositionTests(HarnessTestCase):
                     tool_schema.tool_grammar(strict_policy(*schemas), False)
                 self.assertEqual(caught.exception.status, 400)
 
+    def test_framing_reads_keywords_of_any_kind(self):
+        # A reference can reach data that is not a schema, an older dialect
+        # leaves newer keywords unchecked, and the schema of a tool that is
+        # not strict is not checked at all, so framing meets keywords of any
+        # kind. A keyword of another kind than it takes constrains nothing,
+        # as do a value that is not a schema, a type name that stands for no
+        # JSON type and a reference to nothing: a tool's parameters keep the
+        # types it declares, and a strict tool's grammar generates them. A
+        # cycle of references still cannot be framed, and a type that names
+        # JSON types alone, by their names in any case or common aliases, none
+        # of them object, allows no object.
+        a = {"a": {"type": "integer"}}
+
+        def reaching(data):
+            return {
+                "type": "object",
+                "default": data,
+                "allOf": [{"$ref": "#/default"}],
+                "properties": a,
+            }
+
+        for schema in (
+            reaching(5),
+            reaching({"$ref": [1]}),
+            reaching({"$ref": "#/nowhere"}),
+            reaching({"required": [["a"]]}),
+            reaching({"required": [1, "a"]}),
+            reaching({"enum": 5}),
+            reaching({"if": {}, "then": 5, "anyOf": None}),
+            {
+                "$schema": "http://json-schema.org/draft-03/schema#",
+                "type": "any",
+                "properties": a,
+            },
+            {
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "type": "object",
+                "$defs": 5,
+                "definitions": {"n": {"type": "integer"}},
+                "properties": {"a": {"$ref": "#/definitions/n"}},
+            },
+        ):
+            with self.subTest(schema=schema):
+                self.check_arguments(schema, {"a": 7})
+                types, _ = tool_policy({"t0": schema}).parameter_types("t0")
+                self.assertEqual(types, {"a": {"integer"}})
+        for schema in (
+            # Go writes a nil slice, map or pointer as null.
+            {"properties": a, "required": None},
+            {"properties": None, "allOf": [{"properties": a}]},
+            {"type": None, "properties": a},
+            {"type": "OBJECT", "properties": {"a": {"type": "INTEGER"}}},
+            {"type": ["Object", "null"], "properties": a},
+            {"properties": a, "allOf": [{"properties": {"a": {"type": "any"}}}]},
+            {"type": ["null", {"type": "object"}], "properties": a},
+            {"properties": a, "required": [1, {}, "a"]},
+            {"properties": a, "patternProperties": None, "allOf": [5]},
+            {"properties": a, "anyOf": None, "oneOf": None},
+            {"properties": a, "if": None, "then": 5, "else": None},
+            {"properties": a, "dependentSchemas": {"a": None}},
+            {"properties": a, "$ref": 5},
+            {"properties": a, "$ref": "#/$defs/missing"},
+            {"properties": a, "$ref": "https://example.com/arguments"},
+        ):
+            with self.subTest(schema=schema):
+                types, _ = tool_policy({"t0": schema}).parameter_types("t0")
+                self.assertEqual(types, {"a": {"integer"}})
+        for schema in (
+            {"properties": a, "allOf": [{"$ref": "#"}]},
+            {"type": ["string", "null"], "properties": a},
+            {"type": ["list", "null"], "properties": a},
+            {"type": ["String", "NULL"], "properties": a},
+        ):
+            with self.subTest(schema=schema):
+                types = tool_policy({"t0": schema}).parameter_types("t0")
+                self.assertEqual(types, ({}, None))
+
+    def test_a_strict_tool_generates_the_types_its_type_names_stand_for(self):
+        # Draft 3 takes any type name. A strict tool's grammar generates the
+        # JSON type a name stands for in any case or as a common alias, as
+        # the tool's values convert by it, and closes its arguments, typed
+        # "dict", to the parameters it declares.
+        call = (
+            "<tool_call>\n<function=t0>\n<parameter={}>\n{}\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        for parameter, value, other in (
+            ({"type": "int"}, 42, "4.5"),
+            ({"type": "INTEGER"}, 42, "x"),
+            ({"type": "float"}, 4.5, "x"),
+            ({"type": "bool"}, True, "1"),
+            ({"type": " Boolean "}, False, "x"),
+            ({"type": "list", "items": {"type": "Int"}}, [1, 2], '["a"]'),
+            ({"type": "dict", "properties": {"a": {"type": "int"}}}, {"a": 1}, "[]"),
+            ({"type": "str"}, "42", None),
+            ({"type": "text"}, "true", None),
+            ({"type": "STRING"}, "[1]", None),
+        ):
+            with self.subTest(parameter=parameter):
+                schema = {
+                    "$schema": "http://json-schema.org/draft-03/schema#",
+                    "type": "dict",
+                    "properties": {"v": parameter},
+                }
+                policy, _ = self.check_arguments(schema, {"v": value})
+                self.assertFalse(self.accepts(policy, call.format("w", "1")))
+                if other is not None:
+                    self.assertFalse(self.accepts(policy, call.format("v", other)))
+
     def test_recursive_objects_keep_json_framing(self):
         schema = {
             "type": "object",

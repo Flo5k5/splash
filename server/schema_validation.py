@@ -185,9 +185,9 @@ _checked_schemas = LRUCache(8 * 1024 * 1024, capacity=1024)
 def check_schema(schema):
     """Raise SchemaError unless `schema` is valid in the dialect it declares.
 
-    A tool's schema needs no other check, as its calls are not validated, and
-    a client sends its tools on every turn, so each outcome is kept: a tool
-    that is not strict keeps an invalid schema to describe itself with."""
+    A strict tool's schema needs no other check, as its calls are not
+    validated, and a client sends its tools on every turn, so each outcome is
+    kept."""
     # json.dumps uses ASCII escapes, so character count equals source bytes.
     key = json.dumps(schema, sort_keys=True)
     with _checked_schemas_lock:

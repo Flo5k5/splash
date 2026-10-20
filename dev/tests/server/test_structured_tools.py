@@ -544,11 +544,12 @@ class StructuredToolGrammarTest(unittest.TestCase):
                 with self.subTest(strict=strict, name=name):
                     self.assert_not_complete(call.format(name, "1"), **settings)
 
-    def test_a_tool_with_an_unreadable_schema_takes_free_arguments(self):
-        # Its schema, which says n is a string, is not read: a grammar holds
-        # its calls to the tags alone, beside a strict tool or a response
-        # format too, and its values convert untyped.
-        unreadable = {
+    def test_a_tool_with_an_invalid_schema_takes_free_arguments(self):
+        # Its schema, which breaks its dialect's meta-schema, builds no
+        # grammar: a grammar holds its calls to the tags alone, beside a
+        # strict tool or a response format too. Its values still convert by
+        # the types it declares, n as a string.
+        invalid = {
             "type": "function",
             "function": {
                 "name": "note",
@@ -563,9 +564,9 @@ class StructuredToolGrammarTest(unittest.TestCase):
             "</function>\n</tool_call>"
         )
         for tools, schema in (
-            ([unreadable], None),
-            ([unreadable, *strict_tools(TOOLS[1])], None),
-            ([unreadable], SCHEMA),
+            ([invalid], None),
+            ([invalid, *strict_tools(TOOLS[1])], None),
+            ([invalid], SCHEMA),
         ):
             with self.subTest(tools=len(tools), schema=schema is not None):
                 self.assert_complete(
@@ -573,7 +574,7 @@ class StructuredToolGrammarTest(unittest.TestCase):
                 )
                 _, calls, _ = project(call, policy("required", tools=tools))
                 self.assertEqual(
-                    json.loads(calls[0]["function"]["arguments"]), {"n": 7}
+                    json.loads(calls[0]["function"]["arguments"]), {"n": "7"}
                 )
 
     def test_function_names_read_back_as_the_grammar_writes_them(self):
