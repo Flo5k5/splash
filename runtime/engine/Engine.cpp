@@ -999,10 +999,14 @@ Engine::SpillAdmission Engine::admitSpill(Request &active, bool resuming, uint64
   if (!resuming && !config_.spill.always && residentInstead())
     return SpillAdmission::Resident;
   // Otherwise the quota bounds its output to the pages it holds, if they
-  // leave a page of output past what the request holds; those of the chain
-  // it restores that have copies need none.
+  // hold a token past the tokens the request holds; those of the chain it
+  // restores that have copies need none. A resume counts among them the
+  // anchor its model holds once it selected the request's first token
+  // (Request::suspendedWithAnchor), which the model decodes only with
+  // output left past it: it emits a last budgeted anchor as it selects it.
+  const uint64_t held = active.exactTokens.size() + (active.suspendedWithAnchor ? 1 : 0);
   const uint64_t copied = cache_.copiedBlocks(chainEnd);
-  const uint64_t needed = active.exactTokens.size() / KvCache::pageTokens + 1 - copied;
+  const uint64_t needed = held / KvCache::pageTokens + 1 - copied;
   if (room >= needed) {
     active.outputLimit = static_cast<uint32_t>(std::min<uint64_t>(
         active.outputLimit, (copied + room) * KvCache::pageTokens - active.promptTokens));
@@ -2142,6 +2146,11 @@ void Engine::suspendLane(Request &active, uint64_t workEnd, metal::AllocationFai
   if (!active.lane || scheduler_.suspended(active.request.id)) {
     throw std::logic_error("request cannot be suspended");
   }
+  // A decoding lane holds an anchor unless its first mask has yet to select
+  // one; a lane in prefill holds what it held when its replay began.
+  if (scheduler_.phase(active.request.id) == Phase::Decode)
+    active.suspendedWithAnchor =
+        scheduler_.decodeStage(active.request.id) == DecodeStage::Regular;
   vacateLane(active, true);
   active.resumeKvTargetTokens = workEnd;
   active.replayTokens = static_cast<uint32_t>(active.exactTokens.size());

@@ -8781,6 +8781,85 @@ void testSpillResumeCommitsAgain() {
   }
 }
 
+// A Spill request resumed after a suspension holds the anchor its model
+// selected under its whole output, which the model decodes only with output
+// left past it: it emits a last budgeted anchor as it selects it. The quota
+// bounds a resume's output only to pages that hold a token past that anchor:
+// a resume whose quota holds the pages up to its anchor and none past them
+// ends at its length; one more page bounds its output to that page's end.
+void testSpillResumeBoundLeavesOutputPastItsAnchor() {
+  for (const uint32_t slots : {3U, 4U}) {
+    Spilling spill(20);
+    // No copies: the request holds its whole history without any.
+    spill.allowSpillWrites(false);
+    EngineRequest background = Spilling::prompt(1, 1, 2, 100);
+    background.priority = RequestPriority::Background;
+    spill.engine.submit(std::move(background));
+    // 65 tokens of prompt and 30 of output end a token short of the third
+    // page, which the anchor ends.
+    spill.runUntil([&] { return spill.events.outputs[1].size() == 30; },
+                   "the request did not decode");
+    // A Normal start is refused memory while it is resident, which
+    // suspends it.
+    spill.model.beginGrowthBlocked = [&] {
+      return spill.model.lastBeginId == 2 && spill.model.requests.at(1).resident;
+    };
+    spill.model.resumeDenied = true;
+    spill.engine.submit(Spilling::prompt(2, 2, 1, 1));
+    spill.runUntil([&] { return spill.events.completedCount == 1; },
+                   "the Normal request did not run");
+    spill.budget->setActiveLimitBytes(uint64_t{slots} * 100);
+    spill.model.resumeDenied = false;
+    spill.runUntilIdle();
+    const bool ends = slots == 3;
+    require(spill.model.suspensions == 1 && spill.model.resumptions == (ends ? 0u : 1u) &&
+                spill.events.completedCount == 2 &&
+                spill.events.usage.at(1).second == (ends ? 30u : 63u) &&
+                spill.events.boundedIds == std::vector<uint64_t>{1} &&
+                spill.engine.snapshot().spill.lengthEnds == 1 && spill.committedSlots() == 0,
+            ends ? "a resume whose quota held no output past its anchor did not end at its length"
+                 : "a resume was not bounded to the output past its anchor that the quota holds");
+  }
+}
+
+// A Spill request suspended in its prompt holds no anchor: the step that
+// completes its prompt selects its first token under the output limit its
+// resume is given. A quota of exactly its prompt's pages bounds its output
+// to that token, which it emits.
+void testSpillResumeInItsPromptHoldsNoAnchor() {
+  Spilling spill(20);
+  // No copies: the request holds its whole history without any.
+  spill.allowSpillWrites(false);
+  // 95 tokens of prompt end a token short of the third page, and each
+  // prefill command takes a page of them.
+  spill.model.groupRows = KvCache::pageTokens;
+  EngineRequest background = request(1, std::vector<uint32_t>(3 * KvCache::pageTokens - 1, 1));
+  background.maxNewTokens = 100;
+  background.priority = RequestPriority::Background;
+  spill.engine.submit(std::move(background));
+  spill.runUntil([&] { return spill.model.prefillChunks[1] == 1; }, "the prompt did not start");
+  // A Normal start is refused memory while it is resident, which suspends
+  // it.
+  spill.model.beginGrowthBlocked = [&] {
+    return spill.model.lastBeginId == 2 && spill.model.requests.at(1).resident;
+  };
+  spill.model.resumeDenied = true;
+  spill.engine.submit(Spilling::prompt(2, 2, 1, 1));
+  spill.runUntil([&] { return spill.events.completedCount == 1; },
+                 "the Normal request did not run");
+  require(spill.model.suspensions == 1 &&
+              spill.engine.snapshot().activeRequests.front().promptProcessed <
+                  3 * KvCache::pageTokens - 1,
+          "the request was not suspended in its prompt");
+  spill.budget->setActiveLimitBytes(3 * 100);
+  spill.model.resumeDenied = false;
+  spill.runUntilIdle();
+  require(spill.model.resumptions == 1 && spill.model.outputLimits.at(1) == 1 &&
+              spill.events.completedCount == 2 && spill.events.usage.at(1).second == 1 &&
+              spill.events.boundedIds == std::vector<uint64_t>{1} && spill.committedSlots() == 0,
+          "a resume in its prompt was not bounded to the token its prompt's pages leave");
+}
+
 // A decoding lane whose history holds Index pages reads them through the hot
 // block cache: the model refuses its floor there, and decode runs the other
 // lanes without it, which waits rather than fails while they hold memory.
@@ -11898,6 +11977,8 @@ int main() {
     testSpilledFullExtentsLeaveOnceNoPromptGrows();
     testSpillMovesThroughTheHostPause();
     testSpillResumeCommitsAgain();
+    testSpillResumeBoundLeavesOutputPastItsAnchor();
+    testSpillResumeInItsPromptHoldsNoAnchor();
     testDecodeLeavesOutALaneRefusedItsHotFloor();
     testARefusedDecodeTakesThePrefillLanesMemory();
     testRefusedModelMemoryTakesWhatGivesMemoryBack();

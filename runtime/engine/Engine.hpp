@@ -391,6 +391,12 @@ private:
     // (ModelStepResult::firstToken) and until the first decode cycle commits
     // it: that cycle emits it first, and its event leaves it out.
     std::optional<uint32_t> sentFirstToken;
+    // Its model held an anchor when its lane was last suspended: the token
+    // it selected last, which the suspension keeps (Model::suspend). A
+    // decoding lane holds one once its first token is selected, a
+    // constrained lane's under its first mask; a lane in prefill holds what
+    // it held when its replay began.
+    bool suspendedWithAnchor = false;
     // Made from exactTokens and the request's prompt identity, which do not
     // change while the request waits; refreshed each pass and dropped once it starts or
     // skips the cache.
@@ -519,10 +525,11 @@ private:
   // quota of active KV (Cache::spillRoom) must hold the pages it publishes
   // up to its projection. Short of that, a start that fits alone starts
   // Resident, unless every request spills; otherwise the quota bounds its
-  // output to what it holds, if that leaves at least a page of it; it waits
-  // while other requests' active KV (the copies of the blocks they hold,
-  // and their commitments) holds what it lacks; and otherwise a start is
-  // refused, and a resume ends at its length.
+  // output to what it holds, if that leaves a token of it past what the
+  // request holds, the anchor of a resume that holds one included; it
+  // waits while other requests' active KV (the copies of the blocks they
+  // hold, and their commitments) holds what it lacks; and otherwise a start
+  // is refused, and a resume ends at its length.
   enum class SpillAdmission : uint8_t {
     // The quota holds what it publishes: commit it once the lane is taken.
     Commit,
