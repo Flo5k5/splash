@@ -49,7 +49,9 @@ class LocalServeTests(unittest.TestCase):
 
     def serve(self, target, *options):
         with (
-            mock.patch.object(launcher.paths, "PACKAGED", True),
+            # Hosted macOS runners expose a virtual GPU. Runtime/device
+            # checks have their own tests; keep local preparation real.
+            mock.patch.object(launcher, "_ensure_runtime") as setup,
             mock.patch.object(
                 launcher,
                 "_ensure_installed",
@@ -67,6 +69,7 @@ class LocalServeTests(unittest.TestCase):
                     *options,
                 ]
             )
+        setup.assert_called_once_with()
         return result, execute
 
     def test_local_gguf_is_prepared_by_splash_python_and_served_without_the_hub(self):
