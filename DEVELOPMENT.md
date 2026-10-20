@@ -1334,7 +1334,9 @@ PDFs arrive inline too: Chat `file` parts with `file_data`, Responses
 1,048,576 pixels. PDF input supports base64 documents within a shared 64 MiB
 source/rendering budget and the native 64-image limit (one image per page).
 Model context and isolated rendering limits also apply. URL inputs, `file_id`,
-opening passwords and citations are unsupported.
+opening passwords and citations are unsupported. PDFs render one at a time: a
+request waits for its turn and renders without holding any of the server's
+preparation capacity, so other requests prepare meanwhile.
 
 A model served with `--language-only` refuses both with 400 ([vision](#vision)).
 

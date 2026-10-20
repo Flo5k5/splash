@@ -1,6 +1,7 @@
 import copy
 import json
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from unittest import mock
 
@@ -930,7 +931,9 @@ class ChatTemplateFrontendTests(unittest.TestCase):
         }
         chat, _ = api_shapes.responses_to_chat_body(body, body["input"])
         prompt = harness.app._render_prompt(
-            harness.app._prepare_prompt(chat, None, deadline=fixtures.FOREVER),
+            harness.app._prepare_prompt(
+                chat, None, deadline=fixtures.FOREVER, without_slot=nullcontext
+            ),
             float("inf"),
             check_context=False,
         ).text
@@ -1005,6 +1008,7 @@ class LeadingSystemMergeTests(unittest.TestCase):
             ],
             vision=True,
             deadline=fixtures.FOREVER,
+            without_slot=nullcontext,
         )
         self.assertEqual(
             merged,
@@ -1023,6 +1027,7 @@ class LeadingSystemMergeTests(unittest.TestCase):
                 ],
                 vision=True,
                 deadline=fixtures.FOREVER,
+                without_slot=nullcontext,
             )[0],
             {"role": "system", "content": "  Only  "},
         )
@@ -1050,7 +1055,10 @@ class LeadingSystemMergeTests(unittest.TestCase):
             with self.subTest(messages=messages):
                 self.assertEqual(
                     api_shapes.normalize_messages(
-                        messages, vision=True, deadline=fixtures.FOREVER
+                        messages,
+                        vision=True,
+                        deadline=fixtures.FOREVER,
+                        without_slot=nullcontext,
                     ),
                     [
                         {"role": "system", "content": "Base\n\nDeveloper"},

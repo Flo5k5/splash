@@ -1,5 +1,6 @@
 import json
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest import mock
 
@@ -930,7 +931,9 @@ class StructuredToolRequestTest(HarnessTestCase):
                     },
                 )
                 original = json.dumps(body, sort_keys=True)
-                prompt = harness.app._prepare_prompt(body, None, deadline=FOREVER)
+                prompt = harness.app._prepare_prompt(
+                    body, None, deadline=FOREVER, without_slot=nullcontext
+                )
                 self.assertEqual(json.dumps(body, sort_keys=True), original)
                 self.assertEqual(prompt.messages, body["messages"])
                 self.assertEqual(prompt.response_schema, schema)
