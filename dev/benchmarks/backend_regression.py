@@ -34,8 +34,13 @@ otherwise idle:
   reported.
 - weight bytes: after the rounds both builds load the model's weight images
   once more and must hold the same images with the same bytes
-  (weights.compare_builds). A baseline of an earlier release prepares into a
-  cache of its own, <output dir>/baseline-weights. With
+  (weights.compare_builds). With --expert-memory SIZE and --ple-memory SIZE,
+  as weight-digests takes them, both stream the routed experts and the PLE
+  table, whose bytes are then not among the images; the result records the
+  options and the report names them. Before the rounds, the options are
+  refused for a build without a weight-digests that takes them, such as a
+  baseline of an earlier release. A baseline of an earlier release prepares
+  into a cache of its own, <output dir>/baseline-weights. With
   --expect-image-change (or EXPECT_IMAGE_CHANGE=1), for a change of the image
   layout, the images that differ are reported and fail nothing.
 
@@ -85,13 +90,14 @@ class RegressionError(RuntimeError):
     pass
 
 
-def usage(benchmark: Path) -> str:
-    """A backend-benchmark's usage, which it prints without arguments. It
-    names the options a build takes: older builds take one --scenario and no
-    short or transcripts scenario, and builds before the Neural Engine split no
-    --ane-ffn-share."""
+def usage(tool: Path) -> str:
+    """The usage a build's backend-benchmark or weight-digests prints without
+    arguments. It names the options the tool takes: older benchmarks take one
+    --scenario and no short or transcripts scenario, benchmarks before the
+    Neural Engine split no --ane-ffn-share, and older weight-digests no
+    --expert-memory or --ple-memory."""
     return subprocess.run(
-        [str(benchmark)], capture_output=True, text=True, timeout=60
+        [str(tool)], capture_output=True, text=True, timeout=60
     ).stderr
 
 
@@ -493,6 +499,18 @@ def parse_args(argv=None):
         help="the prefill FFN's Neural Engine share in [0, 1) every round runs "
         "(0: the GPU alone; default: the first share a round reports)",
     )
+    parser.add_argument(
+        "--expert-memory",
+        metavar="SIZE",
+        help="load the compared weight images with the routed experts streamed "
+        "through a store of SIZE (weight-digests --expert-memory)",
+    )
+    parser.add_argument(
+        "--ple-memory",
+        metavar="SIZE",
+        help="load the compared weight images with the PLE table streamed "
+        "through a row cache of SIZE (weight-digests --ple-memory)",
+    )
     args = parser.parse_args(argv)
     if args.samples < 1:
         parser.error("--samples must be positive")
@@ -502,6 +520,26 @@ def parse_args(argv=None):
                 parser.error(f"missing retained benchmark or library: {path}")
     if not weights.loads_in_memory(args.candidate / "build"):
         parser.error(f"the candidate build has no {weights.WEIGHT_DIGESTS}")
+    # Each build's weight-digests must take the options given, which its usage
+    # names: a baseline of an earlier release has no weight-digests, and an
+    # older weight-digests takes none of them.
+    given = {
+        option: value
+        for option, value in (
+            ("--expert-memory", args.expert_memory),
+            ("--ple-memory", args.ple_memory),
+        )
+        if value is not None
+    }
+    for name, tree in (("baseline", args.baseline), ("candidate", args.candidate)):
+        tool = tree / "build" / weights.WEIGHT_DIGESTS
+        text = usage(tool) if given and tool.is_file() else ""
+        if not all(option in text for option in given):
+            parser.error(
+                f"the {name} build has no {weights.WEIGHT_DIGESTS} that takes "
+                + " and ".join(given)
+            )
+    args.weight_digest_options = [word for item in given.items() for word in item]
     if (
         smoke.model_artifacts.installation_kind(args.model_root)
         != smoke.model_artifacts.ASSEMBLY
@@ -541,6 +579,7 @@ def main(argv=None) -> int:
         "trees": {name: str(tree) for name, tree in trees.items()},
         "samples": args.samples,
         "scenario_invocations": invocations(args.combined, args.scenarios),
+        "weight_digest_options": args.weight_digest_options,
         "expect_image_change": args.expect_image_change,
         "pass": False,
     }
@@ -569,6 +608,7 @@ def main(argv=None) -> int:
             trees["candidate"] / "build",
             args.model_root,
             environments["baseline"],
+            args.weight_digest_options,
         )
         document["pass"] = document["comparison"]["pass"] and (
             document["weights"]["pass"] or args.expect_image_change
@@ -607,8 +647,10 @@ def report(document: dict) -> None:
         f"elastic budget change: {plans['dynamic_budget_change_bytes']} bytes"
     )
     images = document["weights"]
+    options = document["weight_digest_options"]
     print(
         f"weight bytes: {len(images['images'])} images "
+        + (f"(loaded with {' '.join(options)}) " if options else "")
         + (
             "PASS"
             if images["pass"]

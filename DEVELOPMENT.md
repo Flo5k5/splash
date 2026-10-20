@@ -3372,12 +3372,12 @@ does, and `REVISION`, `DRAFT_MODEL` and `LANGUAGE_ONLY=1` as its `--revision`,
 
 | Target | Runs |
 | --- | --- |
-| `verify-models` | the installer's restarts without the Hub, `verify --full`, and the record of the weight images (`dev/tools/installer_restarts.py`, `weight-digests`, [Release check](#release-check)) |
+| `verify-models` | the installer's restarts without the Hub, `verify --full`, and the record of the weight images (`dev/tools/installer_restarts.py`, `weight-digests` with `WEIGHT_DIGESTS_ARGS` added, such as `WEIGHT_DIGESTS_ARGS="--expert-memory 7G --ple-memory 2G"` to stream the routed experts and the PLE table, [Release check](#release-check)) |
 | `test-real` | vision parity with the family's fixture in `dev/tests/fixtures/vision-parity/` when the installation serves vision, and the native model runtime oracle, each of its three runs with `ORACLE_ARGS` added (`ORACLE_ARGS="--kv-format bf16"`, `"--expert-memory 16G"` or `"--yarn-factor 4"`); for a block-sparse target their spill checks take the default prompts, two staging buffers, and 32K tokens with the default window |
 | `test-http-real` | the HTTP frontend on an isolated server (`dev/tests/smoke_real.py`), whose greedy comparisons (a penalized greedy request repeats, `min_p` 1 answers as greedy) run where `/status` reports `verify_rows` `all`, which on any MoE target takes `HTTP_SMOKE_ARGS="--verify-rows all"`; with `HTTP_SMOKE_ARGS="--persistent-cache --max-cache-disk 8G"`, instead of that smoke, the [persistent cache](#persistent-cache) across a restart in a fresh cache directory: a clean stop, a restart that takes the restore point back, and a next turn that restores the prompt from disk; `release-check` runs both |
 | `test-agent-real` | the five official clients through `splash serve` (`dev/tests/agent_real.py`), in `AGENT_SCENARIO` `complete` (the default) or `smoke` |
 | `test-release-real` | the HTTP smoke and all five clients on one `splash serve` |
-| `test-performance-real` | the native decode, partial-prefix and short-prompt benchmark, or with `BASELINE` its ABBA comparison with that build (`dev/benchmarks/backend_regression.py`) |
+| `test-performance-real` | the native decode, partial-prefix and short-prompt benchmark, or with `BASELINE` its ABBA comparison with that build, in which both builds' `weight-digests` take `WEIGHT_DIGESTS_ARGS` (`dev/benchmarks/backend_regression.py`) |
 | `release-check` | one model on this Mac ([Release check](#release-check)) |
 
 `test-agent-real` and `test-release-real` first run the tests
@@ -3497,11 +3497,26 @@ the other. Per model, `release-check`:
   every round at that share instead, in each build whose benchmark takes one
   (0: the GPU alone); a baseline whose benchmark takes none must report none.
 
+Where the Mac's memory cannot hold a model's weight images, or its largest
+Metal buffer cannot hold one of them, as for Qwen3.8-Flash-Next,
+`WEIGHT_DIGESTS_ARGS` streams its routed experts and PLE table in the loads
+whose images are recorded and compared ([streamed experts](#streamed-experts),
+[PLE table streaming](#ple-table-streaming)): it gives `weight-digests` the
+`--expert-memory SIZE` and `--ple-memory SIZE` that `ORACLE_ARGS` gives the
+runtime oracle, each SIZE a whole number of bytes or of `K`, `M` or `G`, such
+as `7G`, in `verify-models` and in both builds of the comparison with
+`BASELINE`, whose `weight-digests` must take them. The layers' images then
+leave out their routed experts, and a PLE table that streams has no image
+(`ple.bin`): the engine reads those bytes from the source files, which
+`verify --full` hashes, and the digests do not cover them. Any size a store
+takes records the same images.
+
 Results go to `build/release/<owner>--<repo>[--VARIANT]/`. The weight images
-do not depend on the GPU, so each model's `weights.json` must be identical on
-the two Macs. The unpinned `verify-models`, run after the pinned ones while the
-default branch still names the pinned commit, resolves the branch online, and
-its unreachable-Hub restart must fall back with the Hub's reason. The agent
+do not depend on the GPU, so each model's `weights.json`, recorded with the
+same `WEIGHT_DIGESTS_ARGS`, must be identical on the two Macs. The unpinned
+`verify-models`, run after the pinned ones while the default branch still
+names the pinned commit, resolves the branch online, and its unreachable-Hub
+restart must fall back with the Hub's reason. The agent
 clients depend on neither the model's format nor the GPU: run the smoke
 scenario once per Mac, with the five clients split between the Macs, and
 `AGENT_SCENARIO=complete` for one model when the client integration changed.

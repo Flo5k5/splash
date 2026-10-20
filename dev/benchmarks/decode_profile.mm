@@ -1,7 +1,7 @@
 // Per-kernel GPU time attribution for the production executor.
 //
 //   decode-profile METALLIB MODEL_ROOT [--prompt-tokens N] [--cycles K] [--kv-format int8|bf16]
-//                  [--state-format fp32|bf16] [--expert-memory BYTES] [--ple-memory BYTES]
+//                  [--state-format fp32|bf16] [--expert-memory SIZE] [--ple-memory SIZE]
 //                  [--dispatch-list FILE]
 //   decode-profile METALLIB MODEL_ROOT --images HxW[,HxW...] [--cycles K]
 //
@@ -30,6 +30,7 @@
 #include "model/WeightImages.hpp"
 #include "engine/MemoryGovernor.hpp"
 #include "model/QwenState.hpp"
+#include "tools/LoadOptions.hpp"
 
 #import <Foundation/Foundation.h>
 
@@ -128,14 +129,6 @@ uint32_t parseCount(std::string_view text, std::string_view label) {
       !value) {
     throw std::invalid_argument(std::string(label) + " must be positive");
   }
-  return value;
-}
-
-uint64_t parseBytes(std::string_view text, std::string_view label) {
-  uint64_t value = 0;
-  auto result = std::from_chars(text.data(), text.data() + text.size(), value);
-  if (result.ec != std::errc{} || result.ptr != text.data() + text.size() || !value)
-    throw std::invalid_argument(std::string(label) + " must be a positive byte count");
   return value;
 }
 
@@ -307,7 +300,7 @@ int main(int argc, char **argv) {
       if (argc < 3) {
         std::cerr << "usage: decode-profile METALLIB MODEL_ROOT "
                      "[--prompt-tokens N] [--cycles K] [--kv-format int8|bf16] "
-                     "[--state-format fp32|bf16] [--expert-memory BYTES] [--ple-memory BYTES] "
+                     "[--state-format fp32|bf16] [--expert-memory SIZE] [--ple-memory SIZE] "
                      "[--dispatch-list FILE]\n"
                      "       decode-profile METALLIB MODEL_ROOT "
                      "--images HxW[,HxW...] [--cycles K]\n";
@@ -318,7 +311,7 @@ int main(int argc, char **argv) {
       kv::Format format = kv::Format::Int8;
       ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
       std::vector<ops::ImageGrid> grids;
-      // Streamed routed experts and PLE table, as serve-native's options.
+      // Streamed routed experts and PLE table (tools/LoadOptions.hpp).
       model::ModelLoadOptions loadOptions;
       bool textOptions = false;
       std::string dispatchList;
@@ -343,11 +336,7 @@ int main(int argc, char **argv) {
             throw std::invalid_argument("--state-format takes fp32 or bf16");
           stateFormat = value == "fp32" ? ops::GdnStateFormat::Float32 : ops::GdnStateFormat::BFloat16;
           textOptions = true;
-        } else if (option == "--expert-memory") {
-          loadOptions.expertMemoryBytes = parseBytes(argv[index + 1], "--expert-memory");
-          textOptions = true;
-        } else if (option == "--ple-memory") {
-          loadOptions.streamedTableBytes = parseBytes(argv[index + 1], "--ple-memory");
+        } else if (tools::takeLoadOption(option, argv[index + 1], loadOptions)) {
           textOptions = true;
         } else if (option == "--dispatch-list") {
           dispatchList = argv[index + 1];
