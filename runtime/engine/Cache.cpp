@@ -32,7 +32,7 @@ bool older(const std::optional<CacheEvictionCandidate> &left,
 Cache::Cache(KvPool &pool, KvTier *kvTier, std::shared_ptr<model::DiskBudget> diskBudget,
              std::optional<CacheSpillPolicy> spill)
     : pool_(pool), tier_(kvTier), spill_(spill), persistent_(kvTier && kvTier->persistent()),
-      diskBudget_(std::move(diskBudget)), kv_(pool, recency_, spill.has_value()),
+      diskBudget_(std::move(diskBudget)), kv_(pool, recency_, spill.has_value(), persistent_),
       states_(kv_, recency_, [this](bool inUse) { return freeDiskSpace(inUse); }, persistent_) {
   // Spilled K/V lives in the tier's copies, within its quota.
   if (spill_ && (!tier_ || !diskBudget_))
@@ -1198,7 +1198,7 @@ void Cache::checkInvariants() const {
     if (!holds)
       throw std::logic_error(std::string("cache invariant broken: ") + what);
   };
-  kv_.checkInvariants();
+  kv_.checkInvariants([this](uint64_t block) { return states_.onDisk(block); });
   uint64_t committed = 0;
   for (const auto &[_, active] : requests_) {
     check(active.cachedBlocks.size() <= active.pages.size(),

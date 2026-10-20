@@ -336,9 +336,6 @@ void KvCache::countState(uint64_t blockId, bool added, bool inUse) noexcept {
     added ? ++entry.statesBelow : --entry.statesBelow;
     if (inUse)
       added ? ++entry.statesInUseBelow : --entry.statesInUseBelow;
-    // Its copy is needed again, or no longer.
-    if (entry.statesBelow == (added ? 1u : 0u))
-      reindex(entry);
   });
 }
 
@@ -346,6 +343,22 @@ void KvCache::countStateInUse(uint64_t blockId, bool added) noexcept {
   countAbove(blockId, [&](Block &entry) {
     added ? ++entry.statesInUseBelow : --entry.statesInUseBelow;
   });
+}
+
+void KvCache::countDiskState(uint64_t blockId, bool added) noexcept {
+  if (!persistent_)
+    return;
+  for (uint64_t id = blockId; id;) {
+    const auto found = blocks_.find(id);
+    if (found == blocks_.end())
+      std::terminate();
+    Block &entry = found->second;
+    added ? ++entry.diskStates : --entry.diskStates;
+    // Its redundant copy is needed again, or no longer.
+    if (entry.diskStates == (added ? 1u : 0u))
+      reindex(entry);
+    id = entry.parent;
+  }
 }
 
 bool KvCache::stateBelow(uint64_t blockId) const { return block(blockId).statesBelow > 0; }
@@ -650,29 +663,43 @@ const KvCache::Block &KvCache::block(uint64_t blockId) const {
 
 // Resident leaves wait in one order, disk copies in another: redundant
 // copies of blocks whose page holds their K/V, or the only copies, of a
-// spilled or disk-only block without children. The disk copies no state
-// needs wait in a third as well. A block a request uses or holds, one in
-// transfer, or a poisoned one is in no order: quota never takes a copy
-// active KV reads, nor RAM reclaim a page a request holds.
+// spilled or disk-only block without children. In a persistent cache the
+// disk copies no state needs wait in a third as well: a redundant one that
+// no state on disk restores through, and the only one of a leaf without a
+// state. A block a request uses or holds, one in transfer, or a poisoned one
+// is in no order: quota never takes a copy active KV reads, nor RAM reclaim
+// a page a request holds.
+KvCache::Orders KvCache::orders(const Block &entry) const noexcept {
+  if (entry.activeUsers || entry.held || entry.transfer != Transfer::None || entry.poisoned)
+    return {};
+  const bool paged = entry.page != noPage;
+  const bool full = paged && entry.form == kv::PageForm::Full;
+  Orders result;
+  result.ramLeaf = paged && !entry.residentChildren;
+  if (!entry.slot)
+    return result;
+  result.duplicate = full;
+  result.diskLeaf = !full && !entry.children;
+  result.unneeded = persistent_ && (full ? !entry.diskStates : !entry.statesHere && !entry.children);
+  return result;
+}
+
 void KvCache::reindex(Block &entry) noexcept {
   RecencyOrder::unlink(entry.ramNode);
   RecencyOrder::unlink(entry.diskNode);
   RecencyOrder::unlink(entry.unneededNode);
-  if (entry.activeUsers || entry.held || entry.transfer != Transfer::None || entry.poisoned)
-    return;
-  const bool paged = entry.page != noPage;
-  const bool full = paged && entry.form == kv::PageForm::Full;
-  if (paged && !entry.residentChildren)
+  const Orders placed = orders(entry);
+  if (placed.ramLeaf)
     ramLeaves_.link(entry.ramNode, entry.lastUsed, entry.id);
-  if (entry.slot && full)
+  if (placed.duplicate)
     duplicates_.link(entry.diskNode, entry.lastUsed, entry.id);
-  else if (entry.slot && !entry.children)
+  else if (placed.diskLeaf)
     diskLeaves_.link(entry.diskNode, entry.lastUsed, entry.id);
-  if (entry.slot && !entry.statesHere && !entry.statesBelow && (full || !entry.children))
+  if (placed.unneeded)
     unneeded_.link(entry.unneededNode, entry.lastUsed, entry.id);
 }
 
-void KvCache::checkInvariants() const {
+void KvCache::checkInvariants(const std::function<bool(uint64_t blockId)> &stateOnDisk) const {
   const auto check = [](bool holds, const char *what) {
     if (!holds)
       throw std::logic_error(std::string("KV cache invariant broken: ") + what);
@@ -731,6 +758,38 @@ void KvCache::checkInvariants() const {
   }
   check(disk == diskBlocks_ && spilled == indexBlocks_ && heldCopies == heldCopies_,
         "the counts of copies, spilled blocks and held copies");
+  // In a persistent cache each block counts the states on disk at it and
+  // below it.
+  std::unordered_map<uint64_t, uint32_t> diskStates;
+  check(!persistent_ || static_cast<bool>(stateOnDisk),
+        "a persistent cache's check names the states on disk");
+  if (persistent_)
+    for (const auto &[id, _] : blocks_)
+      if (stateOnDisk(id))
+        for (uint64_t above = id; above; above = blocks_.at(above).parent)
+          ++diskStates[above];
+  for (const auto &[id, entry] : blocks_) {
+    const auto counted = diskStates.find(id);
+    check(entry.diskStates == (counted == diskStates.end() ? 0 : counted->second),
+          "a block counts the states on disk at it and below it");
+  }
+  // Each order holds the blocks reindex places in it, under their recency.
+  const auto checkOrder = [&](const RecencyOrder &order, const auto &placed, const char *what) {
+    size_t members = 0;
+    for (auto member = order.oldest(); member; member = order.next(*member), ++members) {
+      const auto found = blocks_.find(member->id);
+      check(found != blocks_.end() && found->second.lastUsed == member->lastUsed &&
+                placed(orders(found->second)),
+            what);
+    }
+    check(members == static_cast<size_t>(std::ranges::count_if(
+                         blocks_, [&](const auto &each) { return placed(orders(each.second)); })),
+          what);
+  };
+  checkOrder(ramLeaves_, [](const Orders &in) { return in.ramLeaf; }, "the order of resident leaves");
+  checkOrder(duplicates_, [](const Orders &in) { return in.duplicate; }, "the order of redundant copies");
+  checkOrder(diskLeaves_, [](const Orders &in) { return in.diskLeaf; }, "the order of only copies");
+  checkOrder(unneeded_, [](const Orders &in) { return in.unneeded; }, "the order of copies no state needs");
 }
 
 void KvCache::erasePoisonedLeaf(uint64_t blockId) noexcept {

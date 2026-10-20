@@ -3242,8 +3242,10 @@ make room only for a copy that is itself in use, and last. A persistent tier
 keeps restore points whole instead, since its redundant copies are what the next
 start takes back: a full quota drops a KV copy that no state needs first, then
 the oldest state copy, redundant or not, after which the copies of its chain
-that no other state needs go first in turn; the only copy of a state in use
-makes room only for a copy in use, and last. Either way an ordinary state that
+that no other state needs go first in turn. A state in RAM restores through the
+K/V RAM holds, not its copies: a copy of K/V that RAM holds too goes once no
+state on disk restores through it. The only copy of a state in use makes room
+only for a copy in use, and last. Either way an ordinary state that
 finds no other room is dropped. Before reclaim takes a state in RAM, only a
 spilling request's page takes the spilled KV under it, the state first,
 once nothing else is left. A freed slot returns its quota at once and its

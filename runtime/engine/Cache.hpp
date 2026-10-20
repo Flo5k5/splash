@@ -870,12 +870,15 @@ private:
   // exceed what active KV leaves of the limit; returns how many copies went.
   uint32_t fitDiskLimit();
   // In a persistent tier a redundant copy is what the next process takes
-  // back, and the unit worth keeping is a restore point, a state and its
-  // chain. A copy no state needs goes first (dropUnneededCopy), then the
+  // back, and the unit worth keeping is a restore point, a state on disk and
+  // its chain. A copy no state needs goes first (dropUnneededCopy), then the
   // oldest state copy, redundant or not: the copies of its chain that no
   // other state needs become unneeded and go on later calls, so a chain
-  // stays whole while a state needs it. The only copy of a state in use goes
-  // only for a copy in use, and last. False when no state copy can go.
+  // stays whole while a state on disk needs it. A state in RAM needs only
+  // the copies that hold the only K/V of its chain's blocks: a redundant
+  // copy goes once no state on disk restores through it. The only copy of a
+  // state in use goes only for a copy in use, and last. False when no state
+  // copy can go.
   [[nodiscard]] bool dropOldestPoint(bool inUse);
   [[nodiscard]] bool dropUnneededCopy();
   // A persistent tier's label for the block's disk copy.

@@ -10,6 +10,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -72,9 +73,11 @@ public:
   // With spill, requests may spill the blocks (Cache's spill policy): a
   // block on a page a request holds is held (holdPage), and a disk-only
   // block that adopts a writer's page gives its copy up, so that every block
-  // has one content, whichever form its page has.
-  KvCache(KvPool &pool, CacheRecency &recency, bool spill = false)
-      : pool_(pool), recency_(recency), spill_(spill), blockOnPage_(pool.pageCount()) {}
+  // has one content, whichever form its page has. A persistent cache keeps
+  // the copies no state needs in an order of their own (unneededCopy).
+  KvCache(KvPool &pool, CacheRecency &recency, bool spill = false, bool persistent = false)
+      : pool_(pool), recency_(recency), spill_(spill), persistent_(persistent),
+        blockOnPage_(pool.pageCount()) {}
   KvCache(const KvCache &) = delete;
   KvCache &operator=(const KvCache &) = delete;
   ~KvCache() noexcept;
@@ -149,6 +152,11 @@ public:
   // own block and every block above.
   void countState(uint64_t blockId, bool added, bool inUse) noexcept;
   void countStateInUse(uint64_t blockId, bool added) noexcept;
+  // In a persistent cache, StateCache counts each state's disk copy in from
+  // the first attempt of its write and out when it goes: the redundant copies
+  // of a chain are what the next process takes back for the states on disk
+  // at their blocks or below.
+  void countDiskState(uint64_t blockId, bool added) noexcept;
   // A state sits below the block. Without one, the disk-only blocks below
   // it are never read again.
   [[nodiscard]] bool stateBelow(uint64_t blockId) const;
@@ -199,8 +207,10 @@ public:
   // without children. Pass the previous candidate to continue the scan.
   [[nodiscard]] std::optional<CacheEvictionCandidate>
   diskCandidate(bool duplicate, uint64_t after = 0) const;
-  // Oldest unused holder of a disk copy that no state needs: none sits at
-  // its block or below. A disk-only one is a leaf.
+  // In a persistent cache, the oldest unused holder of a disk copy that no
+  // state needs: a redundant copy once no state with a disk copy sits at its
+  // block or below, as a state in RAM restores through the page, and the
+  // only copy of a spilled or disk-only leaf without a state.
   [[nodiscard]] std::optional<CacheEvictionCandidate> unneededCopy() const noexcept {
     return unneeded_.oldest();
   }
@@ -224,9 +234,12 @@ public:
   // was on the disk once already.
   [[nodiscard]] uint64_t rewrites() const noexcept { return rewrites_; }
   // Tests: std::logic_error unless every block's links, counts, form and
-  // held mark agree with the graph and the pool, and, between commands, no
-  // copy of a block that nothing holds or moves has a reader.
-  void checkInvariants() const;
+  // held mark agree with the graph and the pool, every order holds exactly
+  // the blocks reindex places in it, and, between commands, no copy of a
+  // block that nothing holds or moves has a reader. A persistent cache's
+  // caller names the blocks where a state with a disk copy sits
+  // (StateCache::onDisk), which the blocks' counts of them must match.
+  void checkInvariants(const std::function<bool(uint64_t blockId)> &stateOnDisk = {}) const;
 
 private:
   struct Block {
@@ -247,6 +260,9 @@ private:
     uint32_t statesHere = 0;
     uint32_t statesBelow = 0;
     uint32_t statesInUseBelow = 0;
+    // States with a disk copy at the block or below it, in a persistent
+    // cache.
+    uint32_t diskStates = 0;
     uint32_t activeUsers = 0;
     uint32_t depth = 0;
     uint64_t lastUsed = 0;
@@ -263,9 +279,18 @@ private:
     RecencyOrder::Node unneededNode;
   };
 
+  // The orders a block waits in, as its fields stand.
+  struct Orders final {
+    bool ramLeaf = false;
+    bool duplicate = false;
+    bool diskLeaf = false;
+    bool unneeded = false;
+  };
+
   [[nodiscard]] Block &block(uint64_t blockId);
   [[nodiscard]] const Block &block(uint64_t blockId) const;
-  // Places the block in the orders its state calls for.
+  [[nodiscard]] Orders orders(const Block &entry) const noexcept;
+  // Places the block in its orders.
   void reindex(Block &entry) noexcept;
   void giveDiskCopy(Block &entry, std::shared_ptr<KvDiskSlot> slot);
   // The block takes the page, whose form it keeps and whose holders, if
@@ -282,6 +307,7 @@ private:
   KvPool &pool_;
   CacheRecency &recency_;
   const bool spill_;
+  const bool persistent_;
   std::unordered_map<uint64_t, Block> blocks_;
   // The resident block on each page, 0 for none. A resident block owns its
   // page: a writer whose block already exists moves onto that block's page,

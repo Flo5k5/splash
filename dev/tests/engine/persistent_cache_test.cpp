@@ -352,6 +352,99 @@ void testOldestPointGoes() {
           "a copy no state needs stayed while a point was given up");
 }
 
+// Points whose states stay in RAM go the same way: the oldest one's state
+// copy, then the copies of its chain, which its state in RAM does not read,
+// before any other point. Both newer points stay durable, and the next
+// process takes them back.
+void testOldestPointInRamGoesWithItsChain() {
+  Process process(true);
+  process.tier.capacity = 6;
+  process.shelf->capacity = 2;
+  const auto keep = [&](uint64_t point) {
+    const PersistStatus status = process.cache.persist(point);
+    process.tier.complete();
+    static_cast<void>(process.cache.pollTransfers());
+    return status;
+  };
+  const std::vector<uint64_t> oldest = process.cachePrompt(1, promptOf(1000, 3));
+  process.publish(oldest[2]);
+  const uint64_t older = process.cachePrompt(2, promptOf(2000, 3))[2];
+  process.publish(older);
+  require(keep(oldest[2]) == PersistStatus::Started && keep(older) == PersistStatus::Started &&
+              process.tier.slots == 6 && process.shelf->disk.size() == 2,
+          "the two points did not fill the tier");
+  const uint64_t newest = process.cachePrompt(3, promptOf(3000, 2))[1];
+  process.publish(newest);
+  const auto copiesOf = [&](const std::vector<uint64_t> &chain) {
+    return std::ranges::count_if(process.kvLabels(), [&](const auto &bytes) {
+      return std::ranges::find(chain, decodeLabel<KvBlockLabel>(bytes)->id) != chain.end();
+    });
+  };
+  require(keep(newest) == PersistStatus::Started && process.cache.persist(older) == PersistStatus::Durable &&
+              process.cache.persist(newest) == PersistStatus::Durable && copiesOf(oldest) == 1 &&
+              process.cache.stateResident(oldest[2]),
+          "the newest point did not take the room of the oldest point's chain");
+  Process next(true);
+  const CacheAdoption adoption = next.adopt(process.kvLabels(), process.stateLabels());
+  require(adoption.states == 2 && adoption.blocks == 5 && adoption.dropped == 1,
+          "the next process did not take the two newer points back whole");
+  next.cache.checkInvariants();
+}
+
+// A state counts for its chain from the first attempt of its write, and no
+// longer once none starts. Once the deeper point of a chain left the disk,
+// no state needs the chain's copies; a point on that chain persisted at a
+// full tier keeps the copies of its own chain while room is made for its
+// state: the deeper point's own copies go, then the oldest other point, and
+// only the state is written.
+void testPointKeepsItsChainWhileItsStateIsWritten() {
+  Process process(true);
+  process.shelf->capacity = 0;
+  const auto keep = [&](uint64_t point) {
+    const PersistStatus status = process.cache.persist(point);
+    process.tier.complete();
+    static_cast<void>(process.cache.pollTransfers());
+    return status;
+  };
+  const auto copiesOf = [&](std::initializer_list<uint64_t> blocks) {
+    return std::ranges::count_if(process.kvLabels(), [&](const auto &bytes) {
+      return std::ranges::find(blocks, decodeLabel<KvBlockLabel>(bytes)->id) != blocks.end();
+    });
+  };
+  const std::vector<uint64_t> chain = process.cachePrompt(1, promptOf(1000, 4));
+  process.publish(chain[3]);
+  require(keep(chain[3]) == PersistStatus::Refused, "a point the state file has no room for was kept");
+  process.cache.checkInvariants();
+  process.shelf->capacity = 1;
+  require(keep(chain[3]) == PersistStatus::Started && process.tier.slots == 4 &&
+              process.cache.reclaimOneState(StateClass::Ordinary, false) &&
+              !process.cache.stateResident(chain[3]),
+          "the deeper point did not reach the tier and leave RAM");
+  // The deeper point, on disk alone, gives way to the next one.
+  const uint64_t other = process.cachePrompt(2, promptOf(2000, 1))[0];
+  process.publish(other);
+  require(keep(other) == PersistStatus::Started && process.shelf->disk.size() == 1 &&
+              process.tier.slots == 5,
+          "the deeper point did not give way to the next one");
+  process.publish(chain[1]);
+  const uint32_t writes = process.tier.demotions;
+  const uint64_t stateWrites = process.cache.snapshot().stateCache.offloads;
+  require(keep(chain[1]) == PersistStatus::Started &&
+              process.cache.persist(chain[1]) == PersistStatus::Durable &&
+              process.tier.demotions == writes &&
+              process.cache.snapshot().stateCache.offloads == stateWrites + 1,
+          "making room for the point's state took its own chain, which it wrote again");
+  require(copiesOf({chain[0], chain[1]}) == 2 && !copiesOf({chain[2], chain[3]}) &&
+              process.cache.stateResident(other) && process.shelf->disk.size() == 1,
+          "room for the point's state was not the deeper point's copies, then the oldest point");
+  process.cache.checkInvariants();
+  Process next(true);
+  const CacheAdoption adoption = next.adopt(process.kvLabels(), process.stateLabels());
+  require(adoption.states == 1 && adoption.blocks == 2 && adoption.dropped == 1,
+          "the next process did not take the point back whole");
+  next.cache.checkInvariants();
+}
+
 // Making room for a point can give up its own state, when it is the oldest
 // copy: the point is refused then, and the chain it no longer holds is not
 // touched.
@@ -831,9 +924,10 @@ void testWriteThroughCopiesAreRestorePoints() {
 
 // A full quota takes no copy a state needs, and a state in RAM has no disk
 // copy for it to give up, so the spilled chain of the ended request's replay
-// point outlasts every other copy. A committed page is a request's KV, which
-// comes before it: once nothing else is left, the page's slot takes that
-// chain, the state first.
+// point outlasts every other copy, the redundant copy of the Full page above
+// it among them. A committed page is a request's KV, which comes before it:
+// once nothing else is left, the page's slot takes that chain, the state
+// first.
 void testCommittedPagesTakeTheSpilledChainOfAStateInRam() {
   const auto budget = std::make_shared<model::DiskBudget>(400);
   Process process(true, budget, CacheSpillPolicy{1, 1});
@@ -846,20 +940,21 @@ void testCommittedPagesTakeTheSpilledChainOfAStateInRam() {
           "the Spill request was not admitted");
   process.cache.publishCommittedBlocks(1, prompt, static_cast<uint32_t>(prompt.size()), {});
   static_cast<void>(test::spillRound(process.cache, process.tier));
+  const uint64_t dense = process.cache.blockAt(1, KvCache::pageTokens);
   const uint64_t point = process.cache.blockAt(1, 3 * KvCache::pageTokens);
   process.publish(point);
   process.cache.endRequest(1);
   require(process.cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::Ordinary).madeProgress &&
               process.tier.slots == 4 && process.cache.stateResident(point),
           "the tail below the replay point did not leave RAM");
-  const std::vector<uint32_t> next = promptOf(5000, 2);
+  const std::vector<uint32_t> next = promptOf(5000, 3);
   process.cache.beginRequest(2, KvMode::Spill);
-  require(process.cache.commitSpill(2, 2) && admitTokens(process.cache, 2, next.size()).granted(),
+  require(process.cache.commitSpill(2, 3) && admitTokens(process.cache, 2, next.size()).granted(),
           "the second Spill request was not admitted");
   process.cache.publishCommittedBlocks(2, next, static_cast<uint32_t>(next.size()), {});
-  require(process.cache.writeThrough() == 2 && !process.cache.stateResident(point) &&
-              process.tier.slots == 4,
-          "a committed page did not take the spilled chain of a state in RAM");
+  require(process.cache.writeThrough() == 3 && !process.cache.stateResident(point) &&
+              !process.cache.copiedBlocks(dense) && process.tier.slots == 4,
+          "a committed page did not take the spilled chain of a state in RAM, or took it first");
   process.tier.complete();
   static_cast<void>(process.cache.pollTransfers());
   process.cache.checkInvariants();
@@ -874,6 +969,8 @@ int main() {
     testSaltedPointsComeBackUnderTheirSalt();
     testBrokenChainsStayBehind();
     testOldestPointGoes();
+    testOldestPointInRamGoesWithItsChain();
+    testPointKeepsItsChainWhileItsStateIsWritten();
     testAdoptionTrimsToTheLimit();
     testLowerLimitKeepsCopiesInUse();
     testCleanStopRecordsRecency();
