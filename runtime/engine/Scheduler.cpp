@@ -34,6 +34,20 @@ bool listed(std::span<const uint64_t> ids, uint64_t id) noexcept {
   return std::find(ids.begin(), ids.end(), id) != ids.end();
 }
 
+// The rows of an uncontended command of a lane with `remaining` rows to
+// prefill: up to a chunk, or for a lane whose commands may be prefill groups
+// of up to `groupRows` rows, its remaining chunks split evenly over the
+// fewest groups that hold them (a short last group would pay a whole pass
+// over a target's streamed experts for a few rows).
+uint32_t uncontendedRows(uint32_t remaining, uint32_t groupRows) noexcept {
+  constexpr uint32_t chunk = model::ExecutionLimits::prefillTokenBudget;
+  if (remaining <= chunk || groupRows <= chunk)
+    return std::min(remaining, chunk);
+  const uint32_t chunks = (remaining + chunk - 1) / chunk;
+  const uint32_t groups = (chunks + groupRows / chunk - 1) / (groupRows / chunk);
+  return std::min(remaining, (chunks + groups - 1) / groups * chunk);
+}
+
 } // namespace
 
 void Scheduler::submit(RequestSpec request) {
@@ -305,7 +319,14 @@ Scheduler::planPrefill(std::vector<PrefillRequestView> ready) const {
   plan.kind = WorkKind::Prefill;
   uint32_t budget = prefillBudget(ready.front(), ready);
   uint64_t pairs = 0;
+  // The command's rows so far: a lane joins only while they lie within the
+  // first chunk, and its group rows bound the command's
+  // (ExecutionLimits::prefillTokenBudget).
+  uint32_t planned = 0;
   for (const PrefillRequestView &view : ready) {
+    if (planned > model::ExecutionLimits::prefillTokenBudget)
+      break;
+    budget = std::min(budget, view.request->spec.prefillGroupRows - planned);
     if (!budget || view.request->spec.priority != selectedPriority ||
         plan.width() == model::ExecutionLimits::maximumBatchWidth)
       break;
@@ -324,6 +345,7 @@ Scheduler::planPrefill(std::vector<PrefillRequestView> ready) const {
     pairs += attentionPairs(view.promptProcessed, rows);
     plan.items.push_back(
         {view.request->spec.id, rows, view.promptProcessed});
+    planned += rows;
     budget -= rows;
   }
   return plan;
@@ -364,8 +386,10 @@ uint32_t Scheduler::prefillBudget(
   // A leader that finishes within the full budget ends the command at its
   // last row: prefill cost is linear above the slice, so shortest-first
   // sequential commands minimise first-token latency. Long prefills share a
-  // command only when no lane finishes.
-  return std::min(leaderRemaining, maximum);
+  // command only when no lane finishes. A leader that runs prefill groups
+  // takes up to a group; planPrefill gives what its rows leave to the next
+  // lanes within ExecutionLimits::prefillTokenBudget's contract.
+  return uncontendedRows(leaderRemaining, leader.request->spec.prefillGroupRows);
 }
 
 std::optional<BatchPlan> Scheduler::nextDecode(std::span<const uint64_t> excluded) const {
