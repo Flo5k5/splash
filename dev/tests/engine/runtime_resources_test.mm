@@ -839,20 +839,21 @@ void testStartGrowsThroughHostPressure(const char *metallibPath) {
 }
 
 // A model served with YaRN starts and runs as any other, with YaRN all the
-// way into its runtime: the start names the window it serves, the runtime's
-// geometry serves that window, its arenas hold YaRN's rotary frequencies, and
-// its prefill and decode build the target's RoPE tables with the attention
-// factor.
+// way into its runtime: the start names its factor and the context it
+// serves, the runtime's geometry serves that window, its arenas hold YaRN's
+// rotary frequencies, and its prefill and decode build the target's RoPE
+// tables with the attention factor.
 void testYarnRuntime(const char *metallibPath) {
   const test::TemporaryDirectory root("splash-yarn");
   RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "yarn-test");
-  config.model = model::withYarn(std::move(config.model), 4.0);
+  config.model = model::servedFor(std::move(config.model), 1'010'000);
   std::unique_ptr<RuntimeResources> resources;
   const std::string started =
       test::capturedStderr([&] { resources = RuntimeResources::create(config, 0); });
-  require(started.find("YaRN scales the target's RoPE by 4: a window of 1010000 tokens instead of the native "
-                       "262144.") != std::string::npos,
-          "a start with YaRN did not name the window it serves");
+  require(started.find("YaRN is on: the target's RoPE is scaled by 3.85284 for 1010000 tokens of context, past the "
+                       "native window of 262144. Static YaRN changes answers at every length, so pass a "
+                       "--max-context above 262144 only when a request needs it.") != std::string::npos,
+          "a start with YaRN did not name its factor and the context it serves");
   const model::RuntimeContext context = resources->modelContext();
   const auto geometry = model::RuntimeGeometry::from(context.model, kv::Format::Int8, ops::GdnStateFormat::Float32);
   require(geometry.target.ropeScaling == config.model.ropeScaling && geometry.target.contextTokens() == 1'010'000,

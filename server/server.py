@@ -1695,8 +1695,6 @@ def _native_command(args, model_root, relaunch_context=None):
         )
     if args.allow_idle_sleep:
         command.extend(("--idle-sleep", "allow"))
-    if args.yarn_factor is not None:
-        command.extend(("--yarn-factor", str(args.yarn_factor)))
     if relaunch_context is not None and args.max_context is None:
         command.extend(("--relaunch-context", str(relaunch_context)))
     for flag, value in (
@@ -1790,15 +1788,12 @@ def main():
         if not runtime.wait_ready():
             raise engine_runtime.EngineUnhealthy("native runtime did not become ready")
         readiness = runtime.readiness
-        if (
-            readiness is None
-            or not 1
-            <= readiness.max_context_tokens
-            <= serve_options.context_window(args.yarn_factor)
-            or (
-                args.max_context is not None
-                and readiness.max_context_tokens != args.max_context
-            )
+        # The engine serves --max-context as given, and without it a context
+        # the native window holds.
+        if readiness is None or not (
+            readiness.max_context_tokens == args.max_context
+            if args.max_context is not None
+            else 1 <= readiness.max_context_tokens <= serve_options.MAX_CONTEXT_TOKENS
         ):
             raise engine_runtime.EngineUnhealthy(
                 "native runtime reported an invalid context window"

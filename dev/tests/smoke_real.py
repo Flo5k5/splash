@@ -128,8 +128,6 @@ class RealServer:
             command.extend(("--expert-memory", arguments.expert_memory))
         if arguments.verify_rows is not None:
             command.extend(("--verify-rows", arguments.verify_rows))
-        if arguments.yarn_factor is not None:
-            command.extend(("--yarn-factor", str(arguments.yarn_factor)))
         if cache_dir is not None:
             command.extend(("--persistent-cache", "--cache-dir", str(cache_dir)))
         if arguments.max_image_pixels is not None:
@@ -1734,11 +1732,6 @@ def add_server_arguments(parser):
         choices=("auto", "all"),
         help="the rows of each draft block decode verifies (splash serve "
         "--verify-rows); a MoE model's greedy output repeats only with all",
-    )
-    parser.add_argument(
-        "--yarn-factor",
-        type=serve_options.parse_yarn_factor,
-        help="serve with YaRN by this factor (splash serve --yarn-factor)",
     )
     parser.add_argument("--max-image-pixels", type=int)
     parser.add_argument("--kv-format", choices=("int8", "bf16"), default="int8")

@@ -732,16 +732,17 @@ void qsaTest(MetalBackend &backend, QsaCase c) {
 
 // A target's QSA scratch (model::Qwen4Steps) takes rows to the end of the
 // window it serves: a prefill chunk's and a verify step's last rows at the
-// native window, or at the 1,010,000 tokens YaRN by 4 serves, whose prefill
-// scores keep the native window's scratch; the native window's scratch
-// refuses rows at the end of YaRN's.
+// native window, or at the 1,010,000 tokens YaRN serves at most, by their
+// ratio to the native window (model::servedFor), whose prefill scores keep
+// the native window's scratch; the native window's scratch refuses rows at
+// the end of YaRN's.
 void qsaScratchCoversWindow(MetalBackend &backend) {
   constexpr uint32_t kChunk = 2048, kVerify = 8, kLanes = 4;
   const model::Qwen4ExpWeights weights;
   const std::array<uint32_t, 1> captured{47};
   const model::QwenTargetGeometry native(model::Qwen4ExpLayout{}, captured);
   model::QwenTargetGeometry scaled = native;
-  scaled.ropeScaling = {4.0, 262144};
+  scaled.ropeScaling = {1'010'000.0 / 262'144, 262'144};
   const model::QwenTargetGeometry &yarn = scaled;
   const MetalBuffer table = scratch(backend, 8);
   const auto selects = [&](const model::Qwen4Scratch &s, uint32_t rows, std::vector<uint32_t> firsts) {

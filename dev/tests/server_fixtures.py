@@ -787,7 +787,6 @@ def main_args(**overrides):
             "thinking_token_budget": None,
             "thinking_end_text": None,
             "max_context": None,
-            "yarn_factor": None,
             "max_memory": None,
             "idle_release": None,
             "max_cache_disk": None,

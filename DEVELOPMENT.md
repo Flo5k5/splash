@@ -94,8 +94,7 @@ access.
 | `--api-key` | `SPLASH_API_KEY` or none | Require this key, as a bearer token or `x-api-key`, on every route but the chat page, `/health` and `/ready`. |
 | `--no-webui` | Off | Disable the chat page. |
 | `--max-memory` | Auto | Lower the ceiling on Metal allocations, e.g. `28G`; not combined process RSS. See [memory and context](#memory-and-context). |
-| `--max-context` | Auto | Set the context limit, e.g. `100K`. See [memory and context](#memory-and-context). |
-| `--yarn-factor` | Off | Stretch the 256K window by a factor of up to 4 (1,010,000 tokens) with YaRN. See [memory and context](#memory-and-context). |
+| `--max-context` | Auto | Set the context limit, e.g. `100K` or `1M` (K = 1024 tokens, M = 1,000,000), up to 1,010,000 tokens; past the 256K native window it turns on YaRN. See [memory and context](#memory-and-context). |
 | `--kv-format` | `int8` | Target KV storage: `int8` or `bf16`. See [KV cache precision](#kv-cache-precision). |
 | `--state-format` | `fp32` | Recurrent state storage: `fp32` or `bf16`. See [state precision](#state-precision). |
 | `--ple-memory` | Auto | Qwen3.8-Flash-Next: read the PLE n-gram table from the SSD through a host row cache of this size, e.g. `2G`; `off` loads the whole table. Auto loads it where memory holds it, else streams it through its share of the budget. See [PLE table streaming](#ple-table-streaming). |
@@ -125,7 +124,8 @@ Sizes (`--max-memory`, `--max-cache-disk`, `--max-cache-disk-writes`,
 `G` suffix in binary units: `28G` is 28 GiB, and `28GB`, `28GiB` and `28g` say
 the same. With a suffix the number may have a fraction, rounded down to whole
 bytes: `2.5G` is 2,560 MiB. Token counts (`--max-context`) are a whole number, or one with a `K`
-suffix of 1024 tokens: `100K` is 102,400 tokens. `--max-memory`, `--max-context`, `--max-cache-disk`,
+suffix of 1024 tokens or an `M` suffix of a million: `100K` is 102,400 tokens and `1M` is
+1,000,000. `--max-memory`, `--max-context`, `--max-cache-disk`,
 `--ple-memory`, `--expert-memory` and `--sparse-kv-memory` also take `auto`, their default,
 `--ple-memory off` and `--expert-memory off` load the whole table and every expert, `--max-cache-disk 0` turns the SSD cache off,
 and `--max-cache-disk-writes 0`, its default, sets no write budget. Durations
@@ -197,10 +197,12 @@ model's native window, 256K tokens for both supported families, when the budget
 holds it beside the weights and, unless `--disable-ane`, the
 [Neural Engine split](#neural-engine-prefill) this Mac's calibration of a dense
 model takes, and otherwise as much as the budget holds beside them.
-`--max-context` sets it, such as `--max-context 100K`, up to what the budget
-holds without the split: beyond what the split leaves, the split takes fewer
-channels or the GPU runs alone, with a warning. A larger value stops startup
-with the most the model and memory allow.
+`--max-context` sets it, such as `--max-context 100K` (K is 1024 tokens, M a
+million), up to what the budget holds without the split: beyond what the split
+leaves, the split takes fewer channels or the GPU runs alone, with a warning.
+Past the native window it turns on YaRN, up to 1,010,000 tokens (below). A
+larger value than the budget holds stops startup with the most the model and
+memory allow.
 
 One plan sizes everything within the budget (`engine::planStreamedMemory`).
 Its floors come first: the weights that load, the arenas, the runtime
@@ -250,16 +252,21 @@ opens however little room the volume has, and each request's commitment
 checks the room as it starts. The plans that size the streamed stores take
 the room the volume leaves when the start begins, before the weights load.
 
-`--yarn-factor FACTOR` stretches the native window by FACTOR, above 1 and at
-most 4, with YaRN RoPE scaling, as Qwen describes for these models: `2` gives a
-window of 524,288 tokens, `4` the 1,010,000 Qwen validates them to. The
-context limit then follows the same rule up to that window, so it is what the
-budget holds: about a million tokens of the 27B's int8 KV on a 64 GB Mac, more
-of the 35B's, whose KV per token is a third of the 27B's. The scaling is
-YaRN's defaults and static: every request, short or long, takes the same
-factor, so turn it on only for prompts past 256K; a start whose context the
-native window holds says so. It scales the target's attention RoPE alone; the draft
-keeps its own, which keeps its acceptance at a million tokens. A long uncached
+A `--max-context` past the native window, up to the 1,010,000 tokens Qwen
+validates these models to, turns on YaRN RoPE scaling, as Qwen describes for
+them: the factor is the context over the native window, so that the stretched
+window is the context asked for, such as 2 for `--max-context 512K` and about
+3.81 for `1M`. Without `--max-context`, or at 256K or less, YaRN stays off, so
+answers and the persistent cache are the native window's. The budget must
+hold the context: about a million tokens of the 27B's int8 KV on a 64 GB Mac,
+more of the 35B's, whose KV per token is a third of the 27B's; where it does
+not, startup stops with the most it holds, which a `--max-context` of that
+much then serves. The scaling is YaRN's defaults and static: every request,
+short or long, takes the same factor, which changes answers at every length,
+so pass more than 256K only when a request needs it, as startup says. Each
+such context has its own factor, and so its own persistent cache. It scales
+the target's attention RoPE alone; the draft keeps its own, which keeps its
+acceptance at a million tokens. A long uncached
 prompt is slow to prefill, as attention grows with depth. Past the native
 window a prefill command takes fewer rows, so that its attention does no more
 than a full chunk's at the native window's end, which keeps it well within the
@@ -537,7 +544,7 @@ refused.
 Files live in `~/Library/Caches/Splash/prefix-cache/<namespace>/` (mode 0700;
 `--cache-dir` sets the root, which the engine keeps out of Time Machine when it
 creates it). The namespace digests the weights' manifest, the KV and state
-layouts, the YaRN factor (`--yarn-factor`) and the cache format, so no model
+layouts, the YaRN factor (of a `--max-context` past 256K) and the cache format, so no model
 reads another's cache. The manifest names each image's path, declared size and
 header, and the SHA-256 of the assembly's `model.json`, which records the
 resolved sources and each linked file's path, size, times and digest
@@ -1477,7 +1484,7 @@ Proxy consumers can use these fields; additional fields may be added:
 | `active_requests` | Each request the engine holds, ordered by `id`: its `id`, `phase` (`queued`, `waiting_resources`, `waiting_prefix`, `prefill`, `decode` or `waiting_mask`, and `failed` for one whose deadline passed while a cached state it restores was being read from disk, until that read drains), `priority`, `prompt_tokens` and how many of them are encoded (`prompt_processed`, cached ones included), `generated_tokens` of `max_new_tokens`, where a block-sparse target keeps its KV (`kv_mode`: `resident` or `spill`, only while its KV can go to the SSD), and `age_ms` since it arrived |
 | `memory_actual.current_bytes`, `peak_bytes` | Metal allocations, not process RSS |
 | `weights.idle_release_seconds`, `released`, `restoring`, `restores`, `restore_failures` | `--idle-release` in seconds (`null` for `off`), whether the weights' memory is released now, whether a request's restore of it is under way (it stays `released` until the last image is back), the times it was restored for a request since engine start, and the restores that gave up for want of memory |
-| `identity.cache.rope_scaling` | With `--yarn-factor`, the target's RoPE scaling, which every cached key went through: `type` `yarn`, its `factor` and `original_context_tokens`; `null` otherwise |
+| `identity.cache.rope_scaling` | With a `--max-context` past 256K, the target's RoPE scaling, which every cached key went through: `type` `yarn`, its `factor` and `original_context_tokens`; `null` otherwise |
 | `streamed_table` | While the PLE table streams, the [streamed PLE table](#ple-table-streaming)'s cache, stages, reads and prefetches; `null` otherwise |
 | `streamed_experts` | While routed experts stream, the [streamed experts](#streamed-experts)' store: its slots and resident experts, per use its loads, reads, read-ahead and host-step round trips, and its failure; `null` otherwise |
 | `kv_spill` | While a block-sparse target's KV can go to the SSD, its [KV on the SSD](#kv-on-the-ssd): the requests that started in each mode, converted to `spill`, had their output bounded or ended at that bound, and were refused for the quota, the write budget or a closed tier, and the starts waiting for the quota (`requests`); the pages that hold only their index and those whose KV is on the SSD; the write-through of spilling requests' pages; page moves, rewrites and restores; the quota of KV in service; the hot block cache's memory, hits, reads and host steps (`block_cache`; `read` over `resolves` is the blocks a layer's step missed on average) and the history streams' reads, how long each layer's took (`read_ms`, whose total gives with `bytes` the streams' bandwidth) and staging, the streamed commands that ran beside decoders, and the decoders' gaps across them (`history_stream`); absent for a target whose KV stays in memory, whose plan's `memory_plan.budget.kv_spill` is `null` |
@@ -2515,7 +2522,7 @@ lane retained, so a block a rejected row completed is pooled again by the
 next step from the committed tokens. No page holds a raw key. Queries and
 pooled keys rotate by the same target RoPE row (`target_rope_pair`, the
 queries' from the step's tables, a pooled key's at its block's first token),
-with YaRN's frequencies and attention factor under `--yarn-factor`. A row's
+with YaRN's frequencies and attention factor when YaRN is on. A row's
 scores and bitmap cover every block of the window the model serves; a prefill
 chunk scores its rows in batches that keep the native window's score scratch,
 256 rows at 256K, 64 at 1,010,000.
@@ -3396,7 +3403,7 @@ does, and `REVISION`, `DRAFT_MODEL` and `LANGUAGE_ONLY=1` as its `--revision`,
 | Target | Runs |
 | --- | --- |
 | `verify-models` | the installer's restarts without the Hub, `verify --full`, and the record of the weight images (`dev/tools/installer_restarts.py`, `weight-digests` with `WEIGHT_DIGESTS_ARGS` added, such as `WEIGHT_DIGESTS_ARGS="--expert-memory 7G --ple-memory 2G"` to stream the routed experts and the PLE table, [Release check](#release-check)) |
-| `test-real` | vision parity with the family's fixture in `dev/tests/fixtures/vision-parity/` when the installation serves vision, and the native model runtime oracle, each of its three runs with `ORACLE_ARGS` added (`ORACLE_ARGS="--kv-format bf16"`, `"--expert-memory 16G"` or `"--yarn-factor 4"`); for a block-sparse target their spill checks take the default prompts, two staging buffers, and 32K tokens with the default window |
+| `test-real` | vision parity with the family's fixture in `dev/tests/fixtures/vision-parity/` when the installation serves vision, and the native model runtime oracle, each of its three runs with `ORACLE_ARGS` added (`ORACLE_ARGS="--kv-format bf16"`, `"--expert-memory 16G"` or `"--max-context 1010000"`); for a block-sparse target their spill checks take the default prompts, two staging buffers, and 32K tokens with the default window |
 | `test-http-real` | the HTTP frontend on an isolated server (`dev/tests/smoke_real.py`), whose greedy comparisons (a penalized greedy request repeats once its prompt is cached, `min_p` 1 answers as greedy) run where `/status` reports `verify_rows` `all`, which on any MoE target takes `HTTP_SMOKE_ARGS="--verify-rows all"`; with `HTTP_SMOKE_ARGS="--persistent-cache --max-cache-disk 8G"`, instead of that smoke, the [persistent cache](#persistent-cache) across a restart in a fresh cache directory: a clean stop, a restart that takes the restore point back, and a next turn that restores the prompt from disk; `release-check` runs both |
 | `test-agent-real` | the five official clients through `splash serve` (`dev/tests/agent_real.py`), in `AGENT_SCENARIO` `complete` (the default) or `smoke` |
 | `test-release-real` | the HTTP smoke and all five clients on one `splash serve` |

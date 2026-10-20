@@ -165,22 +165,26 @@ class ServerMainTests(unittest.TestCase):
                     status.call_args_list,
                 )
 
-    def test_main_serves_the_window_yarn_stretches(self):
-        # The engine announces the window --yarn-factor stretched; without it
-        # a window past the native one is no engine the server started.
-        for factor, window, served in (
-            (4.0, 1010000, True),
-            (4.0, 1010001, False),
-            (2.5, 655360, True),
-            (2.5, 655361, False),
+    def test_main_serves_the_context_it_asked_for(self):
+        # The engine announces --max-context as given, past the native window
+        # too, where YaRN serves it; without it, a context the native window
+        # holds, which the automatic context never passes.
+        for max_context, window, served in (
+            (1010000, 1010000, True),
+            (300000, 300000, True),
+            (1000000, 1010000, False),
+            (300000, 262144, False),
+            (None, 262144, True),
             (None, 262145, False),
         ):
-            with self.subTest(factor=factor, window=window):
+            with self.subTest(max_context=max_context, window=window):
                 runtime = mock.Mock()
                 runtime.readiness = native_wire.ReadyEvent(4, window, False)
                 with (
                     mock.patch.object(
-                        api, "parse_args", return_value=main_args(yarn_factor=factor)
+                        api,
+                        "parse_args",
+                        return_value=main_args(max_context=max_context),
                     ),
                     unprepared_hold(),
                     mock.patch.object(api, "load_thinking_key", return_value=None),

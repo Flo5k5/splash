@@ -4,8 +4,8 @@
 // supported family's: the MLX target's config.json and its DFlash2 draft's,
 // read from FIXTURES (dev/tests/fixtures/model-configs/<family>), and the
 // config the installer derives from a GGUF's metadata with the metadata it
-// copies (gguf-metadata.json there). Also the descriptor --yarn-factor makes
-// of one, and YaRN's rotary frequencies.
+// copies (gguf-metadata.json there). Also the descriptor a context past the
+// native window makes of one, and YaRN's rotary frequencies.
 //
 //   model-configuration FIXTURES
 
@@ -20,7 +20,6 @@
 #include <array>
 #include <cmath>
 #include <filesystem>
-#include <limits>
 #include <initializer_list>
 #include <iostream>
 #include <optional>
@@ -676,13 +675,15 @@ void testConfigurationCheck(const std::filesystem::path &fixtures) {
 
 } // namespace
 
-// --yarn-factor stretches every family's 262,144-token window by its factor
-// (withYarn), up to four times, to at most the 1,010,000 tokens Qwen
-// validates; a family that states no YaRN window refuses it. YaRN's rotary
-// frequencies follow its reference computation (beta_fast 32, beta_slow 1),
-// here for the targets' 32 pairs of base 10^7, whose
-// correction range runs from pair 14 to pair 22: below it each frequency is
-// kept, above it divided by the factor, between them blended.
+// A family served for a context past its 262,144-token window takes YaRN by
+// the context over the native window (servedFor), the factor Qwen gives for
+// a context, and that context as its window, up to the 1,010,000 tokens Qwen
+// validates; within the native window, and for auto, it is served as it is.
+// A family that states no YaRN window serves no context past its native
+// one. YaRN's rotary frequencies follow its reference computation
+// (beta_fast 32, beta_slow 1), here for the targets' 32 pairs of base 10^7,
+// whose correction range runs from pair 14 to pair 22: below it each
+// frequency is kept, above it divided by the factor, between them blended.
 void testYarn(const std::filesystem::path &fixtures) {
   for (const SourceModel &source :
        {mlxModel(fixtures, "qwen3.8-27b"), mlxModel(fixtures, "qwen3.6-35b-a3b"),
@@ -690,21 +691,41 @@ void testYarn(const std::filesystem::path &fixtures) {
     const model::ModelDescriptor native = inspect(source);
     require(native.capabilities.maximumContextTokens == 262144 && !native.ropeScaling.yarn(),
             "a model served without YaRN has another window or a RoPE scaling");
-    for (const auto [factor, window] :
-         {std::pair{4.0, 1010000U}, {3.9, 1010000U}, {3.8, 996147U}, {2.0, 524288U}, {2.5, 655360U}}) {
-      const model::ModelDescriptor scaled = model::withYarn(native, factor);
-      require(scaled.valid() && scaled.capabilities.maximumContextTokens == window &&
+    for (const uint32_t context : {0U, 1U, 262144U}) {
+      const model::ModelDescriptor served = model::servedFor(native, context);
+      require(served.valid() && served.capabilities.maximumContextTokens == 262144 && !served.ropeScaling.yarn(),
+              "a context of " + std::to_string(context) + " tokens was not served by the native window");
+    }
+    for (const auto [context, factor] : {std::pair{262145U, 1.000003814697265625}, {300000U, 1.1444091796875},
+                                         {524288U, 2.0}, {1000000U, 3.814697265625}, {1010000U, 3.85284423828125}}) {
+      const model::ModelDescriptor scaled = model::servedFor(native, context);
+      require(scaled.valid() && scaled.capabilities.maximumContextTokens == context &&
                   scaled.ropeScaling == model::RopeScaling{factor, 262144},
-              "YaRN by " + std::to_string(factor) + " did not stretch the window to " + std::to_string(window));
-      rejects([&] { static_cast<void>(model::withYarn(scaled, 2.0)); }, "already scaled",
+              "a context of " + std::to_string(context) + " tokens was not served with YaRN by its ratio to the "
+              "native window");
+      rejects([&] { static_cast<void>(model::servedFor(scaled, context)); }, "already scaled",
               "a model's RoPE was scaled twice");
     }
-    for (const double factor : {1.0, 0.5, 4.5, -2.0, std::numeric_limits<double>::quiet_NaN()})
-      rejects([&] { static_cast<void>(model::withYarn(native, factor)); }, "above 1 and at most 4",
-              "YaRN by " + std::to_string(factor) + " was accepted");
+    rejects([&] { static_cast<void>(model::servedFor(native, 1010001)); }, "serves at most 1010000 tokens",
+            "a context past YaRN's window was served");
+    // A model is valid only with the window its scaling serves, and within
+    // YaRN's: by 4 that is 1,048,576 tokens, past the 1,010,000.
+    model::ModelDescriptor beyond = native;
+    beyond.ropeScaling = {4.0, 262144};
+    for (const uint32_t window : {1010000U, 1048576U}) {
+      beyond.capabilities.maximumContextTokens = window;
+      require(!beyond.valid(), "a model scaled by 4 was valid with a window of " + std::to_string(window) + " tokens");
+    }
+    // A context over a native window it does not divide, whose factor is
+    // inexact, is served whole.
+    model::ModelDescriptor other = native;
+    std::visit([](auto &layout) { layout.nativeContextTokens = 100000; }, other.target);
+    other.capabilities.maximumContextTokens = 100000;
+    require(model::servedFor(other, 100002).capabilities.maximumContextTokens == 100002,
+            "a context over another native window was not served whole");
     model::ModelDescriptor unserved = native;
     std::visit([](auto &layout) { layout.yarnContextTokens = 0; }, unserved.target);
-    rejects([&] { static_cast<void>(model::withYarn(unserved, 2.0)); }, "is not served with YaRN",
+    rejects([&] { static_cast<void>(model::servedFor(unserved, 262145)); }, "serves at most 262144 tokens",
             "a family without a YaRN window was served with YaRN");
   }
 

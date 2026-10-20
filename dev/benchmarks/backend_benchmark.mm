@@ -886,7 +886,8 @@ int main(int argc, char **argv) {
                    "  ROWS: the least rows of a chunk that share takes "
                    "(default: 512)\n"
                    "  TOKENS: the context the engine serves, as serve's "
-                   "--max-context (default: what memory holds)\n"
+                   "--max-context, with YaRN past the model's native window "
+                   "(default: what memory holds)\n"
                    "  DIR: the logits scenario's dump, and the earlier dump whose "
                    "prefixes it scores (default: its own greedy transcripts')\n"
                    "  LANES: the score requests the logits scenario runs at once "
@@ -945,7 +946,7 @@ int main(int argc, char **argv) {
     auto &config = bootstrapConfig.resources;
     config.metallibPath = std::filesystem::path(argv[1]);
     config.modelRoot = std::filesystem::path(argv[2]);
-    config.model = model::inspectModelRoot(config.modelRoot);
+    config.model = model::servedFor(model::inspectModelRoot(config.modelRoot), maxContext);
     config.buildId = SPLASH_BUILD_ID;
     config.aneFfn = engine::AneFfnSetting::fromGiven(aneFfnShare, aneFfnMinimumRows);
     // The verify budget's rows follow the wall times and acceptance of the

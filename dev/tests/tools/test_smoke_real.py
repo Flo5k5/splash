@@ -142,7 +142,6 @@ class SmokeRealTests(unittest.TestCase):
                         ple_memory=None,
                         expert_memory=None,
                         verify_rows=None,
-                        yarn_factor=None,
                         max_image_pixels=None,
                         kv_format="bf16" if absolute else "int8",
                     )
@@ -186,7 +185,6 @@ class SmokeRealTests(unittest.TestCase):
             ple_memory=None,
             expert_memory=None,
             verify_rows=None,
-            yarn_factor=None,
             max_image_pixels=None,
             kv_format="int8",
         )
@@ -246,19 +244,19 @@ class SmokeRealTests(unittest.TestCase):
             finally:
                 server.close()
 
-    def test_yarn_factor_reaches_the_server(self):
+    def test_max_context_reaches_the_server(self):
+        # Past the native window, the context the server serves with YaRN.
         model = ["--model", "mlx-community/Qwen3.8-27B-4bit"]
-        self.assertIsNone(smoke_real.parse_args(model).yarn_factor)
+        self.assertIsNone(smoke_real.parse_args(model).max_context)
         self.assertEqual(
-            smoke_real.parse_args([*model, "--yarn-factor", "4"]).yarn_factor, 4.0
+            smoke_real.parse_args([*model, "--max-context", "1010000"]).max_context,
+            1010000,
         )
-        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            smoke_real.parse_args([*model, "--yarn-factor", "5"])
         with self.server():
             command = smoke_real.subprocess.Popen.call_args.args[0]
-            self.assertNotIn("--yarn-factor", command)
+            self.assertNotIn("--max-context", command)
         arguments = self.server_arguments()
-        arguments.yarn_factor = 4.0
+        arguments.max_context = 1010000
         with (
             mock.patch.object(smoke_real, "available_port", return_value=8000),
             mock.patch.object(smoke_real.subprocess, "Popen") as popen,
@@ -267,7 +265,7 @@ class SmokeRealTests(unittest.TestCase):
             server = smoke_real.RealServer(arguments)
             try:
                 command = popen.call_args.args[0]
-                self.assertEqual(command[command.index("--yarn-factor") + 1], "4.0")
+                self.assertEqual(command[command.index("--max-context") + 1], "1010000")
             finally:
                 server.close()
 

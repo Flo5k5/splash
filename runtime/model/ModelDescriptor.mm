@@ -751,8 +751,11 @@ bool ModelDescriptor::valid() const noexcept {
         return layout.vocabularySize == capabilities.vocabularySize &&
                layout.servedContextTokens(ropeScaling) ==
                    capabilities.maximumContextTokens &&
+               // YaRN stretches the native window, at most to the family's
+               // YaRN window.
                (!ropeScaling.yarn() ||
-                ropeScaling.originalContextTokens == layout.nativeContextTokens) &&
+                (ropeScaling.originalContextTokens == layout.nativeContextTokens &&
+                 capabilities.maximumContextTokens <= layout.yarnContextTokens)) &&
                capabilities.sparseKv == sparseKvShape(layout) &&
                (!capabilities.sparseKv || capabilities.sparseKv->blockTokens == SPLASH_ATTENTION_BLOCK_TOKENS) &&
                layout.hiddenSize == draft.hiddenSize &&
@@ -764,17 +767,19 @@ bool ModelDescriptor::valid() const noexcept {
       target);
 }
 
-ModelDescriptor withYarn(ModelDescriptor model, double factor) {
-  static_assert(RopeScaling::kMaximumFactor == 4.0, "the message names the maximum factor");
-  if (!(factor > 1.0 && factor <= RopeScaling::kMaximumFactor))
-    throw std::invalid_argument("the YaRN factor must be above 1 and at most 4");
+ModelDescriptor servedFor(ModelDescriptor model, uint32_t contextTokens) {
   if (model.ropeScaling.yarn())
     throw std::invalid_argument("the target's RoPE is already scaled");
   std::visit(
       [&](const auto &layout) {
-        if (!layout.yarnContextTokens)
-          throw std::invalid_argument(std::string(layout.family) + " is not served with YaRN");
-        model.ropeScaling = {.factor = factor, .originalContextTokens = layout.nativeContextTokens};
+        if (contextTokens <= layout.nativeContextTokens)
+          return;
+        if (contextTokens > layout.yarnContextTokens)
+          throw std::invalid_argument(
+              std::string(layout.family) + " serves at most " +
+              std::to_string(std::max(layout.nativeContextTokens, layout.yarnContextTokens)) + " tokens of context");
+        model.ropeScaling = {.factor = static_cast<double>(contextTokens) / layout.nativeContextTokens,
+                             .originalContextTokens = layout.nativeContextTokens};
         model.capabilities.maximumContextTokens = layout.servedContextTokens(model.ropeScaling);
       },
       model.target);

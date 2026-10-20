@@ -18,13 +18,16 @@ const char *boolean(bool value) noexcept { return value ? "true" : "false"; }
 
 // The RoPE scaling every key of the cache went through: YaRN's factor, to the
 // digits that read back as it, over its original window; null without YaRN.
+// The rest of the document keeps its own precision.
 void appendRopeScaling(std::ostringstream &out, const model::RopeScaling &rope) {
   if (!rope.yarn()) {
     out << "null";
     return;
   }
-  out << "{\"type\":\"yarn\",\"factor\":" << std::setprecision(std::numeric_limits<double>::max_digits10)
-      << rope.factor << std::setprecision(6) << ",\"original_context_tokens\":" << rope.originalContextTokens << '}';
+  const std::streamsize precision = out.precision(std::numeric_limits<double>::max_digits10);
+  out << "{\"type\":\"yarn\",\"factor\":" << rope.factor;
+  out.precision(precision);
+  out << ",\"original_context_tokens\":" << rope.originalContextTokens << '}';
 }
 
 // idle_release_seconds is null with --idle-release off.

@@ -31,16 +31,23 @@ def values(flag, accepted, refused, repeatable=False):
     )
 
 
+# Up to the native window and past it, where the engine serves the context
+# with YaRN, to the 1010000 tokens Qwen validates; K is 1024 tokens and M a
+# million.
 ACCEPTED_CONTEXTS = {
     "auto": None,
     "100K": 102400,
     "256k": 262144,
     "262144": 262144,
     "1": 1,
+    "262145": 262145,
+    "512K": 524288,
+    "1m": 1000000,
+    "1000000": 1000000,
+    "1010000": 1010000,
 }
-# Past the native window without --yarn-factor, or past the 1010000 tokens it
-# stretches it to.
-REFUSED_CONTEXTS = ("0", "-1", "257K", "262145", "1010001", "bad")
+# Past 1010000 tokens (987K is 1010688), or no count of tokens.
+REFUSED_CONTEXTS = ("0", "-1", "1010001", "987K", "2M", "1.5M", "M", "bad")
 # Every shared option: accepted arguments with the value they parse to, and
 # refused arguments.
 OPTIONS = {
@@ -166,28 +173,7 @@ OPTIONS = {
             ["--cache-dir=", "--persistent-cache", "--max-cache-disk=5G"],
         ],
     ),
-    "--max-context": (
-        [
-            *values("--max-context", ACCEPTED_CONTEXTS, ())[0],
-            # Past the native window with --yarn-factor, up to the window it
-            # stretches the native one to.
-            (["--max-context=1010000", "--yarn-factor=4"], 1010000),
-            (["--max-context=655360", "--yarn-factor=2.5"], 655360),
-        ],
-        [
-            *values("--max-context", {}, REFUSED_CONTEXTS)[1],
-            ["--max-context=512K", "--yarn-factor=1.5"],
-            ["--max-context=655361", "--yarn-factor=2.5"],
-            ["--max-context=1024K", "--yarn-factor=4"],
-        ],
-    ),
-    "--yarn-factor": values(
-        "--yarn-factor",
-        # The last, which the forwarding test combines with --max-context's
-        # last, holds its 655360 tokens.
-        {"4": 4.0, "2": 2.0, "1.01": 1.01, "2.5": 2.5},
-        ("1", "0.5", "4.01", "-2", "inf", "nan", "four"),
-    ),
+    "--max-context": values("--max-context", ACCEPTED_CONTEXTS, REFUSED_CONTEXTS),
     "--decode-share": values(
         "--decode-share",
         {"0": 0.0, "0.25": 0.25, "2": 2.0},

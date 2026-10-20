@@ -4,7 +4,6 @@
 #include "model/StateLayout.hpp"
 #include "ops/PagedKv.hpp"
 
-#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -21,7 +20,7 @@ enum class QwenFfnKind : uint8_t { Dense, SparseMoe };
 // GGUF planner and the runtime's QwenTargetGeometry.
 struct QwenTargetDimensions {
   // The native window, the context max_position_embeddings states, and the
-  // most context YaRN (--yarn-factor) stretches it to, as the family's model
+  // most context YaRN stretches it to (servedFor), as the family's model
   // card validates it: zero for a family YaRN does not serve. Both fit the
   // runtime's KV ceiling (kv::kMaximumLogicalTokens).
   uint32_t nativeContextTokens = 0;
@@ -89,11 +88,13 @@ struct QwenTargetDimensions {
     return convolutionDimension + attentionWidth + 2 * gdnValueHeads;
   }
   // The window the target serves with `scaling`: the native one, or YaRN's,
-  // the native one stretched by its factor up to yarnContextTokens.
+  // the native one times its factor, rounded to the nearest token so that a
+  // factor taken as a context over the native window (servedFor) serves that
+  // context.
   [[nodiscard]] uint32_t servedContextTokens(const RopeScaling &scaling) const noexcept {
     if (!scaling.yarn())
       return nativeContextTokens;
-    return std::min(static_cast<uint32_t>(std::floor(nativeContextTokens * scaling.factor)), yarnContextTokens);
+    return static_cast<uint32_t>(std::lround(nativeContextTokens * scaling.factor));
   }
   // Whether the residual is hyperConnections streams, which a mix joins
   // before each mixer, each FFN and the logits in place of a norm.

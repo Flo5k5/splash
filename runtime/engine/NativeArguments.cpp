@@ -35,15 +35,13 @@ bool parseContext(std::string_view value,
          result <= capabilities.maximumContextTokens;
 }
 
-uint32_t parseMaxContext(std::string_view value,
-                         const model::ModelCapabilities &capabilities) {
+// MAX_CONTEXT, zero for auto; the model bounds it (model::servedFor).
+uint32_t parseMaxContext(std::string_view value) {
   if (value == "auto")
     return 0;
   uint32_t result = 0;
-  if (!parseContext(value, capabilities, result)) {
-    throw UsageError("MAX_CONTEXT must be auto or an integer in [1, " +
-                     std::to_string(capabilities.maximumContextTokens) + "]");
-  }
+  if (!parsePositive(value, result))
+    throw UsageError("MAX_CONTEXT must be auto or a positive integer");
   return result;
 }
 
@@ -114,7 +112,6 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
   NativeArguments result;
   // Read once the model's own context is known.
   std::optional<std::string_view> relaunchContext;
-  std::optional<double> yarnFactor;
   int next = 5;
   if (next < argc && !std::string_view(argv[next]).starts_with("--")) {
     const std::string_view quota(argv[next++]);
@@ -179,11 +176,6 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
       result.verifyRows = value == "all" ? model::VerifyRows::All : model::VerifyRows::Auto;
     } else if (option == "--relaunch-context") {
       relaunchContext = value;
-    } else if (option == "--yarn-factor") {
-      double factor = 0.0;
-      if (!parseFinite(value, factor))
-        throw UsageError("--yarn-factor requires a number");
-      yarnFactor = factor;
     } else {
       throw UsageError("unexpected argument " + std::string(option));
     }
@@ -195,15 +187,13 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
   if (!result.cacheRoot.empty() && !result.persistentCache)
     throw UsageError("--cache-dir requires --persistent-cache on");
   result.modelRoot = requireModelRoot(argv[2]);
-  result.model = model::inspectModelRoot(result.modelRoot);
-  if (yarnFactor) {
-    try {
-      result.model = model::withYarn(std::move(result.model), *yarnFactor);
-    } catch (const std::invalid_argument &error) {
-      throw UsageError(std::string("--yarn-factor: ") + error.what());
-    }
+  model::ModelDescriptor inspected = model::inspectModelRoot(result.modelRoot);
+  result.maxContext = parseMaxContext(argv[3]);
+  try {
+    result.model = model::servedFor(std::move(inspected), result.maxContext);
+  } catch (const std::invalid_argument &error) {
+    throw UsageError(std::string("MAX_CONTEXT: ") + error.what());
   }
-  result.maxContext = parseMaxContext(argv[3], result.model.capabilities);
   if (relaunchContext) {
     if (result.maxContext)
       throw UsageError("--relaunch-context requires MAX_CONTEXT auto");
