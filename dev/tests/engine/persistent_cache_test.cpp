@@ -922,6 +922,56 @@ void testWriteThroughCopiesAreRestorePoints() {
           "the next process did not take the written-through point back whole");
 }
 
+// A request that computes the blocks of a point's chain again leaves their
+// copies to the point, though they hold what another command computed: a
+// Resident request writes none, and a Spill request writes its own over them
+// before its pages spill. The next process could take the point back whole
+// at every step. Until a copy of its own replaces one, the copy is the
+// point's, cached, and no KV of the request: a Spill request's commitment
+// holds the room of its own copies alone.
+void testRecomputedChainsStayWhole() {
+  const std::vector<uint32_t> prompt = promptOf(1000, 4);
+  for (const KvMode mode : {KvMode::Resident, KvMode::Spill}) {
+    const auto budget = std::make_shared<model::DiskBudget>(1600);
+    Process process(true, budget, CacheSpillPolicy{1, 1});
+    process.tier.budget = budget;
+    // Room for an Index extent beside the eight Full pages.
+    process.storage.budgetPages = 9;
+    const std::vector<uint64_t> chain = process.cachePrompt(1, prompt);
+    process.publish(chain[3]);
+    process.writeEverything();
+    const auto whole = [&] {
+      Process next(true);
+      const CacheAdoption adoption = next.adopt(process.kvLabels(), process.stateLabels());
+      return adoption.states == 1 && adoption.blocks == 4;
+    };
+    require(whole() && !process.cache.stateResident(chain[3]) && !process.cache.snapshot().pool.pagesPrefix,
+            "the point did not leave RAM for the tier whole");
+    process.cache.beginRequest(2, mode);
+    require((mode == KvMode::Resident || process.cache.commitSpill(2, 4)) &&
+                admitTokens(process.cache, 2, prompt.size()).granted(),
+            "the request computing the chain again was not admitted");
+    process.cache.publishCommittedBlocks(2, prompt, static_cast<uint32_t>(prompt.size()), {});
+    require(process.cache.blockAt(2, static_cast<uint32_t>(prompt.size())) == chain[3] && whole(),
+            "computing the chain again gave its copies up");
+    const bool spills = mode == KvMode::Spill;
+    const auto activeKv = [&](uint64_t held, uint64_t committed) {
+      const KvSpillSnapshot spilled = process.cache.spillSnapshot();
+      return spilled.heldBytes == held && spilled.committedBytes == committed;
+    };
+    require(activeKv(0, spills ? 400 : 0),
+            "the copies of another command's K/V counted as the request's KV, or its commitment went");
+    const uint32_t writes = process.tier.demotions;
+    static_cast<void>(test::spillRound(process.cache, process.tier));
+    require(whole() && process.tier.demotions == writes + (spills ? 4 : 0) &&
+                process.cache.spillSnapshot().spilledPages == (spills ? 2u : 0u) &&
+                activeKv(spills ? 400 : 0, 0),
+            "a Spill request did not write its own copies before its pages spilled, or another wrote");
+    process.cache.endRequest(2);
+    process.cache.checkInvariants();
+  }
+}
+
 // A full quota takes no copy a state needs, and a state in RAM has no disk
 // copy for it to give up, so the spilled chain of the ended request's replay
 // point outlasts every other copy, the redundant copy of the Full page above
@@ -984,6 +1034,7 @@ int main() {
     testWritesKeepToTheWriteBudget();
     testPointsWaitForTheTier();
     testWriteThroughCopiesAreRestorePoints();
+    testRecomputedChainsStayWhole();
     testCommittedPagesTakeTheSpilledChainOfAStateInRam();
     std::cout << "Persistent cache tests passed\n";
   } catch (const std::exception &error) {

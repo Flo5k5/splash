@@ -573,7 +573,10 @@ nothing of it written; once the budget admits its state, the state is written
 and then the pages of its chain. A point larger than what the cache may hold
 now, its quota or what the volume leaves it, is not written. A full quota
 keeps restore points whole: it drops copies no point needs first, then the
-oldest point.
+oldest point. A request that computes blocks of a point's chain again
+leaves their copies to the point: they count as its copies, not as the
+request's KV. One whose KV spills writes its own over them before its pages
+spill.
 
 A start takes back every recorded point whose chain is whole. A clean stop
 writes the waiting points (newest first, up to 6 s, whatever the write budget)
@@ -3134,7 +3137,7 @@ file's descriptor, which names the right volume however the file was made, and
 sets the budget's limit to min(quota, max(0, available + held - floor) / 4) for
 the automatic quota and to min(quota, max(0, available + held - floor)) for a
 size, held being the blocks the tier's files take (`st_blocks`). The KV of
-requests in service, the slots of the blocks they hold and the commitments of
+requests in service, the copies of the KV they hold and the commitments of
 spilling requests, may use the latter under either
 (`DiskBudget::activeLimitBytes`, [KV on the SSD](#kv-on-the-ssd)). The tier's
 own writes and punches move bytes between available and held, so they leave the

@@ -133,8 +133,8 @@ struct CacheAdoption final {
 // failed, and a pause after the volume filled; pages that moved to the index
 // form and back, and blocks written again once their copy had gone;
 // restores of a page's index and of a whole page, and how long they took;
-// the quota of active KV, the slots of held blocks and the commitments of
-// Spill requests within it, and commitments revoked.
+// the quota of active KV, the copies of the KV requests hold and the
+// commitments of Spill requests within it, and commitments revoked.
 struct KvSpillSnapshot final {
   uint32_t spilledPages = 0;
   uint64_t spilledBytes = 0;
@@ -399,10 +399,10 @@ public:
       return SpillGate::WriteBudget;
     return SpillGate::Open;
   }
-  // The quota of active KV, the slots of blocks requests hold and what Spill
-  // requests committed (DiskBudget::activeLimitBytes); none without
+  // The quota of active KV, the copies of the KV requests hold and what
+  // Spill requests committed (DiskBudget::activeLimitBytes); none without
   // spilling. What it leaves for new commitments, without giving any copy
-  // up: activeLimit - held slots - committed.
+  // up: activeLimit - held copies - committed.
   [[nodiscard]] uint64_t spillLimit() const noexcept {
     return spill_ ? diskBudget_->activeLimitBytes() : 0;
   }
@@ -421,8 +421,9 @@ public:
   // has a copy, landed or being written: pages of a Spill request that
   // holds them need no commitment.
   [[nodiscard]] uint32_t copiedBlocks(uint64_t block) const;
-  // Starts writing Spill requests' published pages that have no copy, as
-  // the tier's share for them allows; returns the writes started.
+  // Starts writing Spill requests' published pages that have no copy of
+  // what they hold (KvCache::kvCopied), as the tier's share for them allows;
+  // returns the writes started.
   uint32_t writeThrough();
   // Between commands: moves the eligible pages whose copies landed to the
   // index form, into free Index pages, the runway's among them, and the
@@ -970,7 +971,8 @@ private:
   // for (pendingPages); copies persist() keeps hold only their blocks.
   std::vector<Write> writes_;
   // Write-through waits after a write found the volume full, until the
-  // active limit holds another slot beside the blocks requests hold.
+  // active limit holds another slot beside the copies of the KV requests
+  // hold.
   bool writeThroughPaused_ = false;
   // The order requests began to spill in (Request::spillOrder).
   uint64_t spillSequence_ = 0;

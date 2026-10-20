@@ -71,10 +71,10 @@ public:
   };
 
   // With spill, requests may spill the blocks (Cache's spill policy): a
-  // block on a page a request holds is held (holdPage), and a disk-only
-  // block that adopts a writer's page gives its copy up, so that every block
-  // has one content, whichever form its page has. A persistent cache keeps
-  // the copies no state needs in an order of their own (unneededCopy).
+  // block on a page a request holds is held (holdPage), and a block spills
+  // only to a copy of what its page holds (kvCopied), so that it has one
+  // content, whichever form its page has. A persistent cache keeps the
+  // copies no state needs in an order of their own (unneededCopy).
   KvCache(KvPool &pool, CacheRecency &recency, bool spill = false, bool persistent = false)
       : pool_(pool), recency_(recency), spill_(spill), persistent_(persistent),
         blockOnPage_(pool.pageCount()) {}
@@ -90,7 +90,8 @@ public:
                                                BlockIdentity identity) const;
   // Existing content is returned as is: the writer moves onto its page,
   // either form, unless a restore is filling it, and then keeps its own. A
-  // disk-only block adopts the writer's page instead.
+  // disk-only block adopts the writer's page instead and keeps its copy,
+  // which holds what another command computed (kvCopied).
   [[nodiscard]] BlockMatch insert(uint64_t parentBlock,
                                   std::span<const uint32_t> tokens,
                                   uint32_t physicalPage,
@@ -121,15 +122,17 @@ public:
   // A request's reference to a page (KvPool::retainPage and releasePage,
   // not as its owner), which marks the block on it held while any request
   // holds the page: neither quota nor RAM reclaim takes a held block or its
-  // copy. Only a cache whose requests may spill (CacheSpillPolicy) holds
-  // blocks; on a layout that cannot, quota strips and evicts copies as it
-  // always has. A poisoned block leaves once nothing holds it or keeps it
-  // otherwise.
+  // copy, unless the copy holds what another command computed (kvCopied),
+  // which no request reads. Only a cache whose requests may spill
+  // (CacheSpillPolicy) holds blocks; on a layout that cannot, quota strips
+  // and evicts copies as it always has. A poisoned block leaves once nothing
+  // holds it or keeps it otherwise.
   void holdPage(uint32_t page);
   void unholdPage(uint32_t page);
   [[nodiscard]] bool held(uint64_t blockId) const;
-  // Held blocks with a disk copy: the copies of active KV
-  // (model::DiskBudget::commit).
+  // Held blocks whose K/V has a copy (kvCopied): the copies of active KV
+  // (model::DiskBudget::commit). A copy of another command's K/V beside a
+  // held page is a cached copy.
   [[nodiscard]] uint32_t heldCopies() const noexcept { return heldCopies_; }
   void touch(uint64_t blockId) noexcept;
 
@@ -146,6 +149,11 @@ public:
   // The block on a page; 0 for none.
   [[nodiscard]] uint64_t blockOn(uint32_t page) const { return blockOnPage_.at(page); }
   [[nodiscard]] std::shared_ptr<KvDiskSlot> slot(uint64_t blockId) const;
+  // The block's K/V has a copy: a slot that holds what its page holds, or
+  // its only K/V. The copy a disk-only block keeps beside the page a writer
+  // filled it with (insert) is none: a restore point's chain keeps it, until
+  // a copy of the page replaces it or the page goes.
+  [[nodiscard]] bool kvCopied(uint64_t blockId) const;
   [[nodiscard]] bool hasDiskChildren(uint64_t blockId) const;
   // StateCache counts each of its entries in and out, and each entry while
   // an unfinished request uses it: a state restores through the KV of its
@@ -202,15 +210,16 @@ public:
   // the previous candidate to continue the scan without a lookup.
   [[nodiscard]] std::optional<CacheEvictionCandidate>
   evictionCandidate(uint64_t after) const;
-  // Oldest unused holder of a disk copy to replace: with duplicate, a
-  // resident block whose copy is redundant; otherwise a disk-only block
-  // without children. Pass the previous candidate to continue the scan.
+  // Oldest holder of a disk copy to replace that no request reads (reindex):
+  // with duplicate, a resident block whose copy is redundant; otherwise a
+  // disk-only block without children. Pass the previous candidate to
+  // continue the scan.
   [[nodiscard]] std::optional<CacheEvictionCandidate>
   diskCandidate(bool duplicate, uint64_t after = 0) const;
-  // In a persistent cache, the oldest unused holder of a disk copy that no
-  // state needs: a redundant copy once no state with a disk copy sits at its
-  // block or below, as a state in RAM restores through the page, and the
-  // only copy of a spilled or disk-only leaf without a state.
+  // In a persistent cache, the oldest holder of a disk copy that no request
+  // reads and no state needs: a redundant copy once no state with a disk
+  // copy sits at its block or below, as a state in RAM restores through the
+  // page, and the only copy of a spilled or disk-only leaf without a state.
   [[nodiscard]] std::optional<CacheEvictionCandidate> unneededCopy() const noexcept {
     return unneeded_.oldest();
   }
@@ -272,6 +281,9 @@ private:
     bool held = false;
     // It had a disk copy once (rewrites).
     bool copied = false;
+    // Its copy holds what another command computed than its page, which a
+    // writer filled (insert).
+    bool foreignCopy = false;
     bool poisoned = false;
     bool hadState = false;
     RecencyOrder::Node ramNode;
@@ -293,6 +305,9 @@ private:
   // Places the block in its orders.
   void reindex(Block &entry) noexcept;
   void giveDiskCopy(Block &entry, std::shared_ptr<KvDiskSlot> slot);
+  // Marks the block's copy as one of another command's K/V, or of its own;
+  // the caller reindexes it.
+  void setForeignCopy(Block &entry, bool foreign) noexcept;
   // The block takes the page, whose form it keeps and whose holders, if
   // any, hold it; or leaves its page with noPage.
   void placeOnPage(Block &entry, uint32_t page);

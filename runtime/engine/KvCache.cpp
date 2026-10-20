@@ -114,10 +114,12 @@ KvCache::BlockMatch KvCache::insert(uint64_t parentBlock,
     BlockMatch result{existing->id, existing->physicalPage};
     if (existing->physicalPage == noPage) {
       adoptPage(existing->id, physicalPage);
-      // The copy holds what another command computed: a block that may
-      // spill keeps one content, the writer's, which its copy must hold.
-      if (spill_ && block(existing->id).slot)
-        setSlot(existing->id, nullptr);
+      // The copy, which holds what another command computed, stays: a
+      // restore point's chain on disk may need it. The block spills only
+      // once a copy of the writer's page replaced it.
+      Block &adopted = block(existing->id);
+      setForeignCopy(adopted, true);
+      reindex(adopted);
       result.physicalPage = physicalPage;
     } else if (block(existing->id).transfer == Transfer::Filling) {
       // Its page is still being filled; the writer keeps its own copy. A
@@ -307,6 +309,11 @@ std::shared_ptr<KvDiskSlot> KvCache::slot(uint64_t blockId) const {
   return block(blockId).slot;
 }
 
+bool KvCache::kvCopied(uint64_t blockId) const {
+  const Block &entry = block(blockId);
+  return entry.slot && !entry.foreignCopy;
+}
+
 bool KvCache::hasDiskChildren(uint64_t blockId) const {
   const Block &entry = block(blockId);
   return entry.children > entry.residentChildren;
@@ -427,7 +434,7 @@ void KvCache::setHeld(Block &entry, bool held) noexcept {
   if (entry.held == held)
     return;
   entry.held = held;
-  if (entry.slot)
+  if (entry.slot && !entry.foreignCopy)
     held ? ++heldCopies_ : --heldCopies_;
   reindex(entry);
 }
@@ -443,6 +450,7 @@ void KvCache::setSlot(uint64_t blockId, std::shared_ptr<KvDiskSlot> slot) {
 }
 
 void KvCache::giveDiskCopy(Block &entry, std::shared_ptr<KvDiskSlot> slot) {
+  setForeignCopy(entry, false);
   if (static_cast<bool>(entry.slot) != static_cast<bool>(slot)) {
     slot ? ++diskBlocks_ : --diskBlocks_;
     if (entry.held)
@@ -451,6 +459,15 @@ void KvCache::giveDiskCopy(Block &entry, std::shared_ptr<KvDiskSlot> slot) {
   if (slot)
     rewrites_ += std::exchange(entry.copied, true);
   entry.slot = std::move(slot);
+}
+
+void KvCache::setForeignCopy(Block &entry, bool foreign) noexcept {
+  if (entry.foreignCopy == foreign)
+    return;
+  // Only a copy of what the page holds is active KV.
+  if (entry.held && entry.slot)
+    foreign ? --heldCopies_ : ++heldCopies_;
+  entry.foreignCopy = foreign;
 }
 
 void KvCache::placeOnPage(Block &entry, uint32_t page) {
@@ -511,6 +528,8 @@ void KvCache::dropPage(uint64_t blockId) {
     throw std::logic_error("KV cache block is still in use");
   const uint32_t page = entry.page;
   placeOnPage(entry, noPage);
+  // Its copy holds its only K/V now, whoever computed it.
+  setForeignCopy(entry, false);
   reindex(entry);
   if (entry.parent) {
     Block &parent = block(entry.parent);
@@ -668,15 +687,17 @@ const KvCache::Block &KvCache::block(uint64_t blockId) const {
 // no state on disk restores through, and the only one of a leaf without a
 // state. A block a request uses or holds, one in transfer, or a poisoned one
 // is in no order: quota never takes a copy active KV reads, nor RAM reclaim
-// a page a request holds.
+// a page a request holds. Active KV reads no copy of another command's K/V,
+// which waits as a redundant copy beside a page requests use or hold.
 KvCache::Orders KvCache::orders(const Block &entry) const noexcept {
-  if (entry.activeUsers || entry.held || entry.transfer != Transfer::None || entry.poisoned)
+  if (entry.transfer != Transfer::None || entry.poisoned)
     return {};
+  const bool used = entry.activeUsers || entry.held;
   const bool paged = entry.page != noPage;
   const bool full = paged && entry.form == kv::PageForm::Full;
   Orders result;
-  result.ramLeaf = paged && !entry.residentChildren;
-  if (!entry.slot)
+  result.ramLeaf = paged && !entry.residentChildren && !used;
+  if (!entry.slot || (used && !entry.foreignCopy))
     return result;
   result.duplicate = full;
   result.diskLeaf = !full && !entry.children;
@@ -709,7 +730,7 @@ void KvCache::checkInvariants(const std::function<bool(uint64_t blockId)> &state
   for (const auto &[id, entry] : blocks_) {
     check(entry.id == id, "a block's id");
     disk += entry.slot != nullptr;
-    heldCopies += entry.held && entry.slot;
+    heldCopies += entry.held && entry.slot && !entry.foreignCopy;
     // Reads of spilled K/V hold a copy only while a request holds its block
     // or a transfer moves it (Cache::cutPageTable), so a copy quota gives up
     // returns its slot at once. A command's cut names blocks its lanes held,
@@ -727,6 +748,8 @@ void KvCache::checkInvariants(const std::function<bool(uint64_t blockId)> &state
       ++all;
       resident += entry.page != noPage;
     }
+    check(!entry.foreignCopy || (entry.slot && entry.page != noPage && entry.form == kv::PageForm::Full),
+          "a copy of another command's K/V sits beside a Full page");
     if (entry.page == noPage) {
       check(entry.slot != nullptr || entry.poisoned, "a disk-only block has a copy");
       check(!entry.held && entry.transfer == Transfer::None,
