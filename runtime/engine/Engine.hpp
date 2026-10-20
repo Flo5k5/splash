@@ -269,12 +269,13 @@ public:
   // critical directive has no target and takes them all. Under critical
   // pressure it then evicts every unpinned cache entry (Cache::evictAll()).
   // Otherwise it releases empty KV extents and reclaims the cache one
-  // Cache::reclaimOne step at a time, in the order that step's contract
-  // (Cache.hpp) gives, returning the buffers an evicted state handed back to
-  // the model's pool after each step. While the target is still unmet, it
-  // then takes the image rows only evicted states held. A pass counts only
-  // memory that leaves the engine: released KV extents, the caches and idle
-  // buffers the model returns; evicting a state frees nothing by itself.
+  // Cache::reclaimOne step at a time, up to the directive's class, in the
+  // order that step's contract (Cache.hpp) gives, returning the buffers an
+  // evicted state handed back to the model's pool after each step. While
+  // the target is still unmet, it then takes the image rows only evicted
+  // states held. A pass counts only memory that leaves the engine: released
+  // KV extents, the caches and idle buffers the model returns; evicting a
+  // state frees nothing by itself.
   // Pages whose copies are being written count toward the target. A pass
   // short of critical keeps one lane's pooled buffers and one empty extent.
   // Requests waiting for memory retry after any step that freed some, kept
@@ -647,7 +648,9 @@ private:
   // follows the state before it in the command. A checkpoint whose
   // predecessor a reader pins takes only the pool or the admission too:
   // refused, its command ends at it, and apply publishes it from the lane
-  // only if the pin has gone by then. Null buffers when refused.
+  // only if the pin has gone by then. The prompt's replay point that only
+  // the host refuses once room is made takes its buffers as memory the
+  // request in service needs (Serving). Null buffers when refused.
   [[nodiscard]] Reservation reserveCapture(Request &request, StateClass kind, uint32_t tokens,
                                            bool followsCheckpoint);
   // Makes room for one state's buffers, a step of what its class may take

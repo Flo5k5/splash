@@ -2676,10 +2676,14 @@ memory: it keeps a spare reserve of 7% of the Mac's memory (2 to 7 GiB) and a
 purgeable pages and half of what compressing the anonymous pages would free at
 the compressor's present ratio, at most a quarter of them. When the spare memory
 runs short of that, such growth pauses and the cache gives memory back, a paced
-pass at a time, down to one lane's state buffers and one KV extent. So it does,
-however much spare memory there is, while macOS reports warning memory pressure,
-its signal for caches to give memory back: each pass then returns up to 1 GiB
-until the level is normal again and keeps the state a follow-up resumes from,
+pass at a time, down to one lane's state buffers and one KV extent. A pass that
+no request waits for keeps the state a follow-up resumes from and takes nothing
+in use (below), such as the replay point a request in service has just
+published: what it would free there would only go back to that request's
+growth. So it does, however much spare memory there is, while macOS reports
+warning memory pressure, its signal for caches to give memory back: each pass
+then returns up to 1 GiB until the level is normal again, still taking nothing
+in use unless a request waits, and keeps the state a follow-up resumes from,
 even while a request waits, whose growth the warning refuses as well (`/status`:
 `memory_governor.system_pressure`, and `growth_allowed` is false meanwhile). A
 pass counts only memory that leaves the engine; a cached state it evicts first
@@ -2727,16 +2731,18 @@ becomes the newest ordinary state; the older points on its chain keep their age.
 Cache victims come in three classes: checkpoints, then ordinary states and KV
 (first the KV no state restores through, which saves no prefill), then what is
 in use. No work displaces anything of a class above its own. Memory for running
-requests takes what is in use after everything else. Two kinds of work take
-nothing in use. A start that a resident lane holds back waits for that lane. And
-when no lane's growth fits, the lane that yields first, such as one just started
-beside a decoding lane, pays for the memory with its own suspension; while other
-lanes fit, it waits for them, resident, as any lane refused its KV does, since
-they grow too and are refused in turn. Where KV spills, a refusal they do not
-share, of the model's memory for reading KV from the SSD cache (a decoding
-lane's share of the hot block cache, a prompt's staging), which no transfer in
-flight returns, suspends the lane that yields first if that lane yields before
-it and is resident outside its command. A prefill command captures the state of
+requests takes what is in use after everything else, and so does a paced pass
+that a request waits for. Three kinds of work take nothing in use: a paced pass
+that nothing waits for, under macOS's warning too, and the two that follow. A
+start that a resident lane holds back waits for that lane. And when no lane's
+growth fits, the lane that yields first, such as one just started beside a
+decoding lane, pays for the memory with its own suspension; while other lanes
+fit, it waits for them, resident, as any lane refused its KV does, since they
+grow too and are refused in turn. Where KV spills, a refusal they do not share,
+of the model's memory for reading KV from the SSD cache (a decoding lane's share
+of the hot block cache, a prompt's staging), which no transfer in flight
+returns, suspends the lane that yields first if that lane yields before it and
+is resident outside its command. A prefill command captures the state of
 each boundary it reaches, in buffers reserved before it runs. A junction or a
 checkpoint retires its lane's checkpoint once published, and a checkpoint the
 same command would capture before it is not captured at all; the prompt's
@@ -2754,9 +2760,13 @@ pin has gone. Refused, the replay point, which is in use, takes cached KV and
 states in the same order, then the oldest state in use; of the KV it takes only
 leaves whose page frees at once, and only while an extent can be emptied, which
 is released at once; it drops a state whose write must wait for the write in
-flight. A junction makes room the same way short of what is in use, and an
-optional checkpoint takes only checkpoints; neither drops a state whose write
-must wait. A state whose lane holds no such checkpoint makes that room before
+flight. Refused then by the host alone, it takes its buffers as memory the
+request in service needs, as that request's KV does: a headroom between the
+1 GiB margin and the margin plus one state would otherwise refuse every replay
+point once no cached state is left to recycle. A junction makes room the same
+way short of what is in use, and an optional checkpoint takes only
+checkpoints; neither drops a state whose write must wait, and the host's margin
+refuses both. A state whose lane holds no such checkpoint makes that room before
 its command, and still refused ends its command at its boundary. With the SSD
 cache, a state its command could not capture and memory still refuses is
 written from the lane unless another write is in flight. A disk copy in use may
