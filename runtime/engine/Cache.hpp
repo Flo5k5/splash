@@ -1,5 +1,6 @@
 #pragma once
 
+#include "AwakeClock.hpp"
 #include "engine/KvCache.hpp"
 #include "engine/KvPool.hpp"
 #include "engine/KvTier.hpp"
@@ -11,6 +12,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <limits>
 #include <map>
 #include <memory>
@@ -121,18 +123,15 @@ struct CacheAdoption final {
   uint32_t dropped = 0;
 };
 
-// What spilling holds and did (/status kv_spill). Index pages, those of
-// spilled blocks, and their bytes in memory and on the tier; write-through
-// of Spill requests' pages: pages and bytes written, writes in flight and
+// What spilling holds and did (/status kv_spill). Spilled blocks, whose
+// pages hold only their index, and their copies' bytes; write-through of
+// Spill requests' pages: pages and bytes written, writes in flight and
 // failed, and a pause after the volume filled; pages that moved to the index
 // form and back, and blocks written again once their copy had gone;
 // restores of a page's index and of a whole page, and how long they took;
 // the quota of active KV, the slots of held blocks and the commitments of
-// Spill requests within it, and commitments revoked; the empty Index extent
-// kept for spilling at the memory limit.
+// Spill requests within it, and commitments revoked.
 struct KvSpillSnapshot final {
-  uint32_t indexPages = 0;
-  uint64_t indexBytes = 0;
   uint32_t spilledPages = 0;
   uint64_t spilledBytes = 0;
   uint64_t writeThroughPages = 0;
@@ -150,7 +149,6 @@ struct KvSpillSnapshot final {
   uint64_t heldBytes = 0;
   uint64_t committedBytes = 0;
   uint64_t revokedCommitments = 0;
-  uint64_t indexRunwayBytes = 0;
 };
 
 struct CacheSnapshot final {
@@ -181,17 +179,29 @@ struct TokenAdmission final {
   uint32_t additionalPages = 0;
   uint32_t availablePages = 0;
   metal::AllocationFailure allocationFailure = metal::AllocationFailure::None;
+  // The form of the pages refused, which reclaimForPages makes room for.
+  kv::PageForm form = kv::PageForm::Full;
 
   [[nodiscard]] bool granted() const noexcept {
     return failure == TokenAdmissionFailure::None;
   }
 };
 
+// The page list a command of a request reads (Cache::cutPageTable).
 struct PageTableView final {
   std::span<const uint32_t> pages;
   // Where each page reads its K/V (ModelBatchItem::pageSources); null while
   // none holds only its index.
   std::shared_ptr<const model::KvPageSources> sources;
+  uint64_t revision = 0;
+  uint32_t firstChanged = 0;
+};
+
+// A request's page list as it is now, with the revision and first change its
+// next cut gives it (Cache::pageTable): what the engine and tests inspect,
+// never what a command reads.
+struct PageTableState final {
+  std::span<const uint32_t> pages;
   uint64_t revision = 0;
   uint32_t firstChanged = 0;
 };
@@ -226,6 +236,13 @@ struct CacheReclaimResult final {
 // only what gives pages goes, KV leaves, and a state only where it sits on
 // the leaf that goes next; its buffers would give no page otherwise.
 enum class CacheReclaimMode { KeepExtents, ReleaseExtents, ReusePages };
+
+// What becomes of the Full extents a spill's moves leave empty
+// (Cache::spillWritten): they stay allocated for a reclaim to take; they
+// leave memory but one, the runway the next Full pages come from without
+// an allocation; or the Full pages left gather in the fewest extents
+// (Cache::compactExtent) and every empty one leaves.
+enum class SpilledExtents : uint8_t { Kept, KeepRunway, Released };
 
 // The highest class a reclaim step may take (the class rule). Ordinary:
 // checkpoints, ordinary states and KV, for growth that can wait or yield
@@ -337,6 +354,12 @@ public:
   [[nodiscard]] std::optional<double> diskWritesAdmittedAt() const noexcept {
     return diskBudget_ ? diskBudget_->admitsAgainAt() : std::nullopt;
   }
+  // When the write budget covers what Spill requests committed again, so
+  // that a request may start to spill (spillGate), on its clock; empty
+  // while it does now or without a budget.
+  [[nodiscard]] std::optional<double> spillWritesAdmittedAt() const noexcept {
+    return diskBudget_ ? diskBudget_->admitsSpillAt(diskBudget_->committedBytes()) : std::nullopt;
+  }
   // At a clean stop: the write budget holds nothing back any more.
   void liftDiskWriteBudget() noexcept {
     if (diskBudget_)
@@ -371,17 +394,26 @@ public:
   [[nodiscard]] bool commitSpill(uint64_t requestId, uint32_t pages);
   // Turns a Resident request whose growth was denied into a Spill request:
   // checks the tier, the write budget and the room for `pages` pages,
-  // commits them and starts write-through of its published blocks. It
-  // allocates nothing; false, changing nothing, when spilling cannot relieve
-  // it.
+  // commits them, starts write-through of its published blocks and moves
+  // those whose copies landed already into free Index pages. It allocates
+  // nothing; false, changing nothing, when spilling cannot relieve it.
   [[nodiscard]] bool convertToSpill(uint64_t requestId, uint32_t pages);
+  // The blocks on the chain that ends at this block (none for 0) whose K/V
+  // has a copy, landed or being written: pages of a Spill request that
+  // holds them need no commitment.
+  [[nodiscard]] uint32_t copiedBlocks(uint64_t block) const;
   // Starts writing Spill requests' published pages that have no copy, as
   // the tier's share for them allows; returns the writes started.
   uint32_t writeThrough();
   // Between commands: moves the eligible pages whose copies landed to the
-  // index form, into free Index pages or the Index runway, then refills the
-  // runway, optionally. A refusal leaves the rest Full.
-  [[nodiscard]] TokenAdmission spillWritten();
+  // index form, into free Index pages, the runway's among them, and the
+  // rest into extents of the index form it allocates; then refills the
+  // runway, an extent's worth of free Index pages, which the next spill
+  // takes without an allocation; and once it stands, the Full extents the
+  // moves left empty go as `extents` says. Denied, of the index form, when
+  // an allocation was refused: the pages it leaves Full, or the runway's;
+  // the caller makes room for them or does without.
+  [[nodiscard]] TokenAdmission spillWritten(SpilledExtents extents = SpilledExtents::Kept);
   // Pages of the form that transfers in flight will free: demotions, and
   // for Full the eligible write-throughs that an Index page will take.
   [[nodiscard]] uint32_t pendingPages(kv::PageForm form) const noexcept;
@@ -412,6 +444,12 @@ public:
   // Gives the request the matched chain up to its state. Disk-only blocks
   // get fresh pages and start their restores; the request waits on
   // kvRestoreStatus() before it runs. Pages are admitted like ensureTokens().
+  // By the request's mode: a Spill request takes a disk-only block past the
+  // dense history as an Index page and restores its index alone, and holds
+  // spilled blocks as they are. A Resident request restores disk-only blocks
+  // whole, and moves a spilled block back to a Full page and restores it
+  // whole when no other request holds it and no transfer moves it; else it
+  // holds it spilled too.
   [[nodiscard]] TokenAdmission restoreRequest(uint64_t requestId,
                                               const CacheLookup &lookup);
   [[nodiscard]] KvRestoreStatus kvRestoreStatus(uint64_t requestId) const;
@@ -425,14 +463,14 @@ public:
   [[nodiscard]] TokenAdmission
   ensureTokens(uint64_t requestId, uint64_t tokenCount,
                uint64_t writtenTokens = std::numeric_limits<uint64_t>::max());
-  // The request's page list. Its revision moves on every change of the
-  // list, and the list differs from the one at revision - 1 from
-  // firstChanged on.
-  [[nodiscard]] PageTableView pageTable(uint64_t requestId) const;
+  // The request's page list as it is now, at the revision and first change
+  // its next cut gives it.
+  [[nodiscard]] PageTableState pageTable(uint64_t requestId) const;
   // The page list a command of the request reads, once per lane and
   // command: every change since the last cut makes one new revision, which
   // differs from the last from the first page any of them changed, with its
-  // sources cut from there.
+  // sources cut from there. A command reads only a cut list: another change
+  // before the next cut stays in the same revision.
   [[nodiscard]] PageTableView cutPageTable(uint64_t requestId);
 
   // Canonicalizes every newly complete Page32 block. A block whose parent,
@@ -544,10 +582,10 @@ public:
   [[nodiscard]] CacheReclaimResult reclaimForPages(uint32_t pages, CacheReclaimMode mode,
                                                    ReclaimClass upTo,
                                                    kv::PageForm form = kv::PageForm::Full);
-  // The most pages reclaimForPages(pages, mode, upTo) can leave free: every
-  // allocated page no request holds, but with Ordinary not the idle KV that
-  // states in use restore through.
-  [[nodiscard]] uint32_t reusablePages(ReclaimClass upTo) const;
+  // The most pages of the form reclaimForPages(pages, mode, upTo, form) can
+  // leave free: every allocated page of the form no request holds, but with
+  // Ordinary not the idle KV that states in use restore through.
+  [[nodiscard]] uint32_t reusablePages(ReclaimClass upTo, kv::PageForm form = kv::PageForm::Full) const;
   // One step of room for the buffers of a state, which a command will
   // capture (Model::reserveState) or which is taken from its lane after the
   // command that ended at it (Model::snapshot), taking nothing of a class
@@ -589,8 +627,8 @@ public:
   }
   [[nodiscard]] CacheSnapshot snapshot() const;
   [[nodiscard]] KvSpillSnapshot spillSnapshot() const;
-  // Tests: std::logic_error unless the blocks, pages, references and quota
-  // keep every invariant spilling relies on.
+  // Tests, between commands: std::logic_error unless the blocks, pages,
+  // references and quota keep every invariant spilling relies on.
   void checkInvariants() const;
 
 private:
@@ -604,21 +642,42 @@ private:
   struct Request final {
     std::vector<uint32_t> pages;
     std::vector<uint64_t> cachedBlocks;
-    uint64_t pageTableRevision = 0;
-    uint32_t firstChangedPage = 0;
+    KvMode mode = KvMode::Resident;
+    // The last cut (cutPageTable) and the first page changed since, if any.
+    uint64_t revision = 0;
+    uint32_t firstChanged = 0;
+    std::optional<uint32_t> dirtyFrom;
+    std::shared_ptr<const model::KvPageSources> sources;
+    // Its pages of the index form.
+    uint32_t indexPages = 0;
+    // A Spill request: the slots its commitment holds, when it began to
+    // spill (revocation goes newest first), the blocks it holds whose copy
+    // it still owes, in publication order after those whose write failed,
+    // and how far its blocks are known spilled or kept Full by another
+    // holder (spillWritten).
+    uint32_t committedPages = 0;
+    uint64_t spillOrder = 0;
+    std::deque<uint64_t> owedCopies;
+    uint32_t spillScan = 0;
     uint32_t pendingRestores = 0;
     bool restoreFailed = false;
   };
   // Records a change of the request's page list from index first on.
   static void pagesChanged(Request &active, uint32_t first) noexcept;
-  struct Demotion final {
+  // A page being written to the tier, and what for (WriteClass): a reclaim
+  // demotion, whose page frees once the copy lands; a copy persist() keeps
+  // of a page that stays; or a Spill request's page written through, which
+  // stays Full until spillWritten moves it.
+  struct Write final {
     uint64_t block = 0;
+    WriteClass write = WriteClass::Reclaim;
     std::unique_ptr<KvTransfer> transfer;
   };
   struct Restore final {
     // Null until the tier has room for it.
     std::unique_ptr<KvTransfer> transfer;
     std::vector<uint64_t> waiters;
+    AwakeClock::time_point started;
   };
 
   [[nodiscard]] Request &request(uint64_t requestId);
@@ -650,8 +709,8 @@ private:
     bool kv = false;
   };
 
-  [[nodiscard]] TokenAdmission admitPages(uint32_t count,
-                                          std::vector<uint32_t> &pages);
+  [[nodiscard]] TokenAdmission admitPages(uint32_t count, std::vector<uint32_t> &pages,
+                                          kv::PageForm form = kv::PageForm::Full);
   // One eviction: checkpoints first, then the ordinary class's
   // reclaimOldest, then, up to InUse, that of what is in use. pagesOnly
   // (CacheReclaimMode::ReusePages) skips the checkpoints and scans for pages.
@@ -720,9 +779,10 @@ private:
   // The KV tier's part of pollTransfers().
   [[nodiscard]] bool pollTierTransfers();
   // A slot for a new KV copy, replacing older copies while the tier is at its
-  // limit, and none while the limit cannot hold one; inUse when a state in
-  // use needs the copy.
-  [[nodiscard]] std::shared_ptr<KvDiskSlot> acquireDiskSlot(bool inUse);
+  // limit for the draw, and none while that limit cannot hold one; inUse
+  // when a state in use needs the copy.
+  [[nodiscard]] std::shared_ptr<KvDiskSlot> acquireDiskSlot(model::DiskBudget::Draw draw,
+                                                            bool inUse);
   // Gives up one disk copy for a new copy, in use or not: the oldest
   // redundant one, KV or state, else the oldest that is the only copy, never
   // the KV of a state in RAM. A persistent tier gives up restore points
@@ -730,8 +790,9 @@ private:
   // it restores through, go only for a copy in use, and after every other.
   // False when the disk holds nothing the new copy may displace.
   [[nodiscard]] bool freeDiskSpace(bool inUse);
-  // Gives up copies not in use while the tier holds more than its limit;
-  // returns how many went.
+  // Revokes commitments, newest Spill request first, while active KV
+  // exceeds its limit, then gives up copies not in use while cached copies
+  // exceed what active KV leaves of the limit; returns how many copies went.
   uint32_t fitDiskLimit();
   // In a persistent tier a redundant copy is what the next process takes
   // back, and the unit worth keeping is a restore point, a state and its
@@ -758,14 +819,64 @@ private:
   // empties; progress with zero bytes when the extent emptied is the runway
   // kept. No progress when the free pages fill none.
   [[nodiscard]] CacheReclaimResult releaseExtent(bool keepRunway);
-  // Empties one extent that still holds pages (KvPool::compactExtent); the
-  // blocks and requests on its pages follow them. A page a transfer reads or
-  // writes stays where it is until the transfer has landed. False when the
-  // free pages cover no extent.
-  [[nodiscard]] bool compactExtent();
+  // Empties one extent that still holds pages, of the form or of either
+  // (KvPool::compactExtent); the blocks and requests on its pages follow
+  // them. A page a transfer reads or writes stays where it is until the
+  // transfer has landed. False when the free pages cover no extent.
+  [[nodiscard]] bool compactExtent(std::optional<kv::PageForm> form = std::nullopt);
+  // The blocks and requests on moved pages follow them, and the requests'
+  // page lists change from the first one moved.
+  void followMoves(const KvPageMoves &moves);
+  // The sources of the request's pages from its last cut's first change
+  // on, beside the chunks before it; null without an Index page.
+  [[nodiscard]] std::shared_ptr<const model::KvPageSources>
+  cutSources(const Request &active) const;
+
+  // Spilling (a cache with a spill policy).
+  [[nodiscard]] uint64_t heldSlotBytes() const noexcept {
+    return tier_ ? uint64_t{kv_.heldCopies()} * tier_->slotBytes() : 0;
+  }
+  // A Spill request's commitment: locks quota for `pages` slots; false,
+  // committing nothing, when active KV's limit cannot hold them.
+  [[nodiscard]] bool commit(Request &active, uint32_t pages);
+  // A slot drawn for the request came back unwritten: it commits the slot
+  // again, or, while active KV's limit cannot hold it, counts the
+  // commitment revoked.
+  void recommit(Request &active);
+  // Returns `pages` slots of the request's commitment.
+  void returnCommitment(Request &active, uint32_t pages) noexcept;
+  // The request owes a copy of each of these blocks that has none.
+  void oweCopies(Request &active, std::span<const uint64_t> blocks);
+  // Starts writing the copies the request owes, each on its commitment or,
+  // past it, on a slot it commits then. False once the tier's share, the
+  // volume or the file stops every request's writes; true when only the
+  // active limit's room for this request's next commitment ran out.
+  [[nodiscard]] bool writeThrough(Request &active, uint32_t &started);
+  // Whether a Full block whose copy has landed may move to the index form:
+  // it lies past the dense history, and requests hold it, all of them
+  // spilling and outside their tail windows (Eligible). Later: one holds it
+  // in its window, which moves on as it commits. KeptFull while a holder
+  // reads it Full, a Resident one or its dense history, and without
+  // holders.
+  enum class Eligibility : uint8_t { Eligible, Later, KeptFull };
+  [[nodiscard]] Eligibility spillEligibility(uint64_t block) const;
+  // Writes of the class in flight.
+  [[nodiscard]] uint32_t writes(WriteClass write) const noexcept;
+  // Pages written through whose Full pages free once their copies land.
+  [[nodiscard]] uint32_t spillingWrites() const noexcept;
+  // Rescans every Spill request's blocks from its dense history: a holder
+  // that kept some of them Full ended or began to spill.
+  void rescanSpills() noexcept;
+  // spillWritten(extents), or without `allocate` only its moves into free
+  // Index pages, which allocate nothing: those past them stay Full, and so
+  // do the Full extents they empty.
+  [[nodiscard]] TokenAdmission moveLandedPages(bool allocate, SpilledExtents extents = SpilledExtents::Kept);
+  // The copy of the K/V on an Index page.
+  [[nodiscard]] model::KvPageSource sourceOf(uint32_t page) const;
 
   KvPool &pool_;
   KvTier *tier_;
+  std::optional<CacheSpillPolicy> spill_;
   bool persistent_;
   CacheAdoption adoption_;
   std::shared_ptr<model::DiskBudget> diskBudget_;
@@ -774,19 +885,24 @@ private:
   KvCache kv_;
   StateCache states_;
   std::unordered_map<uint64_t, Request> requests_;
-  std::vector<Demotion> demotions_;
-  // Pages persist() writes while they stay in RAM: transfers that free
-  // nothing, so they hold no memory a reclaim waits for (pendingPages), only
-  // their blocks.
-  std::vector<Demotion> copies_;
-  // At most this many at once, of the tier's demotion share.
-  static constexpr uint32_t kCopies = 16;
+  // Writes in flight, in the order they started. Only reclaim demotions,
+  // and writes through whose pages will spill, free memory a reclaim waits
+  // for (pendingPages); copies persist() keeps hold only their blocks.
+  std::vector<Write> writes_;
+  // Write-through waits after a write found the volume full, until the
+  // active limit holds another slot.
+  bool writeThroughPaused_ = false;
+  // The order requests began to spill in (Request::spillOrder).
+  uint64_t spillSequence_ = 0;
   // Block IDs increase from parent to child. Restores start in that order so
   // cancellation can discard an unread suffix without stranding its parents.
   std::map<uint64_t, Restore> restores_;
   // Blocks whose read failed, until they have left.
   std::vector<uint64_t> poisoned_;
   KvTierSnapshot kvTier_;
+  // The spill counters of spillSnapshot(), and the restores' latencies.
+  KvSpillSnapshot spilled_;
+  model::LatencyHistogram restoreLatency_;
   CacheLookupSnapshot lookup_;
   double extentCompactMaxMilliseconds_ = 0.0;
   std::function<void()> completionNotifier_;
