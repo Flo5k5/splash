@@ -2158,7 +2158,13 @@ are its state's (after the PLE history in a state cell,
 `QwenTargetDimensions::indexerPendingBytes`): a prefill writes them after its
 rows and at each state it captures, and a verify's commit after the rows the
 lane retained, so a block a rejected row completed is pooled again by the
-next step from the committed tokens. No page holds a raw key.
+next step from the committed tokens. No page holds a raw key. Queries and
+pooled keys rotate by the same target RoPE row (`target_rope_pair`, the
+queries' from the step's tables, a pooled key's at its block's first token),
+with YaRN's frequencies and attention factor under `--yarn-factor`. A row's
+scores and bitmap cover every block of the window the model serves; a prefill
+chunk scores its rows in batches that keep the native window's score scratch,
+256 rows at 256K, 64 at 1,010,000.
 
 A layout that keeps values token-major (`kv::Layout::valuesTokenMajor`)
 attends sparsely, on kernels compiled for 24 query heads over two KV heads
@@ -2905,7 +2911,7 @@ does, and `REVISION`, `DRAFT_MODEL` and `LANGUAGE_ONLY=1` as its `--revision`,
 | Target | Runs |
 | --- | --- |
 | `verify-models` | the installer's restarts without the Hub, `verify --full`, and the record of the weight images (`dev/tools/installer_restarts.py`, `weight-digests`, [Release check](#release-check)) |
-| `test-real` | vision parity with the family's fixture in `dev/tests/fixtures/vision-parity/` when the installation serves vision, and the native model runtime oracle, each of its three runs with `ORACLE_ARGS` added (`ORACLE_ARGS="--kv-format bf16"` or `"--yarn-factor 4"`) |
+| `test-real` | vision parity with the family's fixture in `dev/tests/fixtures/vision-parity/` when the installation serves vision, and the native model runtime oracle, each of its three runs with `ORACLE_ARGS` added (`ORACLE_ARGS="--kv-format bf16"`, `"--expert-memory 16G"` or `"--yarn-factor 4"`) |
 | `test-http-real` | the HTTP frontend on an isolated server (`dev/tests/smoke_real.py`); with `HTTP_SMOKE_ARGS="--persistent-cache --max-cache-disk 8G"`, instead of that smoke, the [persistent cache](#persistent-cache) across a restart in a fresh cache directory: a clean stop, a restart that takes the restore point back, and a next turn that restores the prompt from disk; `release-check` runs both |
 | `test-agent-real` | the five official clients through `splash serve` (`dev/tests/agent_real.py`), in `AGENT_SCENARIO` `complete` (the default) or `smoke` |
 | `test-release-real` | the HTTP smoke and all five clients on one `splash serve` |
