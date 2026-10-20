@@ -162,8 +162,9 @@ uint32_t grantKvPages(MemoryGovernor &governor,
 // The plan budgets the memory Metal holds outside the backend's buffers
 // (pipelines, driver allocations) inside its reserves and advertises the
 // context the rest of the budget holds. One request must reach that context
-// whatever part of the reserves this memory takes; memory beyond them is
-// still charged, and the device never exceeds the hard budget.
+// through the plan's governor whatever part of the reserves this memory
+// takes; memory beyond them is still charged, and the device never exceeds
+// the hard budget.
 void testAdvertisedContextIsGrantable() {
   struct Machine {
     const char *name;
@@ -200,10 +201,8 @@ void testAdvertisedContextIsGrantable() {
       test::metalStatistics().deviceCurrentAllocatedBytes =
           test::metalStatistics().allocatedBytes + untracked;
       metal::MetalBackend backend("unused");
-      // Configured as RuntimeResources configures it.
-      MemoryGovernor governor(
-          backend, budget.hardBudgetBytes, 2 * kGiB, 2 * kGiB,
-          [] { return hostMemory(200 * kGiB); }, reserves);
+      // The plan's governor, as a start and the runtime oracle build it.
+      MemoryGovernor governor(backend, budget, [] { return hostMemory(200 * kGiB); });
       const uint32_t granted = grantKvPages(governor, budget);
       const std::string context = std::string(machine.name) + ", " +
                                   std::to_string(untracked / kMiB) +

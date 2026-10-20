@@ -1025,11 +1025,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     // only beyond them, and elastic state and KV never grow into them. The
     // split only moves bytes from KV to fixed runtime memory, so the governor
     // is the same with it or without.
-    auto memoryGovernor = std::make_unique<MemoryGovernor>(
-        *backend, memoryPlan.breakdown().hardBudgetBytes, hostReserveBytes,
-        EngineMemoryPolicy::hostSpareReserveBytes(device.physicalMemoryBytes), config.hostMemory,
-        memoryPlan.breakdown().pipelineReserveBytes + memoryPlan.breakdown().runtimeOverheadReserveBytes,
-        memoryPlan.breakdown().streamedTableBytes);
+    auto memoryGovernor = std::make_unique<MemoryGovernor>(*backend, memoryPlan.breakdown(), config.hostMemory);
     if (config.memoryPressure)
       memoryGovernor->setPressure(config.memoryPressure());
     // What the start allocates, the KV runway, the arenas and the warmup, is

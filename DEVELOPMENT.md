@@ -3363,11 +3363,19 @@ memory pressure, which the smaller GGUF variants such a Mac uses can reach under
 an agent's load; `SPLASH_TEST_PRESSURE_STOP=4` stops only at critical pressure,
 to observe how the engine sheds its cache. The runtime oracle in `test-real` has
 no production memory guard: the weights must fit in what macOS has available
-above its reserve, and what the runtime then allocates as it runs must leave
-the spare reserve and the 1 GiB margin of the spare memory free, as growth that
-no request in service needs does, so it stops, naming what it needs, while
-other programs hold that memory. With only desktop applications open, a 24 GB
-Mac runs it for those variants.
+above its reserve. Its checks can neither wait for memory nor yield it, so the
+governor a start builds admits all the runtime then allocates, its arenas and
+the lanes, KV and cached states of the requests the oracle runs together, as
+memory a request in service needs: only the memory plan's budget and macOS's
+critical pressure refuse it, and the run stops at critical pressure, naming
+what it asked for. Production grants that only to its start, a request it
+serves alone and the KV of the requests it serves; a start beside a resident
+request, and the cache, are held to the spare reserve, the 1 GiB margin above
+it and macOS's warning. A Neural Engine split leaves the plan room for what the
+checks hold at once (every lane's state, six cached states and the oracle's KV
+pages), as a start's split leaves `--max-context`, so the oracle's split may
+take fewer of the Neural Engine's units than a server's does. With only desktop
+applications open, a 24 GB Mac runs it for those variants.
 
 The engine's `--kv-spill always`, which `splash serve` never passes, keeps
 the KV of every request of a block-sparse target on the SSD cache
