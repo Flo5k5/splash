@@ -308,6 +308,15 @@ struct BatchPlan final {
   bool constrained = false;
   std::vector<BatchItem> items;
   DecodeStage decodeStage = DecodeStage::Regular;
+  // A prefill of one lane may run in passes, each over the next of `passes`
+  // even shares of the target's layers (Model::prefillPasses): this command
+  // is pass `pass`. The first pass begins the rows, the last ends them and
+  // commits; the rows' work between lives in the model's prefill memory,
+  // which no other prefill touches meanwhile, while other lanes' decode
+  // commands run between passes. A request that ends between passes leaves
+  // the rest unrun and nothing of the rows committed.
+  uint32_t pass = 0;
+  uint32_t passes = 1;
 
   [[nodiscard]] bool empty() const noexcept { return items.empty(); }
   [[nodiscard]] uint32_t width() const noexcept {
@@ -371,6 +380,8 @@ struct ModelBatchItem final {
 
 struct ModelStepResult final {
   uint64_t requestId = 0;
+  // A prefill's rows, which only its last pass consumes (BatchPlan::passes):
+  // an earlier pass's result is the request's id and nothing else.
   uint32_t consumedPromptTokens = 0;
   std::vector<uint32_t> outputTokens;
   // True after a stop token or the final score-only prefill chunk.
@@ -708,7 +719,9 @@ public:
   [[nodiscard]] virtual StateAdmission begin(const ModelRequest &request) = 0;
   // Safe-point preemption returns the request's state buffers, retaining
   // only its host-side sampling/constraint continuation. Resume replays the
-  // supplied committed history through the ordinary prefill path.
+  // supplied committed history through the ordinary prefill path, and takes
+  // the output limit it is given (maxNewTokens), which the engine sets anew
+  // at each start of a request (the SSD cache's quota may bound it).
   virtual void suspend(uint64_t requestId) = 0;
   [[nodiscard]] virtual StateAdmission resume(const ModelRequest &request) = 0;
   // Restores a cached state into the request's lane at `boundary`. A RAM
@@ -769,9 +782,20 @@ public:
   // buffers, and the maximum when no number of states does (a buffer no
   // cached state holds, such as Qwen's draft rings).
   [[nodiscard]] virtual uint32_t statesToActivate() const noexcept { return 0; }
-  // The most rows of one lane's prefill command: a prefill group's when the
-  // model runs them (one lane's chunks, layer by layer), else a chunk's.
-  [[nodiscard]] virtual uint32_t prefillGroupRows() const noexcept { return ExecutionLimits::prefillTokenBudget; }
+  // The most rows of one lane's prefill command: a prefill group's where
+  // the model runs them (one lane's chunks, layer by layer) to read
+  // something once for all of them, its streamed experts for every lane or a
+  // spilled history for a lane whose K/V spills (`spills`), else a chunk's.
+  [[nodiscard]] virtual uint32_t prefillGroupRows(bool spills) const noexcept {
+    static_cast<void>(spills);
+    return ExecutionLimits::prefillTokenBudget;
+  }
+  // The most passes over its layers one lane's prefill command may run in
+  // (BatchPlan::passes): its layers where a command pays a cost per layer
+  // whatever its rows, which keeps a command long however few they are, as
+  // a streamed target's expert reads; 1 where a command runs whole. A
+  // command that encodes images or streams its history runs whole.
+  [[nodiscard]] virtual uint32_t prefillPasses() const noexcept { return 1; }
   // Releases one unit of idle model memory and returns its bytes; zero when
   // nothing in scope is idle. A unit is one pooled state buffer (keepLane
   // keeps those one lane starts from); with BuffersThenCaches, once no

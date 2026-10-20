@@ -215,6 +215,11 @@ struct CacheSpillPolicy final {
   uint32_t windowPages = 0;
 };
 
+// Whether a request may start to spill now, or what holds it back: the KV
+// tier takes no writes (it is off, or a file stopped taking them), or the
+// write budget does not cover the writes Spill requests have committed.
+enum class SpillGate : uint8_t { Open, TierClosed, WriteBudget };
+
 struct CacheReclaimResult final {
   bool madeProgress = false;
   // Bytes of the KV extents the step released.
@@ -227,6 +232,10 @@ struct CacheReclaimResult final {
   // state's buffers return to the model's pool, which reclaimIdleState gives
   // back to the host.
   bool evictedState = false;
+  // The step evicted KV, whose pages are free for other KV, or will be once
+  // their demotion lands. Only reclaimForMemory reports it: its progress is
+  // memory that came back, which KV gives only as an extent it empties.
+  bool evictedKv = false;
 };
 
 // What a reclaim step does with memory. KeepExtents: extents stay
@@ -385,8 +394,23 @@ public:
   void beginRequest(uint64_t requestId, KvMode mode = KvMode::Resident);
   void endRequest(uint64_t requestId);
 
-  // Spilling. What the quota of active KV leaves for new commitments,
-  // without giving any copy up: activeLimit - held slots - committed.
+  // Spilling. Whether a new Spill request may start, or a Resident one
+  // convert: a writable tier, and a write budget that covers what Spill
+  // requests committed (DiskBudget::admitsSpill).
+  [[nodiscard]] SpillGate spillGate() const noexcept {
+    if (!kvTierWritable())
+      return SpillGate::TierClosed;
+    if (diskBudget_ && !diskBudget_->admitsSpill(diskBudget_->committedBytes()))
+      return SpillGate::WriteBudget;
+    return SpillGate::Open;
+  }
+  // The quota of active KV, the slots of blocks requests hold and what Spill
+  // requests committed (DiskBudget::activeLimitBytes); none without
+  // spilling. What it leaves for new commitments, without giving any copy
+  // up: activeLimit - held slots - committed.
+  [[nodiscard]] uint64_t spillLimit() const noexcept {
+    return spill_ ? diskBudget_->activeLimitBytes() : 0;
+  }
   [[nodiscard]] uint64_t spillRoom() const noexcept;
   // Commits quota for `pages` pages of a Spill request, which each page it
   // publishes then draws or returns (DiskBudget::commit); false, committing
@@ -579,9 +603,25 @@ public:
   // may then grow the pool), or until nothing more of the class can go; one
   // step instead of a retry per page. The pages are of the form, whose free
   // and pending pages count, and empty extents of the other form go first.
+  // What is in use waits, and the step reports pending, only while a
+  // transfer in flight can still cover the pages (returnsInFlight).
   [[nodiscard]] CacheReclaimResult reclaimForPages(uint32_t pages, CacheReclaimMode mode,
                                                    ReclaimClass upTo,
                                                    kv::PageForm form = kv::PageForm::Full);
+  // The reclaim step for memory the governor funds that an allocation was
+  // refused: a lane's state, or the model's memory for its reads of spilled
+  // KV. It takes what reclaimOne(ReleaseExtents, upTo, false, keepRunway)
+  // takes, in its order, until memory comes back: an extent's bytes
+  // (reclaimedBytes), or a state's buffers, which the model's pool returns
+  // (evictedState). A KV leaf gives back memory only as the extent its page
+  // empties, so leaves go until one is released, and only while one can be
+  // (extentWithinReach(upTo)); otherwise only a state goes, as
+  // reclaimStateForLane takes it. It makes progress only once memory has
+  // come back, since the KV it takes before then frees pages of extents that
+  // stay, which it reports apart (evictedKv); it is pending as
+  // reclaimForPages is, while a transfer in flight can still return that
+  // memory.
+  [[nodiscard]] CacheReclaimResult reclaimForMemory(ReclaimClass upTo, bool keepRunway);
   // The most pages of the form reclaimForPages(pages, mode, upTo, form) can
   // leave free: every allocated page of the form no request holds, but with
   // Ordinary not the idle KV that states in use restore through.
@@ -614,13 +654,14 @@ public:
   // alone.
   [[nodiscard]] StateRoom reclaimOneState(StateClass state, bool growth);
   // Recycles one unpinned state, preferring checkpoints, for a lane that
-  // takes the state's buffers, taking nothing of a class above upTo. For
-  // running work (InUse) a state in use goes once no other state is left and
-  // no transfer in flight can return what is needed first; a start that a
-  // resident lane holds back (Ordinary) takes nothing in use. A state the
-  // tier could take once the write in flight has finished stays and is
-  // reported pending, as in reclaimOne. evictableStates(upTo) are those it
-  // can take.
+  // takes the state's buffers, as a lane's state does while the host
+  // refuses growth, taking nothing of a class above upTo. For running work
+  // (InUse) a state in use goes once no other state is left and no transfer
+  // in flight can return what is needed first (returnsInFlight: no page
+  // covers a state's buffers); a start that a resident lane holds back
+  // (Ordinary) takes nothing in use. A state the tier could take once the
+  // write in flight has finished stays and is reported pending, as in
+  // reclaimOne. evictableStates(upTo) are those it can take.
   [[nodiscard]] CacheReclaimResult reclaimStateForLane(ReclaimClass upTo);
   [[nodiscard]] uint32_t evictableStates(ReclaimClass upTo) const noexcept {
     return states_.evictableStates(upTo == ReclaimClass::InUse);
@@ -711,11 +752,45 @@ private:
 
   [[nodiscard]] TokenAdmission admitPages(uint32_t count, std::vector<uint32_t> &pages,
                                           kv::PageForm form = kv::PageForm::Full);
+  // What an allocation that was refused lacks, as the free pages that cover
+  // it: the KV pages it lacks, of their form; for memory the governor funds,
+  // an extent's worth of Full pages, whose extent then leaves memory; none
+  // for a state's buffers while the host refuses growth, which only a state
+  // gives.
+  struct Shortfall final {
+    uint32_t pages = 0;
+    kv::PageForm form = kv::PageForm::Full;
+  };
+  // Whether a transfer in flight can still cover a shortfall once it lands.
+  // A restore, a demotion, a persistence write and the state write each
+  // hold back what a reclaim would take then: the block a restore fills or a
+  // write copies, the page a demotion frees and the leaf above it, the
+  // states that wait for the write. A Spill request's page written through
+  // holds back no cached block: it counts only by the Full page it frees
+  // once it spills (pendingPages), where those pages and the free ones cover
+  // the shortfall. Without spilling this is transfersInFlight().
+  [[nodiscard]] bool returnsInFlight(const Shortfall &shortfall) const noexcept;
+  // One eviction step: what it takes, as reclaimOne's arguments say, and
+  // the allocation that was refused, if it is taken for one rather than for
+  // a pass.
+  struct EvictionStep final {
+    CacheReclaimMode mode;
+    ReclaimClass upTo;
+    bool keepResumePoint = false;
+    std::optional<Shortfall> refused;
+  };
   // One eviction: checkpoints first, then the ordinary class's
-  // reclaimOldest, then, up to InUse, that of what is in use. pagesOnly
-  // (CacheReclaimMode::ReusePages) skips the checkpoints and scans for pages.
-  [[nodiscard]] CacheReclaimResult evictOne(ReclaimClass upTo, bool keepResumePoint,
-                                            bool pagesOnly);
+  // reclaimOldest, then, up to InUse, that of what is in use, as reclaimOne
+  // describes. ReusePages skips the checkpoints and scans for pages. What is
+  // in use waits, and a step that finds nothing reports pending, while a
+  // transfer in flight can return what is needed first: one that can still
+  // cover the refused allocation's shortfall (returnsInFlight), or for a
+  // pass any (transfersInFlight).
+  [[nodiscard]] CacheReclaimResult evictOne(const EvictionStep &step);
+  // reclaimStateForLane's step for a shortfall: what is in use waits, and
+  // finding nothing is pending, while a transfer in flight can still cover
+  // it.
+  [[nodiscard]] CacheReclaimResult recycleState(ReclaimClass upTo, const Shortfall &shortfall);
   // One reclaimOldest scan: the class it takes (what is in use, or the
   // ordinary class), whether it keeps the resume point, what becomes of a
   // state whose write cannot start now, how long the caller can wait for KV
@@ -810,11 +885,13 @@ private:
   // An ordinary state at the block or anywhere below it.
   [[nodiscard]] bool holdsOrdinaryState(uint64_t block) const;
   void startRestore(uint64_t block);
-  // Evicting ordinary KV may empty an extent: the pages Ordinary may reuse
+  // Evicting KV of the class may empty an extent: the pages upTo may reuse
   // (reusablePages), less those whose demotion is in flight, cover one. That
   // counts the leaves that need a demotion too, which an Immediate step
-  // passes over while the tier takes writes.
-  [[nodiscard]] bool extentWithinReach() const;
+  // passes over while the tier takes writes. A page written through is none
+  // of them: its Spill request holds it, though it frees once its copy lands
+  // (pendingPages).
+  [[nodiscard]] bool extentWithinReach(ReclaimClass upTo = ReclaimClass::Ordinary) const;
   // Returns one extent of free pages: an empty one, or the one compactExtent
   // empties; progress with zero bytes when the extent emptied is the runway
   // kept. No progress when the free pages fill none.

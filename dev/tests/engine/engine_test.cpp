@@ -8,13 +8,16 @@
 #include "engine/Engine.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdlib>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <numeric>
 #include <optional>
 #include <stdexcept>
+#include <tuple>
 #include <utility>
 
 using namespace splash;
@@ -55,10 +58,12 @@ public:
     maskRequests.emplace_back(
         requestId, std::vector<uint32_t>(simulation.begin(), simulation.end()));
   }
-  void completed(uint64_t id, EngineFinishReason, uint32_t prompt,
+  void completed(uint64_t id, EngineFinishReason, bool bounded, uint32_t prompt,
                  uint32_t completion, uint32_t deduplicated,
                  std::span<const float>, const SpeculativeCounts &speculation) override {
     ++completedCount;
+    if (bounded)
+      boundedIds.push_back(id);
     usage[id] = {prompt, completion};
     deduplicatedTokens[id] = deduplicated;
     speculativeCounts[id] = speculation;
@@ -78,6 +83,8 @@ public:
   std::vector<uint64_t> startIds;
   std::unordered_map<uint64_t, std::vector<uint32_t>> outputs;
   std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> usage;
+  // The requests that ended at a bound of the engine's own.
+  std::vector<uint64_t> boundedIds;
   std::unordered_map<uint64_t, uint32_t> deduplicatedTokens;
   std::unordered_map<uint64_t, SpeculativeCounts> speculativeCounts;
   std::vector<std::string> failures;
@@ -469,6 +476,107 @@ void testSharedPrefillDoesNotBlockUnrelatedWork() {
     runUntilIdle(engine);
     require(model.prefillRows == 4 * 193 && events.completedCount == 4,
             "unrelated work incorrectly reused a shared state");
+  }
+}
+
+// A prompt with images runs prefill groups as a text prompt does: an image
+// anywhere in a conversation leaves its long prompts' commands groups.
+void testImagePromptsRunPrefillGroups() {
+  for (bool images : {false, true}) {
+    test::TestKvStorage storage(512, 4096, 4);
+    KvPool pool(storage, 0);
+    engine::Cache cache(pool, nullptr, nullptr);
+    Executor model;
+    model.groupRows = 4 * model::ExecutionLimits::prefillTokenBudget;
+    Events events;
+    engine::Engine engine(test::engineConfig(), cache, model, events);
+    guardReleases(storage, engine);
+    // Groups run once prefill has a measured cost, as after the start's.
+    engine.observePrefill(model::ExecutionLimits::prefillTokenBudget, 1000.0, 0.0);
+    auto value = request(1, std::vector<uint32_t>(8193, 7));
+    if (images) {
+      value.images = {{4000, 16, 8, 8, 1, 1}};
+      value.imagePixels.assign(value.images.front().pixelBytes(), 1);
+    }
+    engine.submit(std::move(value));
+    runUntilIdle(engine);
+    require(events.completedCount == 1 && model.prefillChunks.at(1) == 2,
+            images ? "a prompt with an image did not run prefill groups"
+                   : "a text prompt did not run prefill groups");
+  }
+}
+
+// Where the model runs a prefill command in passes over its layers, a long
+// prompt's commands run in passes, each its own command with the command's
+// rows: a decoding lane's steps run between them, its own page table goes
+// with each, and only the last commits the rows. A cancel between two
+// passes ends the request at once and leaves the rest of its command unrun.
+void testPrefillPassesInterleaveDecodeAndEndAtACancel() {
+  for (const bool cancel : {false, true}) {
+    test::TestKvStorage storage(512, 4096, 4);
+    KvPool pool(storage, 0);
+    engine::Cache cache(pool, nullptr, nullptr);
+    Executor model;
+    model.groupRows = 4 * model::ExecutionLimits::prefillTokenBudget;
+    model.passes = 6;
+    model.decodeFinishes = false;
+    // Each command in order: its kind, first lane, pass and passes.
+    struct Command final {
+      WorkKind kind;
+      uint64_t requestId;
+      uint32_t pass, passes, rows;
+    };
+    std::vector<Command> commands;
+    model.commandTimes = [&](const BatchPlan &plan, std::span<const ModelBatchItem>) {
+      commands.push_back({plan.kind, plan.items.front().requestId, plan.pass, plan.passes,
+                          plan.items.front().tokenCount});
+      return plan.kind == WorkKind::Decode ? test::CommandTimes{.wallMilliseconds = 100.0}
+                                           : test::CommandTimes{500.0, 300.0};
+    };
+    Events events;
+    engine::Engine engine(test::engineConfig({.decodeShare = 0.5}), cache, model, events);
+    guardReleases(storage, engine);
+    // A streamed target's chunk: 4.9 s, 3.4 s of it on expert reads.
+    engine.observePrefill(model::ExecutionLimits::prefillTokenBudget, 4900.0, 3400.0);
+    EngineRequest decoding = request(1, std::vector<uint32_t>(100, 3));
+    decoding.maxNewTokens = 10'000;
+    engine.submit(std::move(decoding));
+    double now = 1;
+    tickUntil(engine, now, [&] { return events.outputs.contains(1); }, "the short request did not decode");
+    // Five chunks: two groups of three chunks' rows, in six passes each.
+    engine.submit(request(2, std::vector<uint32_t>(8193, 7)));
+    const auto prefill = [](const Command &command) {
+      return command.kind == WorkKind::Prefill && command.requestId == 2;
+    };
+    const auto passes = [&] { return std::ranges::count_if(commands, prefill); };
+    if (cancel) {
+      tickUntil(engine, now, [&] { return passes() == 3 && !engine.commandInFlight(); },
+                "the long prompt did not run three passes");
+      engine.cancel(2);
+      require(engine.snapshot().cancelled == 1, "a cancel between passes did not end the request at once");
+      const size_t ran = commands.size();
+      for (uint32_t step = 0; step < 8; ++step) static_cast<void>(engine.tick(now++));
+      require(passes() == 3 && commands.size() > ran && !model.prefillChunks.contains(2),
+              "a cancelled command's passes ran on, or the decoding lane stopped");
+    } else {
+      tickUntil(engine, now, [&] { return events.outputs.contains(2); }, "the long prompt did not end");
+      require(model.prefillChunks.at(2) == 2 && model.prefillRows == 100 + 8193,
+              "a command in passes committed its rows other than once, with its last pass");
+    }
+    std::vector<Command> prefills;
+    for (size_t index = 0; index < commands.size(); ++index) {
+      const Command &command = commands[index];
+      if (!prefill(command)) continue;
+      prefills.push_back(command);
+      require(command.passes == 6 && command.rows == (prefills.size() <= 6 ? 6144u : 2049u) &&
+                  command.pass == (prefills.size() - 1) % 6,
+              "a long prompt's command did not run its rows in six passes in order");
+      require(!command.pass || (commands[index - 1].kind == WorkKind::Decode && commands[index - 1].requestId == 1),
+              "the decoding lane did not step between two passes");
+    }
+    engine.cancel(1);
+    if (!cancel) engine.cancel(2);
+    runUntilIdle(engine);
   }
 }
 
@@ -3259,6 +3367,39 @@ void testDroppedLeaseLooksUpAgain() {
           "a start that dropped its lease recomputed the state the reclaim wrote");
 }
 
+// The host's refusal never makes a start drop its own lease: alone, with
+// nothing to reuse, it waits for the pressure to lift, since the fallback
+// that lets the lease go answers only a refusal nothing will lift, and then
+// resumes from its cached state.
+void testHostRefusedStartKeepsItsLease() {
+  test::TestKvStorage storage(16, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor executor(1);
+  Events events;
+  bool paused = false;
+  engine::Engine engine(test::engineConfig({.growthPaused = [&] { return paused; }}), cache,
+                        executor, events);
+  guardReleases(storage, engine);
+  const std::vector<uint32_t> prompt(65, 1);
+  double now = 1;
+  engine.submit(request(1, prompt));
+  tickUntil(engine, now, [&] { return idle(engine); }, "the first request did not finish");
+  paused = true;
+  executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
+  executor.beginGrowthBlocked = [&] { return paused; };
+  engine.submit(request(2, prompt));
+  for (int step = 0; step < 5; ++step)
+    static_cast<void>(engine.tick(now++));
+  require(cache.probe(prompt, {}).cachedTokens() == 64 && events.startIds.size() == 1 &&
+              events.failedCount == 0,
+          "a start the host refused gave up its cached state");
+  paused = false;
+  tickUntil(engine, now, [&] { return idle(engine); }, "the refused start did not run");
+  require(events.starts.back() == 64 && executor.prefillRows == 65 + 1,
+          "the refused start did not resume from its cached state");
+}
+
 void testSingletonCapacityFailureTerminatesCleanly() {
   test::TestKvStorage storage(2, 4096, 1);
   storage.budgetPages = 1;
@@ -3968,6 +4109,74 @@ void testPrefillGrowthPreservesAnActiveDecodePeer() {
           "mixed-phase pressure failed to finish both requests");
 }
 
+// A decoding lane refused a page while the lane beside it fits is left out
+// of their command, which runs: the lanes grow too, and are refused in
+// turn. The prompt's lane outside that command, which yields first, keeps
+// its memory, and yields only once its own command is refused.
+void testARefusedDecodeLeavesThePromptOutsideItsCommand() {
+  test::TestKvStorage storage(1024, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, nullptr, nullptr);
+  Executor executor;
+  executor.decodeFinishes = false;
+  Events events;
+  engine::Engine engine(test::engineConfig(), resources, executor, events);
+  guardReleases(storage, engine);
+  // Each command's kind and lanes.
+  std::vector<std::pair<WorkKind, std::vector<uint64_t>>> commands;
+  executor.commandTimes = [&](const BatchPlan &plan, std::span<const ModelBatchItem> items) {
+    std::vector<uint64_t> lanes;
+    for (const ModelBatchItem &item : items)
+      lanes.push_back(item.requestId);
+    commands.emplace_back(plan.kind, std::move(lanes));
+    return test::CommandTimes{};
+  };
+  // Lane 1's decode needs a fourth page two tokens in, lane 2's 24 tokens in.
+  const auto promptTokens = [](uint64_t id) { return id == 1 ? 87U : 65U; };
+  for (const uint32_t id : {1U, 2U}) {
+    auto decoding = request(id, std::vector<uint32_t>(promptTokens(id), id));
+    decoding.maxNewTokens = 1000;
+    engine.submit(std::move(decoding));
+  }
+  double now = 1;
+  tickUntil(engine, now, [&] { return events.outputs.contains(1) && events.outputs.contains(2); },
+            "the lanes did not decode");
+  // A long prompt's commands run between theirs.
+  engine.submit(request(3, std::vector<uint32_t>(8 * model::ExecutionLimits::prefillTokenBudget, 3)));
+  const auto needsPage = [&](uint64_t id) {
+    return promptTokens(id) + events.outputs[id].size() + model::ExecutionLimits::targetVerifyRows >
+           uint64_t{resources.pageTable(id).pages.size()} * KvCache::pageTokens;
+  };
+  tickUntil(
+      engine, now,
+      [&] {
+        return !engine.commandInFlight() && !commands.empty() &&
+               commands.back().first == WorkKind::Prefill && needsPage(1) && !needsPage(2);
+      },
+      "lane 1 did not come to need a page that lane 2 does not");
+  // At the wall, with nothing in flight: no free page, and no growth.
+  storage.growthBlocked = true;
+  const KvPageAcquisition held = pool.acquirePages(pool.freePageCount());
+  static_cast<void>(engine.tick(now++));
+  require(held.granted() && engine.commandInFlight() &&
+              commands.back() == std::pair{WorkKind::Decode, std::vector<uint64_t>{2}} &&
+              executor.suspensions == 0 && executor.requests.at(3).resident,
+          "a lane refused its KV beside a lane that fit suspended the prompt outside their command");
+  // The prompt's own command, refused next, suspends its lane.
+  const size_t submitted = commands.size();
+  tickUntil(engine, now, [&] { return executor.suspensions != 0 || commands.size() != submitted; },
+            "nothing ran or yielded after the decode");
+  require(executor.suspensions == 1 && !executor.requests.at(3).resident &&
+              commands.size() == submitted,
+          "the prompt's lane did not yield once its own command was refused");
+  for (const uint32_t page : held.pages)
+    pool.releasePage(page, false);
+  storage.growthBlocked = false;
+  executor.decodeFinishes = true;
+  tickUntil(engine, now, [&] { return idle(engine); }, "the lanes did not finish");
+  require(events.completedCount == 3 && events.failedCount == 0, "the lanes did not all complete");
+}
+
 void testKvPressureSuspendsInsteadOfKillingActiveWork() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
@@ -4532,6 +4741,37 @@ void testSharedJunctionPublishesFromCachedKv() {
               snapshot.junctionMaterializationFailures == 0 && executor.restored == 160 &&
               executor.prefillRows == 193 + 33 && events.completedCount == 2,
           "the shared junction did not make room from cached KV");
+}
+
+// A lane's state is memory the governor funds, on a target whose KV stays in
+// memory too: cached KV gives it memory only as the extent its pages leave
+// empty. Refused its state at the engine's limit, a start takes another
+// conversation's leaves until an extent has left memory, and asks for the
+// state again once then, not after each leaf.
+void testRefusedStateAsksAgainOnceAnExtentLeft() {
+  test::TestKvStorage storage(64, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, nullptr, nullptr);
+  Executor executor;
+  Events events;
+  engine::Engine engine(test::engineConfig(), resources, executor, events);
+  guardReleases(storage, engine);
+  // Another conversation's KV, with no state, fills two whole extents.
+  const std::vector<uint32_t> other(257, 6);
+  resources.beginRequest(900);
+  require(resources.ensureTokens(900, 256).granted(), "the other conversation got no pages");
+  resources.publishCommittedBlocks(900, other, 256, {});
+  resources.endRequest(900);
+  // The start's state fits only once an extent has left memory.
+  const uint32_t releases = storage.releasedExtents;
+  executor.beginGrowthBlocked = [&] { return storage.releasedExtents == releases; };
+  const uint32_t attempts = executor.beginAttempts;
+  engine.submit(request(1, std::vector<uint32_t>(65, 7)));
+  runUntilIdle(engine);
+  require(events.completedCount == 1 && events.failedCount == 0 &&
+              executor.beginAttempts == attempts + 2 && storage.releasedExtents == releases + 1 &&
+              resources.lookup(other, {}).kvBoundary == 128,
+          "a refused state was asked for again after each leaf, or took more than an extent");
 }
 
 // While growth is paused a released extent gives a state's buffers nothing,
@@ -7855,6 +8095,939 @@ void testIncompleteConfigIsRefused() {
           "the engine needs the governor's growth pause and serving mark");
   refused([](EngineConfig &config) { config.serving = {}; },
           "the engine needs the governor's growth pause and serving mark");
+  refused([](EngineConfig &config) { config.spill.capable = true; },
+          "a target that can spill needs its page and slot sizes");
+}
+
+// On a target that can spill, a request that would spill starts Resident
+// while the SSD cache takes no writes and its projection fits in memory
+// alone; it is counted as a Resident start.
+void testUnwritableTierKeepsRequestsResident() {
+  test::TestKvStorage storage(64, 4096, 4);
+  KvPool pool(storage, 0);
+  test::TestKvTier tier;
+  tier.writableFile = false;
+  engine::Cache cache(pool, &tier, nullptr);
+  Executor model;
+  Events events;
+  EngineConfig config = test::engineConfig();
+  config.spill = {.capable = true,
+                  .always = true,
+                  .denseTokens = 2048,
+                  .geometry = {.fullPageBytes = 423'936,
+                               .indexPageBytes = 24'576,
+                               .slotBytes = 425'984,
+                               .residentKvBytes = uint64_t{1} << 40,
+                               .densePages = 64,
+                               .windowPages = 64,
+                               .groupPages = 256}};
+  engine::Engine engine(config, cache, model, events);
+  guardReleases(storage, engine);
+  engine.submit(request(1, std::vector<uint32_t>(100, 3)));
+  runUntilIdle(engine);
+  const SpillRequestsSnapshot spill = engine.snapshot().spill;
+  require(events.completedCount == 1 && events.failedCount == 0 && spill.resident == 1 &&
+              spill.spill == 0 && spill.refusedClosed == 0,
+          "a request did not start Resident while the SSD cache took no writes");
+}
+
+// A target whose requests may spill (EngineConfig::spill), on a cache with a
+// spill policy: Full pages of 100 bytes and Index pages of 10, four to an
+// extent unless `extent` says, with the Index runway allocated; a tier of
+// 100-byte slots whose quota, active KV's limit included, holds `slots` of
+// them; and a dense history and a tail window of a page each. With
+// `always`, every request spills (--kv-spill always); otherwise every
+// request starts Resident, as the planner's geometry (SpillGeometry) is the
+// planner's to test. The tier's transfers land as the fixture ticks on, and
+// decode runs to each request's output limit.
+struct Spilling {
+  // The pages of an extent, of a type of its own for a call to name.
+  struct Extent final {
+    uint32_t pages;
+  };
+  explicit Spilling(uint32_t slots, bool always = true, Extent extent = {4})
+      : storage(256, 100, extent.pages, 10),
+        budget(std::make_shared<model::DiskBudget>(uint64_t{slots} * 100)),
+        cache(pool, &tier, budget, CacheSpillPolicy{1, 1}),
+        engine(config(always, &paused, &serving), cache, model, events) {
+    tier.budget = budget;
+    tier.transferLimit = 1024;
+    require(static_cast<bool>(pool.fillRunway(kv::PageForm::Index)),
+            "the Index runway was not allocated");
+    guardReleases(storage, engine);
+    model.decodeFinishes = false;
+  }
+
+  static EngineConfig config(bool always, const bool *paused, bool *serving) {
+    EngineConfig result = test::engineConfig();
+    result.growthPaused = [paused] { return *paused; };
+    result.serving = [serving](bool value) { return std::exchange(*serving, value); };
+    result.spill = {.capable = true,
+                    .always = always,
+                    .denseTokens = KvCache::pageTokens,
+                    .geometry = {.fullPageBytes = 100,
+                                 .indexPageBytes = 10,
+                                 .slotBytes = 100,
+                                 .residentKvBytes = 100'000,
+                                 .densePages = 1,
+                                 .windowPages = 1,
+                                 .groupPages = 4}};
+    return result;
+  }
+  // A request whose prompt is `pages` whole pages of `token` and one token
+  // more, which may generate `output` tokens.
+  static EngineRequest prompt(uint64_t id, uint32_t token, uint32_t pages, uint32_t output) {
+    EngineRequest result =
+        request(id, std::vector<uint32_t>(pages * KvCache::pageTokens + 1, token));
+    result.maxNewTokens = output;
+    return result;
+  }
+  // Ticks on, landing the tier's transfers after each tick, until done().
+  void runUntil(const std::function<bool()> &done, const char *message) {
+    for (uint32_t step = 0; step < 2000 && !done(); ++step) {
+      static_cast<void>(engine.tick(now++));
+      tier.complete();
+    }
+    require(done(), message);
+  }
+  void runUntilIdle() {
+    runUntil([&] { return idle(engine); }, "the requests did not end");
+  }
+  // The slots the quota of active KV keeps for commitments now.
+  [[nodiscard]] uint64_t committedSlots() const { return budget->committedBytes() / 100; }
+  void allowSpillWrites(bool allowed) {
+    tier.writeLimits[static_cast<size_t>(WriteClass::Spill)] = allowed ? 32 : 0;
+  }
+
+  test::TestKvStorage storage;
+  KvPool pool{storage, 0};
+  test::TestKvTier tier;
+  std::shared_ptr<model::DiskBudget> budget;
+  engine::Cache cache;
+  Executor model;
+  Events events;
+  // Whether the host holds growth back (EngineConfig::growthPaused), and
+  // whether the engine marks what it allocates as memory a request in
+  // service needs (EngineConfig::serving).
+  bool paused = false;
+  bool serving = false;
+  engine::Engine engine;
+  double now = 1;
+};
+
+// A Spill request's commitment covers each page of its projection that has
+// no copy, those of the chain it restores included: a cached chain whose
+// copies were never written takes a slot a page as its new pages do, and
+// each of those pages draws one as it is written.
+void testSpillCommitmentCoversTheChainWithoutCopies() {
+  Spilling spill(64);
+  // The first turn's pages are written nowhere: the tier takes no writes
+  // of Spill requests' pages.
+  spill.allowSpillWrites(false);
+  spill.engine.submit(Spilling::prompt(1, 1, 4, 1));
+  spill.runUntilIdle();
+  require(spill.tier.writes.empty() && spill.committedSlots() == 0,
+          "the first turn wrote copies or kept its commitment");
+  spill.allowSpillWrites(true);
+  // The second turn restores the first's four pages and the state at their
+  // end, and its projection holds two pages more: six, none with a copy.
+  spill.engine.submit(Spilling::prompt(2, 1, 6, 1));
+  spill.runUntil([&] { return spill.events.startIds.size() == 2; },
+                 "the second turn did not start");
+  require(spill.events.starts.back() == 4 * KvCache::pageTokens && spill.committedSlots() == 6,
+          "the commitment left out the restored pages that have no copy");
+  spill.runUntilIdle();
+  require(spill.events.completedCount == 2 && spill.tier.writes.size() == 6 &&
+              std::ranges::all_of(spill.tier.draws,
+                                  [](model::DiskBudget::Draw draw) {
+                                    return draw == model::DiskBudget::Draw::Commitment;
+                                  }) &&
+              spill.committedSlots() == 0 && spill.engine.snapshot().spill.spill == 2,
+          "the restored and new pages were not written on the commitment");
+}
+
+// A Resident lane that memory refuses to grow converts to Spill: it commits
+// a slot for each page of its projection that has no copy, its published
+// history's included, starts writing its pages through, and waits, without
+// allocating anything, for the pages their copies free, then grows into
+// them; so it does at the engine's limit and while the host refuses growth.
+// A quota that holds the pages it has still to publish, but not its history
+// too, refuses the conversion, and the lane that could not grow fails as it
+// would without the SSD cache.
+void testConversionCommitsTheHistoryWithoutCopies() {
+  for (const auto failure :
+       {metal::AllocationFailure::EngineBudget, metal::AllocationFailure::HostPressure}) {
+    for (const uint32_t slots : {5U, 8U}) {
+      // The host's refusal makes a lone lane that cannot convert wait rather
+      // than fail: the engine's limit shows the refusal.
+      if (failure == metal::AllocationFailure::HostPressure && slots == 5)
+        continue;
+      Spilling spill(slots, false);
+      // Two Full extents beside the Index runway, and one Index extent more.
+      spill.storage.budgetPages = 9;
+      spill.storage.allocationFailure = failure;
+      // Seven pages of prompt and 40 tokens of output reach a ninth page past
+      // 248 tokens; the projection then is eight whole pages, none copied.
+      spill.engine.submit(Spilling::prompt(1, 1, 7, 40));
+      spill.runUntilIdle();
+      const SpillRequestsSnapshot counts = spill.engine.snapshot().spill;
+      if (slots == 5) {
+        require(counts.converted == 0 && spill.tier.writes.empty() &&
+                    spill.events.failures == std::vector<std::string>{"capacity_exhausted"} &&
+                    spill.events.failureDetails.front().first.find("SSD cache") !=
+                        std::string::npos,
+                "a conversion the quota could not hold with the history went ahead");
+      } else {
+        require(counts.converted == 1 && counts.resident == 1 &&
+                    spill.events.completedCount == 1 && spill.events.usage.at(1).second == 40 &&
+                    spill.tier.writes.size() == 8 && spill.storage.allocatedBytes() <= 900,
+                "the converted lane did not wait for its spilled pages and grow into them");
+      }
+      require(spill.committedSlots() == 0, "the lane kept its commitment");
+    }
+  }
+}
+
+// A start that converts to Spill when memory refuses its restore starts as a
+// Spill request, counted as one. Refused all the same, as while its writes
+// have not landed beside a resident lane, it decides its mode afresh at each
+// attempt and counts no conversion, however often it retries.
+void testAStartThatConvertsCountsNoConversion() {
+  Spilling spill(64, false);
+  spill.model.deniedReservations = 1000;
+  spill.model.stateTier = std::make_shared<OffloadControl>();
+  spill.model.stateTier->ready = true;
+  spill.model.restoreControl->ready = true;
+  // The first turn's state goes to the disk: the second restores it.
+  spill.engine.submit(Spilling::prompt(1, 1, 4, 1));
+  spill.runUntilIdle();
+  // A resident lane decodes within its last page.
+  spill.engine.submit(Spilling::prompt(3, 3, 3, 30));
+  spill.runUntil([&] { return spill.events.outputs.contains(3); }, "the resident lane did not decode");
+  // The second turn's restore is refused memory; it converts, and the
+  // writes of its chain do not land for 2 s.
+  spill.storage.growthBlocked = true;
+  spill.engine.submit(Spilling::prompt(2, 1, 6, 1));
+  for (int step = 0; step < 20; ++step) {
+    spill.now += 100;
+    static_cast<void>(spill.engine.tick(spill.now));
+  }
+  require(spill.events.startIds.size() == 2 && spill.tier.writes.size() == 4 &&
+              spill.engine.snapshot().spill.converted == 0,
+          "the start that converted and waited counted its conversions, or did not convert");
+  // Once memory grows again it starts Resident, its next attempt's mode.
+  spill.storage.growthBlocked = false;
+  spill.runUntilIdle();
+  const SpillRequestsSnapshot counts = spill.engine.snapshot().spill;
+  require(spill.events.completedCount == 3 && counts.converted == 0 && counts.spill == 0 &&
+              counts.resident == 3,
+          "a start was not counted once, by the mode it started in");
+}
+
+// Short of its projection, a Spill start that the quota of active KV holds
+// with a page of output is bounded to what the quota holds, which the model
+// is given, and ends there; one that other Spill requests' commitments keep
+// out waits for them, and admits nothing that arrived after it meanwhile;
+// one that the quota cannot hold even alone is refused, retrying would
+// fail the same way.
+void testShortQuotaBoundsWaitsOrRefusesASpillStart() {
+  {
+    // 3 pages of prompt and 200 tokens of output project 9 pages: 5 hold
+    // the prompt and 63 tokens.
+    Spilling spill(5);
+    spill.engine.submit(Spilling::prompt(1, 1, 3, 200));
+    spill.runUntilIdle();
+    const SpillRequestsSnapshot counts = spill.engine.snapshot().spill;
+    require(spill.events.completedCount == 1 && spill.events.usage.at(1).second == 63 &&
+                spill.model.outputLimits.at(1) == 63 && counts.bounded == 1 &&
+                counts.lengthEnds == 1 && spill.events.boundedIds == std::vector<uint64_t>{1} &&
+                spill.tier.writes.size() == 5 && spill.committedSlots() == 0,
+            "a start the quota holds with a page of output was not bounded to it");
+  }
+  {
+    Spilling spill(10);
+    // The first request commits 8 of the 10 slots.
+    spill.engine.submit(Spilling::prompt(1, 1, 2, 191));
+    spill.runUntil([&] { return spill.events.outputs.contains(1); },
+                   "the first request did not decode");
+    // The second needs 4 for its prompt and a page of output, and waits; the
+    // third, which arrives then, would fit in the 2 left.
+    spill.engine.submit(Spilling::prompt(2, 2, 3, 200));
+    spill.runUntil([&] { return spill.engine.resourceWaitSnapshot(spill.now).diskQuota == 1; },
+                   "the second request did not wait for the quota");
+    spill.engine.submit(Spilling::prompt(3, 3, 1, 31));
+    for (int step = 0; step < 5; ++step) {
+      static_cast<void>(spill.engine.tick(spill.now++));
+      spill.tier.complete();
+    }
+    const ResourceWaitSnapshot waits = spill.engine.resourceWaitSnapshot(spill.now);
+    require(spill.events.startIds == std::vector<uint64_t>{1} && waits.diskQuota == 1 &&
+                waits.memory == 0 && waits.heldBehindRefusal == 1,
+            "a start waiting for the quota let a later arrival take it");
+    spill.runUntilIdle();
+    require(spill.events.startIds == std::vector<uint64_t>{1, 2, 3} &&
+                spill.events.completedCount == 3 && spill.events.usage.at(2).second == 200 &&
+                spill.events.usage.at(3).second == 31 && spill.events.boundedIds.empty() &&
+                spill.committedSlots() == 0,
+            "the waiting start did not run once the quota it waited for came back, or ended bounded");
+  }
+  {
+    Spilling spill(3);
+    spill.engine.submit(Spilling::prompt(1, 1, 3, 200));
+    spill.runUntilIdle();
+    require(spill.events.failures == std::vector<std::string>{"kv_disk_quota"} &&
+                !spill.events.failureDetails.front().second &&
+                spill.events.failureDetails.front().first.find("--max-cache-disk") !=
+                    std::string::npos &&
+                spill.engine.snapshot().spill.refusedQuota == 1 && spill.committedSlots() == 0,
+            "a start the quota cannot hold even alone was not refused naming it");
+  }
+}
+
+// On a target whose prefill groups save only a spilling lane's reads, its
+// experts loaded whole, a Spill request's long prompt runs as groups and a
+// Resident one's as chunks, as without the SSD cache: a request that arrives
+// beside a Resident one waits for a chunk, not a group.
+void testOnlySpillingLanesRunPrefillGroups() {
+  for (const bool spills : {false, true}) {
+    Spilling spill(256, spills);
+    spill.model.groupRows = 4 * model::ExecutionLimits::prefillTokenBudget;
+    spill.model.groupsOnlySpilling = true;
+    // Groups run once prefill has a measured cost, as after the start's.
+    spill.engine.observePrefill(model::ExecutionLimits::prefillTokenBudget, 1000.0, 0.0);
+    // 128 pages and a token: three chunks, or one group.
+    spill.engine.submit(Spilling::prompt(1, 1, 128, 1));
+    spill.runUntilIdle();
+    require(spill.events.completedCount == 1 && spill.model.prefillChunks.at(1) == (spills ? 1u : 3u),
+            spills ? "a Spill request's prompt did not run as a prefill group"
+                   : "a Resident request's prompt ran as a prefill group");
+  }
+}
+
+// A Resident lane that restored a spilled chain, whose copies landed, and
+// converts to Spill when memory refuses its prefill command spills the
+// chain's pages at once (Cache::convertToSpill): from that command on it
+// streams its history from the SSD cache, which the plan made before did
+// not know. The command runs it as the scheduler runs a lane that streams,
+// alone and whole: in one pass where the model runs a command in passes
+// over its layers, and without a lane planned beside it, which it leads or
+// follows. Only a command that streams the history reserves its staging.
+// Refused it, the lane leaves the command it leads, and the peer planned
+// beside it runs there: nothing yields.
+void testALaneThatConvertsAtItsPrefillRunsItAloneAndWhole() {
+  // The model's passes; the rows of a peer whose prompt has run a chunk,
+  // beside which the lane's command is planned: none, more than the lane's,
+  // or fewer; and whether the model refuses the lane its staging there.
+  for (const auto &[passes, peerRows, refused] :
+       {std::tuple{4u, 0u, false}, {1u, 300u, false}, {1u, 40u, false}, {1u, 300u, true}}) {
+    Spilling spill(64, false);
+    // Each prefill command: its lanes, its passes, and the lane whose
+    // history it streams, if any (one at most, as the model checks).
+    struct Command final {
+      std::vector<uint64_t> lanes;
+      uint32_t passes;
+      uint64_t streamed;
+    };
+    std::vector<Command> prefills;
+    spill.model.commandTimes = [&](const BatchPlan &plan, std::span<const ModelBatchItem> items) {
+      if (plan.kind == WorkKind::Prefill) {
+        const auto streamed = std::ranges::find_if(items, [](const ModelBatchItem &item) {
+          return item.pageSources != nullptr;
+        });
+        std::vector<uint64_t> lanes;
+        for (const ModelBatchItem &item : items)
+          lanes.push_back(item.requestId);
+        prefills.push_back(
+            {std::move(lanes), plan.passes, streamed == items.end() ? 0 : streamed->requestId});
+      }
+      return test::CommandTimes{};
+    };
+    // The first turn converts at the memory wall as it decodes, and its
+    // pages spill as their copies land, but its dense page and its window's;
+    // the wall took its states, and the turn again keeps one at its end.
+    spill.storage.budgetPages = 9;
+    spill.engine.submit(Spilling::prompt(1, 1, 7, 40));
+    spill.runUntilIdle();
+    std::vector<uint32_t> history(7 * KvCache::pageTokens + 1, 1);
+    history.insert(history.end(), spill.events.outputs.at(1).begin(), spill.events.outputs.at(1).end());
+    spill.storage.budgetPages = std::numeric_limits<uint32_t>::max();
+    spill.engine.submit(request(2, history));
+    spill.runUntilIdle();
+    require(spill.engine.snapshot().spill.converted == 1 && spill.cache.spillSnapshot().spilledPages == 6,
+            "the first turn did not spill its chain");
+    // The next turn starts Resident and restores the chain into Full pages,
+    // its copies kept; 192 tokens more take seven pages past its eight.
+    spill.model.passes = passes;
+    spill.engine.observePrefill(model::ExecutionLimits::prefillTokenBudget, passes > 1 ? 4900.0 : 1000.0,
+                                passes > 1 ? 3400.0 : 0.0);
+    history.insert(history.end(), 192, 5);
+    spill.engine.submit(request(3, history));
+    static_cast<void>(spill.engine.tick(spill.now++));
+    if (peerRows) {
+      // A peer runs its first chunk while the restore is in flight, which
+      // lands before the peer's next command.
+      spill.engine.submit(
+          request(4, std::vector<uint32_t>(model::ExecutionLimits::prefillTokenBudget + peerRows, 7)));
+      static_cast<void>(spill.engine.tick(spill.now++));
+      spill.tier.complete();
+      static_cast<void>(spill.engine.tick(spill.now++));
+    }
+    // The host refuses growth until the chain spills again: the lane's
+    // command converts it, and its pages move into free Index pages.
+    spill.storage.growthAllowed = [&](uint32_t) { return spill.cache.spillSnapshot().spilledPages != 0; };
+    if (refused) {
+      spill.model.refusedStaging = {3};
+      spill.runUntil([&] { return spill.engine.snapshot().spill.converted == 2; },
+                     "the lane did not convert at its prefill");
+      // The command in flight, beside which no lane decodes, is the one the
+      // lane converted at: its peer's.
+      require(spill.engine.commandInFlight() && prefills.back().lanes == std::vector<uint64_t>{4} &&
+                  spill.engine.snapshot().resourceSuspensions == 0,
+              "a lane refused its staging held back the peer it leads, or a lane yielded");
+      spill.model.refusedStaging.clear();
+    }
+    spill.runUntilIdle();
+    require(spill.events.failedCount == 0 && spill.events.completedCount == (peerRows ? 4u : 3u) &&
+                spill.engine.snapshot().spill.converted == 2 &&
+                std::ranges::any_of(prefills, [](const Command &command) { return command.streamed == 3; }),
+            "the lane did not convert at its prefill and stream its history");
+    require(std::ranges::all_of(prefills,
+                                [](const Command &command) {
+                                  return !command.streamed ||
+                                         (command.lanes.size() == 1 && command.passes == 1);
+                                }),
+            "a command streamed a lane's history beside another lane or in passes");
+    std::vector<uint64_t> streamed;
+    for (const Command &command : prefills)
+      if (command.streamed)
+        streamed.push_back(command.streamed);
+    require(spill.model.stagings == streamed,
+            "a lane reserved the history's staging for a command that did not stream it");
+  }
+}
+
+// The Full extents a spill empties leave memory, but one, the runway, while
+// a spilling prompt still grows into it or the host holds growth back.
+void testSpilledFullExtentsLeaveOnceNoPromptGrows() {
+  for (const bool paused : {false, true}) {
+    Spilling spill(1024);
+    const auto emptyFullExtents = [&] {
+      const KvPoolSnapshot pool = spill.pool.snapshot();
+      return (pool.reclaimableBytes - pool.index.reclaimableBytes) /
+             (uint64_t{spill.pool.extentPages()} * spill.pool.bytesPerPage());
+    };
+    // 70 pages and a token: two prefill commands, the second after the
+    // first's pages spilled, then 64 tokens of output.
+    spill.paused = paused;
+    spill.engine.submit(Spilling::prompt(1, 1, 70, 64));
+    uint64_t prompting = 0;
+    spill.runUntil(
+        [&] {
+          if (spill.events.outputs.contains(1)) return true;
+          prompting = std::max(prompting, emptyFullExtents());
+          return false;
+        },
+        "the request did not decode");
+    spill.runUntil([&] { return spill.cache.spillSnapshot().spilledPages == 68; },
+                   "the prompt's pages did not spill");
+    require(spill.model.prefillChunks.at(1) == 2 && prompting <= 1 && emptyFullExtents() == (paused ? 1u : 0u),
+            paused ? "the Full extents spills emptied did not keep the runway while the host held growth back"
+                   : "the Full extents spills emptied stayed, or the runway went while the prompt grew");
+    spill.paused = false;
+    spill.runUntilIdle();
+  }
+}
+
+// While the host holds growth back, a Spill prompt's landed pages move to
+// Index pages past the runway too: the Index extents they take are memory
+// the request in service needs, as its Full pages are, and free many times
+// what they take. A prompt that the engine's limit holds with its pages
+// spilled, but not as Full pages, completes with them spilled.
+void testSpillMovesThroughTheHostPause() {
+  Spilling spill(1024);
+  // As the governor does, the host refuses growth unless a request in
+  // service needs it, then the engine's limit: 90 Full pages.
+  spill.storage.budgetPages = 90;
+  spill.storage.growthAllowed = [&](uint32_t) {
+    const bool host = spill.paused && !spill.serving;
+    spill.storage.allocationFailure =
+        host ? metal::AllocationFailure::HostPressure : metal::AllocationFailure::EngineBudget;
+    return !host;
+  };
+  spill.paused = true;
+  // 120 pages and a token: two prefill commands, the second after 62 of the
+  // first's 64 pages spilled, 58 of them past the runway's four Index pages.
+  // As Full pages, the prompt's 121 outgrow the limit.
+  spill.engine.submit(Spilling::prompt(1, 1, 120, 8));
+  spill.runUntilIdle();
+  require(spill.events.failedCount == 0 && spill.events.completedCount == 1 &&
+              spill.events.usage.at(1).second == 8 && spill.model.prefillChunks.at(1) == 2 &&
+              spill.cache.spillSnapshot().spilledPages == 118,
+          "a Spill prompt kept its landed pages Full under the host's pause until the engine's limit");
+}
+
+// A Spill request suspended for a higher priority returns its commitment
+// and commits again for what it still projects when it resumes; short of
+// that, the quota bounds its output there too, and the model is given that
+// bound. Each attempt bounds it afresh: a bounded attempt that could not
+// resume leaves the next one the whole output.
+void testSpillResumeCommitsAgain() {
+  for (const bool roomLater : {false, true}) {
+    Spilling spill(20);
+    // No copies: the request holds its whole history without any.
+    spill.allowSpillWrites(false);
+    EngineRequest background = Spilling::prompt(1, 1, 2, 100);
+    background.priority = RequestPriority::Background;
+    spill.engine.submit(std::move(background));
+    spill.runUntil([&] { return spill.events.outputs[1].size() >= 10; },
+                   "the request did not decode");
+    // A Normal start is refused memory while it is resident, which
+    // suspends it.
+    spill.model.beginGrowthBlocked = [&] {
+      return spill.model.lastBeginId == 2 && spill.model.requests.at(1).resident;
+    };
+    spill.model.resumeDenied = true;
+    spill.engine.submit(Spilling::prompt(2, 2, 1, 1));
+    spill.runUntil([&] { return spill.events.completedCount == 1; },
+                   "the Normal request did not run");
+    require(spill.model.suspensions == 1 && spill.committedSlots() == 0,
+            "the suspended request kept its commitment");
+    // Its projection is 5 pages, none copied; 4 hold its history and a page
+    // of output, 63 tokens in all.
+    spill.allowSpillWrites(true);
+    spill.budget->setActiveLimitBytes(4 * 100);
+    if (roomLater) {
+      const uint32_t attempts = spill.model.resumeAttempts;
+      spill.runUntil([&] { return spill.model.resumeAttempts > attempts; },
+                     "the request did not try to resume");
+      require(spill.model.outputLimits.at(1) == 63, "the refused resume was not bounded");
+      spill.budget->setActiveLimitBytes(20 * 100);
+    }
+    spill.model.resumeDenied = false;
+    spill.runUntil([&] { return spill.model.resumptions == 1; }, "the request did not resume");
+    require(spill.committedSlots() == (roomLater ? 5 : 4),
+            "the resumed request did not commit for what it still projects");
+    spill.runUntilIdle();
+    const uint32_t output = roomLater ? 100 : 63;
+    require(spill.events.completedCount == 2 && spill.events.usage.at(1).second == output &&
+                spill.model.outputLimits.at(1) == output && spill.committedSlots() == 0,
+            roomLater ? "a bound of a resume that did not start outlived it"
+                      : "the resumed request was not bounded to what the quota holds");
+  }
+}
+
+// A decoding lane whose history holds Index pages reads them through the hot
+// block cache: the model refuses its floor there, and decode runs the other
+// lanes without it, which waits rather than fails while they hold memory.
+void testDecodeLeavesOutALaneRefusedItsHotFloor() {
+  Spilling spill(64);
+  spill.model.refusedSpilledReads = {2};
+  spill.engine.submit(Spilling::prompt(1, 1, 5, 20));
+  spill.engine.submit(Spilling::prompt(2, 2, 5, 20));
+  spill.runUntil([&] { return spill.events.usage.contains(1); },
+                 "the lane given its floor did not finish");
+  require(spill.cache.holdsIndexPages(2) && !spill.events.outputs.contains(2) &&
+              spill.events.failedCount == 0,
+          "a lane refused its hot floor decoded or failed beside a lane that ran");
+  spill.model.refusedSpilledReads.clear();
+  spill.runUntilIdle();
+  require(spill.events.completedCount == 2 && spill.events.usage.at(2).second == 20,
+          "the lane refused its hot floor did not run once it had it");
+}
+
+// A prefill lane holds memory between its commands that a Spill lane's
+// first decode may need for its floor of the hot block cache, as a
+// streaming prompt holds its history's staging. Refused it beside a lane
+// that decodes, the lane takes it from the prefill lane, which yields before
+// it, as when no lane fits: it decodes while the prompt waits, rather than
+// once the decoding lane or the prompt has ended. It does not wait for the
+// pages written through after each command either, which a prompt keeps in
+// flight and which free too few pages to empty an extent: they return no
+// memory.
+void testARefusedDecodeTakesThePrefillLanesMemory() {
+  for (const bool writesInFlight : {false, true}) {
+    // With writes in flight, extents of 64 pages, which the requests share.
+    Spilling spill(1024, true, Spilling::Extent{writesInFlight ? 64u : 4u});
+    // Lane 3's floor fits only while the prompt's lane is not resident.
+    spill.model.spilledReadsRoom = [&](uint64_t id) {
+      const auto prompt = spill.model.requests.find(2);
+      return id != 3 || prompt == spill.model.requests.end() || !prompt->second.resident;
+    };
+    // Prefill takes 4 ms a row: beside a decoding lane, a command runs 64
+    // rows, two pages.
+    spill.model.commandTimes = [](const BatchPlan &plan, std::span<const ModelBatchItem>) {
+      uint32_t rows = 0;
+      for (const BatchItem &item : plan.items)
+        rows += item.tokenCount;
+      return test::CommandTimes{plan.kind == WorkKind::Decode ? 10.0 : 4.0 * rows};
+    };
+    // With writes in flight, the tier lands every transfer but the writes of
+    // the pages the prompt's lane holds, which stay in flight. No restore
+    // runs: its writes and transfers pair up in order.
+    std::unordered_set<uint32_t> promptPages;
+    const auto run = [&](const std::function<bool()> &done, const char *message) {
+      for (uint32_t step = 0; step < 2000 && !done(); ++step) {
+        static_cast<void>(spill.engine.tick(spill.now++));
+        const auto prompt = spill.model.requests.find(2);
+        if (writesInFlight && prompt != spill.model.requests.end() && prompt->second.resident)
+          for (const uint32_t page : spill.cache.pageTable(2).pages)
+            promptPages.insert(page);
+        for (size_t index = 0; index < spill.tier.writes.size(); ++index)
+          spill.tier.transfers.at(index)->ready =
+              !promptPages.contains(spill.tier.writes[index].page);
+      }
+      require(done(), message);
+    };
+    spill.engine.submit(Spilling::prompt(1, 1, 5, 200));
+    run([&] { return spill.events.outputs.contains(1); }, "the decoding lane did not start");
+    // The prompt runs three commands, whose pages but its first and last
+    // the tier would spill.
+    spill.engine.submit(Spilling::prompt(2, 2, 40, 1));
+    run([&] { return spill.model.prefillChunks[2] >= 3; }, "the prompt did not run");
+    spill.engine.submit(Spilling::prompt(3, 3, 5, 8));
+    run(
+        [&] {
+          return spill.events.outputs.contains(3) || spill.events.usage.contains(1) ||
+                 spill.events.usage.contains(2);
+        },
+        "no request decoded or ended");
+    require(spill.events.outputs.contains(3) && !spill.events.usage.contains(1) &&
+                !spill.events.usage.contains(2) &&
+                spill.engine.snapshot().resourceSuspensions == 1,
+            writesInFlight
+                ? "a lane refused its hot floor waited for writes that return no memory"
+                : "a lane refused its hot floor waited for the decoding lane or the prompt to end");
+    spill.runUntilIdle();
+    require(spill.events.completedCount == 3 && spill.events.failedCount == 0 &&
+                spill.events.usage.at(3).second == 8,
+            "the lanes did not all complete once the prompt had yielded");
+  }
+}
+
+// The model's memory for a lane's reads of spilled KV is memory the
+// governor funds: only an extent's bytes or a state's buffers make room for
+// it. Refused a lane's floor of the hot block cache, the engine evicts no KV
+// leaf whose page cannot empty an extent, as an idle spilled chain's Index
+// pages cannot, and asks for the floor again only once memory has come
+// back, not after each leaf.
+void testRefusedModelMemoryTakesWhatGivesMemoryBack() {
+  // Extents of 64 pages, which the requests share.
+  Spilling spill(1024, true, Spilling::Extent{64});
+  // An earlier conversation leaves its spilled chain cached, its pages
+  // holding their index.
+  const std::vector<uint32_t> earlier(40 * KvCache::pageTokens + 1, 1);
+  spill.engine.submit(request(1, earlier));
+  spill.runUntilIdle();
+  const uint32_t indexPages = spill.cache.spillSnapshot().spilledPages;
+  require(spill.cache.lookup(earlier, {}).kvBoundary == 40 * KvCache::pageTokens && indexPages != 0,
+          "the earlier conversation did not leave its spilled chain cached");
+  // A lane decodes beside one refused its floor.
+  uint32_t attempts = 0;
+  bool room = false;
+  spill.model.spilledReadsRoom = [&](uint64_t id) {
+    attempts += id == 3;
+    return id != 3 || room;
+  };
+  spill.engine.submit(Spilling::prompt(2, 2, 5, 200));
+  spill.engine.submit(Spilling::prompt(3, 3, 5, 8));
+  spill.runUntil([&] { return attempts != 0; }, "the lane did not ask for its floor");
+  require(attempts <= 4 && spill.cache.spillSnapshot().spilledPages >= indexPages,
+          "a refused floor evicted Index pages, asking for it again after each");
+  room = true;
+  spill.runUntilIdle();
+  require(spill.events.completedCount == 3 && spill.events.failedCount == 0,
+          "the lane refused its floor did not run once it had it");
+}
+
+// A cached chain leaves memory leaf first, and a leaf a state on the SSD
+// needs is written before it goes: its block keeps its page until the copy
+// lands, and only then is the block above it a leaf. So a chain whose newest
+// blocks have no copy, as a finished lane's prompt past the chain it restored
+// or a cancelled cold prompt, gives its memory back one landed write at a
+// time, the blocks with a copy at once after them. A Spill lane refused its
+// floor of the hot block cache, left alone by such a neighbour, waits for
+// those writes rather than fail while the memory it lacks comes back.
+void testALoneLaneWaitsForTheChainANeighbourLeft() {
+  for (const bool restored : {true, false}) {
+    // Extents of 16 pages, which the requests share. Every state goes
+    // straight to the SSD.
+    Spilling spill(1024, true, Spilling::Extent{16});
+    spill.model.deniedReservations = std::numeric_limits<uint32_t>::max();
+    spill.model.stateTier = std::make_shared<OffloadControl>();
+    spill.model.stateTier->ready = true;
+    spill.model.restoreControl->ready = true;
+    // An earlier turn leaves its chain spilled, its copies written through.
+    if (restored) {
+      spill.engine.submit(Spilling::prompt(1, 1, 40, 1));
+      spill.runUntilIdle();
+    }
+    // The neighbour starts Resident, as a request does while the SSD cache
+    // takes no writes: it restores that chain into Full pages, its copies
+    // kept, or none, and runs eight pages of prompt past it.
+    spill.tier.writableFile = false;
+    spill.engine.submit(Spilling::prompt(2, 1, 48, 10000));
+    spill.runUntil([&] { return spill.events.outputs.contains(2); }, "the neighbour did not decode");
+    spill.tier.writableFile = true;
+    // The Spill lane's floor fits once two extents have left memory since it
+    // first asked for it.
+    std::optional<uint64_t> limit;
+    spill.model.spilledReadsRoom = [&](uint64_t id) {
+      if (id != 3)
+        return true;
+      if (!limit)
+        limit = spill.storage.allocatedBytes() - 2 * 16 * 100;
+      return spill.storage.allocatedBytes() <= *limit;
+    };
+    spill.engine.submit(Spilling::prompt(3, 3, 20, 8));
+    spill.runUntil([&] { return limit.has_value(); }, "the Spill lane did not ask for its floor");
+    // The neighbour finishes, or is cancelled.
+    if (restored)
+      spill.model.decodeFinishes = true;
+    else
+      spill.engine.cancel(2);
+    spill.runUntilIdle();
+    require(spill.events.failedCount == 0 && spill.events.outputs.contains(3),
+            restored ? "a lone lane refused its floor failed while a finished neighbour's chain was written"
+                     : "a lone lane refused its floor failed while a cancelled neighbour's chain was written");
+    require(std::ranges::count_if(spill.tier.writes,
+                                  [](const test::TestKvTier::Write &write) {
+                                    return write.write == WriteClass::Reclaim;
+                                  }) > 1,
+            "the neighbour's chain left memory without writes one after another");
+  }
+}
+
+// A lane's memory for its reads of spilled KV is reserved once every lane of
+// the command has its KV: a lane that converts to Spill moves the landed
+// pages of the blocks it shares with Spill lanes to the index form, those
+// of a lane admitted before it in the command too. Here a Spill lane and a
+// Resident one decode on the same prompt, whose copies the Spill lane
+// wrote: those pages stay Full while the Resident lane holds them, so the
+// Spill lane reads no Index page. Refused a page at the wall, the Resident
+// lane, after it in the command, converts and its pages spill: both lanes
+// read them through their floors of the hot block cache.
+void testAConversionLeavesNoLaneWithoutItsFloor() {
+  Spilling spill(1024);
+  // The Spill lane writes its copies only once the Resident lane holds them.
+  spill.allowSpillWrites(false);
+  spill.engine.submit(Spilling::prompt(1, 1, 4, 200));
+  spill.runUntil([&] { return spill.events.outputs.contains(1); }, "the Spill lane did not decode");
+  // The Resident lane starts while the SSD cache takes no writes.
+  spill.tier.writableFile = false;
+  spill.engine.submit(Spilling::prompt(2, 1, 4, 200));
+  spill.runUntil([&] { return spill.events.outputs.contains(2); }, "the Resident lane did not decode");
+  spill.tier.writableFile = true;
+  spill.allowSpillWrites(true);
+  // Lane 2's next command needs a page that lane 1's does not.
+  const auto needsPage = [&](uint64_t id) {
+    const uint64_t tokens = 4 * KvCache::pageTokens + 1 + spill.events.outputs[id].size() +
+                            model::ExecutionLimits::targetVerifyRows;
+    return tokens > uint64_t{spill.cache.pageTable(id).pages.size()} * KvCache::pageTokens;
+  };
+  spill.runUntil(
+      [&] {
+        return !spill.engine.commandInFlight() &&
+               spill.cache.copiedBlocks(spill.cache.blockAt(1, 4 * KvCache::pageTokens)) == 4 &&
+               needsPage(2) && !needsPage(1);
+      },
+      "lane 2 did not come to need a page that lane 1 does not");
+  require(spill.engine.snapshot().spill.spill == 1 && spill.engine.snapshot().spill.resident == 1 &&
+              !spill.cache.holdsIndexPages(1) &&
+              spill.cache.pageTable(1).pages.front() == spill.cache.pageTable(2).pages.front(),
+          "the lanes did not share the prompt, its pages Full beside their copies");
+  // At the wall: no free Full page, and no growth.
+  spill.storage.growthBlocked = true;
+  const KvPageAcquisition held = spill.pool.acquirePages(spill.pool.freePageCount());
+  static_cast<void>(spill.engine.tick(spill.now++));
+  require(held.granted() && spill.engine.commandInFlight() &&
+              spill.engine.snapshot().spill.converted == 1 && spill.cache.holdsIndexPages(1) &&
+              spill.model.spilledReadFloors.contains(1) && spill.model.spilledReadFloors.contains(2),
+          "a lane whose pages a later lane's conversion spilled read them without its floor");
+  for (const uint32_t page : held.pages)
+    spill.pool.releasePage(page, false);
+  spill.storage.growthBlocked = false;
+  spill.model.decodeFinishes = true;
+  spill.runUntilIdle();
+  require(spill.events.completedCount == 2 && spill.events.failedCount == 0,
+          "the lanes did not complete after the conversion");
+}
+
+// A Spill lane whose pages the SSD cache takes no more of keeps them Full.
+// Alone at the memory wall, a decoding lane then ends with Length, as at
+// the end of its context, and a prefilling one fails naming the SSD cache;
+// either returns its commitment.
+void testLoneSpillLaneEndsAtTheWall() {
+  for (const bool decoding : {true, false}) {
+    Spilling spill(64);
+    // Two Full extents beside the Index runway: eight Full pages.
+    spill.storage.budgetPages = 9;
+    spill.allowSpillWrites(false);
+    spill.engine.submit(Spilling::prompt(1, 1, decoding ? 4 : 10, 200));
+    spill.runUntilIdle();
+    if (decoding) {
+      const uint32_t output =
+          spill.events.usage.contains(1) ? spill.events.usage.at(1).second : 0;
+      require(spill.events.failedCount == 0 && output > 0 &&
+                  4 * KvCache::pageTokens + 1 + output <= 8 * KvCache::pageTokens &&
+                  spill.engine.snapshot().spill.lengthEnds == 1 &&
+                  spill.events.boundedIds == std::vector<uint64_t>{1},
+              "a lone Spill lane at the wall did not end with Length at its bound");
+    } else {
+      require(spill.events.failures == std::vector<std::string>{"capacity_exhausted"} &&
+                  spill.events.failureDetails.front().first.find("SSD cache") !=
+                      std::string::npos,
+              "a lone Spill prefill at the wall did not fail naming the SSD cache");
+    }
+    require(spill.committedSlots() == 0, "the lane kept its commitment");
+  }
+}
+
+// The hot block cache grows toward its planned size between commands, an
+// allocation that may be refused: refused, it takes no cache the model can
+// rebuild, among which that cache's own slots past its floor are, and
+// nothing while the host refuses growth. The lane decodes all the same.
+void testHotCacheGrowthTakesNoModelCache() {
+  for (const auto failure :
+       {metal::AllocationFailure::EngineBudget, metal::AllocationFailure::HostPressure}) {
+    Spilling spill(64);
+    spill.model.cacheUnits = {100};
+    spill.model.refusedGrowth = failure;
+    spill.engine.submit(Spilling::prompt(1, 1, 5, 20));
+    spill.runUntilIdle();
+    require(spill.model.growthAttempts > 0 && spill.model.cacheReclaims == 0 &&
+                spill.model.cacheUnits.size() == 1 && spill.events.completedCount == 1 &&
+                spill.events.failedCount == 0,
+            "the hot block cache's growth took a cache the model can rebuild");
+  }
+}
+
+// A Spill lane past its dense history and tail window streams its history
+// in each prefill command. Beside a decoding lane its commands take the
+// rows of any contended command until one has read Index pages; that one's
+// wait on the reads (ModelBatchTicket::streamMilliseconds) then sizes the
+// next: its group's rows, halved while they still cover the wait. A command
+// that read nothing, as before its pages spilled, leaves that estimate
+// alone, and the decoding lane's gaps across its commands are recorded.
+void testStreamingLaneSizesItsCommandsByItsReads() {
+  Spilling spill(256);
+  // Prefill takes 1.5 ms a row, so a contended command takes 256 rows; one
+  // that reads Index pages waits a second more on the reads. The rows of
+  // the long prompt's commands, and whether each read Index pages.
+  std::vector<std::pair<uint32_t, bool>> commands;
+  spill.model.commandTimes = [&](const BatchPlan &plan, std::span<const ModelBatchItem> items) {
+    if (plan.kind == WorkKind::Decode)
+      return test::CommandTimes{.wallMilliseconds = 10.0};
+    uint32_t rows = 0;
+    for (const BatchItem &item : plan.items)
+      rows += item.tokenCount;
+    const bool reads = items.front().pageSources != nullptr;
+    if (plan.items.front().requestId == 1)
+      commands.emplace_back(rows, reads);
+    const double stream = reads ? 1000.0 : 0.0;
+    return test::CommandTimes{1.5 * rows + stream, stream, stream};
+  };
+  spill.engine.submit(Spilling::prompt(2, 2, 3, 400));
+  spill.runUntil([&] { return spill.events.outputs.contains(2); },
+                 "the decoding lane did not start");
+  // The long prompt's pages are written only once its second command, past
+  // its dense history and tail window, has run: that command reads nothing.
+  spill.allowSpillWrites(false);
+  spill.engine.submit(Spilling::prompt(1, 1, 56, 1));
+  spill.runUntil([&] { return commands.size() == 2; }, "the long prompt did not run twice");
+  spill.allowSpillWrites(true);
+  spill.runUntil([&] { return spill.events.usage.contains(1); }, "the long prompt did not end");
+  const std::vector<std::pair<uint32_t, bool>> expected{
+      {256, false}, {256, false}, {256, true}, {1024, true}, {1, true}};
+  const SchedulerSnapshot scheduler = spill.engine.snapshot().scheduler;
+  require(commands == expected && scheduler.contendedStreamingPrefillBatches == 3 &&
+              scheduler.decodeGap.count == 3,
+          "the streaming lane's commands were not sized by its reads");
+  spill.runUntilIdle();
+}
+
+// KV that the SSD cache cannot read back fails only the lane that read it,
+// as a retry recomputes it (503 kv_unreadable), before that lane's command
+// publishes or emits anything, and without taking the state it restored for
+// the failure: the read says nothing of it. The other lanes go on, and the
+// block's copy is given up, so no later lookup matches it or what follows.
+void testUnreadableKvEndsOnlyItsLane() {
+  Spilling spill(64);
+  // A first request leaves the state at 128 tokens that the failing lane
+  // restores.
+  spill.engine.submit(Spilling::prompt(30, 3, 4, 2));
+  spill.runUntil([&] { return spill.events.outputs.contains(30); },
+                 "the first request did not decode");
+  const uint64_t unreadable = spill.cache.blockAt(30, 2 * KvCache::pageTokens);
+  spill.runUntilIdle();
+  const uint64_t invalidations = spill.cache.snapshot().stateCache.invalidations;
+  // The failing lane's first step after its restore reads the block, and
+  // cannot.
+  spill.model.unreadableBlocks[3] = {unreadable};
+  for (uint64_t id = 1; id <= 4; ++id)
+    spill.engine.submit(Spilling::prompt(id, static_cast<uint32_t>(id), id == 3 ? 6 : 4, 4));
+  spill.runUntilIdle();
+  require(spill.events.failures == std::vector<std::string>{"kv_unreadable"} &&
+              spill.events.failureDetails.front().second && spill.events.completedCount == 4 &&
+              !spill.events.outputs.contains(3) &&
+              std::ranges::all_of(std::array<uint64_t, 3>{1, 2, 4},
+                                  [&](uint64_t id) {
+                                    return spill.events.usage.at(id).second == 4;
+                                  }),
+          "unreadable KV failed other lanes, or its own lane emitted its step");
+  require(spill.cache.snapshot().stateCache.invalidations == invalidations,
+          "the state the failing lane restored was taken for the failure");
+  const std::vector<uint32_t> prompt(6 * KvCache::pageTokens + 1, 3);
+  require(spill.cache.lookup(prompt, {}).kvBoundary == KvCache::pageTokens &&
+              spill.committedSlots() == 0,
+          "a lookup still matched the block whose copy could not be read");
+}
+
+// A request's KV is projected to hold its prompt and at most
+// kProjectedOutputTokens (4096) of output, whatever its output limit: a
+// Spill start commits for that much.
+void testProjectionClipsTheOutput() {
+  Spilling spill(200);
+  spill.engine.submit(Spilling::prompt(1, 1, 1, 10'000));
+  spill.runUntil([&] { return spill.events.startIds.size() == 1; }, "the request did not start");
+  require(spill.committedSlots() == (KvCache::pageTokens + 1 + kProjectedOutputTokens) /
+                                        KvCache::pageTokens,
+          "the projection did not clip the output limit");
+  spill.engine.cancel(1);
+  spill.runUntilIdle();
+  require(spill.committedSlots() == 0, "the cancelled request kept its commitment");
+}
+
+// A Spill start commits once it holds its lane, before it restores its
+// prefix: a restore that fails vacates the lane and returns the commitment,
+// and the start runs later from the prefix that remains.
+void testFailedRestoreReturnsTheCommitment() {
+  Spilling spill(64);
+  // The first request's state at 128 tokens goes to the disk tier: no cache
+  // slot takes it.
+  spill.model.deniedReservations = 1000;
+  spill.model.stateTier = std::make_shared<OffloadControl>();
+  spill.model.stateTier->ready = true;
+  spill.engine.submit(Spilling::prompt(1, 1, 4, 1));
+  spill.runUntilIdle();
+  require(spill.engine.snapshot().diskStatePublications == 1,
+          "fixture did not write the replay state to disk");
+  spill.engine.submit(Spilling::prompt(2, 1, 6, 1));
+  spill.runUntil([&] { return spill.model.diskReads == 1; }, "the start did not restore its state");
+  require(spill.committedSlots() > 0, "the start did not commit before its restore");
+  // The read fails; the start's next attempt waits for the host.
+  bool hostRefuses = true;
+  spill.model.beginAllocationFailure = metal::AllocationFailure::HostPressure;
+  spill.model.beginGrowthBlocked = [&] { return hostRefuses; };
+  spill.model.restoreControl->ready = true;
+  spill.model.restoreControl->success = false;
+  static_cast<void>(spill.engine.tick(spill.now++));
+  require(spill.committedSlots() == 0 && spill.events.startIds.size() == 1,
+          "the failed restore kept its commitment");
+  hostRefuses = false;
+  spill.runUntilIdle();
+  require(spill.events.completedCount == 2 && spill.events.starts.back() == 0 &&
+              spill.committedSlots() == 0,
+          "the start did not run from the prefix that remained");
 }
 
 } // namespace
@@ -10335,6 +11508,8 @@ int main() {
     testSharedPrefillWaiterCancellationAndDeadline();
     testSharedPrefillFailedPublicationFallsBack();
     testSharedPrefillDoesNotBlockUnrelatedWork();
+    testImagePromptsRunPrefillGroups();
+    testPrefillPassesInterleaveDecodeAndEndAtACancel();
     testSharedPrefillHonorsPriorityAndLateArrival();
     testLateSharedPrefillExtendsTheProducerPlan();
     testLateSiblingBoundaryNeedsAWholeDraftWindow();
@@ -10399,6 +11574,27 @@ int main() {
     testCheckpointsSkipNearResumeAndReplayBoundaries();
     testDecodeShareValidation();
     testIncompleteConfigIsRefused();
+    testUnwritableTierKeepsRequestsResident();
+    testSpillCommitmentCoversTheChainWithoutCopies();
+    testConversionCommitsTheHistoryWithoutCopies();
+    testAStartThatConvertsCountsNoConversion();
+    testShortQuotaBoundsWaitsOrRefusesASpillStart();
+    testOnlySpillingLanesRunPrefillGroups();
+    testALaneThatConvertsAtItsPrefillRunsItAloneAndWhole();
+    testSpilledFullExtentsLeaveOnceNoPromptGrows();
+    testSpillMovesThroughTheHostPause();
+    testSpillResumeCommitsAgain();
+    testDecodeLeavesOutALaneRefusedItsHotFloor();
+    testARefusedDecodeTakesThePrefillLanesMemory();
+    testRefusedModelMemoryTakesWhatGivesMemoryBack();
+    testALoneLaneWaitsForTheChainANeighbourLeft();
+    testAConversionLeavesNoLaneWithoutItsFloor();
+    testLoneSpillLaneEndsAtTheWall();
+    testHotCacheGrowthTakesNoModelCache();
+    testStreamingLaneSizesItsCommandsByItsReads();
+    testUnreadableKvEndsOnlyItsLane();
+    testProjectionClipsTheOutput();
+    testFailedRestoreReturnsTheCommitment();
     testColdPublishesReplayStateAndRebuildsALostOne();
     testConcurrentDuplicateStateIsCapturedOnce();
     testReplayStateEndsBeforeTheGenerationPrompt();
@@ -10468,6 +11664,7 @@ int main() {
     testRefusedStartKeepsItsLeaseBesideAResidentLane();
     testRefusedStartKeepsItsLeaseWhileMemoryIsPending();
     testDroppedLeaseLooksUpAgain();
+    testHostRefusedStartKeepsItsLease();
     testSingletonCapacityFailureTerminatesCleanly();
     testQueuedLongPrefillsLeaveRoomForShortWork();
     testAdmissionUsesCachedRemainingWork();
@@ -10487,6 +11684,7 @@ int main() {
     testGrowthKeepsPrefillProgressWhenAnUnstartedPeerCanYield();
     testGrowthYieldsLowerPriorityResidentOutsideBatch();
     testPrefillGrowthPreservesAnActiveDecodePeer();
+    testARefusedDecodeLeavesThePromptOutsideItsCommand();
     testKvPressureSuspendsInsteadOfKillingActiveWork();
     testRecoveryDrainDoesNotConsumeResourceWaitBudget();
     testRecoveryDrainEndsWithItsCause();
@@ -10505,6 +11703,7 @@ int main() {
     testResumedLaneRebuildsItsPointFromCachedKv(2);
     testRefusedBuffersTakeAtMostOneStateOfExtents();
     testSharedJunctionPublishesFromCachedKv();
+    testRefusedStateAsksAgainOnceAnExtentLeft();
     testPausedPublicationInUseTakesNoKv();
     testPreemptedDecodeRestoresItsResidentCompositeState();
     testPreemptedDecodeReplayBoundaryIgnoresTheGenerationPrompt();

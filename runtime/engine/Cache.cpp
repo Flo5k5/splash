@@ -510,7 +510,7 @@ CacheReclaimResult Cache::evictAll() {
   uint64_t released = releaseEmptyExtents(false);
   bool evicted = false;
   // Everything unpinned goes before anything moves.
-  while (evictOne(ReclaimClass::InUse, false, false).madeProgress)
+  while (evictOne({.mode = CacheReclaimMode::KeepExtents, .upTo = ReclaimClass::InUse}).madeProgress)
     evicted = true;
   do {
     released += releaseEmptyExtents(false);
@@ -527,17 +527,23 @@ CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode, ReclaimClass upTo,
       return released;
   }
   CacheReclaimResult evicted =
-      evictOne(upTo, keepResumePoint, mode == CacheReclaimMode::ReusePages);
+      evictOne({.mode = mode, .upTo = upTo, .keepResumePoint = keepResumePoint});
   if (evicted.madeProgress && release)
     evicted.reclaimedBytes += pool_.reclaimEmptyExtents(keepRunway, 1);
   return evicted;
 }
 
-CacheReclaimResult Cache::evictOne(ReclaimClass upTo, bool keepResumePoint, bool pagesOnly) {
+CacheReclaimResult Cache::evictOne(const EvictionStep &step) {
+  const bool pagesOnly = step.mode == CacheReclaimMode::ReusePages;
+  // Whether a transfer in flight can return what the step needs before
+  // anything in use goes.
+  const auto returns = [&] {
+    return step.refused ? returnsInFlight(*step.refused) : transfersInFlight();
+  };
   // Disposable checkpoints go first, except in a page scan, to which their
   // buffers give no page; one whose write must wait for the one in flight
   // stays and holds back nothing else.
-  if (const auto oldest = states_.checkpointCandidate(keepResumePoint); oldest && !pagesOnly) {
+  if (const auto oldest = states_.checkpointCandidate(step.keepResumePoint); oldest && !pagesOnly) {
     if (states_.reclaim(oldest->id, StateCache::Unwritten::Wait).evicted)
       return {.madeProgress = true, .evictedState = true};
   }
@@ -547,12 +553,12 @@ CacheReclaimResult Cache::evictOne(ReclaimClass upTo, bool keepResumePoint, bool
   // KV they need follow in a pass of their own, up to InUse and once no
   // transfer in flight can return what is needed first.
   for (const bool inUse : {false, true}) {
-    if (inUse && upTo == ReclaimClass::Ordinary)
+    if (inUse && step.upTo == ReclaimClass::Ordinary)
       break;
-    if (inUse && transfersInFlight())
+    if (inUse && returns())
       return {.pending = true};
     if (const auto victim = reclaimOldest({.inUse = inUse,
-                                           .keepResumePoint = keepResumePoint,
+                                           .keepResumePoint = step.keepResumePoint,
                                            .unwritten = StateCache::Unwritten::Wait,
                                            .timing = ReclaimTiming::CanWait,
                                            .pagesOnly = pagesOnly}))
@@ -560,7 +566,7 @@ CacheReclaimResult Cache::evictOne(ReclaimClass upTo, bool keepResumePoint, bool
   }
   // Nothing to reclaim now. Transfers land only in pollTransfers(), so what
   // was in flight during the pass still is, and comes back.
-  return {.pending = transfersInFlight()};
+  return {.pending = returns()};
 }
 
 CacheReclaimResult Cache::reclaimForPages(uint32_t pages, CacheReclaimMode mode,
@@ -587,7 +593,8 @@ CacheReclaimResult Cache::reclaimForPages(uint32_t pages, CacheReclaimMode mode,
   // Leaves of either form go, oldest first: an idle spilled chain's Index
   // leaves go before the Full pages of its dense history above them.
   while (pool_.freePageCount(form) + pendingPages(form) < pages) {
-    const CacheReclaimResult step = reclaimOne(mode, upTo);
+    const CacheReclaimResult step =
+        evictOne({.mode = mode, .upTo = upTo, .refused = Shortfall{pages, form}});
     if (!step.madeProgress) {
       total.pending = step.pending;
       break;
@@ -601,6 +608,33 @@ CacheReclaimResult Cache::reclaimForPages(uint32_t pages, CacheReclaimMode mode,
       break;
   }
   return total;
+}
+
+CacheReclaimResult Cache::reclaimForMemory(ReclaimClass upTo, bool keepRunway) {
+  const Shortfall memory{pool_.extentPages(), kv::PageForm::Full};
+  // Free pages first, as the extent they fill; one that empties the runway
+  // kept gives nothing yet, and the next one does.
+  for (CacheReclaimResult released; (released = releaseExtent(keepRunway)).madeProgress;)
+    if (released.reclaimedBytes)
+      return released;
+  // Then the victims in reclaimOne's order while their KV can empty an
+  // extent, until one is released or a state goes; otherwise only a state.
+  // Whatever it returns says whether KV went.
+  bool evictedKv = false;
+  const auto outcome = [&](CacheReclaimResult result) {
+    result.evictedKv = evictedKv;
+    return result;
+  };
+  while (extentWithinReach(upTo)) {
+    const CacheReclaimResult evicted =
+        evictOne({.mode = CacheReclaimMode::ReleaseExtents, .upTo = upTo, .refused = memory});
+    if (!evicted.madeProgress || evicted.evictedState)
+      return outcome(evicted);
+    evictedKv = true;
+    if (const CacheReclaimResult released = releaseExtent(keepRunway); released.reclaimedBytes)
+      return outcome(released);
+  }
+  return outcome(recycleState(upTo, memory));
 }
 
 uint32_t Cache::reusablePages(ReclaimClass upTo, kv::PageForm form) const {
@@ -697,15 +731,20 @@ StateRoom Cache::reclaimOneState(StateClass state, bool growth) {
 }
 
 CacheReclaimResult Cache::reclaimStateForLane(ReclaimClass upTo) {
+  // No page covers a state's buffers.
+  return recycleState(upTo, Shortfall{});
+}
+
+CacheReclaimResult Cache::recycleState(ReclaimClass upTo, const Shortfall &shortfall) {
   // Running work takes a state in use after every other, once no transfer
   // in flight can return what is needed first.
   std::optional<CacheEvictionCandidate> state = states_.checkpointCandidate(false);
   if (!state)
     state = states_.ordinaryCandidate(false);
-  if (!state && upTo == ReclaimClass::InUse && !transfersInFlight())
+  if (!state && upTo == ReclaimClass::InUse && !returnsInFlight(shortfall))
     state = states_.inUseCandidate();
   if (!state)
-    return {.pending = transfersInFlight()};
+    return {.pending = returnsInFlight(shortfall)};
   const StateEviction eviction = states_.reclaim(state->id, StateCache::Unwritten::Wait);
   return {.madeProgress = eviction.evicted,
           .pending = eviction.pending,
@@ -791,8 +830,8 @@ void Cache::dropPoisoned() {
   });
 }
 
-bool Cache::extentWithinReach() const {
-  return pendingPages(kv::PageForm::Full) + pool_.extentPages() <= reusablePages(ReclaimClass::Ordinary);
+bool Cache::extentWithinReach(ReclaimClass upTo) const {
+  return writes(WriteClass::Reclaim) + pool_.extentPages() <= reusablePages(upTo);
 }
 
 CacheReclaimResult Cache::releaseExtent(bool keepRunway) {
@@ -847,6 +886,17 @@ bool Cache::transfersInFlight() const noexcept {
          states_.writing() || spillingWrites();
 }
 
+bool Cache::returnsInFlight(const Shortfall &shortfall) const noexcept {
+  if (!restores_.empty() || writes(WriteClass::Reclaim) || writes(WriteClass::Persist) ||
+      states_.writing())
+    return true;
+  // With no demotion in flight, the pages of the form that transfers free
+  // are those written through that will spill.
+  const uint32_t freed = pendingPages(shortfall.form);
+  return freed && shortfall.pages &&
+         pool_.freePageCount(shortfall.form) + freed >= shortfall.pages;
+}
+
 uint64_t Cache::pendingBytes() const noexcept {
   return uint64_t{pendingPages(kv::PageForm::Full)} * pool_.bytesPerPage();
 }
@@ -893,8 +943,8 @@ bool Cache::commitSpill(uint64_t requestId, uint32_t pages) {
 
 bool Cache::convertToSpill(uint64_t requestId, uint32_t pages) {
   Request &active = request(requestId);
-  if (!spill_ || active.mode == KvMode::Spill || !kvTierWritable() ||
-      !diskBudget_->admitsSpill(diskBudget_->committedBytes()) || !commit(active, pages))
+  if (!spill_ || active.mode == KvMode::Spill || spillGate() != SpillGate::Open ||
+      !commit(active, pages))
     return false;
   active.mode = KvMode::Spill;
   active.spillOrder = ++spillSequence_;

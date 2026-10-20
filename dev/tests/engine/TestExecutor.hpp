@@ -232,6 +232,7 @@ public:
     if (beginObserver) beginObserver();
     beganFlags[request.id] = request.flags;
     beganSampling[request.id] = request.sampling;
+    outputLimits[request.id] = request.maxNewTokens;
     if (beginGrowthBlocked && beginGrowthBlocked())
       return {{}, StateFailure::MemoryPressure, beginAllocationFailure};
     if (deniedBegins) {
@@ -263,6 +264,8 @@ public:
     if (!entry.resident)
       throw std::logic_error("request is already suspended");
     pageTables.erase(id);
+    spilledReadFloors.erase(id);
+    historyStaging.erase(id);
     entry.resident = false;
     entry.position = 0;
     ++suspensions;
@@ -272,6 +275,7 @@ public:
   StateAdmission resume(const ModelRequest &request) override {
     ++resumeAttempts;
     lastRestoredTokens = request.restoredTokens;
+    outputLimits[request.id] = request.maxNewTokens;
     if (resumeDenied)
       return {{}, StateFailure::MemoryPressure, metal::AllocationFailure::HostPressure};
     const uint64_t id = request.id;
@@ -386,6 +390,7 @@ public:
       // A step that fails commits nothing.
       if (step.failure.empty())
         step.capturedStates = std::move(captured);
+      step.unreadableKvBlocks = takeUnreadable(item.requestId);
       result.push_back(std::move(step));
     }
     return result;
@@ -420,6 +425,7 @@ public:
           step.draftedTokens = speculative->second.first;
           step.acceptedDraftTokens = speculative->second.second;
         }
+        step.unreadableKvBlocks = takeUnreadable(item.requestId);
         result.push_back(std::move(step));
       }
     }
@@ -454,6 +460,35 @@ public:
   submit(const BatchPlan &plan, std::span<const ModelBatchItem> items,
          std::function<void()> completion) override {
     checkPageTables(items);
+    // A prefill command streams the history of one lane at most, whose
+    // pages hold only their index, and only whole, as the production
+    // runtime refuses another.
+    if (plan.kind == WorkKind::Prefill) {
+      const auto streams = std::ranges::count_if(items, [](const ModelBatchItem &item) {
+        return item.pageSources && item.pageSources->indexPages();
+      });
+      if (streams > 1)
+        throw std::logic_error("a prefill command streams the history of one sequence");
+      if (streams && plan.passes > 1)
+        throw std::invalid_argument("a prefill command's passes are not ones the runtime runs");
+    }
+    // A lane reads the K/V only a copy holds through memory reserved for it
+    // before its command, as the production runtime's readers require: a
+    // decoding lane's floor of the hot block cache, a prefill's staging of
+    // the pages its command reads.
+    for (const ModelBatchItem &item : items) {
+      if (!item.pageSources || !item.pageSources->indexPages())
+        continue;
+      const auto staged = historyStaging.find(item.requestId);
+      const bool reserved =
+          plan.kind == WorkKind::Decode
+              ? spilledReadFloors.contains(item.requestId)
+              : staged != historyStaging.end() &&
+                    uint64_t{staged->second} * engine::KvCache::pageTokens >=
+                        item.logicalPosition + item.tokenCount;
+      if (!reserved)
+        throw std::logic_error("a lane reads spilled K/V without memory reserved for its reads");
+    }
     std::unique_ptr<ModelBatchTicket> ticket;
     if (plan.kind == WorkKind::Decode && plan.constrained &&
         plan.decodeStage == DecodeStage::Regular) {
@@ -471,15 +506,27 @@ public:
       heldCompletion = std::move(completion);
       ticket = std::make_unique<HeldTicket>(prefill(plan, items),
                                             holdPrefillUntil, 1.0);
+    } else if (plan.kind == WorkKind::Prefill && plan.pass + 1 < plan.passes) {
+      // A pass before a command's last commits nothing, as the production
+      // runtime's returns.
+      std::vector<ModelStepResult> results(items.size());
+      for (size_t lane = 0; lane < items.size(); ++lane) results[lane].requestId = items[lane].requestId;
+      const CommandTimes times = commandTimes ? commandTimes(plan, items) : CommandTimes{};
+      ticket = immediateTicket(std::move(results), completion, times);
     } else {
+      const CommandTimes times = commandTimes ? commandTimes(plan, items) : CommandTimes{};
       ticket = immediateTicket(plan.kind == WorkKind::Prefill ? prefill(plan, items)
                                                               : decode(plan, items),
-                               completion);
+                               completion, times);
     }
     if (submitObserver)
       submitObserver();
     return ticket;
   }
+  uint32_t prefillGroupRows(bool spills) const noexcept override {
+    return spills || !groupsOnlySpilling ? groupRows : model::ExecutionLimits::prefillTokenBudget;
+  }
+  uint32_t prefillPasses() const noexcept override { return passes; }
   uint64_t snapshotBytes() const noexcept override { return stateBytes; }
   // The production model takes a cached state's buffers from its pool, or
   // with one admission, for a resident lane's page-aligned boundary, and
@@ -525,6 +572,35 @@ public:
   uint32_t statesToActivate() const noexcept override {
     return statesLacked ? statesLacked() : 0;
   }
+  // The production model reserves a decoding lane's floor of the hot block
+  // cache, which the fake refuses for the requests in refusedSpilledReads,
+  // and while spilledReadsRoom reports no memory for the request's. The lane
+  // holds it until it is suspended or ends.
+  model::ModelMemoryAdmission reserveSpilledReads(uint64_t id) override {
+    if (refusedSpilledReads.contains(id) || (spilledReadsRoom && !spilledReadsRoom(id)))
+      return {.allocationFailure = metal::AllocationFailure::EngineBudget};
+    spilledReadFloors.insert(id);
+    return {.ok = true};
+  }
+  // It stages the history a prefill command streams, as many pages as the
+  // command reads, which the fake refuses for the requests in
+  // refusedStaging.
+  model::ModelMemoryAdmission reserveHistoryStaging(uint64_t id, uint32_t pages) override {
+    if (refusedStaging.contains(id))
+      return {.allocationFailure = metal::AllocationFailure::EngineBudget};
+    uint32_t &staged = historyStaging[id];
+    staged = std::max(staged, pages);
+    stagings.push_back(id);
+    return {.ok = true};
+  }
+  // It grows that cache toward its planned size, which the fake refuses
+  // with refusedGrowth.
+  model::ModelMemoryAdmission growSpilledReads() override {
+    ++growthAttempts;
+    if (refusedGrowth)
+      return {.allocationFailure = *refusedGrowth};
+    return {.ok = true};
+  }
   uint64_t reclaimIdleState(bool keepLane, model::IdleMemory scope) noexcept override {
     keptLane = keepLane;
     // The buffers of states the cache let go of refill the lane's footprint;
@@ -569,6 +645,8 @@ public:
   void end(uint64_t id) override {
     requests.erase(id);
     pageTables.erase(id);
+    spilledReadFloors.erase(id);
+    historyStaging.erase(id);
   }
 
   // What a page holds once prefill has written a block's first row to it.
@@ -709,19 +787,49 @@ public:
   std::function<void()> healthCheck;
   // Runs once each command is submitted, a held one's completion stored.
   std::function<void()> submitObserver;
+  // The times each command that completes at once reports, from its plan
+  // and items; none without it.
+  std::function<CommandTimes(const BatchPlan &, std::span<const ModelBatchItem>)> commandTimes;
   // Score requests whose final prompt step reports a non-finite logit.
   std::unordered_set<uint64_t> invalidScores;
   // Requests whose prefill steps report a row that is not finite.
   std::unordered_set<uint64_t> nonFinitePrefills;
-  // The flags and sampling each request began with.
+  // The flags and sampling each request began with, and the output limit
+  // (ModelRequest::maxNewTokens) its latest begin() or resume() was given.
   std::unordered_map<uint64_t, uint32_t> beganFlags;
   std::unordered_map<uint64_t, SamplingParameters> beganSampling;
+  std::unordered_map<uint64_t, uint32_t> outputLimits;
   // The prefill steps each request took.
   std::unordered_map<uint64_t, uint32_t> prefillChunks;
+  // The most rows of a prefill command (Model::prefillGroupRows): a chunk's,
+  // or a prefill group's, for every lane, as where experts stream, or with
+  // groupsOnlySpilling only for a lane whose K/V spills.
+  uint32_t groupRows = model::ExecutionLimits::prefillTokenBudget;
+  bool groupsOnlySpilling = false;
+  // The most passes over its layers a prefill command runs in
+  // (Model::prefillPasses).
+  uint32_t passes = 1;
   // The tokens a decode step emits.
   uint32_t decodeTokens = 1;
   // The masks the model took.
   uint32_t providedMasks = 0;
+  // Requests whose floor of the hot block cache is refused
+  // (reserveSpilledReads), and those whose history's staging is
+  // (reserveHistoryStaging).
+  std::unordered_set<uint64_t> refusedSpilledReads;
+  std::function<bool(uint64_t)> spilledReadsRoom;
+  std::unordered_set<uint64_t> refusedStaging;
+  // The requests that hold their floor of the hot block cache, and the
+  // pages of history staged for each; the requests the staging was reserved
+  // for, in order.
+  std::unordered_set<uint64_t> spilledReadFloors;
+  std::unordered_map<uint64_t, uint32_t> historyStaging;
+  std::vector<uint64_t> stagings;
+  std::optional<metal::AllocationFailure> refusedGrowth;
+  uint32_t growthAttempts = 0;
+  // Blocks of KV the SSD cache holds that each request's next step reports
+  // it could not read (ModelStepResult::unreadableKvBlocks).
+  std::unordered_map<uint64_t, std::vector<uint64_t>> unreadableBlocks;
 
   // Holds every command until the flag it returns is set.
   std::shared_ptr<std::atomic<bool>> holdCommands() {
@@ -730,6 +838,15 @@ public:
   }
 
 private:
+  // The blocks the request's step reports it could not read, once.
+  std::vector<uint64_t> takeUnreadable(uint64_t id) {
+    const auto found = unreadableBlocks.find(id);
+    if (found == unreadableBlocks.end())
+      return {};
+    std::vector<uint64_t> blocks = std::move(found->second);
+    unreadableBlocks.erase(found);
+    return blocks;
+  }
   // The state the step that captured it keeps in the reserved buffers.
   std::shared_ptr<const CompositeState> seal(Reservation &reservation) {
     std::shared_ptr<uint64_t> pool = reservation.seal();

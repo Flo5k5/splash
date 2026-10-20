@@ -105,6 +105,18 @@ enum class LaneOutcome : uint8_t {
   InvalidMask,
   // The server left a token-mask request unanswered (Engine.cpp's limit).
   MaskTimeout,
+  // The SSD cache could not read back KV of an earlier part of the request
+  // (ModelStepResult::unreadableKvBlocks); its copies are given up, so a
+  // retry recomputes it.
+  KvUnreadable,
+  // Its KV does not fit in memory and would go to the SSD cache, whose
+  // daily write budget (--max-cache-disk-writes) is spent until it refills.
+  KvWriteBudget,
+  // Its KV does not fit in memory, and the SSD cache's quota of active KV
+  // (--max-cache-disk, and the volume's free space) cannot hold even its
+  // prompt's, without any other request's: retrying the same request fails
+  // the same way.
+  KvDiskQuota,
 };
 
 struct LaneOutcomeWire final {
@@ -129,6 +141,12 @@ laneOutcomeWire(LaneOutcome outcome) noexcept {
     return {"invalid_mask_response", false};
   case LaneOutcome::MaskTimeout:
     return {"mask_timeout", true};
+  case LaneOutcome::KvUnreadable:
+    return {"kv_unreadable", true};
+  case LaneOutcome::KvWriteBudget:
+    return {"kv_write_budget", true};
+  case LaneOutcome::KvDiskQuota:
+    return {"kv_disk_quota", false};
   }
 }
 
@@ -150,11 +168,14 @@ public:
   virtual void tokens(uint64_t requestId, std::span<const uint32_t> tokens) = 0;
   virtual void maskRequested(uint64_t requestId,
                              std::span<const uint32_t> simulationTokens) = 0;
+  // bounded: a Length end short of the request's maxNewTokens, at a bound
+  // of the engine's own (the SSD cache's quota, or the memory a lone lane
+  // could not grow past), which ends the response as its context would.
   // deduplicatedTokens: tokens whose KV the request read from cached blocks
   // another request computed, past the cached prefix it started from: blocks
   // it computed and then found cached, and blocks a resume after a
   // suspension restored past those it had published.
-  virtual void completed(uint64_t requestId, EngineFinishReason reason,
+  virtual void completed(uint64_t requestId, EngineFinishReason reason, bool bounded,
                          uint32_t promptTokens, uint32_t completionTokens,
                          uint32_t deduplicatedTokens,
                          std::span<const float> optionLogits,

@@ -315,9 +315,9 @@ place (`target_weights_bytes`). Off by default.
   ([Host steps](#host-steps)), so the work after a load starts at once and at
   full clocks rather than after the GPU's wake-up.
 - A prefill command runs a group of up to four chunks of 2048 rows layer by
-  layer, so each layer's experts are read once for all of them; a prompt with
-  images runs one chunk per command. A contended prefill command's slice
-  counts the time its GPU work waited on the reads as a fixed cost
+  layer, so each layer's experts are read once for all of them, a prompt's
+  with images too. A contended prefill command's slice counts the time its
+  GPU work waited on the reads as a fixed cost
   ([Admission and eviction](#admission-and-eviction)).
 - A load checks its files unchanged after it read them. A read is tried once
   more when it fails. A load that fails (a routed expert cannot be read, or
@@ -1363,6 +1363,7 @@ its path, `/v1/systemone`'s included: OpenAI's `server_error` with code
 | 400 | `invalid_request_error` | A malformed request, or a field Splash cannot honor; the message names it. |
 | 400 | `context_length_exceeded` | The prompt exceeds the context limit, or leaves no room in it for output. |
 | 400 | `capacity_exhausted` | The request cannot fit in memory even alone; retrying fails the same way. |
+| 400 | `kv_disk_quota` | The request's KV does not fit in memory, and the SSD cache may not hold even its prompt's (`--max-cache-disk`, and the volume's free space); retrying fails the same way. |
 | 401 | `authentication_error` | The API key is missing or wrong. |
 | 403 | `forbidden` | A Host or Origin the server does not serve; the message names the flag that admits it. |
 | 404 | `model_not_found` | `model` is neither the served ID nor an alias. |
@@ -1377,8 +1378,10 @@ its path, `/v1/systemone`'s included: OpenAI's `server_error` with code
 | 503 | `engine_recovering`, `runtime_unavailable` | The engine is restarting; retry. |
 | 503 | `server_shutdown` | The server is stopping: requests that arrive or are still running get it. |
 | 503 | `frontend_overloaded` | The server holds `--queue-size` requests, every connection slot holds a request ([request limits](#request-limits-and-timeouts)), or a shared input budget or request preparation is full; retry. |
-| 503 | `resource_timeout` | The request waited for memory and got none in time; retry, or free memory. |
+| 503 | `resource_timeout` | The request waited for memory, or for the SSD cache's room for its KV, and got none in time; retry, or free memory. |
 | 503 | `mask_timeout` | The server left the request's token mask unanswered for 5 s; retry. |
+| 503 | `kv_unreadable` | KV of an earlier part of the request could not be read back from the SSD cache, which gave the copy up; a retry recomputes it. |
+| 503 | `kv_write_budget` | The request's KV does not fit in memory and would go to the SSD cache, whose `--max-cache-disk-writes` budget is spent until it refills. |
 | 503 | `runtime_busy` | The server could not hand the request's token mask to the engine: its mask queue was full or the engine connection failed; retry. |
 | 504 | `request_timeout` | The request's `timeout`, or `--request-timeout`, ran out. |
 | 505 | `http_version_not_supported` | The request is not HTTP/1.0 or HTTP/1.1. |
@@ -2508,19 +2511,22 @@ is in service unless it can start from what the engine already holds, and with
 none in service it starts. A request whose start was refused memory, under host
 pressure or at `--max-memory`, holds back the requests that arrived after it
 until it starts, fails or is cancelled, so the lanes that finish leave their
-memory to it; a higher priority is not held back. It keeps holding them back
-while it waits for a prefix another lane is computing. After a suspension,
-suspended requests resume before new work of their priority or below, one at a
-time, higher priority first and then in the order they arrived; one refused
-memory holds back the suspended requests after it, and their resource waits do
-not run out while it does. When every lane is taken, or a new request's start
-is refused memory that no copy being written to disk is about to free, the
-resident of the lowest priority below it is suspended for it
-(`cache.priority_suspensions` in `/status`) and resumes once a lane and its
+memory to it; a higher priority is not held back. So does a start that waits
+for the SSD cache's room for its KV, which other long requests hold. It keeps
+holding them back while it waits for a prefix another lane is computing. After
+a suspension, suspended requests resume before new work of their priority or
+below, one at a time, higher priority first and then in the order they
+arrived; one refused memory holds back the suspended requests after it, and
+their resource waits do not run out while it does. When every lane is taken,
+or a new request's start is refused memory that no copy being written to disk
+is about to free, the resident of the lowest priority below it is suspended for
+it (`cache.priority_suspensions` in `/status`) and resumes once a lane and its
 memory are free. A new request below the priority of a running lane neither
 starts nor takes a lane until no lane of that priority runs, since it could not
 run before. Critical pressure evicts every unpinned cache entry and stops all
-growth.
+growth. Refused at `--max-memory`, a lane's state, or the model's memory for
+reading KV from the SSD cache, takes cached KV only while evicting it can empty
+an extent, and is tried again only once an extent or a state has gone.
 
 A request keeps its reusable model state at the last whole 32-token page before
 its generation prompt, the text a chat template appends to open the reply: the
@@ -2536,7 +2542,12 @@ requests takes what is in use after everything else. Two kinds of work take
 nothing in use. A start that a resident lane holds back waits for that lane. And
 when no lane's growth fits, the lane that yields first, such as one just started
 beside a decoding lane, pays for the memory with its own suspension; while other
-lanes fit, it waits for them, resident. A prefill command captures the state of
+lanes fit, it waits for them, resident, as any lane refused its KV does, since
+they grow too and are refused in turn. Where KV spills, a refusal they do not
+share, of the model's memory for reading KV from the SSD cache (a decoding
+lane's share of the hot block cache, a prompt's staging), which no transfer in
+flight returns, suspends the lane that yields first if that lane yields before
+it and is resident outside its command. A prefill command captures the state of
 each boundary it reaches, in buffers reserved before it runs. A junction or a
 checkpoint retires its lane's checkpoint once published, and a checkpoint the
 same command would capture before it is not captured at all; the prompt's
@@ -2609,7 +2620,12 @@ part, the time its GPU work waited on host steps (a streamed target's expert
 reads), and a part per row; the slice grows to twice the fixed part, so a
 command's rows take at least as long as its reads. Unopposed, a target whose
 experts stream runs its remaining chunks in as few prefill groups of up to four
-as hold them, evenly split. Without contention, a prompt that can
+as hold them, evenly split. A lane whose history holds KV only the SSD cache has
+reads all of that history in each command, whatever its rows: it runs alone,
+and contended it takes the fewest rows, halving from its group's, whose time
+still covers its own running estimate of that wait, and never fewer than another
+contended command; the wait stays out of the command estimate. Without
+contention, a prompt that can
 finish within one 2048-token chunk ends its chunk at its last row instead of
 sharing it with a longer prompt. While requests of the same or a higher priority
 decode (a lane waiting for its token mask is owed nothing), each slice owes them
@@ -2726,8 +2742,12 @@ and write-behind wakes when the budget has room again.
 Writes happen when RAM reclamation selects a victim. States copy through one
 staging buffer, freeing their RAM immediately. KV leaves needed by a state
 on them or below them are written straight from their extents and released
-after the write succeeds. Unneeded tails are dropped without writing, before any
-state, together with any disk copies below them. A restored page is read
+after the write succeeds; only then is the block above such a leaf a leaf. A
+chain whose newest blocks have no copy, as a finished request's prompt past the
+chain it restored, so leaves RAM one write at a time, and an allocation refused
+meanwhile waits for each write. Unneeded
+tails are dropped without writing, before any state, together with any disk
+copies below them. A restored page is read
 straight into its extent. Either way the transfer runs on the file's IO worker
 beside whatever command the model runs: a cached page is never written by a
 command, and no command uses a page before its read has landed. While a step
