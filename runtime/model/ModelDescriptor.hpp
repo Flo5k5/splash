@@ -45,7 +45,7 @@ struct ModelDescriptor final {
   // (inspectModelRoot): what every image is written from
   // (WeightFileRecord).
   std::string sourceIdentity;
-  // The target's RoPE scaling (withYarn), which stretches the window
+  // The target's RoPE scaling (servedFor), which stretches the window
   // capabilities states beyond the layout's native one.
   RopeScaling ropeScaling;
 
@@ -70,12 +70,13 @@ struct ModelDescriptor final {
                                                   VisionSource visionSource);
 [[nodiscard]] ModelDescriptor
 inspectModelRoot(const std::filesystem::path &root);
-// `model` served with YaRN by `factor` (RopeScaling): its window, the native
-// one stretched by the factor up to the family's YaRN window
-// (QwenTargetDimensions::servedContextTokens). std::invalid_argument for a
-// factor outside (1, RopeScaling::kMaximumFactor], a family YaRN does not
-// serve or a model that is already scaled.
-[[nodiscard]] ModelDescriptor withYarn(ModelDescriptor model, double factor);
+// `model` served for a context of `contextTokens`, zero for auto: as it is
+// within its native window, and past it with YaRN by the context over the
+// native window (RopeScaling), whose window is that context
+// (QwenTargetDimensions::servedContextTokens). std::invalid_argument past
+// the family's YaRN window, or the native one of a family YaRN does not
+// serve, or for a model that is already scaled.
+[[nodiscard]] ModelDescriptor servedFor(ModelDescriptor model, uint32_t contextTokens);
 
 // The family of an upstream model's configuration, checked by the rules
 // inspectModelRoot holds its assembly to: config, the target's config.json

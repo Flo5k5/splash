@@ -164,11 +164,16 @@ void testServerCommandLines(const char *path) {
          read.maxContext = 102400;
          read.maxMemoryBytes = 32 * kGiB;
        }},
-      {"yarn", [](NativeArguments &read) { read.model.ropeScaling = {4.0, 262144}; }},
-      {"yarn_context",
+      // Past the native window, YaRN by the context over it.
+      {"yarn",
        [](NativeArguments &read) {
-         read.maxContext = 655360;
-         read.model.ropeScaling = {2.5, 262144};
+         read.maxContext = 1000000;
+         read.model.ropeScaling = {3.814697265625, 262144};
+       }},
+      {"yarn_double",
+       [](NativeArguments &read) {
+         read.maxContext = 524288;
+         read.model.ropeScaling = {2.0, 262144};
        }},
       {"ple_memory", [](NativeArguments &read) { read.pleMemory = {StreamedSetting::Mode::Size, 2 * kGiB}; }},
       {"ple_memory_off", [](NativeArguments &read) { read.pleMemory = {StreamedSetting::Mode::Off, 0}; }},
@@ -180,7 +185,7 @@ void testServerCommandLines(const char *path) {
       {"sparse_kv_memory", [](NativeArguments &read) { read.sparseKvMemory = 1200 * (kGiB >> 10); }},
   };
   // Every field but the model inspected from the directory, whose RoPE
-  // scaling --yarn-factor sets.
+  // scaling MAX_CONTEXT sets.
   const auto same = [](const NativeArguments &read, const NativeArguments &meant) {
     return read.modelRoot == meant.modelRoot && read.maxContext == meant.maxContext &&
            read.model.ropeScaling == meant.model.ropeScaling &&
@@ -305,17 +310,27 @@ void testRefusals() {
           "unexpected argument --max-memory");
   for (const char *memory : {"0", "32G", "-1"})
     refuses({"auto", memory}, "MAX_MEMORY_BYTES must be auto or a positive integer");
-  // The model's own context bounds MAX_CONTEXT.
+  // MAX_CONTEXT serves the model as it is up to its native window, and past
+  // it with YaRN by the context over the native window, up to the 1,010,000
+  // tokens Qwen validates.
   const std::string maximum = std::to_string(
       model::inspectModelRoot(model.path()).capabilities.maximumContextTokens);
-  for (const std::string &context : {std::string("0"), std::string("100K"),
-                                     std::to_string(std::stoull(maximum) + 1)})
-    refuses({context, "auto"},
-            "MAX_CONTEXT must be auto or an integer in [1, " + maximum + "]");
-  require(parse(model, {maximum, "auto"}).maxContext == std::stoul(maximum),
-          "the model's whole context was refused");
+  for (const char *context : {"0", "-1", "100K", "1M", ""})
+    refuses({context, "auto"}, "MAX_CONTEXT must be auto or a positive integer");
+  refuses({"1010001", "auto"}, "MAX_CONTEXT: Qwen3.8-27B serves at most 1010000 tokens of context");
+  const NativeArguments native = parse(model, {maximum, "auto"});
+  require(native.maxContext == 262144 && !native.model.ropeScaling.yarn() &&
+              native.model.capabilities.maximumContextTokens == 262144,
+          "the native window was not served as it is");
+  for (const auto [context, factor] : {std::pair{262'145U, 1.000003814697265625}, {524'288U, 2.0},
+                                       {1'000'000U, 3.814697265625}, {1'010'000U, 3.85284423828125}}) {
+    const NativeArguments stretched = parse(model, {std::to_string(context), "auto"});
+    require(stretched.maxContext == context && stretched.model.capabilities.maximumContextTokens == context &&
+                stretched.model.ropeScaling == model::RopeScaling{factor, 262144},
+            "MAX_CONTEXT " + std::to_string(context) + " was not served with YaRN by its ratio to the native window");
+  }
   // A relaunch's context is one the model holds, and only without
-  // MAX_CONTEXT, which every start holds.
+  // MAX_CONTEXT, which every start holds; auto never serves it with YaRN.
   for (const std::string &context : {std::string("0"), std::string("auto"), std::string("100K"),
                                      std::to_string(std::stoull(maximum) + 1), std::string()})
     refuses({"auto", "auto", "--relaunch-context", context},
@@ -327,29 +342,6 @@ void testRefusals() {
   require(parse(model, {"auto", "auto", "--relaunch-context", maximum}).relaunchContext ==
               std::stoul(maximum),
           "the model's whole context was refused a relaunch");
-  // --yarn-factor stretches the window MAX_CONTEXT and a relaunch's context
-  // may ask for, by more than 1 and at most 4.
-  for (const char *factor : {"1", "0.5", "4.5", "-2"})
-    refuses({"auto", "auto", "--yarn-factor", factor},
-            "--yarn-factor: the YaRN factor must be above 1 and at most 4");
-  for (const char *factor : {"four", "", "inf", "nan"})
-    refuses({"auto", "auto", "--yarn-factor", factor}, "--yarn-factor requires a number");
-  const std::string stretched = std::to_string(2 * std::stoull(maximum));
-  refuses({stretched, "auto"}, "MAX_CONTEXT must be auto or an integer in [1, " + maximum + "]");
-  const NativeArguments yarn = parse(model, {stretched, "auto", "--yarn-factor", "2"});
-  require(yarn.maxContext == 2 * std::stoul(maximum) &&
-              yarn.model.capabilities.maximumContextTokens == 2 * std::stoul(maximum) &&
-              yarn.model.ropeScaling == model::RopeScaling{2.0, static_cast<uint32_t>(std::stoul(maximum))},
-          "--yarn-factor 2 did not double the window");
-  refuses({std::to_string(2 * std::stoull(maximum) + 1), "auto", "--yarn-factor", "2"},
-          "MAX_CONTEXT must be auto or an integer in [1, " + stretched + "]");
-  require(parse(model, {"auto", "auto", "--yarn-factor", "2", "--relaunch-context", stretched})
-                  .relaunchContext == 2 * std::stoul(maximum),
-          "a relaunch was refused the stretched window");
-  // By 4 the window stops at the 1,010,000 tokens Qwen validates.
-  require(parse(model, {"1010000", "auto", "--yarn-factor", "4"}).maxContext == 1010000,
-          "--yarn-factor 4 did not serve 1,010,000 tokens");
-  refuses({"1010001", "auto", "--yarn-factor", "4"}, "MAX_CONTEXT must be auto or an integer in [1, 1010000]");
 
   const auto commandRefused = [](const std::vector<std::string> &command,
                                  std::string_view expected) {

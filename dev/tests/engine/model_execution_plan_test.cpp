@@ -204,7 +204,7 @@ void checkLaneScratch(const model::LoadedModel &loaded) {
 // descriptor whose window is not the one its scaling serves is refused.
 void checkYarnGeometry() {
   auto loaded = loadedModel<model::Qwen3_6MoeWeights>();
-  loaded.descriptor = model::withYarn(std::move(loaded.descriptor), 2.0);
+  loaded.descriptor = model::servedFor(std::move(loaded.descriptor), 524'288);
   const auto geometry = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32);
   require(geometry.target.ropeScaling == loaded.descriptor.ropeScaling &&
               geometry.target.contextTokens() == 524'288 && geometry.target.nativeContextTokens == 262'144,

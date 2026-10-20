@@ -273,14 +273,20 @@ void testCleanRuntimeStatus(const char *goldenPath) {
   require(bf16Status.find("\"format\":\"bf16\"") != std::string::npos &&
               bf16Status.find("\"scale_type\":\"none\"") != std::string::npos,
           "BF16 cache identity advertised INT8 storage");
-  // YaRN's factor and original window, which every key went through.
+  // YaRN's factor, to the digits that read back as it, as a context of a
+  // million tokens takes it, and its original window, which every key went
+  // through; the rest of the document keeps its precision.
   auto yarnIdentity = identity;
-  yarnIdentity.ropeScaling = {2.5, 262144};
-  const auto yarnStatus = runtimeStatusJson(memoryPlan, engine, metal, warmup, audit(memoryPlan), metrics,
-                                            executorTelemetry, yarnIdentity, governor, true, {}, {}, {}, {}, {}, {});
-  require(yarnStatus.find("\"block_tokens\":32,\"rope_scaling\":{\"type\":\"yarn\",\"factor\":2.5,"
-                          "\"original_context_tokens\":262144}}") != std::string::npos,
-          "the cache identity did not report YaRN");
+  yarnIdentity.ropeScaling = {3.814697265625, 262144};
+  std::string yarnExpected = json;
+  const std::string unscaled = "\"rope_scaling\":null";
+  yarnExpected.replace(yarnExpected.find(unscaled), unscaled.size(),
+                       "\"rope_scaling\":{\"type\":\"yarn\",\"factor\":3.814697265625,"
+                       "\"original_context_tokens\":262144}");
+  require(runtimeStatusJson(memoryPlan, engine, metal, warmup, audit(memoryPlan), metrics, executorTelemetry,
+                            yarnIdentity, governor, true, {}, wait, NativeLoopTiming{1843.25},
+                            {600.0, false, false, 2, 1}, aneFfn, ThermalState::Fair) == yarnExpected,
+          "the cache identity did not report YaRN, or the status after it lost its precision");
   auto tokenMajorIdentity = identity;
   tokenMajorIdentity.kvLayout.valuesTokenMajor = true;
   const auto tokenMajorStatus = runtimeStatusJson(memoryPlan, engine, metal, warmup, audit(memoryPlan),

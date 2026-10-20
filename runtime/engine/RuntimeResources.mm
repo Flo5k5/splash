@@ -1049,9 +1049,10 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     logLine("Kernel policy for GPU family ", device.appleGpuFamily,
             " with ", device.gpuCoreCount, " cores.");
     if (const model::RopeScaling &rope = config.model.ropeScaling; rope.yarn())
-      logLine("YaRN scales the target's RoPE by ", rope.factor, ": a window of ",
-              config.model.capabilities.maximumContextTokens, " tokens instead of the native ",
-              rope.originalContextTokens, ".");
+      logLine("YaRN is on: the target's RoPE is scaled by ", rope.factor, " for ",
+              config.model.capabilities.maximumContextTokens, " tokens of context, past the native window of ",
+              rope.originalContextTokens, ". Static YaRN changes answers at every length, so pass a --max-context "
+              "above ", rope.originalContextTokens, " only when a request needs it.");
     // The split leaves the context asked for, else a relaunch's.
     const RequestedContext splitContext =
         requestedContextTokens ? RequestedContext{.tokens = requestedContextTokens}

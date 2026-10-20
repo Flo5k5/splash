@@ -10,7 +10,7 @@
 namespace splash::model {
 
 // YaRN, the RoPE scaling that stretches a target's native window by a factor
-// (--yarn-factor). The rotary frequencies whose wavelengths fit the native
+// (servedFor). The rotary frequencies whose wavelengths fit the native
 // window beta_fast (32) times or more keep their value, those that fit it
 // beta_slow (1) times or less are divided by the factor, and those between
 // blend linearly; the rotated dimensions of queries and keys are then scaled
@@ -22,12 +22,8 @@ namespace splash::model {
 // family YaRN serves states the most context it stretches the window to
 // (QwenTargetDimensions::yarnContextTokens).
 struct RopeScaling final {
-  // Qwen stretches the native window of 262,144 tokens by 4 for its million
-  // tokens of context.
-  static constexpr double kMaximumFactor = 4.0;
-
-  // 1 without YaRN. A double, as the server reads it, so that both sides
-  // compute the same window from it.
+  // 1 without YaRN; with it, the context served over the native window, as
+  // Qwen's model cards take it.
   double factor = 1.0;
   // The window YaRN stretches, original_max_position_embeddings; zero
   // without YaRN.
