@@ -117,7 +117,7 @@ access.
 | `--queue-size` | `32` | Requests admitted at once, running or waiting; more get 503 with `Retry-After`. |
 | `--decode-share` | `0.5` | Decode time owed per unit of prefill time while other requests generate. Higher keeps their output faster during a long prompt and slows that prompt; `0` alternates one command each. |
 | `--disable-ane` | Off | Prefill on the GPU alone. By default a dense model's long prompts also use the Neural Engine when that is faster. See [Neural Engine prefill](#neural-engine-prefill). |
-| `--verify-rows` | `auto` | The rows of each draft block decode cycles verify: `auto` lets the verify budget choose a MoE target's rows, which is faster but makes its greedy and seeded outputs vary from run to run, and verifies every row of a dense target; `all` verifies every row the output limit leaves on every target, so those outputs repeat. See [drafts](#drafts). |
+| `--verify-rows` | `auto` | The rows of each draft block decode cycles verify: `auto` lets the verify budget choose a MoE target's rows, which is faster but makes its greedy and seeded outputs vary from run to run, and verifies every row of a dense target; `all` verifies every row the output limit leaves on every target, so those outputs repeat when a request runs alone with the same cached prefixes. See [drafts](#drafts) and [sampling](#sampling). |
 | `--allow-idle-sleep` | Off | Let the Mac sleep automatically while requests run; by default it stays awake until they finish (the display may still sleep). |
 
 Sizes (`--max-memory`, `--max-cache-disk`, `--max-cache-disk-writes`,
@@ -189,8 +189,10 @@ that includes loopback when launching agents locally.
 
 Splash sizes memory and context when it starts. Its Metal budget is the GPU's
 recommended working set less a small margin; `--max-memory` can only lower it,
-such as `--max-memory 28G` to leave room for other applications. The budget
-caps Metal allocations, not combined process RSS. The context limit is the
+such as `--max-memory 28G`. The automatic plan takes the whole budget, so on a
+Mac that also runs other applications, `--max-memory` (or `--expert-memory` for
+a model whose experts stream) leaves them room. The budget caps Metal
+allocations, not combined process RSS. The context limit is the
 model's native window, 256K tokens for both supported families, when the budget
 holds it beside the weights and, unless `--disable-ane`, the
 [Neural Engine split](#neural-engine-prefill) this Mac's calibration of a dense
@@ -525,18 +527,22 @@ when the engine exits.
 
 `--persistent-cache` keeps the SSD cache across restarts of the same model, so a
 restart, an upgrade or a crash keeps conversations' prefixes; an upgrade that
-changes the model's weight images, which the namespace digests, starts its
-cache cold once. It follows
+changes what the namespace digests (below), such as a weight image's size,
+starts its cache cold once, and one that only lays out images of the same sizes
+and headers anew keeps it. It follows
 `--max-cache-disk`, which sizes it as it does the SSD cache; it needs the SSD
 cache, so a start with `--persistent-cache` and `--max-cache-disk 0` is
 refused.
 
 Files live in `~/Library/Caches/Splash/prefix-cache/<namespace>/` (mode 0700;
 `--cache-dir` sets the root, which the engine keeps out of Time Machine when it
-creates it). The namespace digests the model manifests, the KV and state
+creates it). The namespace digests the weights' manifest, the KV and state
 layouts, the YaRN factor (`--yarn-factor`) and the cache format, so no model
-reads another's cache. One engine holds a directory at a time; another waits
-20 s, then uses temporary files, as
+reads another's cache. The manifest names each image's path, declared size and
+header, and the SHA-256 of the assembly's `model.json`, which records the
+resolved sources and each linked file's path, size, times and digest
+([Installation](#installation)). One engine holds a directory at a time;
+another waits 20 s, then uses temporary files, as
 `auto` does when the root's volume is not local or leaves the cache too little
 room.
 One limit, the quota or what the volume leaves, bounds the whole root, and this
@@ -1102,7 +1108,11 @@ it, memory could not hold. With `--state-format bf16` the state is also rounded
 at each state a chunk captures (a replay point, junction or checkpoint). So on a
 dense target, or a MoE target under `--verify-rows all`, a greedy or seeded
 request repeats its output when it runs alone with the same cached prefixes;
-alongside other requests, or with other prefixes cached, it can differ. By
+alongside other requests, or with other prefixes cached, it can differ. A
+request's own repeat is such a case: served from the prefix cache, it computes
+only the rows past the state its first run cached, so its output can differ
+from that run's, which computed the whole prompt; repeats meant to match each
+take a `cache_salt` of their own (below). By
 default a MoE target's decode cycles verify the rows the verify budget chooses
 ([Drafts](#drafts)), which follow the machine's timing and the requests served
 before, and a row's MoE result depends on which rows share its expert tiles:
@@ -2902,9 +2912,22 @@ pressure or at `--max-memory`, holds back the requests that arrived after it
 until it starts, fails or is cancelled, so the lanes that finish leave their
 memory to it; a higher priority is not held back. So does a start that waits
 for the SSD cache's room for its KV, which other long requests hold. It keeps
-holding them back while it waits for a prefix another lane is computing. After
-a suspension, suspended requests resume before new work of their priority or
-below, one at a time, higher priority first and then in the order they
+holding them back while it waits for a prefix another lane is computing.
+
+A prompt near the context limit can hold back every other start of its priority
+or below until it ends, its prefill alone taking many minutes: in service, its
+KV grows into the host's spare memory, which pauses other growth; a start beside
+it takes only what the engine already holds, such as a lane's state buffers that
+a finished request left in the pool; and the first start refused holds back the
+rest, its wait's limit restarting while the long request works (below).
+`/status` shows it: `admission.held_behind_refusal` counts the requests held
+back, `memory_governor.growth_allowed` and `host_headroom_bytes` show whether
+and how far the host lets the engine grow, and `state.idle_gdn_cells`,
+`idle_draft_rings` and `idle_context_windows` count the pooled lane buffers a
+start can take. A request's `timeout`, or `--request-timeout`, bounds the wait.
+
+After a suspension, suspended requests resume before new work of their priority
+or below, one at a time, higher priority first and then in the order they
 arrived; one refused memory holds back the suspended requests after it, and
 their resource waits do not run out while it does. When every lane is taken,
 or a new request's start is refused memory that no copy being written to disk
@@ -3374,7 +3397,7 @@ does, and `REVISION`, `DRAFT_MODEL` and `LANGUAGE_ONLY=1` as its `--revision`,
 | --- | --- |
 | `verify-models` | the installer's restarts without the Hub, `verify --full`, and the record of the weight images (`dev/tools/installer_restarts.py`, `weight-digests` with `WEIGHT_DIGESTS_ARGS` added, such as `WEIGHT_DIGESTS_ARGS="--expert-memory 7G --ple-memory 2G"` to stream the routed experts and the PLE table, [Release check](#release-check)) |
 | `test-real` | vision parity with the family's fixture in `dev/tests/fixtures/vision-parity/` when the installation serves vision, and the native model runtime oracle, each of its three runs with `ORACLE_ARGS` added (`ORACLE_ARGS="--kv-format bf16"`, `"--expert-memory 16G"` or `"--yarn-factor 4"`); for a block-sparse target their spill checks take the default prompts, two staging buffers, and 32K tokens with the default window |
-| `test-http-real` | the HTTP frontend on an isolated server (`dev/tests/smoke_real.py`), whose greedy comparisons (a penalized greedy request repeats, `min_p` 1 answers as greedy) run where `/status` reports `verify_rows` `all`, which on any MoE target takes `HTTP_SMOKE_ARGS="--verify-rows all"`; with `HTTP_SMOKE_ARGS="--persistent-cache --max-cache-disk 8G"`, instead of that smoke, the [persistent cache](#persistent-cache) across a restart in a fresh cache directory: a clean stop, a restart that takes the restore point back, and a next turn that restores the prompt from disk; `release-check` runs both |
+| `test-http-real` | the HTTP frontend on an isolated server (`dev/tests/smoke_real.py`), whose greedy comparisons (a penalized greedy request repeats once its prompt is cached, `min_p` 1 answers as greedy) run where `/status` reports `verify_rows` `all`, which on any MoE target takes `HTTP_SMOKE_ARGS="--verify-rows all"`; with `HTTP_SMOKE_ARGS="--persistent-cache --max-cache-disk 8G"`, instead of that smoke, the [persistent cache](#persistent-cache) across a restart in a fresh cache directory: a clean stop, a restart that takes the restore point back, and a next turn that restores the prompt from disk; `release-check` runs both |
 | `test-agent-real` | the five official clients through `splash serve` (`dev/tests/agent_real.py`), in `AGENT_SCENARIO` `complete` (the default) or `smoke` |
 | `test-release-real` | the HTTP smoke and all five clients on one `splash serve` |
 | `test-performance-real` | the native decode, partial-prefix and short-prompt benchmark, or with `BASELINE` its ABBA comparison with that build, in which both builds' `weight-digests` take `WEIGHT_DIGESTS_ARGS` (`dev/benchmarks/backend_regression.py`) |
