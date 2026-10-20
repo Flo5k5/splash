@@ -2456,8 +2456,8 @@ void requireRefusedStartKeepsItsRows(model::Runtime &executor,
 
 // A reclaim step frees one unit: with two cached images and an idle encoder
 // three steps free the arena, which neither image needs again, then the
-// older entry and the newer, and a step limited to buffers frees none of
-// them.
+// older entry and the newer, which the telemetry counts as evictions, and a
+// step limited to buffers frees none of them.
 void requireReclaimTakesOneCacheUnit(model::Runtime &executor,
                                      metal::MetalBackend &backend,
                                      const model::LoadedModel &model) {
@@ -2497,6 +2497,8 @@ void requireReclaimTakesOneCacheUnit(model::Runtime &executor,
   require(executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches) == 0 &&
               backend.memoryStats().allocatedBytes == originalBytes,
           "cache units leaked resources");
+  require(executor.telemetry().imageEmbeddingEvictions == cached.imageEmbeddingEvictions + 2,
+          "the embedding cache did not count the two entries it let go of");
   std::cout << "reclaim_takes_one_cache_unit=PASS\n";
 }
 

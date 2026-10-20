@@ -665,6 +665,10 @@ struct ModelTelemetry final {
   uint64_t draftStateResets = 0;
   uint64_t imageEncodes = 0;
   uint64_t imageEmbeddingReuses = 0;
+  // Entries the embedding cache let go of, past its bytes or to a reclaim:
+  // the image of one is encoded again where it is placed next, unless
+  // something else still holds its rows.
+  uint64_t imageEmbeddingEvictions = 0;
   // The vision encoder's scratch while it exists, the encoded rows the
   // embedding cache keeps for reuse, those states in RAM hold to resume
   // inside an image, and every image's rows anything holds, each counted

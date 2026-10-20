@@ -619,6 +619,7 @@ struct Runtime::Impl {
     (*entry)->cached.reset();
     embeddingCache.erase(entry);
     embeddingCacheBytes -= bytes;
+    ++counters.imageEmbeddingEvictions;
     return bytes;
   }
 
