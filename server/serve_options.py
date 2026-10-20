@@ -12,6 +12,7 @@ import os
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 
 from . import images, origins
@@ -35,6 +36,8 @@ _SIZE_UNITS = {
     for power, unit in enumerate(("K", "M", "G"), 1)
     for suffix in ("", "B", "IB")
 }
+# A size's number: whole, or with a fraction before a unit (2.5G).
+_SIZE_NUMBER = re.compile(r"\d+(\.\d+)?")
 # A model ID, as --model takes it: OWNER/REPO, a Hugging Face repository ID
 # by the Hub's rule, then optionally :VARIANT, which names the GGUF to serve,
 # such as UD-Q4_K_M.
@@ -128,7 +131,9 @@ def context_window(yarn_factor=None):
 
 
 def parse_max_memory(value):
-    """'auto' (None), or a byte count with an optional K, M or G suffix."""
+    """'auto' (None), or a byte count with an optional K, M or G suffix; a
+    count with a suffix may have a fraction (2.5G), rounded down to whole
+    bytes."""
     normalized = value.strip().upper()
     if normalized == "AUTO":
         return None
@@ -137,13 +142,13 @@ def parse_max_memory(value):
         if normalized.endswith(suffix):
             normalized, multiplier = normalized[: -len(suffix)], _SIZE_UNITS[suffix]
             break
-    try:
-        size = int(normalized) * multiplier
-    except ValueError:
-        size = 0
+    number = _SIZE_NUMBER.fullmatch(normalized)
+    size = 0
+    if number and (multiplier > 1 or not number.group(1)):
+        size = int(Decimal(normalized) * multiplier)
     if not 1 <= size <= 2**63 - 1:
         raise argparse.ArgumentTypeError(
-            "must be 'auto' or a positive byte count such as 32G"
+            "must be 'auto' or a positive byte count such as 32G or 2.5G"
         )
     return size
 
@@ -175,27 +180,34 @@ def parse_max_cache_disk_writes(value):
     return size
 
 
-def _store_size(value, example):
-    """'off' (None), or a byte count with an optional K, M or G suffix: the
-    memory of a store that streams weights from the SSD. The engine refuses a
-    size that holds nothing the store reads."""
-    if value.strip().lower() == "off":
+def _memory_size(value, example, choices):
+    """'auto' (None), one of `choices` as given in lowercase, or a byte count
+    with an optional K, M or G suffix: the memory of a store the engine plans
+    when it is auto. The engine refuses a size below the store's smallest."""
+    normalized = value.strip().lower()
+    if normalized == "auto":
         return None
+    if normalized in choices:
+        return normalized
     try:
-        size = parse_max_memory(value)
+        return parse_max_memory(value)
     except argparse.ArgumentTypeError:
-        size = None
-    if not size:
-        raise argparse.ArgumentTypeError(f"use off, or a size such as {example}")
-    return size
+        options = ", ".join(("auto", *choices))
+        raise argparse.ArgumentTypeError(
+            f"use {options}, or a size such as {example}"
+        ) from None
 
 
 def parse_ple_memory(value):
-    return _store_size(value, "2G")
+    return _memory_size(value, "2G", ("off",))
 
 
 def parse_expert_memory(value):
-    return _store_size(value, "16G")
+    return _memory_size(value, "16G", ("off",))
+
+
+def parse_sparse_kv_memory(value):
+    return _memory_size(value, "1200M", ())
 
 
 def parse_cache_dir(value):
@@ -478,9 +490,10 @@ SERVE_OPTIONS = (
             type=parse_ple_memory,
             default=None,
             metavar="SIZE",
-            help="stream the PLE n-gram table of a Qwen3.8-Flash-Next GGUF from "
-            "the SSD through a RAM row cache of SIZE, e.g. 2G, instead of "
-            "keeping the whole table, tens of GB, in memory (default: off)",
+            help="RAM row cache of the PLE n-gram table of a Qwen3.8-Flash-Next "
+            "GGUF, e.g. 2G, which streams the rest from the SSD; off loads the "
+            "whole table, tens of GB (default: auto, which streams it where "
+            "memory cannot hold it)",
         ),
     ),
     ServeOption(
@@ -490,9 +503,22 @@ SERVE_OPTIONS = (
             type=parse_expert_memory,
             default=None,
             metavar="SIZE",
-            help="keep the routed experts of a MoE model in RAM slots of SIZE in "
-            "all, e.g. 16G, and read the others from the SSD when a token routes "
-            "them, instead of loading every expert (default: off)",
+            help="RAM slots of the routed experts of a MoE model, e.g. 16G, which "
+            "reads the others from the SSD when a token routes them; off loads "
+            "every expert (default: auto, which loads them all where memory "
+            "holds them and otherwise gives them what the context leaves)",
+        ),
+    ),
+    ServeOption(
+        "--sparse-kv-memory",
+        "memory",
+        dict(
+            type=parse_sparse_kv_memory,
+            default=None,
+            metavar="SIZE",
+            help="RAM cache of the KV blocks a block-sparse model such as "
+            "Qwen3.8-Flash-Next reads of requests whose KV is on the SSD, e.g. "
+            "1200M; never below its floor (default: auto, its floor)",
         ),
     ),
     ServeOption(

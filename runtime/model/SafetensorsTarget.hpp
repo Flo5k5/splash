@@ -54,14 +54,4 @@ private:
   ExpertStoreOptions experts_;
 };
 
-// The bytes of every image of the safetensors target in directory, without
-// the routed experts that stream (options.streamExperts).
-[[nodiscard]] uint64_t safetensorsTargetImageBytes(const std::filesystem::path &directory,
-                                                   const QwenTargetDimensions &geometry,
-                                                   gguf::PlanOptions options = {});
-// The bytes of the planes of its routed experts when they stream; 0 for a
-// dense target.
-[[nodiscard]] uint64_t safetensorsRoutedExpertBytes(const std::filesystem::path &directory,
-                                                    const QwenTargetDimensions &geometry);
-
 } // namespace splash::model

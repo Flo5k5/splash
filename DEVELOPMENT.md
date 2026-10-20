@@ -98,8 +98,9 @@ access.
 | `--yarn-factor` | Off | Stretch the 256K window by a factor of up to 4 (1,010,000 tokens) with YaRN. See [memory and context](#memory-and-context). |
 | `--kv-format` | `int8` | Target KV storage: `int8` or `bf16`. See [KV cache precision](#kv-cache-precision). |
 | `--state-format` | `fp32` | Recurrent state storage: `fp32` or `bf16`. See [state precision](#state-precision). |
-| `--ple-memory` | Off | Qwen3.8-Flash-Next: read the PLE n-gram table from the SSD through a host row cache of this size, e.g. `2G`, instead of loading it. See [PLE table streaming](#ple-table-streaming). |
-| `--expert-memory` | Off | MoE targets: hold routed experts in this much memory, e.g. `16G`, and read the others from the SSD when a step routes them. See [streamed experts](#streamed-experts). |
+| `--ple-memory` | Auto | Qwen3.8-Flash-Next: read the PLE n-gram table from the SSD through a host row cache of this size, e.g. `2G`; `off` loads the whole table. Auto loads it where memory holds it, else streams it through its share of the budget. See [PLE table streaming](#ple-table-streaming). |
+| `--expert-memory` | Auto | MoE targets: hold routed experts in this much memory, e.g. `16G`, and read the others from the SSD when a step routes them; `off` loads every expert. Auto loads them all where memory holds them, else gives them what the context leaves. See [streamed experts](#streamed-experts). |
+| `--sparse-kv-memory` | Auto | Qwen3.8-Flash-Next: memory for the KV blocks read back from the SSD for requests whose KV is there, e.g. `1200M`; never below its floor, which auto keeps. See [KV on the SSD](#kv-on-the-ssd). |
 | `--idle-release` | `10m` | Time without a request before the engine unwires its memory and frees the weights; the next request restores them. `off` keeps both, though `POST /v1/memory/release` still frees the weights. See [weight loading](#weight-loading). |
 | `--max-cache-disk` | `auto` | SSD quota for cached KV pages and states: `auto` follows the volume's free space up to 32 GiB, a size such as `16G` sets the quota, `0` turns the cache off. Kept for the session, or across restarts with `--persistent-cache`. See [SSD cache](#ssd-cache). |
 | `--max-cache-disk-writes` | `0` (no limit) | The most the SSD cache writes a day, e.g. `200G`. See [SSD cache](#ssd-cache). |
@@ -119,11 +120,13 @@ access.
 | `--allow-idle-sleep` | Off | Let the Mac sleep automatically while requests run; by default it stays awake until they finish (the display may still sleep). |
 
 Sizes (`--max-memory`, `--max-cache-disk`, `--max-cache-disk-writes`,
-`--max-request-size`, `--ple-memory`, `--expert-memory`) are a whole number of bytes, or one with a `K`, `M` or
+`--max-request-size`, `--ple-memory`, `--expert-memory`, `--sparse-kv-memory`) are a whole number of bytes, or one with a `K`, `M` or
 `G` suffix in binary units: `28G` is 28 GiB, and `28GB`, `28GiB` and `28g` say
-the same. Token counts (`--max-context`) are a whole number, or one with a `K`
-suffix of 1024 tokens: `100K` is 102,400 tokens. `--max-memory`, `--max-context` and `--max-cache-disk`
-also take `auto`, their default, `--max-cache-disk 0` turns the SSD cache off,
+the same. With a suffix the number may have a fraction, rounded down to whole
+bytes: `2.5G` is 2,560 MiB. Token counts (`--max-context`) are a whole number, or one with a `K`
+suffix of 1024 tokens: `100K` is 102,400 tokens. `--max-memory`, `--max-context`, `--max-cache-disk`,
+`--ple-memory`, `--expert-memory` and `--sparse-kv-memory` also take `auto`, their default,
+`--ple-memory off` and `--expert-memory off` load the whole table and every expert, `--max-cache-disk 0` turns the SSD cache off,
 and `--max-cache-disk-writes 0`, its default, sets no write budget. Durations
 (`--idle-release`, `--request-timeout`) are seconds, or a number with an `s`,
 `m` or `h` suffix, such as `90s`, `30m` or `1.5h`; `--idle-release off` turns
@@ -196,6 +199,53 @@ holds without the split: beyond what the split leaves, the split takes fewer
 channels or the GPU runs alone, with a warning. A larger value stops startup
 with the most the model and memory allow.
 
+One plan sizes everything within the budget (`engine::planStreamedMemory`).
+Its floors come first: the weights that load, the arenas, the runtime
+reserves, the SSD cache's state staging, one lane's state and the KV runway,
+the stores of the parts that stream at their smallest, and for a block-sparse
+target the floors of a request whose KV is on the SSD
+([KV on the SSD](#kv-on-the-ssd)). The rest goes by priority. A MoE target's
+routed experts load with their layers where that leaves KV its allowance, and
+otherwise stream through a store of all that the allowance and the PLE
+table's share leave ([streamed experts](#streamed-experts)); the PLE table
+loads where the rest holds it, and otherwise streams through a row cache of
+its share, 2 GiB at most ([PLE table streaming](#ple-table-streaming)); KV and
+the states take what remains. The allowance is the KV of a context, in the
+fewest pages whose extents hold it as one request's KV capacity rounds them:
+a block-sparse target's first 64K tokens, kept in memory. A dense target keeps
+the plan it has without streaming: its allowance is `--max-context`, so that
+its experts load whole wherever that context fits beside them and stream to
+hold it where it does not, or else none, so its experts load wherever they
+fit; only once they stream does it keep the first 64K tokens too. The
+automatic SSD cache gives its state staging up where that alone would stream
+a part, unless the target's KV spills to it. `--expert-memory`, `--ple-memory`
+and `--sparse-kv-memory` set their own part instead; a size below the part's
+smallest store, a `--sparse-kv-memory` beyond what the floors leave and a
+`--ple-memory` size for a table that cannot stream are refused, and startup
+logs how each part was sized. Only a loaded model sizes
+the arenas, which rest on its weights' formats and grow where a part
+streams: prefill groups for streamed experts, a step's staged rows for a
+streamed table. One load gives them for whatever streams, so a start loads
+its weights once where the plan without the arenas already loads each part
+as the plan with them does, as for a model with no part to stream, and
+otherwise loads them again with the stores that plan gives (`Weights loaded
+again`): routed experts the first plan streams load at their smallest store
+until then.
+
+A block-sparse target serves the window where its floors hold a request of
+that length and the SSD cache has room for its KV, and otherwise the longest
+context they hold, or the KV memory holds if that is more. `/status` reports
+the bounds under `memory_plan.budget.context_bounds`: the model's `window`,
+one request's KV in memory (`resident`), the longest context the floors hold
+(`spilled`) and the room the SSD cache has for active KV beside every lane's
+state (`disk`), and in `bound` which one sets the limit (`model`, `memory` or
+`disk`). Its context therefore follows the free space of the cache's volume
+at a first start; a dense target's never does, nor does a block-sparse one's
+with `--max-cache-disk 0`. A relaunch keeps its first engine's context
+whatever room the volume has left since: each request's commitment checks
+the room as it starts. The plans that size the streamed stores take the
+room the volume leaves when the start begins, before the weights load.
+
 `--yarn-factor FACTOR` stretches the native window by FACTOR, above 1 and at
 most 4, with YaRN RoPE scaling, as Qwen describes for these models: `2` gives a
 window of 524,288 tokens, `4` the 1,010,000 Qwen validates them to. The
@@ -215,7 +265,7 @@ quarter of its short-context speed, and the 27B takes about half an hour for
 512K. The KV of one long request also leaves the cache little room.
 
 The startup summary and `maximum_context_tokens` in `/status` show the effective
-context limit. `/v1/models` and `/v1/models/{id}` report the same limit as
+context limit, and a block-sparse target's startup line its bounds. `/v1/models` and `/v1/models/{id}` report the same limit as
 `max_model_len` and its compatibility alias `context_length`, including model
 aliases. Clients can impose a smaller limit. This is a capacity limit, not a
 guarantee of a fast first token for a long uncached prompt. If the model cannot
@@ -226,18 +276,23 @@ fit, startup prints a memory budget breakdown and stops.
 Qwen3.8-Flash-Next's PLE n-gram table (`per_layer_token_embd.weight`, 320M rows
 of 160 values, 28.8 GB in IQ4_NL; other row widths come from GGUF metadata)
 is read by a handful of rows per token: 16 per position, eight heads each of
-the 2- and 3-gram hashes of the token and the tokens before it. With
-`--ple-memory SIZE`, such as `--ple-memory 2G`, the table stays in its
-GGUF on the SSD: no `ple.bin` image is written, and the weights shrink by the
-stored table size. Startup memory requirements also include the cache and
-Metal staging buffers. The rows each command gathers are read through a
-host cache with a SIZE-byte cache and working-memory reservation; the engine
-refuses a SIZE that holds no row, and a SIZE that holds the whole table loads
-it with the weights instead. This reservation is not a strict bound on
-host allocations: prefetch scratch, excess vector capacity, job metadata,
-allocator overhead and reader stacks are additional, and oversized stages
-grow their scratch. Other models ignore the option with a warning; off by
-default.
+the 2- and 3-gram hashes of the token and the tokens before it. Where memory
+cannot hold it beside everything else (`--ple-memory auto`, the default,
+[memory and context](#memory-and-context)), or with `--ple-memory SIZE`, such
+as `--ple-memory 2G`, the table stays in its GGUF on the SSD: no `ple.bin`
+image is written, and the weights shrink by the stored table size. Startup
+memory requirements also include the cache and Metal staging buffers. The
+rows each command gathers are read through a host cache with a SIZE-byte
+cache and working-memory reservation, auto's share of the budget, at most
+2 GiB; the engine refuses a SIZE that holds no row, and a SIZE that holds the
+whole table loads it with the weights instead, as `--ple-memory off` does. A
+table whose rows the GGUF does not store as the gathers read them (NVFP4,
+which the loader rebuilds, or any table of a rotated GGUF) loads with the
+weights, and the engine refuses a SIZE for it.
+This reservation is not a strict bound on host allocations: prefetch scratch,
+excess vector capacity, job metadata, allocator overhead and reader stacks are
+additional, and oversized stages grow their scratch. Other models ignore a
+size with a warning.
 
 - A step's rows are staged before its PLE layer gathers them: the CPU copies
   each distinct row the step reads once into a small Shared buffer of the
@@ -279,11 +334,17 @@ default.
 
 ### Streamed experts
 
-With `--expert-memory SIZE`, such as `--expert-memory 16G`, a MoE target's
-routed experts stay in their files on the SSD, and a store of SIZE bytes holds
-as many of them as fit (`ExpertStore`, `runtime/model/ExpertStore.hpp`): the
+Where memory cannot hold every routed expert of a MoE target beside the
+context (`--expert-memory auto`, the default,
+[memory and context](#memory-and-context)), or with `--expert-memory SIZE`,
+such as `--expert-memory 16G`, its routed experts stay in their files on the
+SSD, and a store holds as many of them as fit in all that the plan leaves
+them, or in SIZE bytes (`ExpertStore`, `runtime/model/ExpertStore.hpp`): the
 weights shrink by the routed experts' bytes, and the store counts in their
-place (`target_weights_bytes`). Off by default.
+place (`target_weights_bytes`). A store holds at least a layer's experts of
+each format mix and every expert of a layer whose mix no other layer shares;
+the engine refuses a SIZE below that, and `--expert-memory off` loads every
+expert, as a SIZE that holds them all does.
 
 - Each MoE layer of a command loads the experts its rows route that are not
   resident: after the layer's routing, a host step of the command claims
@@ -316,9 +377,12 @@ place (`target_weights_bytes`). Off by default.
   full clocks rather than after the GPU's wake-up.
 - A prefill command runs a group of up to four chunks of 2048 rows layer by
   layer, so each layer's experts are read once for all of them, a prompt's
-  with images too. A contended prefill command's slice counts the time its
-  GPU work waited on the reads as a fixed cost
-  ([Admission and eviction](#admission-and-eviction)).
+  with images too. Since every command reads nearly all of each layer's
+  experts however few its rows, one that would take longer than the 500 ms
+  slice runs in passes over the layers, each its own command of about the
+  slice: other requests' decode steps run between passes, and a cancel
+  waits for one pass at most. A pass reads its own layers' experts, so
+  passes add no reads ([Admission and eviction](#admission-and-eviction)).
 - A load checks its files unchanged after it read them. A read is tried once
   more when it fails. A load that fails (a routed expert cannot be read, or
   a file was written) fails its command, and every later load fails too.
@@ -374,7 +438,8 @@ KV pages and request states that a later request could resume from are written
 to the SSD, and a request that matches them reads them back instead of
 computing that part of its prompt again. Without it, a request that runs out of
 memory cannot keep its progress checkpoints and replays its prompt after each
-suspension. It does not raise the context limit.
+suspension. It does not raise a dense target's context limit; a block-sparse
+target keeps the KV of its long requests there ([KV on the SSD](#kv-on-the-ssd)).
 
 `--max-cache-disk` sizes it. The default, `auto`, holds at most a quarter of
 what its volume has beyond the space it keeps free (10 GiB, or 5% of a volume
@@ -396,12 +461,14 @@ it costs, as before, and a quota too small for one state leaves the cache off.
 requested context beside it, and gives it up to the
 [Neural Engine split](#neural-engine-prefill) where the plan holds the split
 only without it; otherwise startup says why the cache is off, and the plan is
-as without it. Memory alone decides this, so every start of a model on a Mac
-advertises the same context, whatever room the disk has. The disk decides only
-whether the cache's files open: `auto` opens them only where its limit, a
-quarter of what a local volume has beyond the floor, would hold two states and
-1 GiB of KV, on the volume of every place the cache may keep its files. Where
-no files open, startup says why the cache is off, and the staging stays unused.
+as without it. Memory alone decides this, so every start of a dense model on a
+Mac advertises the same context, whatever room the disk has; a block-sparse
+target's follows the room for its KV
+([memory and context](#memory-and-context)). The disk decides only whether
+the cache's files open: `auto` opens them only where its limit, a quarter of
+what a local volume has beyond the floor, would hold two states and 1 GiB of
+KV, on the volume of every place the cache may keep its files. Where no files
+open, startup says why the cache is off, and the staging stays unused.
 
 A write that finds the volume full while it shows room beyond the floor met a
 limit the engine cannot see, such as a volume quota, or a volume that filled
@@ -429,9 +496,10 @@ budget when one is set, and that `--max-cache-disk 0` turns the cache off.
 `/status` reports under `disk` the quota (`capacity_bytes`), what the volume
 leaves of it now (`limit_bytes`), `used_bytes`, `volume_available_bytes`, what
 holds writes back (`writes_gated`: `no`, `budget`, or `closed` once a file
-stopped taking writes) and `write_budget_bytes`, the bytes the next state's
-write not in use may take now. Without a write budget `writes_gated` is never
-`budget` and `write_budget_bytes` is 0.
+stopped taking writes), `write_budget_bytes`, the bytes the next state's
+write not in use may take now, and `writes_deferred_ms`, how long writes held
+back for SSD reads a step waited for. Without a write budget `writes_gated` is
+never `budget` and `write_budget_bytes` is 0.
 
 Restarts recompute everything unless `--persistent-cache` is on (see
 [persistent cache](#persistent-cache)); otherwise the cache keeps evicted KV
@@ -485,6 +553,79 @@ and syncs the files. After a crash the next start takes back what reached the
 disk and runs on probation for a minute; if it fails then, the start after it
 begins empty. `/status` reports all this under `disk` (`persistent`,
 `kv_copies`, `taken_back`, `write_behind`).
+
+### KV on the SSD
+
+Qwen3.8-Flash-Next attends only the blocks its index selects
+([sparse attention](#sparse-attention)), so the KV of a long request can stay
+on the SSD cache while memory keeps each page's index and the blocks decode
+steps read. No option turns this on: it needs only the
+[SSD cache](#ssd-cache), and with `--max-cache-disk 0` the target's context is
+what memory holds, as a dense target's is.
+
+- Admission decides it per request. A request whose KV, its prompt and
+  `min(max_tokens, 4096)` tokens of output, fits the memory the plan leaves
+  resident KV beside the other requests' keeps its KV in memory; any other
+  spills. A request in memory whose KV cannot grow spills from then on
+  rather than yield its lane or fail: its pages whose copies landed before,
+  as a prefix restored from the SSD cache has them, spill at once, and it
+  waits while the others' copies land.
+- A spilling request writes each committed page once to the SSD cache. Once
+  the copy has landed, the page keeps only its index, 24 KiB of the int8
+  page's 414 KiB. Its first 2,048 tokens, which rows with less history read
+  whole, its last 64 pages and up to two prefill groups' pages still being
+  written stay whole. The memory the pages free leaves with the extents they
+  empty, all of them once every spilling request decodes, but one while a
+  spilling prompt still grows into it or the host holds growth back.
+- A decode step reads, after each attention layer selects its blocks, the
+  selected blocks not in memory into one hot block cache that all requests
+  share, a page's in one read from its first missed block to its last on the
+  32 SSD readers, and attends them there.
+  The cache holds at least, for n decoding requests, n + 1 times the blocks a
+  request's 8 rows select, 8,192 blocks a layer (390 MiB) for one;
+  `--sparse-kv-memory` raises its target.
+- A prefill streams each attention layer's history from the SSD cache into
+  staging, a layer's pages read whole (36 KiB each) while the previous layer
+  runs, in two buffers where the plan leaves 4 GiB beside its floors. A
+  prefill whose history is on the SSD runs alone, and with others waiting it
+  takes the fewest rows whose work covers its reads. The staging holds
+  nothing between prompts: a decoding request's floor of the hot block cache
+  takes its place, and the next prompt that streams allocates it again.
+- The next turn finds its pages' index in memory, or reads it back, and
+  continues without prefilling the conversation again; with
+  `--persistent-cache`, after a restart too.
+- The `--max-cache-disk` quota holds spilled KV beside the cached copies.
+  Spilled KV of requests in service may take all of the room its volume has
+  beyond the floor, cached copies a quarter of it as before: a request of
+  1,010,000 tokens takes 13.5 GB of slots, about 24 GiB free with the floor.
+  A spilling request commits slots for its KV when admitted; one the cache
+  cannot hold even alone is refused, one that other requests' commitments
+  keep out waits, and one whose prompt fits but not its output ends at the
+  bound it was admitted with, which Messages reports as
+  `model_context_window_exceeded`. A request that cannot spill, the cache
+  short of room, its file closed or its write budget spent, keeps its KV in
+  memory where it fits the context memory holds of one request
+  (`context_bounds.resident`). Past what it committed, as when its output
+  outgrows the 4,096 tokens admission counted, a request commits each
+  page's slot as it writes it, while the room lasts; its pages stay in
+  memory beyond it, and the other requests' committed pages are still
+  written.
+- The KV a spilling request writes is in use and always written, so one long
+  request may overdraw `--max-cache-disk-writes` once. Until the budget
+  covers what spilling requests were promised, a new request that would
+  spill keeps its KV in memory where it fits and is refused otherwise
+  (`kv_write_budget`, 503 with a `Retry-After` of the seconds until the
+  budget covers them again as it refills).
+- A block that cannot be read back fails only the requests that read it, as
+  `kv_unreadable`, which they may retry; the copy is dropped.
+
+A request's outputs are the same whether its KV spills or not, bit for bit,
+for the same schedule and cache hits. `/status` reports the plan's floors
+under `memory_plan.budget.kv_spill` and what spilling does under `kv_spill`
+([status](#status-readiness-and-metrics)). Startup logs one line: the context
+and what bounds it, the KV a request may keep in memory, the hot cache and
+its floor, the staging buffers and the room the SSD cache has for active KV;
+or why long requests keep their KV in memory.
 
 ## Model storage
 
@@ -975,7 +1116,9 @@ turn. Omitted from Chat or Responses, the output may use all the context the
 prompt leaves: the context limit, and `--request-timeout` when set, are the only
 server bounds on a request that names no limit. A response the context limit
 ends finishes as one its limit ends; Messages gives it the `stop_reason`
-`model_context_window_exceeded`, as in Anthropic's API, not `max_tokens`. An
+`model_context_window_exceeded`, not `max_tokens`, and so does one the engine
+ends before its limit at what the SSD cache or memory holds of a long request's
+KV ([KV on the SSD](#kv-on-the-ssd)). An
 invalid value returns 400 naming the field the request sent. Messages refuses
 a final assistant message (prefill) with 400; `count_tokens` still counts it.
 
@@ -1271,12 +1414,14 @@ Proxy consumers can use these fields; additional fields may be added:
 | Field | Meaning |
 | --- | --- |
 | `requests.submitted`, `completed`, `cancelled`, `failed` | Native request counters since engine start |
-| `active_requests` | Each request the engine holds, ordered by `id`: its `id`, `phase` (`queued`, `waiting_resources`, `waiting_prefix`, `prefill`, `decode` or `waiting_mask`, and `failed` for one whose deadline passed while a cached state it restores was being read from disk, until that read drains), `priority`, `prompt_tokens` and how many of them are encoded (`prompt_processed`, cached ones included), `generated_tokens` of `max_new_tokens`, and `age_ms` since it arrived |
+| `active_requests` | Each request the engine holds, ordered by `id`: its `id`, `phase` (`queued`, `waiting_resources`, `waiting_prefix`, `prefill`, `decode` or `waiting_mask`, and `failed` for one whose deadline passed while a cached state it restores was being read from disk, until that read drains), `priority`, `prompt_tokens` and how many of them are encoded (`prompt_processed`, cached ones included), `generated_tokens` of `max_new_tokens`, where a block-sparse target keeps its KV (`kv_mode`: `resident` or `spill`, only while its KV can go to the SSD), and `age_ms` since it arrived |
 | `memory_actual.current_bytes`, `peak_bytes` | Metal allocations, not process RSS |
 | `weights.idle_release_seconds`, `released`, `restoring`, `restores`, `restore_failures` | `--idle-release` in seconds (`null` for `off`), whether the weights' memory is released now, whether a request's restore of it is under way (it stays `released` until the last image is back), the times it was restored for a request since engine start, and the restores that gave up for want of memory |
 | `identity.cache.rope_scaling` | With `--yarn-factor`, the target's RoPE scaling, which every cached key went through: `type` `yarn`, its `factor` and `original_context_tokens`; `null` otherwise |
-| `streamed_table` | With `--ple-memory`, the [streamed PLE table](#ple-table-streaming)'s cache, stages, reads and prefetches; `null` otherwise |
-| `streamed_experts` | With `--expert-memory`, the [streamed experts](#streamed-experts)' store: its slots and resident experts, per use its loads, reads, read-ahead and host-step round trips, and its failure; `null` otherwise |
+| `streamed_table` | While the PLE table streams, the [streamed PLE table](#ple-table-streaming)'s cache, stages, reads and prefetches; `null` otherwise |
+| `streamed_experts` | While routed experts stream, the [streamed experts](#streamed-experts)' store: its slots and resident experts, per use its loads, reads, read-ahead and host-step round trips, and its failure; `null` otherwise |
+| `kv_spill` | While a block-sparse target's KV can go to the SSD, its [KV on the SSD](#kv-on-the-ssd): the requests that started in each mode, converted to `spill`, had their output bounded or ended at that bound, and were refused for the quota, the write budget or a closed tier, and the starts waiting for the quota (`requests`); the pages that hold only their index and those whose KV is on the SSD; the write-through of spilling requests' pages; page moves, rewrites and restores; the quota of KV in service; the hot block cache's memory, hits, reads and host steps (`block_cache`; `read` over `resolves` is the blocks a layer's step missed on average) and the history streams' reads, how long each layer's took (`read_ms`, whose total gives with `bytes` the streams' bandwidth) and staging, the streamed commands that ran beside decoders, and the decoders' gaps across them (`history_stream`); absent for a target whose KV stays in memory, whose plan's `memory_plan.budget.kv_spill` is `null` |
+| `memory_plan.budget.context_bounds` | What bounds `maximum_context_tokens` ([memory and context](#memory-and-context)): the model's `window`, one request's KV in memory (`resident`), the longest context a block-sparse target's floors hold (`spilled`) and its SSD cache's room holds (`disk`), and the `bound` that sets the limit: `model`, `memory` or `disk` |
 | `ane_ffn.state`, `share`, `minimum_rows`, `reason` | The prefill FFN's [Neural Engine split](#neural-engine-prefill): `split` while it serves, at `share` of the FFN's channels over chunks of `minimum_rows` rows or more; `off` when the start left the GPU alone (`share` and `minimum_rows` 0); `stopped` once it stopped while serving, until the engine restarts. `reason` is the start's outcome, or why the split stopped |
 | `ane_ffn.split_commands`, `evaluations`, `ane_ms`, `reruns` | Prefill commands the split ran since engine start, the Neural Engine's evaluations in them and its milliseconds over them (each evaluation's from the GPU's signal to start it to its report); and the chunks the GPU ran again alone after the split's work for them failed |
 | `model_timing.prefill.last_gpu_ms`, `total_gpu_ms` | GPU time of the last prefill command, and of all since engine start, warmup included: each from its first Metal command buffer's start to its last one's end, so with the Neural Engine split it spans the GPU's waits on the Neural Engine; a chunk run again adds the rerun's |
@@ -1352,7 +1497,8 @@ otherwise.
 `{"type": "error", "error": {"type", "message"}}`, with Anthropic's type for the
 status, such as `overloaded_error` for 503. `/v1/systemone` answers invalid
 requests with 422 `detail` arrays and every 503 with 529. Every 503, and every
-529, carries `Retry-After: 1`. A connection the server refuses before reading
+529, carries `Retry-After: 1`, unless the engine says when a retry may succeed,
+as `kv_write_budget` does. A connection the server refuses before reading
 any of its request, as when every connection slot is taken
 ([request limits](#request-limits-and-timeouts)), gets one fixed 503 whatever
 its path, `/v1/systemone`'s included: OpenAI's `server_error` with code
@@ -1381,7 +1527,7 @@ its path, `/v1/systemone`'s included: OpenAI's `server_error` with code
 | 503 | `resource_timeout` | The request waited for memory, or for the SSD cache's room for its KV, and got none in time; retry, or free memory. |
 | 503 | `mask_timeout` | The server left the request's token mask unanswered for 5 s; retry. |
 | 503 | `kv_unreadable` | KV of an earlier part of the request could not be read back from the SSD cache, which gave the copy up; a retry recomputes it. |
-| 503 | `kv_write_budget` | The request's KV does not fit in memory and would go to the SSD cache, whose `--max-cache-disk-writes` budget is spent until it refills. |
+| 503 | `kv_write_budget` | The request's KV does not fit in memory and would go to the SSD cache, whose `--max-cache-disk-writes` budget is spent until it refills; `Retry-After` says when it covers what spilling requests were promised again. |
 | 503 | `runtime_busy` | The server could not hand the request's token mask to the engine: its mask queue was full or the engine connection failed; retry. |
 | 504 | `request_timeout` | The request's `timeout`, or `--request-timeout`, ran out. |
 | 505 | `http_version_not_supported` | The request is not HTTP/1.0 or HTTP/1.1. |
@@ -1941,7 +2087,7 @@ SHA-256 of the record of every source file's digest, the assembly's
 reports (`loaded_model_layout_sha256`, `target_model_sha256`) cover it, so
 models of one layout from different sources never share a fingerprint.
 
-Runtime admission counts the images exactly once (`modelWeightBytes`, which
+Runtime admission counts the images exactly once (`streamableWeights`, which
 the runtime oracle uses too). Before loading, startup refuses
 a model whose images, with the pipeline and runtime reserves, one lane's state,
 the KV runway and any disk tier state staging, exceed the hard budget, so a
@@ -2146,9 +2292,11 @@ Qwen3.8-Flash-Next's full-attention layers attend sparsely (QSA): past 512
 complete blocks of 4 tokens, a query row attends only to the 512 blocks its
 indexer scores highest and to its tokens after its last complete block. The
 indexer (four query heads and one key head of 128) keeps each block's pooled
-key, bf16, in an index region of the KV pages (`PageStorage::indexOffset`),
-which its kernels reach through index tables of their own (`ops::BlockIndex`,
-today the lanes' page tables). A step projects its rows' indexer queries and
+key, bf16, in its page's index, in the index plane of the page's extent apart
+from its K/V (`PageStorage::indexOffset`), which its kernels reach through each
+lane's index table (`ops::BlockIndex`, `DecodeTensor::IndexTable`), written as
+its page table is: a page whose K/V went to the SSD keeps its index
+([KV on the SSD](#kv-on-the-ssd)). A step projects its rows' indexer queries and
 keys, pools the blocks they complete from its rows' keys and, for the tokens
 of a block before its first row, the sequence's pending keys, scores every
 complete block for each row in one MPP product per tile of 8 rows by 32
@@ -2186,15 +2334,46 @@ softmax masks each row's tokens in blocks the row does not attend and past its
 causal end. A tile without a list attends every block of its history.
 Token-major values make a block's values one contiguous run as its keys are;
 the dense page loop keeps them dimension-major, on which its PV runs faster. A
-layout may also keep an index of its keys in regions of the KV pages after
-every layer's K/V region (`kv::Layout::indexDimension`,
-`PageStorage::indexOffset`): per layer each block's bf16 pooled key, part of
-the page wherever the host copies or clears it (`PageStorage::spans`).
+layout may also keep an index of its keys (`kv::Layout::indexDimension`), per
+layer each block's bf16 pooled key, in the index plane of its pages' extents
+(`PageStorage::indexOffset`, `indexSpans`), part of the page wherever the host
+copies or clears it (`PageStorage::spans`).
 `make benchmark-attention-sweep ATTENTION_SWEEP_ARGS='--shapes fn --qsa shared'`
 times the sparse kernels over synthetic selections (`--qsa` also takes
 `independent`, `overlapping`, whose unions are the ~1,500 blocks real
 selections make, and `pages`), and `--qsa indexer` the indexer itself before
 them; each case reports the mean entries of its lists.
+
+Where some of a verify's listed blocks are on the SSD, a host step after the
+layer's selection resolves each lane's list through the hot block cache
+(`KvBlockCache::addResolve`) into a location per entry: the block's place in
+the cache, or `SPLASH_ATTENTION_PAGED` for a block its page holds. The located
+split (`AttentionBlocks::locations` and `locationPages`) reads each block where
+its location says, and a command none of whose lanes reads spilled KV encodes
+the splits as before. A prefill whose history is on the SSD attends through a
+staging of one layer's pages, ordinary entries of a one-layer
+`kv::PageStorage`: the history stream reads the spilled pages into it, and the
+stage kernel (`PagedAttention::addStageLayer`, `kernels/shared/kv_stage.metal`)
+copies those still in the pool, so the prefill kernels run unchanged.
+`attention-sweep --located` moves the listed blocks into a block cache and
+times the located split against the default one.
+
+A block-sparse target declares its attention to the engine
+(`model::SparseKvShape`, `ModelCapabilities::sparseKv`): its blocks' tokens,
+the blocks a row selects and its verify rows, and the rows that read whole
+pages instead, those with at most `denseHistoryTokens` of history and its
+first `sinkTokens` and last `localTokens`. The memory plan sizes the hot block
+cache and the floors of [KV on the SSD](#kv-on-the-ssd) from it, and the
+cache keeps whole the pages those rows read. A target that declares
+`localTokens` keeps its KV in memory: the cache keeps whole only the dense
+history on every path, not each holder's last pages. Its family code reaches K/V that
+left memory through the command's `model::SpilledKvReads`: `verify` after a
+layer's block lists, which locates each listed block of a page that holds
+only its index in the hot block cache for the attention; `prefill` for each
+chunk, which returns the table and layer of the history staged for it; and
+`layerEnd` after a prefill layer, which hands the history's reads on to the
+next. A command none of whose requests holds such a page encodes as without
+them.
 
 ### Neural Engine prefill
 
@@ -2441,7 +2620,12 @@ pressure and swap.
 KV pages live in extents: ordinary shared Metal buffers of one size per pool,
 between half and one and a half times 128 MiB, in which every tensor region of
 each attention layer starts 64 KiB-aligned, sized to leave the fewest of the
-budget's pages unused (`Layout::extentPagesFor`). The pool allocates an extent
+budget's pages unused (`Layout::extentPagesFor`). Each extent has a form
+(`kv::PageForm`): a Full extent holds its pages' K/V and then, for a layout
+with a block index, their index plane; an Index extent only the plane, for
+pages whose K/V is on the SSD, and only a pool that spills allocates one. A
+page moves to the other form, its references with it, when its K/V leaves
+memory or comes back (`KvPool::movePages`). The pool allocates an extent
 when it needs one of its pages. When it is built it allocates the runway, the
 extents of the first 64 pages, which startup warmup runs on; nothing but the
 pool allocates or releases an extent. An extent whose last page is free stays
@@ -2452,13 +2636,18 @@ address in its request's page table, so no command binds KV; the command
 queue's residency set makes extents resident for every command buffer. The host reaches the same memory
 (`PageStorage::spans`), which is how the disk tier moves pages. A reclaim
 returns free pages before it evicts anything: an empty extent as it is, and the
-free pages scattered over the others as soon as they cover the extent that holds
-the fewest pages, whose pages the pool copies to them (`KvPool::compactExtent`).
+free pages scattered over the others of its form as soon as they cover the
+extent of that form that holds the fewest pages, whose pages the pool copies to
+them (`KvPool::compactExtent`): a Full extent before an Index one, unless the
+reclaim needs the memory of one form, as a shortfall of Index pages needs Full
+memory.
 The blocks and requests on those pages follow them, a page a disk transfer reads
 or writes stays where it is, and a pass that evicts everything copies only what
 is left afterwards. Every extent a pass empties is released, except that a
 warning pass, like startup cleanup, keeps one empty extent as the runway the next
-request starts from.
+request starts from, and a pool that spills keeps an extent's worth of free
+Index pages, which spilling draws on first, so that a page spills at the memory
+wall.
 `/status` reports under `kv` the pages of allocated extents (`pages_allocated`),
 those requests and the cache hold (`pages_active`, `pages_cache`) and those
 nothing holds (`pages_free`), the bytes allocated and the bytes of empty extents
@@ -2620,7 +2809,15 @@ part, the time its GPU work waited on host steps (a streamed target's expert
 reads), and a part per row; the slice grows to twice the fixed part, so a
 command's rows take at least as long as its reads. Unopposed, a target whose
 experts stream runs its remaining chunks in as few prefill groups of up to four
-as hold them, evenly split. A lane whose history holds KV only the SSD cache has
+as hold them, evenly split, and so does a request whose KV spills to the SSD
+cache, which reads its history once a group; one whose KV stays in memory on a
+target whose experts load whole runs chunks, so a request that arrives beside it
+waits for a chunk. On a target whose experts stream a request keeps its groups
+whatever contends, and a command whose estimate exceeds the slice runs alone in
+passes over the model's layers, as many as keep each within the slice: its
+later passes come before any other prefill or admission, decode commands run
+between them as the decode share owes them, only the last commits its rows,
+and a request that ends between passes leaves the rest unrun. A lane whose history holds KV only the SSD cache has
 reads all of that history in each command, whatever its rows: it runs alone,
 and contended it takes the fewest rows, halving from its group's, whose time
 still covers its own running estimate of that wait, and never fewer than another
@@ -2674,8 +2871,10 @@ does the automatic quota where the plan has no room for the staging beside the
 model and the requested context, so a start the staging would fail goes on
 without the tier, and where the plan refuses the Neural Engine split beside the
 staging but not without it (`aneFfnRefused`): the split wins. The disk plays no
-part in the plan, so it changes no start's context; the server's relaunch of
-the engine decides the staging as its first engine did and keeps that engine's
+part in a dense target's plan, so it changes no start's context; a block-sparse
+target's first start takes its room for active KV into its context
+([memory and context](#memory-and-context)). The server's relaunch of the
+engine decides the staging as its first engine did and keeps that engine's
 context ([Neural Engine prefill](#neural-engine-prefill)). The tier's files
 open after the plan, where the disk takes them; where none open, the tier turns
 off and the staging the plan set aside stays unused. The automatic quota opens
@@ -2691,9 +2890,13 @@ tier takes anything back, and again at every control pass and whenever a write
 finds the volume full. `DiskSpace` reads the volume with `fstatfs` on the first
 file's descriptor, which names the right volume however the file was made, and
 sets the budget's limit to min(quota, max(0, available + held - floor) / 4),
-held being the blocks the tier's files take (`st_blocks`). The tier's own writes
-and punches move bytes between available and held, so they leave the limit
-where it is, while space anything else takes or frees moves it by a quarter.
+held being the blocks the tier's files take (`st_blocks`). The KV of requests
+in service, the slots of the blocks they hold and the commitments of spilling
+requests, may use min(quota, max(0, available + held - floor)) instead
+(`DiskBudget::activeLimitBytes`, [KV on the SSD](#kv-on-the-ssd)). The tier's
+own writes and punches move bytes between available and held, so they leave
+the limit where it is, while space anything else takes or frees moves it by a
+quarter.
 Several tiers on one volume each settle at (available - floor) / (tiers + 3) of
 what was available before them, and blocks a local snapshot keeps when the tier
 frees them cost it at most a third more than it freed. A limit below what the
@@ -2747,18 +2950,24 @@ chain whose newest blocks have no copy, as a finished request's prompt past the
 chain it restored, so leaves RAM one write at a time, and an allocation refused
 meanwhile waits for each write. Unneeded
 tails are dropped without writing, before any state, together with any disk
-copies below them. A restored page is read
-straight into its extent. Either way the transfer runs on the file's IO worker
-beside whatever command the model runs: a cached page is never written by a
-command, and no command uses a page before its read has landed. While a step
-waits for SSD reads (streamed experts or PLE rows), each 1 MiB of a write
-waits for them, at most 2 ms, unless a restore queued behind the write would
-wait as long (`SlotFile::Options::deferWrites`). At most 128 KV pages are in
-transfer at a time, demotions at most half of them and restores at most three
-quarters, since one worker serves both in order and a burst of either kind
-must leave the other its share. When the tier takes no more, leaves that
-need a write stay until a transfer lands, while leaves whose page frees without
-one still go.
+copies below them. Writes run on their file's IO worker. A KV page is restored
+by the engine's SSD readers (`SsdReaders`), which
+read what the page's form holds, its index alone or the whole page, with one
+aligned read into memory of their own, and scatter it into the page; the
+restores asked for between two submissions (`KvTier::submitRestores`) go out
+together, index restores on every reader and whole ones on at most
+`KvPageTier::kWholeRestoreReaders`. A state is restored on its file's worker.
+Either way the transfer runs beside whatever command the model runs: a cached
+page is never written by a command, and no command uses a page before its read
+has landed. While a step waits for SSD
+reads (streamed experts, PLE rows or spilled KV), each 1 MiB of a write waits
+for them, at most 2 ms, unless a read queued behind the write on its file's
+worker would wait as long (`SlotFile::Options::deferWrites`). At most 64 KV
+writes are in flight (`KvPageTier::kWrites`): a persistent point's copies a
+quarter of them and spilling requests' write-through half, so that neither
+starves the demotions a reclaim needs, which may take the rest. When the tier
+takes no more, leaves that need a write stay until a transfer lands, while
+leaves whose page frees without one still go.
 
 A state with no available RAM cache slot can be written directly from its lane.
 When every state in RAM is in use and no cached KV is left to take, a replay
@@ -2803,17 +3012,25 @@ second such write the tier keeps within what it holds, with one log line, while
 serving continues. On a volume that cannot punch holes the files keep the
 blocks of freed slots, which the runtime reports once; the limit counts them.
 
-Transfers use `pread`/`pwrite` with `F_NOCACHE`, every one an aligned range:
-whole 1 MiB chunks of 16 KiB-aligned memory that start at an aligned offset of
-the slot (a state's staging buffer and lane buffers) move directly, everything
-else through the file's own 1 MiB buffer. A write that fails for another reason
+Transfers use `pread`/`pwrite` with `F_NOCACHE`, every one an aligned range.
+Those of the files' IO workers, every write and a state's reads, move whole
+1 MiB chunks of 16 KiB-aligned memory that start at an aligned offset of the
+slot (a state's staging buffer and lane buffers) directly, everything else
+through the file's own 1 MiB buffer; a KV read on the SSD readers is one read
+of whole 4 KiB pages around the bytes it needs, into the readers' own memory
+(`SlotFile::readAt`). A write that fails for another reason
 than a full volume disables further writes to that file, with one log line.
 Failed KV writes retain RAM pages; failed state writes invalidate the disk
 copy. A failed read invalidates its cached data, allowing lookup to fall back
 to the surviving prefix.
 
-With `--persistent-cache`, each slot's record carries a CRC-32C of its payload;
-a copy that fails it on first read is a miss.
+With `--persistent-cache`, each slot's record carries a CRC-32C of its payload,
+or, in a KV file whose pages hold block records ([KV on the SSD](#kv-on-the-ssd)),
+one of each segment: the page's index, then each block's record. A state that
+fails it on its first read is a miss. Every read of a KV copy a restart took
+back checks the segments it covers: a whole or index restore that fails is a
+miss, and a block or history read that fails is `kv_unreadable` for the
+requests that read it.
 
 `/status` reports the shared quota, its limit, the write budget and KV
 transfers under `disk`. Its cumulative `read_bytes` and `written_bytes` count
@@ -2982,6 +3199,12 @@ the spare reserve and the 1 GiB margin of the spare memory free, as growth that
 no request in service needs does, so it stops, naming what it needs, while
 other programs hold that memory. With only desktop applications open, a 24 GB
 Mac runs it for those variants.
+
+The engine's `--kv-spill always`, which `splash serve` never passes, keeps
+the KV of every request of a block-sparse target on the SSD cache
+([KV on the SSD](#kv-on-the-ssd)), so that a run of `build/splash
+serve-native` with it compares spilled requests' outputs with those of a run
+without it, which must match bit for bit.
 
 Compare performance on the same idle Mac with the same model and workload.
 Keep generated reports, profiles, local paths and experiment notes out of the

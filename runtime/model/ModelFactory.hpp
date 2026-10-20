@@ -32,7 +32,7 @@ class VisionLoader;
 using TargetWeights = std::variant<Qwen3_8Weights, Qwen3_6MoeWeights, Qwen4ExpWeights>;
 
 // How a model loads beside its descriptor: with streamedTableBytes, the rows
-// of a table the target's GGUF holds (streamableTableBytes) stream from its
+// of a table the target's GGUF holds (model/ModelSizing.hpp) stream from its
 // file through a row cache of that many bytes instead of loading into memory
 // (model/SparseRowStore.hpp, --ple-memory). With expertMemoryBytes, a MoE
 // target's routed experts stream from their files through a store of that
@@ -108,7 +108,7 @@ struct RuntimeContext final {
   ops::AneFfn *aneFfn = nullptr;
   // The readers of a spill-capable target's spilled K/V, both or neither:
   // the hot block cache its verifies resolve through, and the stream of its
-  // prefills' history (RuntimeGeometry::from's kvSpills).
+  // prefills' history (StreamedParts::kv).
   KvBlockCache *blockCache = nullptr;
   KvHistoryStream *historyStream = nullptr;
 };
@@ -117,18 +117,10 @@ struct RuntimeContext final {
 // architectures. Each architecture validates its own tensor and state layout.
 void requireCompatibleModel(const LoadedModel &model);
 
-// The bytes of the images loadModel writes, without a table or routed experts
-// that stream, and of the store streamed experts load into.
-[[nodiscard]] uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor,
-                                        const ModelLoadOptions &options = {});
-// The bytes of the planes of a MoE target's routed experts, which an expert
-// store holding them all takes; 0 for a dense target.
-[[nodiscard]] uint64_t routedExpertBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor);
-// The bytes of the rows of the table a target's GGUF holds, which stream from
-// it instead of loading with streamedTableBytes (gguf::PlanOptions::streamTable);
-// 0 for a target without one. Throws for a table that cannot stream
-// (gguf::tableRows).
-[[nodiscard]] uint64_t streamableTableBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor);
+// The rows of a family's streamed table that a step stages and prefetches,
+// beside Qwen4Exp.hpp's: the Qwen3.5 families have no table to stream.
+[[nodiscard]] SparseRowStoreOptions streamedTableRows(const Qwen3_8Layout &layout);
+[[nodiscard]] SparseRowStoreOptions streamedTableRows(const Qwen3_6MoeLayout &layout);
 
 // The vision role's source, planned; null for a model without vision.
 [[nodiscard]] std::unique_ptr<VisionLoader> planVisionLoader(const std::filesystem::path &root,
@@ -154,13 +146,28 @@ loadModel(metal::MetalBackend &backend,
 void withPrefillArena(
     metal::MetalBackend &backend, const LoadedModel &model, const ops::ExecutionPlans &operators, kv::Format format,
     const std::function<void(const ops::PrefillFfnBuffers &, const std::array<metal::MetalBuffer, 2> &)> &use);
-// The runtime's memory, of one whose K/V spills with `kvSpills`
-// (RuntimeContext's readers): its prefill commands run as groups.
+// What of a model streams from the SSD, which its arenas rest on: a target
+// whose routed experts stream runs its prefill commands as groups
+// (RuntimeGeometry::prefillChunks), the step of one whose table streams
+// stages its rows, of tableRowBytes each (zero: the table loads), and a
+// runtime whose K/V spills (RuntimeContext's readers) runs groups too, which
+// read an attention layer's spilled history once each, and holds where its
+// verifies' listed blocks are. loaded() is what streams of `model` as it
+// loaded, and its K/V when `kv` says it spills.
+struct StreamedParts final {
+  bool experts = false;
+  uint64_t tableRowBytes = 0;
+  bool kv = false;
+
+  [[nodiscard]] static StreamedParts loaded(const LoadedModel &model, bool kv = false) noexcept;
+};
+// The lane state and arenas of `model`'s geometry with `parts` streaming,
+// whatever streams of it as it loaded: one load plans them for every part
+// that may stream (engine::planStreamedMemory).
 [[nodiscard]] ModelMemoryPlan
 plannedRuntimeMemory(const LoadedModel &model,
                      const ops::ExecutionPlans &operators,
-                     kv::Format kvFormat, ops::GdnStateFormat stateFormat,
-                     bool kvSpills = false);
+                     kv::Format kvFormat, ops::GdnStateFormat stateFormat, StreamedParts parts);
 [[nodiscard]] std::unique_ptr<RuntimeModel>
 createRuntime(RuntimeContext context);
 

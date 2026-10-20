@@ -22,6 +22,7 @@ namespace {
 
 using namespace splash;
 using engine::NativeArguments;
+using engine::StreamedSetting;
 using splash::test::rejects;
 using splash::test::require;
 
@@ -166,8 +167,14 @@ void testServerCommandLines(const char *path) {
          read.maxContext = 655360;
          read.model.ropeScaling = {2.5, 262144};
        }},
-      {"ple_memory", [](NativeArguments &read) { read.streamedTableBytes = 2 * kGiB; }},
-      {"expert_memory", [](NativeArguments &read) { read.expertMemoryBytes = 16 * kGiB; }},
+      {"ple_memory", [](NativeArguments &read) { read.pleMemory = {StreamedSetting::Mode::Size, 2 * kGiB}; }},
+      {"ple_memory_off", [](NativeArguments &read) { read.pleMemory = {StreamedSetting::Mode::Off, 0}; }},
+      {"expert_memory",
+       [](NativeArguments &read) { read.expertMemory = {StreamedSetting::Mode::Size, 16 * kGiB}; }},
+      {"expert_memory_off", [](NativeArguments &read) { read.expertMemory = {StreamedSetting::Mode::Off, 0}; }},
+      // Auto is the engine's default, which the server leaves out.
+      {"expert_memory_auto", [](NativeArguments &) {}},
+      {"sparse_kv_memory", [](NativeArguments &read) { read.sparseKvMemory = 1200 * (kGiB >> 10); }},
   };
   // Every field but the model inspected from the directory, whose RoPE
   // scaling --yarn-factor sets.
@@ -185,8 +192,9 @@ void testServerCommandLines(const char *path) {
            read.maxImagePatches == meant.maxImagePatches &&
            read.idleReleaseSeconds == meant.idleReleaseSeconds &&
            read.preventIdleSleep == meant.preventIdleSleep &&
-           read.neuralEngine == meant.neuralEngine && read.streamedTableBytes == meant.streamedTableBytes &&
-           read.expertMemoryBytes == meant.expertMemoryBytes;
+           read.neuralEngine == meant.neuralEngine && read.pleMemory == meant.pleMemory &&
+           read.expertMemory == meant.expertMemory && read.sparseKvMemory == meant.sparseKvMemory &&
+           read.kvSpillAlways == meant.kvSpillAlways;
   };
   const auto golden = readGolden(path);
   require(golden.size() == changes.size(),
@@ -210,6 +218,19 @@ void testNeuralEngine() {
               parse(model, {"auto", "auto", "--ane", "on"}).neuralEngine &&
               !parse(model, {"auto", "auto", "--ane", "off"}).neuralEngine,
           "--ane did not reach the arguments as given");
+}
+
+// The stores' memory is the planner's unless set, which the server writes
+// only for off or a size; --kv-spill always, which only validation passes,
+// spills every request of a target that can.
+void testStreamedMemoryAndSpill() {
+  const ModelDirectory model;
+  const NativeArguments automatic =
+      parse(model, {"auto", "auto", "--expert-memory", "auto", "--ple-memory", "auto", "--sparse-kv-memory", "auto"});
+  require(automatic.expertMemory == StreamedSetting{} && automatic.pleMemory == StreamedSetting{} &&
+              !automatic.sparseKvMemory && !automatic.kvSpillAlways,
+          "auto did not leave the stores to the planner");
+  require(parse(model, {"auto", "auto", "--kv-spill", "always"}).kvSpillAlways, "--kv-spill always was not read");
 }
 
 // A command line the server never writes is refused with what is wrong.
@@ -240,11 +261,16 @@ void testRefusals() {
   refuses({"auto", "auto", "--idle-sleep", "never"},
           "--idle-sleep requires prevent or allow");
   refuses({"auto", "auto", "--ane", "gpu"}, "--ane requires on or off");
-  // The server passes bytes.
-  for (const char *size : {"0", "2G", ""})
-    refuses({"auto", "auto", "--ple-memory", size}, "--ple-memory requires a positive byte count");
-  for (const char *size : {"0", "16G", ""})
-    refuses({"auto", "auto", "--expert-memory", size}, "--expert-memory requires a positive byte count");
+  // The server passes bytes, auto or off.
+  for (const char *size : {"0", "2G", "OFF", ""})
+    refuses({"auto", "auto", "--ple-memory", size}, "--ple-memory requires a positive byte count, auto or off");
+  for (const char *size : {"0", "16G", "Auto", ""})
+    refuses({"auto", "auto", "--expert-memory", size},
+            "--expert-memory requires a positive byte count, auto or off");
+  for (const char *size : {"0", "off", "1200M", ""})
+    refuses({"auto", "auto", "--sparse-kv-memory", size}, "--sparse-kv-memory requires a positive byte count or auto");
+  for (const char *spill : {"never", "auto", ""})
+    refuses({"auto", "auto", "--kv-spill", spill}, "--kv-spill requires always");
   refuses({"auto", "auto", "--persistent-cache", "yes"}, "--persistent-cache requires on or off");
   refuses({"auto", "auto", "0", "--persistent-cache", "on"},
           "--persistent-cache requires an SSD cache, which MAX_CACHE_DISK_BYTES 0 turns off");
@@ -339,6 +365,7 @@ int main(int argc, char **argv) {
   try {
     testServerCommandLines(argv[1]);
     testNeuralEngine();
+    testStreamedMemoryAndSpill();
     testRefusals();
     std::cout << "native arguments tests passed\n";
     return EXIT_SUCCESS;

@@ -12,6 +12,7 @@
 #include "model/KvBlockCache.hpp"
 #include "model/KvCopyRead.hpp"
 #include "model/KvHistoryStream.hpp"
+#include "model/ModelSizing.hpp"
 #include "model/Runtime.hpp"
 #include "model/Qwen4Exp.hpp"
 #include "model/Qwen4Steps.hpp"
@@ -2753,7 +2754,7 @@ struct SpillOptions final {
 // The pages a request of a block-sparse target keeps whole before those it
 // may spill: its dense history (engine::CacheSpillPolicy::densePages).
 uint32_t densePagesOf(const model::SparseKvShape &shape) {
-  return (std::max(shape.denseHistoryTokens, shape.sinkTokens) + kv::kPageTokens - 1) / kv::kPageTokens;
+  return (shape.denseTokens() + kv::kPageTokens - 1) / kv::kPageTokens;
 }
 
 // FNV-1a of the values' bytes: logits compared bit for bit.
@@ -2814,14 +2815,15 @@ public:
         states_(backend, admission, model.stateLayout(stateFormat), nullptr),
         readers_(std::make_shared<model::SsdReaders>(model::kSsdReaders)),
         cache_(backend, admission, layout_, extentPages_,
-               {.laneSlots = shape_.verifyRows * shape_.selectedBlocks, .targetBytes = 0, .readers = readers_,
+               {.laneSlots = static_cast<uint32_t>(shape_.laneSlots()), .targetBytes = 0, .readers = readers_,
                 .format = format_}),
         stream_(backend, admission, layout_, extentPages_, readers_, format_, options.buffers),
         tables_{backend.allocateBuffer(lanePages * sizeof(SplashKvPage), metal::BufferStorage::Shared,
                                        "oracle-spill-pages"),
                 backend.allocateBuffer(lanePages * sizeof(SplashKvPage), metal::BufferStorage::Shared,
                                        "oracle-spill-index")} {
-    const model::ModelMemoryPlan plan = model::plannedRuntimeMemory(model, operators, format, stateFormat, true);
+    const model::ModelMemoryPlan plan = model::plannedRuntimeMemory(model, operators, format, stateFormat,
+                                                                    model::StreamedParts::loaded(model, true));
     const uint64_t arenaBytes = plan.sharedPrefillPlannedAllocatedBytes + plan.sharedDecodePlannedAllocatedBytes;
     require(static_cast<bool>(admission(arenaBytes, [&] {
               runtime_.emplace(model::RuntimeContext{backend, model, kv_, states_, operators, nullptr, &cache_,
@@ -3503,8 +3505,11 @@ int main(int argc, char **argv) {
     // Metal operation while loading. This oracle has no such guard, so the
     // weights must fit in reclaimable memory above the macOS reserve before
     // any is loaded; it can refuse a model production starts.
-    const uint64_t weightBytes =
-        model::modelWeightBytes(modelRoot, descriptor, loadOptions) + loadOptions.streamedTableBytes;
+    const model::StreamableWeights streamable = model::streamableWeights(
+        modelRoot, descriptor,
+        {.streamExperts = loadOptions.expertMemoryBytes != 0, .streamTable = loadOptions.streamedTableBytes != 0});
+    const uint64_t weightBytes = streamable.loadedBytes + (streamable.expertBytes ? loadOptions.expertMemoryBytes : 0) +
+                                 (streamable.tableBytes ? loadOptions.streamedTableBytes : 0);
     if (*hostAvailableBytes <= hostReserveBytes ||
         weightBytes > *hostAvailableBytes - hostReserveBytes)
       stopForHostMemory("the weights need " + mebibytes(weightBytes),
@@ -3517,7 +3522,7 @@ int main(int argc, char **argv) {
       std::cout << "ple_memory=" << (model.streamedTable() ? "streamed" : "ignored") << '\n';
     ops::ExecutionPlans operators(backend.capabilities());
     model::ModelMemoryPlan executorPlan =
-        model::plannedRuntimeMemory(model, operators, format, stateFormat);
+        model::plannedRuntimeMemory(model, operators, format, stateFormat, model::StreamedParts::loaded(model));
     // The memory plan with `aneFfnBytes` set aside for the prefill FFN's
     // Neural Engine split.
     const auto planMemory = [&](uint64_t aneFfnBytes) {

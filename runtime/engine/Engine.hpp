@@ -291,9 +291,12 @@ public:
   [[nodiscard]] bool flushRestorePoints();
 
 private:
+  // A lane's end other than its output's, and for a retryable outcome the
+  // seconds after which a retry may succeed, 0 for at once.
   struct LaneEnd final {
     LaneOutcome outcome;
     std::string message;
+    uint32_t retryAfterSeconds = 0;
   };
 
   struct ResourceWait final {
@@ -493,7 +496,8 @@ private:
   // lane's floor), and for every request under --kv-spill always; Resident
   // otherwise. Correctness never depends on it.
   [[nodiscard]] KvMode kvModeFor(const Request &request) const;
-  // The request's projection fits in the memory resident KV may use, alone.
+  // The request's projection fits in memory alone, as it would without the
+  // SSD cache (SpillGeometry::residentTokens).
   [[nodiscard]] bool fitsResidentAlone(const Request &request) const;
   // The last block of a chain of KV a request holds: the one a lookup
   // matched, which it restores, or the one it holds published as its lane

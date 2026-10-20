@@ -7,7 +7,9 @@
 #include "engine/RuntimeResources.hpp"
 #include "engine/Engine.hpp"
 #include "engine/MemoryPlan.hpp"
+#include "model/ModelSizing.hpp"
 #include "model/RuntimeArenas.hpp"
+#include "model/SsdReaders.hpp"
 
 #import <Foundation/Foundation.h>
 
@@ -119,6 +121,186 @@ reading(std::optional<DiskVolume> volume) {
   return [volume](const std::filesystem::path &) { return volume; };
 }
 
+// The routed experts of each layer of the MoE model below.
+constexpr uint32_t kMoeExperts = 128;
+constexpr uint32_t kMoeLayers = 8;
+
+// A MoE model under root whose weights load: the planned model's draft and
+// vision tower beside kMoeLayers layers of Qwen3.6-35B-A3B's geometry, each
+// with kMoeExperts routed experts, eight a token. Its experts above their
+// smallest store, a layer's, take more than the arenas of its prefill groups
+// and the first 64K tokens of its KV.
+RuntimeResourcesConfig moeConfig(const char *metallibPath, const std::filesystem::path &root) {
+  const PlannedModel planned = plannedModel();
+  model::Qwen3_6MoeLayout target;
+  target.layers = kMoeLayers;
+  target.vocabularySize = planned.target.vocabularySize;
+  target.experts = kMoeExperts;
+  static_cast<void>(test::writeSyntheticModel(root, target, planned.draft, planned.vision));
+  RuntimeResourcesConfig config;
+  config.metallibPath = metallibPath;
+  config.modelRoot = root;
+  config.model = model::makeModelDescriptor("moe-test", target, planned.draft, planned.vision,
+                                            model::TargetSource::Safetensors, model::VisionSource::Safetensors);
+  config.model.sourceIdentity = "synthetic";
+  config.buildId = "moe-test";
+  config.hostMemory = [] { return std::optional<HostMemory>(HostMemory{64 * kGiB, 64 * kGiB}); };
+  return config;
+}
+
+// What a start sized: its context, the least memory its plan needs and its
+// arenas, its routed experts' store, whether its SSD cache started, its log
+// and how many times it loaded the weights.
+struct StreamedStart final {
+  uint32_t context = 0;
+  uint64_t minimumRequired = 0, arenaBytes = 0;
+  std::optional<model::ExpertStoreStats> experts;
+  bool tier = false;
+  std::string log;
+  size_t loads = 0;
+};
+
+StreamedStart startStreamed(const RuntimeResourcesConfig &config) {
+  StreamedStart started;
+  started.log = test::capturedStderr([&] {
+    auto resources = RuntimeResources::create(config, 0);
+    const EngineMemoryBreakdown &budget = resources->memoryPlan().breakdown();
+    started.context = resources->memoryPlan().maximumContextTokens();
+    started.minimumRequired = budget.minimumRequiredBytes;
+    started.arenaBytes = budget.sharedPrefillBytes + budget.sharedDecodeBytes;
+    started.experts = resources->streamedExpertStats();
+    started.tier = resources->cache().snapshot().kvTier.capacityBytes != 0;
+  });
+  for (size_t at = started.log.find("Weights loaded"); at != std::string::npos;
+       at = started.log.find("Weights loaded", at + 1))
+    ++started.loads;
+  return started;
+}
+
+// The sizes a model's weights take, planned from its files before it loads,
+// are what it loads: the images without its routed experts and those with
+// all of them, and the smallest store, which holds a layer's experts and
+// refuses a byte less. One load plans the arenas of either: those of streamed
+// experts planned from a model that loads them whole are a streaming model's,
+// and the reverse.
+void testStreamableWeightsAreWhatLoads(const RuntimeResourcesConfig &config) {
+  const std::filesystem::path &root = config.modelRoot;
+  const model::StreamableWeights weights =
+      model::streamableWeights(root, config.model, {.streamExperts = true, .streamTable = true});
+  require(weights.expertBytes > weights.expertFloorBytes && weights.expertFloorBytes && !weights.tableBytes &&
+              !weights.tableFloorBytes && !weights.tableRowBytes && weights.tableRefusal.empty(),
+          "the streamable weights of a MoE without a table are not its experts'");
+  const auto allocated = [](const model::LoadedModel &loaded) {
+    return loaded.targetActualAllocatedBytes() + loaded.draft.actualAllocatedBytes +
+           loaded.vision.actualAllocatedBytes;
+  };
+  metal::MetalBackend backend(config.metallibPath.string());
+  const ops::ExecutionPlans operators(backend.capabilities());
+  const auto arenas = [&](const model::LoadedModel &loaded, model::StreamedParts parts) {
+    const model::ModelMemoryPlan plan =
+        model::plannedRuntimeMemory(loaded, operators, kv::Format::Int8, ops::GdnStateFormat::Float32, parts);
+    return plan.sharedPrefillPlannedAllocatedBytes + plan.sharedDecodePlannedAllocatedBytes;
+  };
+  const model::LoadedModel whole = model::loadModel(backend, root, config.model);
+  require(allocated(whole) == weights.loadedBytes + weights.expertBytes,
+          "the experts loaded with their layers did not take what was planned");
+  // Streamed experts read on a pool of SSD readers, as the engine's do.
+  const auto readers = std::make_shared<model::SsdReaders>(model::kSsdReaders);
+  const model::LoadedModel streamed = model::loadModel(
+      backend, root, config.model, {.expertMemoryBytes = weights.expertFloorBytes, .readers = readers});
+  require(streamed.expertStore() && streamed.expertStore()->stats().slots == kMoeExperts &&
+              allocated(streamed) <= weights.loadedBytes + weights.expertFloorBytes,
+          "the smallest store did not hold a layer's experts within its bytes");
+  require(arenas(whole, {.experts = true}) == arenas(streamed, model::StreamedParts::loaded(streamed)) &&
+              arenas(streamed, {}) == arenas(whole, model::StreamedParts::loaded(whole)) &&
+              arenas(whole, {.experts = true}) > arenas(whole, {}),
+          "the arenas of what streams are not those of a model loaded so, or prefill groups took no more");
+  rejects([&] {
+    static_cast<void>(
+        model::loadModel(backend, root, config.model,
+                         {.expertMemoryBytes = weights.expertFloorBytes - 1, .readers = readers}));
+  }, "holds fewer slots", "a store a byte below the smallest loaded");
+}
+
+// --expert-memory auto loads a MoE target's routed experts where the plan
+// holds them, in one load as main does. Where it does not, they stream
+// through a store of all that the first 64K tokens of KV leave, in two
+// loads: the first plans the arenas of either, and the second loads that
+// store. The automatic SSD cache gives its state staging up where it alone
+// would stream them. Off loads them whatever the budget, a budget without
+// room for their arenas stops the start with its breakdown, and a size below
+// the smallest store is refused by name before anything loads.
+void testAutomaticExpertMemory(RuntimeResourcesConfig config) {
+  const model::StreamableWeights weights =
+      model::streamableWeights(config.modelRoot, config.model, {.streamExperts = true});
+  const StreamedStart whole = startStreamed(config);
+  require(!whole.experts && whole.loads == 1 &&
+              whole.log.find("Routed experts load with their layers") != std::string::npos,
+          "routed experts memory holds did not load with their layers in one load");
+  const auto streams = [&](const StreamedStart &start, const char *message) {
+    require(start.experts && start.experts->slots > kMoeExperts &&
+                start.experts->slots < kMoeLayers * kMoeExperts && start.loads == 2 &&
+                start.log.find("--expert-memory auto leaves it beside the floors") != std::string::npos &&
+                start.context >= 65'536,
+            message);
+  };
+  // A byte short of the budget that holds every expert, which the plan
+  // without the arenas holds: whole, then through the store.
+  config.maximumMemoryBytes = whole.minimumRequired - 1;
+  streams(startStreamed(config),
+          "experts that fit beside everything but the arenas did not stream through the store the plan sizes");
+  // Short of that too: at the floor, then through the store.
+  config.maximumMemoryBytes = whole.minimumRequired - whole.arenaBytes - 1;
+  streams(startStreamed(config),
+          "routed experts memory cannot hold did not stream through the store the plan sizes");
+
+  // A byte short of every expert beside the automatic SSD cache's staging:
+  // the cache gives it up, and they load whole in one load.
+  config.cacheDisk = {.automatic = true};
+  config.diskVolume = reading(localVolume(500 * kGiB));
+  config.maximumMemoryBytes = whole.minimumRequired + config.model.stateLayout.cachedBytes() - 1;
+  const StreamedStart yielded = startStreamed(config);
+  require(!yielded.experts && !yielded.tier && yielded.loads == 1 &&
+              yielded.log.find("SSD cache off: its " + std::to_string(config.model.stateLayout.cachedBytes() >> 20) +
+                               " MiB of state staging would stream the routed experts") != std::string::npos,
+          "the automatic SSD cache's staging streamed experts that load whole without it");
+  config.maximumMemoryBytes += 1;
+  const StreamedStart kept = startStreamed(config);
+  require(!kept.experts && kept.tier && kept.loads == 1, "the automatic SSD cache yielded room it had");
+  config.cacheDisk = {};
+  config.diskVolume = RuntimeResourcesConfig{}.diskVolume;
+
+  config.expertMemory = {StreamedSetting::Mode::Off, 0};
+  config.maximumMemoryBytes = 0;
+  require(!startStreamed(config).experts, "--expert-memory off streamed the experts");
+  // A budget that holds the weights but not their arenas: the start loads
+  // them, and stops with the engine plan's breakdown.
+  config.maximumMemoryBytes = whole.minimumRequired - whole.arenaBytes / 2;
+  try {
+    static_cast<void>(RuntimeResources::create(config, 0));
+    throw std::runtime_error("a plan without room for its arenas started");
+  } catch (const RuntimeResourcesError &error) {
+    require(error.stage() == RuntimeResourceStage::MemoryPlanning &&
+                error.budgetDescription().find("deficit: " + std::to_string(whole.arenaBytes / 2) + " bytes") !=
+                    std::string::npos,
+            "a start without room for its arenas was refused without its breakdown");
+  }
+  config.maximumMemoryBytes = 0;
+  config.expertMemory = {StreamedSetting::Mode::Size, weights.expertFloorBytes};
+  const StreamedStart floor = startStreamed(config);
+  require(floor.experts && floor.experts->slots == kMoeExperts && floor.loads == 1,
+          "an explicit store did not load once at its size");
+  config.expertMemory = {StreamedSetting::Mode::Size, weights.expertFloorBytes - 1};
+  try {
+    static_cast<void>(RuntimeResources::create(config, 0));
+    throw std::runtime_error("a store below its floor was accepted");
+  } catch (const RuntimeResourcesError &error) {
+    require(error.stage() == RuntimeResourceStage::Configuration &&
+                std::string_view(error.what()).find("is less than its smallest store") != std::string_view::npos,
+            "a store below its floor was not refused by name before loading");
+  }
+}
+
 // Startup fails at the loader, whose vision weight files are deliberately
 // absent. Reaching it is the assertion: everything the engine checks before
 // loading the weights let this configuration through.
@@ -140,7 +322,7 @@ void requireReachesModelLoader(RuntimeResourcesConfig config,
 // Beside its weights a model needs at least the runtime reserves, one lane's
 // state and the KV runway.
 uint64_t minimumBytes(const RuntimeResourcesConfig &config) {
-  return minimumRequiredBytes(model::modelWeightBytes(config.modelRoot, config.model) +
+  return minimumRequiredBytes(model::streamableWeights(config.modelRoot, config.model, {}).loadedBytes +
                                   model::kPipelineReserveBytes + model::kRuntimeOverheadReserveBytes,
                               config.model.stateLayout.laneBytes(),
                               config.model.targetKvLayout)
@@ -230,9 +412,9 @@ void testWeightBudgetBeforeLoading(const char *metallibPath) {
   config.memoryPressure = [] { return MemoryPressure::Warning; };
 
   // The low ceiling is one byte short of the minimum, so admission must
-  // charge modelWeightBytes and all a model needs beside its weights. The
-  // other ceilings must reach the real loader, whose expected weight files
-  // are deliberately absent.
+  // charge the weights and all a model needs beside them. The other ceilings
+  // must reach the real loader, whose expected weight files are deliberately
+  // absent.
   const uint64_t minimum = minimumBytes(config);
   for (uint64_t ceiling : {minimum - 1, minimum, uint64_t{0}}) {
     config.maximumMemoryBytes = ceiling;
@@ -366,7 +548,7 @@ void testModelBeyondBudgetIsRefusedBeforeLoading(const char *metallibPath) {
                                             test::qwen3_8Vision(), model::TargetSource::Safetensors,
                                             model::VisionSource::Safetensors);
   writeCheckpoints(root.path(), config.model);
-  config.maximumMemoryBytes = model::modelWeightBytes(root.path(), config.model) + kGiB / 2;
+  config.maximumMemoryBytes = model::streamableWeights(root.path(), config.model, {}).loadedBytes + kGiB / 2;
   try {
     auto resources = RuntimeResources::create(config, 0);
     throw std::runtime_error("a model that cannot fit unexpectedly loaded");
@@ -393,7 +575,8 @@ void testStartupAdmissionIgnoresModelSize(const char *metallibPath) {
   config.model = model::makeModelDescriptor("budget-test", target, draft, test::qwen3_8Vision(),
                                             model::TargetSource::Safetensors, model::VisionSource::Safetensors);
   writeCheckpoints(root.path(), config.model);
-  require(model::modelWeightBytes(root.path(), config.model) > 3 * kGiB, "the model must exceed the sample");
+  require(model::streamableWeights(root.path(), config.model, {}).loadedBytes > 3 * kGiB,
+          "the model must exceed the sample");
   config.hostMemory = [] { return std::optional<HostMemory>(HostMemory{3 * kGiB, 3 * kGiB}); };
   requireReachesModelLoader(config, root.path(),
                             "a model larger than reclaimable host memory "
@@ -815,6 +998,12 @@ int main(int argc, char **argv) {
       testAutomaticTierYieldsToTheContext(argv[1]);
       testAutomaticContextIgnoresTheVolume(argv[1]);
       testEngineFollowsTheGovernor(argv[1]);
+      {
+        const test::TemporaryDirectory root("splash-moe");
+        const RuntimeResourcesConfig moe = moeConfig(argv[1], root.path());
+        testStreamableWeightsAreWhatLoads(moe);
+        testAutomaticExpertMemory(moe);
+      }
       std::cout << "runtime resources tests passed\n";
       return EXIT_SUCCESS;
     } catch (const std::exception &error) {

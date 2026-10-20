@@ -132,6 +132,11 @@ public:
   // The bytes a store of these blocks allocates besides its arenas: its
   // staging, slot tables, jobs and the decode prediction's buffers.
   [[nodiscard]] static uint64_t fixedBytes(const StreamedBlocks &blocks, ops::MoeShape shape);
+  // The smallest store of these blocks (ExpertStoreOptions::memoryBytes),
+  // which the constructor refuses a byte less than: its fixed bytes, a
+  // block's experts of each streamed size and every expert of a size of one
+  // block.
+  [[nodiscard]] static uint64_t minimumBytes(const StreamedBlocks &blocks, ops::MoeShape shape);
 
 private:
   struct Impl;
@@ -139,7 +144,10 @@ private:
 };
 
 // The slot table of a block whose routed experts are all resident: expert e
-// in slot e.
+// in slot e. A model's blocks share one, of residentExpertSlotsBytes.
 [[nodiscard]] metal::MetalBuffer residentExpertSlots(metal::MetalBackend &backend, uint32_t experts);
+[[nodiscard]] constexpr uint64_t residentExpertSlotsBytes(uint32_t experts) noexcept {
+  return uint64_t{experts} * sizeof(uint32_t);
+}
 
 } // namespace splash::model

@@ -26,7 +26,8 @@ namespace {
 using splash::test::capturedStderr;
 using splash::test::require;
 
-EngineMemoryPlan plan() {
+// The 27B's plan, or with another KV layout.
+EngineMemoryPlan plan(const kv::Layout &kvLayout = kv::Layout{16, 4, 256}) {
   DeviceCapabilities device;
   device.deviceName = "test";
   device.appleGpuFamily = 9;
@@ -38,8 +39,9 @@ EngineMemoryPlan plan() {
   device.maxThreadgroupMemoryBytes = 32 * 1024;
   device.maxThreadgroupWidth = 1024;
   device.hasUnifiedMemory = true;
-  return test::requireMemoryPlan(
-      device, test::modelMemoryProfile(2 * kGiB, 1 * kGiB, 1 * kGiB));
+  ModelMemoryProfile profile = test::modelMemoryProfile(2 * kGiB, 1 * kGiB, 1 * kGiB);
+  profile.targetKvLayout = kvLayout;
+  return test::requireMemoryPlan(device, profile);
 }
 
 MemoryAuditResult audit(const EngineMemoryPlan &memoryPlan) {
@@ -132,6 +134,7 @@ void testCleanRuntimeStatus(const char *goldenPath) {
   engine.resources.kvTier.usedBytes = 4096;
   engine.resources.kvTier.volumeAvailableBytes = 46170898432;
   engine.resources.kvTier.writesGated = engine::DiskWritesGate::Budget;
+  engine.resources.kvTier.writesDeferredMicroseconds = 2'500;
   engine.resources.persistent = true;
   engine.resources.kvTier.copies = 64;
   engine.resources.adoption = {2, 96, 4096, 1};
@@ -630,6 +633,108 @@ void testStreamedExpertsStatus() {
           "streamed experts' status differs");
 }
 
+// A target whose KV can spill reports what spilling does under kv_spill,
+// and each active request's kv_mode; one whose KV stays in memory reports
+// neither, as before (its plan's kv_spill is null). The pages that hold only their
+// index are the pool's pages of that form in use, each a spilled block's,
+// which a request holds as the cache does: counted once. An added section:
+// the schema version stays.
+void testKvSpillStatus() {
+  engine::EngineSnapshot engine;
+  engine.activeRequests = {{.id = 7, .phase = engine::Phase::Decode, .promptTokens = 4096, .maxNewTokens = 256},
+                           {.id = 9,
+                            .phase = engine::Phase::Decode,
+                            .promptTokens = 1'000'000,
+                            .promptProcessed = 1'000'000,
+                            .maxNewTokens = 512,
+                            .kvMode = engine::KvMode::Spill}};
+  // That one spilled, one other did after it converted, and one was refused
+  // for want of quota; another start waits for it. Its prefill streamed once
+  // beside a decoder, which waited 40 ms.
+  engine.spill = {.spill = 1, .resident = 3, .converted = 1, .refusedQuota = 1};
+  engine.scheduler.contendedStreamingPrefillBatches = 1;
+  engine.scheduler.decodeGap = {.count = 1, .totalMilliseconds = 40, .maximumMilliseconds = 40,
+                                .p50Milliseconds = 40, .p95Milliseconds = 40, .p99Milliseconds = 40};
+  // 31,250 of its pages hold only their index, of 24 KiB, and a free extent of
+  // them is the runway.
+  engine.resources.pool.index = {.pagesAllocated = 31'506,
+                                 .pagesFree = 256,
+                                 .pagesActive = 31'250,
+                                 .pagesPrefix = 31'250,
+                                 .allocatedBytes = 31'506 * 24'576ULL};
+  ResourceWaitSnapshot wait;
+  wait.diskQuota = 1;
+  KvSpillStatus spill;
+  spill.cache = {.spilledPages = 31'250,
+                 .spilledBytes = 13'312'000'000,
+                 .writeThroughPages = 31'250,
+                 .writeThroughBytes = 13'312'000'000,
+                 .writeThroughInFlight = 3,
+                 .spillMoves = 31'250,
+                 .indexRestores = 12,
+                 .wholeRestores = 2,
+                 .restore = {.count = 2, .totalMilliseconds = 1.5, .maximumMilliseconds = 1, .p50Milliseconds = 0.5,
+                             .p95Milliseconds = 1, .p99Milliseconds = 1},
+                 .activeLimitBytes = 32 * kGiB,
+                 .heldBytes = 13'312'000'000,
+                 .committedBytes = 55'000'000};
+  spill.blockCache = model::KvBlockCacheStats{.bytes = 408'944'640,
+                                              .targetBytes = 408'944'640,
+                                              .floorBytes = 408'944'640,
+                                              .slotsPerLayer = 8'192,
+                                              .lanes = 1,
+                                              .reads = {.resolves = 24,
+                                                        .entries = 98'304,
+                                                        .paged = 1'024,
+                                                        .hits = 60'000,
+                                                        .misses = 37'280,
+                                                        .ghostHits = 512,
+                                                        .readBytes = 310'000'000}};
+  // Two commands read 24 layers' history in 5 s.
+  spill.historyStream = model::KvHistoryStreamStats{
+      .commands = 2,
+      .layers = 24,
+      .pages = 750'000,
+      .bytes = 24'960'000'000,
+      .stagingBytes = 1'056'440'320,
+      .buffers = 2,
+      .read = {.count = 24, .totalMilliseconds = 5'000, .maximumMilliseconds = 250, .p50Milliseconds = 262.144,
+               .p95Milliseconds = 262.144, .p99Milliseconds = 262.144}};
+  const auto status = [&](const EngineMemoryPlan &memoryPlan, const std::optional<KvSpillStatus> &kvSpill) {
+    return runtimeStatusJson(memoryPlan, engine, {}, {}, {}, {}, {}, {}, {}, true, {}, wait, {}, {}, {}, {},
+                             std::nullopt, std::nullopt, kvSpill);
+  };
+  const std::string resident = status(plan(), std::nullopt);
+  const size_t planned = resident.find("\"kv_spill\":null");
+  require(planned < resident.find("\"memory_actual\"") &&
+              resident.find("\"kv_spill\"", planned + 1) == std::string::npos &&
+              resident.find("\"kv_mode\"") == std::string::npos,
+          "a target whose KV stays in memory reported spilling");
+  const std::string json = status(plan(test::sparseKvLayout()), spill);
+  require(json.find("\"id\":7,") < json.find("\"kv_mode\":\"resident\"") &&
+              json.find("\"id\":9,") < json.find("\"kv_mode\":\"spill\""),
+          "the active requests' KV modes are missing");
+  const std::string none = "{\"p50\":0,\"p95\":0,\"p99\":0,\"max\":0,\"total\":0,\"samples\":0}";
+  const std::string expected =
+      "\"kv_spill\":{\"requests\":{\"spill\":1,\"resident\":3,\"converted\":1,\"bounded\":0,\"length_ends\":0,"
+      "\"refused\":{\"quota\":1,\"write_budget\":0,\"closed\":0},\"waiting_quota\":1},\"pages\":{\"index\":31250,"
+      "\"index_bytes\":768000000,\"spilled\":31250,\"spilled_bytes\":13312000000},\"write_through\":{\"pages\":31250,"
+      "\"bytes\":13312000000,\"in_flight\":3,\"failures\":0,\"paused\":false},\"spill_moves\":31250,\"unspills\":0,"
+      "\"rewrites\":0,\"restores\":{\"index_pages\":12,\"whole_pages\":2,\"ms\":{\"p50\":0.5,\"p95\":1,\"p99\":1,"
+      "\"max\":1,\"total\":1.5,\"samples\":2}},\"quota\":{\"active_limit_bytes\":34359738368,\"held_bytes\":"
+      "13312000000,\"committed_bytes\":55000000,\"revoked\":0},\"index_runway_bytes\":6291456,\"block_cache\":"
+      "{\"bytes\":408944640,\"target_bytes\":408944640,\"floor_bytes\":408944640,\"slots_per_layer\":8192,\"lanes\":1,"
+      "\"resolves\":24,\"entries\":98304,\"paged\":1024,\"hits\":60000,\"read\":37280,\"hit_rate\":0.6167763158,"
+      "\"ghost_hits\":512,\"read_bytes\":310000000,\"read_failures\":0,\"resolve_ms\":" +
+      none + ",\"read_ms\":" + none + ",\"host_steps\":{\"pickup_ms\":" + none + ",\"work_ms\":" + none +
+      ",\"resume_ms\":" + none +
+      "}},\"history_stream\":{\"commands\":2,\"contended_commands\":1,\"layers\":24,\"pages\":750000,"
+      "\"bytes\":24960000000,\"staging_bytes\":1056440320,\"buffers\":2,\"read_ms\":{\"p50\":262.144,"
+      "\"p95\":262.144,\"p99\":262.144,\"max\":250,\"total\":5000,\"samples\":24},\"wait_ms\":" +
+      none + ",\"decode_gap_ms\":{\"p50\":40,\"p95\":40,\"p99\":40,\"max\":40,\"total\":40,\"samples\":1}}}";
+  require(json.find(expected) != std::string::npos, "the spilling target's kv_spill differs:\n" + json);
+}
+
 // A streamed table's store (--ple-memory): null without one; with one its
 // memory, per use its stages, rows, hit rate and stage latencies, its reads,
 // prefetches and failure. An added field: the schema version stays.
@@ -800,6 +905,7 @@ int main(int argc, char **argv) {
     testAneFfnStatus();
     testStreamedTableStatus();
     testStreamedExpertsStatus();
+    testKvSpillStatus();
     testThermalStateStatus();
     testThermalStateTransitions();
     testStderrLinesStayWhole();
