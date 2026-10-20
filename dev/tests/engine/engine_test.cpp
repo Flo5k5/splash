@@ -8860,6 +8860,73 @@ void testSpillResumeInItsPromptHoldsNoAnchor() {
           "a resume in its prompt was not bounded to the token its prompt's pages leave");
 }
 
+// A Spill request suspended for a higher priority resumes with the chain it
+// restores and its replay's first page, as a start that restores one does,
+// not with all the pages it held, as Full pages at once: its replay takes
+// Full pages a command at a time, which leave as its blocks are found cached
+// or spill as their copies land, as its output's did. A replay longer than
+// memory holds as Full pages resumes and completes.
+void testSpillResumeTakesItsReplaysPagesAsItRuns() {
+  Spilling spill(1024);
+  // 100 Full pages: a prefill command's 64 fit beside the Index pages of the
+  // request's spilled history, and its 125 pages do not.
+  spill.storage.budgetPages = 100;
+  spill.model.decodeTokens = 8;
+  EngineRequest background = Spilling::prompt(1, 1, 4, 4'096);
+  background.priority = RequestPriority::Background;
+  spill.engine.submit(std::move(background));
+  spill.runUntil([&] { return spill.events.outputs[1].size() >= 3'840; },
+                 "the request did not decode");
+  // A Normal start is refused memory while it is resident, which suspends
+  // it.
+  spill.model.beginGrowthBlocked = [&] {
+    return spill.model.lastBeginId == 2 && spill.model.requests.at(1).resident;
+  };
+  spill.engine.submit(Spilling::prompt(2, 2, 1, 1));
+  spill.runUntilIdle();
+  require(spill.model.suspensions == 1 && spill.model.resumptions == 1 &&
+              spill.events.failedCount == 0 && spill.events.completedCount == 2 &&
+              spill.events.usage.at(1).second == 4'096,
+          "a Spill request whose replay memory holds only a command at a time as Full pages "
+          "did not resume");
+}
+
+// A Resident request suspended for a higher priority resumes with the KV it
+// held, all Full, at once. Where memory no longer holds that, it converts to
+// Spill there, and then takes its replay's first page, as a Spill request
+// resumes, rather than ask for all of it as Full pages again.
+void testAResumeThatConvertsTakesItsReplaysPagesAsItRuns() {
+  // Requests spill only where memory refuses them.
+  Spilling spill(1024, false);
+  spill.model.decodeTokens = 8;
+  EngineRequest background = Spilling::prompt(1, 1, 4, 4'096);
+  background.priority = RequestPriority::Background;
+  spill.engine.submit(std::move(background));
+  // 2,400 tokens of output: 80 pages, all Full.
+  spill.runUntil([&] { return spill.events.outputs[1].size() >= 2'400; },
+                 "the request did not decode");
+  // A Normal start is refused memory while it is resident, which suspends
+  // it, and its resume is refused until memory has shrunk.
+  spill.model.beginGrowthBlocked = [&] {
+    return spill.model.lastBeginId == 2 && spill.model.requests.at(1).resident;
+  };
+  spill.model.resumeDenied = true;
+  spill.engine.submit(Spilling::prompt(2, 2, 1, 1));
+  spill.runUntil([&] { return spill.events.completedCount == 1; },
+                 "the Normal request did not run");
+  // Memory shrinks to 72 Full pages, which hold a prefill command's 64 and
+  // not the 80 it held: a critical pass releases what the cache held.
+  spill.storage.budgetPages = 72;
+  static_cast<void>(spill.engine.reclaimMemory({.critical = true}));
+  spill.model.resumeDenied = false;
+  spill.runUntilIdle();
+  const SpillRequestsSnapshot counts = spill.engine.snapshot().spill;
+  require(counts.resident == 2 && counts.converted == 1 && spill.events.failedCount == 0 &&
+              spill.events.completedCount == 2 && spill.events.usage.at(1).second == 4'096,
+          "a Resident request that converted as it resumed asked for its whole replay as Full "
+          "pages");
+}
+
 // A decoding lane whose history holds Index pages reads them through the hot
 // block cache: the model refuses its floor there, and decode runs the other
 // lanes without it, which waits rather than fails while they hold memory.
@@ -11979,6 +12046,8 @@ int main() {
     testSpillResumeCommitsAgain();
     testSpillResumeBoundLeavesOutputPastItsAnchor();
     testSpillResumeInItsPromptHoldsNoAnchor();
+    testSpillResumeTakesItsReplaysPagesAsItRuns();
+    testAResumeThatConvertsTakesItsReplaysPagesAsItRuns();
     testDecodeLeavesOutALaneRefusedItsHotFloor();
     testARefusedDecodeTakesThePrefillLanesMemory();
     testRefusedModelMemoryTakesWhatGivesMemoryBack();
