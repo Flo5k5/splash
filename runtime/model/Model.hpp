@@ -303,9 +303,6 @@ struct BatchItem final {
 
 struct BatchPlan final {
   WorkKind kind = WorkKind::Decode;
-  // A decode's lanes exchange token masks with the host; constrained and
-  // unconstrained lanes never share a command.
-  bool constrained = false;
   std::vector<BatchItem> items;
   DecodeStage decodeStage = DecodeStage::Regular;
   // A prefill of one lane may run in passes, each over the next of `passes`

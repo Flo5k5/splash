@@ -382,10 +382,8 @@ void prefillToken(model::Runtime &executor, uint64_t requestId,
 ModelStepResult decodeOne(model::Runtime &executor, uint64_t requestId,
                           uint64_t logicalPosition,
                           const std::vector<uint32_t> &pageTable,
-                          bool constrained = false,
                           DecodeStage decodeStage = DecodeStage::Regular) {
   BatchPlan plan{.kind = WorkKind::Decode,
-                 .constrained = constrained,
                  .items = {{requestId, 0}},
                  .decodeStage = decodeStage};
   ModelBatchItem item = withRevision({requestId, logicalPosition, 0, pageTable});
@@ -449,7 +447,6 @@ beginMaskedDecodeOne(model::Runtime &executor, uint64_t requestId,
                      uint64_t logicalPosition,
                      const std::vector<uint32_t> &pageTable) {
   BatchPlan plan{.kind = WorkKind::Decode,
-                 .constrained = true,
                  .items = {{requestId, 0}},
                  .decodeStage = DecodeStage::Regular};
   const std::array items{withRevision({requestId, logicalPosition, 0, pageTable})};
@@ -1913,7 +1910,7 @@ void requireThinkingBudgetClosesThinking(model::Runtime &executor) {
 std::vector<JointDecode>
 decodeConstrainedTogether(model::Runtime &executor, std::span<const uint64_t> ids, uint32_t promptTokens,
                           std::span<const std::vector<uint32_t>> pageTables, uint32_t count, const auto &maskAt) {
-  BatchPlan first{.kind = WorkKind::Decode, .constrained = true, .decodeStage = DecodeStage::ApplyInitialMask};
+  BatchPlan first{.kind = WorkKind::Decode, .decodeStage = DecodeStage::ApplyInitialMask};
   std::vector<ModelBatchItem> firstItems;
   for (size_t index = 0; index < ids.size(); ++index) {
     provideMask(executor, ids[index], maskAt(index, 0));
@@ -1927,7 +1924,7 @@ decodeConstrainedTogether(model::Runtime &executor, std::span<const uint64_t> id
   std::vector<JointDecode> generated(ids.size());
   std::vector<bool> finished(ids.size(), false);
   for (uint32_t cycle = 0;; ++cycle) {
-    BatchPlan plan{.kind = WorkKind::Decode, .constrained = true, .decodeStage = DecodeStage::Regular};
+    BatchPlan plan{.kind = WorkKind::Decode, .decodeStage = DecodeStage::Regular};
     std::vector<ModelBatchItem> items;
     std::vector<size_t> lanes;
     for (size_t index = 0; index < ids.size(); ++index) {
@@ -2750,6 +2747,148 @@ void requireBatchedLanesMatchReordered(model::Runtime &executor, const model::Qw
   std::cout << "batched_lanes_reordered=PASS widths=2,3,4\n";
 }
 
+// A constrained lane decodes in one command beside an unconstrained one,
+// which asks for no mask: the command waits for the constrained lane's masks
+// alone, and its selection reads them for that lane's rows alone. Under masks
+// that admit every token but the stop tokens, both lanes decode the tokens and
+// commit the states, bit for bit, of twins decoded together unconstrained and
+// ignoring end-of-sequence, the constrained lane's first token forced to its
+// twin's: the greedy lane selects alike, and the sampled one makes the same
+// draws. A cycle whose masks then force the constrained lane's first verify
+// row to another token moves that lane alone: it retains its anchor and its
+// next cycle starts from the forced token, while the sampled lane's cycle
+// still matches its twin's, as no mask changes a row of the command's forward.
+void requireConstrainedLaneSharesDecode(model::Runtime &executor, const model::QwenStateStorage &states,
+                                        const model::ModelDescriptor &descriptor, std::span<const uint32_t> seed) {
+  constexpr uint32_t kPromptTokens = 160;
+  constexpr uint32_t kRows = model::ExecutionLimits::targetVerifyRows;
+  // Cycles whose masks admit every token, then the forced cycle and the one
+  // after it.
+  constexpr uint32_t kAdmitting = 3, kCycles = kAdmitting + 2;
+  const std::array<uint32_t, 2> stops =
+      std::visit([](const auto &layout) { return layout.stopTokens; }, descriptor.target);
+  std::vector<uint32_t> admitting(uint64_t{kRows + 1} * kMaskWords, ~0U);
+  for (uint32_t row = 0; row <= kRows; ++row)
+    for (const uint32_t stop : stops)
+      admitting[uint64_t{row} * kMaskWords + stop / 32] &= ~(1U << (stop % 32));
+  const std::array pages{pageRange(40, 8), pageRange(48, 8)};
+  // Request `id` in batch and state lane `slot`: slot 0 decodes greedily,
+  // slot 1 samples.
+  const auto begin = [&](uint64_t id, uint32_t slot, bool constrained) {
+    std::vector<uint32_t> prompt(kPromptTokens);
+    for (uint32_t index = 0; index < kPromptTokens; ++index)
+      prompt[index] = seed[(index + 13 * slot) % seed.size()];
+    EngineRequest request = makeRequest(id, std::move(prompt), 64);
+    if (constrained)
+      request.constraint = ConstraintMode::TokenMask;
+    else
+      request.flags = RequestIgnoreEndOfSequence;
+    if (slot)
+      request.sampling = {.temperature = 0.8F, .topP = 0.95F, .topK = 20, .seed = 977};
+    beginCold(executor, request, slot);
+    return prefillChunk(executor, id, 0, request.prompt, pages[slot]);
+  };
+  const auto items = [&](const std::array<uint64_t, 2> &ids, const std::array<uint64_t, 2> &positions) {
+    return std::array{withRevision({ids[0], positions[0], 0, pages[0]}),
+                      withRevision({ids[1], positions[1], 0, pages[1]})};
+  };
+  const auto plan = [](const std::array<uint64_t, 2> &ids) {
+    return BatchPlan{.kind = WorkKind::Decode, .items = {{ids[0], 0}, {ids[1], 0}},
+                     .decodeStage = DecodeStage::Regular};
+  };
+  const auto advance = [](std::array<uint64_t, 2> &positions, std::span<const ModelStepResult> results) {
+    for (uint32_t slot = 0; slot < 2; ++slot) {
+      require(results[slot].failure.empty() && !results[slot].finished,
+              "a lane beside a constrained one failed or finished");
+      positions[slot] += results[slot].outputTokens.size() - results[slot].outputTokensWithoutKv;
+    }
+  };
+
+  // The twins: both unconstrained, in one command each cycle.
+  constexpr std::array<uint64_t, 2> twins{920, 921};
+  std::array<std::vector<ModelStepResult>, 2> reference;
+  std::array<CommittedState, 2> admitted;
+  CommittedState forcedSampled;
+  const ModelStepResult greedyPrompt = begin(twins[0], 0, false);
+  require(greedyPrompt.firstToken.has_value(), "the greedy twin's prompt left no first token");
+  static_cast<void>(begin(twins[1], 1, false));
+  std::array<uint64_t, 2> positions{kPromptTokens, kPromptTokens};
+  for (uint32_t cycle = 0; cycle < kCycles; ++cycle) {
+    const std::vector<ModelStepResult> results = executor.decode(plan(twins), items(twins, positions));
+    advance(positions, results);
+    for (uint32_t slot = 0; slot < 2; ++slot)
+      reference[slot].push_back(results[slot]);
+    if (cycle + 1 == kAdmitting)
+      admitted = {committedState(executor, states, 0), committedState(executor, states, 1)};
+    if (cycle == kAdmitting)
+      forcedSampled = committedState(executor, states, 1);
+  }
+  for (const uint64_t id : twins)
+    executor.end(id);
+
+  // The greedy lane constrained, its first token its twin's.
+  constexpr std::array<uint64_t, 2> mixed{930, 931};
+  require(begin(mixed[0], 0, true).nextDecodeStage == DecodeStage::ApplyInitialMask,
+          "the constrained lane's prompt did not ask for its first mask");
+  static_cast<void>(begin(mixed[1], 1, false));
+  provideMask(executor, mixed[0], singletonMasks(std::array{*greedyPrompt.firstToken}));
+  static_cast<void>(decodeOne(executor, mixed[0], kPromptTokens, pages[0], DecodeStage::ApplyInitialMask));
+  positions = {kPromptTokens, kPromptTokens};
+  uint32_t forced = 0;
+  for (uint32_t cycle = 0; cycle < kCycles; ++cycle) {
+    const std::string label = "cycle " + std::to_string(cycle) + " beside a constrained lane";
+    PendingMaskedDecode pending = beginMaskedDecode(executor, plan(mixed), items(mixed, positions));
+    require(pending.maskRequests.size() == 1 && pending.maskRequests[0].requestId == mixed[0] &&
+                pending.ticket->ownsMaskWait(mixed[0]) && !pending.ticket->ownsMaskWait(mixed[1]),
+            label + ": the command did not wait for the constrained lane's mask alone");
+    const std::vector<uint32_t> &simulated = pending.maskRequests[0].simulationTokens;
+    if (cycle == kAdmitting) {
+      // Another token than the proposal and the twin's selection at the
+      // first verify row: its cycle's second token, or else its next anchor.
+      const std::vector<uint32_t> &twin = reference[0][cycle].outputTokens;
+      const uint32_t selected = twin.size() > 1 ? twin[1] : reference[0][cycle + 1].outputTokens.front();
+      for (forced = 100; forced == selected || forced == simulated[1];)
+        ++forced;
+      std::array<uint32_t, kRows + 1> rows;
+      rows.fill(forced);
+      rows[0] = simulated[0];
+      provideMask(executor, mixed[0], singletonMasks(rows));
+    } else {
+      provideMask(executor, mixed[0], admitting);
+    }
+    const std::vector<ModelStepResult> results = finishMaskedDecode(std::move(pending));
+    advance(positions, results);
+    const ModelStepResult &greedy = results[0], &sampled = results[1];
+    const ModelStepResult &twin = reference[0][cycle], &sampledTwin = reference[1][cycle];
+    if (cycle < kAdmitting) {
+      require(greedy.outputTokens == twin.outputTokens && greedy.draftedTokens == twin.draftedTokens &&
+                  greedy.acceptedDraftTokens == twin.acceptedDraftTokens,
+              label + ": the constrained lane decoded other tokens than its unconstrained twin");
+    } else if (cycle == kAdmitting) {
+      require(greedy.outputTokens == std::vector<uint32_t>{twin.outputTokens.front()} &&
+                  greedy.acceptedDraftTokens == 0,
+              label + ": the constrained lane did not select the token its mask forced");
+    } else {
+      require(greedy.outputTokens.front() == forced,
+              label + ": the constrained lane's next cycle did not start from the forced token");
+    }
+    require(cycle > kAdmitting || (sampled.outputTokens == sampledTwin.outputTokens &&
+                                   sampled.draftedTokens == sampledTwin.draftedTokens &&
+                                   sampled.acceptedDraftTokens == sampledTwin.acceptedDraftTokens),
+            label + ": the unconstrained lane decoded other tokens than beside an unconstrained lane");
+    if (cycle + 1 == kAdmitting)
+      for (uint32_t slot = 0; slot < 2; ++slot)
+        requireSameCommittedState(committedState(executor, states, slot), admitted[slot],
+                                  label + ": lane " + std::to_string(slot));
+    if (cycle == kAdmitting)
+      requireSameCommittedState(committedState(executor, states, 1), forcedSampled,
+                                label + ": the unconstrained lane");
+  }
+  for (const uint64_t id : mixed)
+    executor.end(id);
+  std::cout << "constrained_lane_shares_decode=PASS\n";
+}
+
 // Under --verify-rows auto a MoE target's decode cycles verify the rows its
 // verify budget chooses, which follow the wall times and acceptance of the
 // cycles before them, so that runs need not repeat one another. Each cycle of
@@ -2780,7 +2919,7 @@ void requireBudgetedCyclesAreWellFormed(model::Runtime &executor, const model::Q
   const auto decode = [&](std::vector<Lane> &lanes, uint32_t cycles) {
     for (uint32_t cycle = 0; cycle < cycles; ++cycle) {
       const bool constrained = lanes.front().request.constraint == ConstraintMode::TokenMask;
-      BatchPlan plan{.kind = WorkKind::Decode, .constrained = constrained, .decodeStage = DecodeStage::Regular};
+      BatchPlan plan{.kind = WorkKind::Decode, .decodeStage = DecodeStage::Regular};
       std::vector<ModelBatchItem> items;
       std::vector<Lane *> active;
       for (Lane &lane : lanes) {
@@ -2872,7 +3011,7 @@ void requireBudgetedCyclesAreWellFormed(model::Runtime &executor, const model::Q
     begin(lane);
     provideMask(executor, lane.request.id, std::vector<uint32_t>(kMaskWords, ~0U));
   }
-  BatchPlan first{.kind = WorkKind::Decode, .constrained = true, .decodeStage = DecodeStage::ApplyInitialMask};
+  BatchPlan first{.kind = WorkKind::Decode, .decodeStage = DecodeStage::ApplyInitialMask};
   std::vector<ModelBatchItem> firstItems;
   for (const Lane &lane : constrained) {
     first.items.push_back({lane.request.id, 0});
@@ -4038,6 +4177,7 @@ int main(int argc, char **argv) {
                                         model.descriptor.hasVision());
     requirePrefillPassesMatchWhole(executor, pages, states, samplingSeedTokens, model.descriptor.hasVision());
     requireBatchedLanesMatchReordered(executor, states, samplingSeedTokens);
+    requireConstrainedLaneSharesDecode(executor, states, model.descriptor, samplingSeedTokens);
 
 
     // Compare the active GDN state from one 16-row chunk and two M8 commits
@@ -4216,7 +4356,7 @@ int main(int argc, char **argv) {
     const std::array<uint32_t, 1> forcedMicroToken{106};
     provideMask(executor, 56, singletonMasks(forcedMicroToken));
     ModelStepResult forcedMicro =
-        decodeOne(executor, 56, prompt8.size(), constrainedPages, true,
+        decodeOne(executor, 56, prompt8.size(), constrainedPages,
                   DecodeStage::ApplyInitialMask);
     require(forcedMicro.outputTokens ==
                 std::vector<uint32_t>{forcedMicroToken.front()},
@@ -4277,7 +4417,7 @@ int main(int argc, char **argv) {
               "replay did not request its initial mask");
       const std::array<uint32_t, 1> firstAnchor{result.outputTokens.front()};
       provideMask(executor, replayId, singletonMasks(firstAnchor));
-      static_cast<void>(decodeOne(executor, replayId, 129, replayPages, true,
+      static_cast<void>(decodeOne(executor, replayId, 129, replayPages,
                                   DecodeStage::ApplyInitialMask));
       auto pending =
           beginMaskedDecodeOne(executor, replayId, 129, replayPages);
@@ -4353,7 +4493,7 @@ int main(int argc, char **argv) {
               "continued replay did not request its initial mask");
       const std::array<uint32_t, 1> anchor{first.outputTokens.front()};
       provideMask(executor, replayId, singletonMasks(anchor));
-      static_cast<void>(decodeOne(executor, replayId, 129, replayPages, true,
+      static_cast<void>(decodeOne(executor, replayId, 129, replayPages,
                                   DecodeStage::ApplyInitialMask));
       // A cycle's mask allows the budgeted lane's tokens, then at the row
       // after them its next anchor, or else a token other than the proposal,
@@ -4555,7 +4695,7 @@ int main(int argc, char **argv) {
     // The first token's selection drafts nothing and, with budget left,
     // emits nothing: the first cycle emits it.
     const ModelStepResult anchorSelection =
-        decodeOne(executor, 40, 129, pageTable, true,
+        decodeOne(executor, 40, 129, pageTable,
                   DecodeStage::ApplyInitialMask);
     require(anchorSelection.outputTokens.empty() &&
                 anchorSelection.draftedTokens == 0 &&
@@ -4611,7 +4751,7 @@ int main(int argc, char **argv) {
     const uint32_t perfectAnchor = 120;
     std::array<uint32_t, 1> perfectInitialTokens{perfectAnchor};
     provideMask(executor, 44, singletonMasks(perfectInitialTokens));
-    static_cast<void>(decodeOne(executor, 44, 129, pageTable, true,
+    static_cast<void>(decodeOne(executor, 44, 129, pageTable,
                                 DecodeStage::ApplyInitialMask));
     PendingMaskedDecode perfectPending =
         beginMaskedDecodeOne(executor, 44, 129, pageTable);
@@ -4657,7 +4797,7 @@ int main(int argc, char **argv) {
     std::array<uint32_t, 1> alternateTokens{anchorC};
     provideMask(executor, 41, singletonMasks(alternateTokens));
     ModelStepResult alternateOutput =
-        decodeOne(executor, 41, 129, pageTable, true,
+        decodeOne(executor, 41, 129, pageTable,
                   DecodeStage::ApplyInitialMask);
     require(!alternateOutput.finished &&
                 alternateOutput.outputTokensWithoutKv == 1 &&
@@ -4710,7 +4850,6 @@ int main(int argc, char **argv) {
     provideMask(executor, 42, singletonMasks(std::span(crossAnchors).first(1)));
     provideMask(executor, 43, singletonMasks(std::span(crossAnchors).last(1)));
     const BatchPlan crossInitialPlan{.kind = WorkKind::Decode,
-                                     .constrained = true,
                                      .items = {{42, 0}, {43, 0}},
                                      .decodeStage = DecodeStage::ApplyInitialMask};
     const std::vector<ModelBatchItem> crossItems{
@@ -4746,7 +4885,6 @@ int main(int argc, char **argv) {
               "B1 initial constrained cycle did not keep only its anchor");
     }
     BatchPlan crossPlan{.kind = WorkKind::Decode,
-                        .constrained = true,
                         .items = {{42, 0}, {43, 0}},
                         .decodeStage = DecodeStage::Regular};
     const std::vector<ModelBatchItem> crossCycleItems{
@@ -5550,7 +5688,7 @@ int main(int argc, char **argv) {
         }
         const ModelStepResult selected =
             decodeOne(executor, sequence.id, sequence.prompt.size(), pageTable,
-                      true, DecodeStage::ApplyInitialMask);
+                      DecodeStage::ApplyInitialMask);
         require(selected.outputTokens.empty(),
                 "the first token's selection emitted a token with budget left");
         stage = selected.nextDecodeStage;
@@ -5573,7 +5711,7 @@ int main(int argc, char **argv) {
                     "preempted constrained decode violated its provided mask");
         } else {
           result = decodeOne(executor, sequence.id, sequence.prompt.size(),
-                             pageTable, false, stage);
+                             pageTable, stage);
         }
         require(!result.outputTokens.empty(), "preempted decode made no progress");
         require(result.outputTokens.size() <= sequence.maxNewTokens - transcript.size() &&

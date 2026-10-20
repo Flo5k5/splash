@@ -3014,12 +3014,14 @@ for the new boundary.
 Higher-priority work does not wait for a lower-priority producer. `/status` exposes
 `scheduler.waiting_prefix` separately from resource waits.
 
-Greedy and sampled requests share unconstrained decode batches; each lane keeps
+Greedy, sampled and constrained requests share decode batches; each lane keeps
 its own sampling policy and RNG, and a greedy lane takes the argmax path in any
-batch. Constrained requests use a separate batch for the host mask exchange. A
-mask request the server leaves unanswered for 5 s fails that request with the
-retryable `mask_timeout` (HTTP 503), so a stalled grammar cannot hold the
-batch's command.
+batch. A batch with a constrained lane runs its cycle as three commands around
+the host mask exchange: the draft, the target forward while the server computes
+each constrained lane's masks from its proposals, and the selection, in which
+only the constrained lanes read masks. A mask request the server leaves
+unanswered for 5 s fails that request with the retryable `mask_timeout` (HTTP
+503), so a stalled grammar cannot hold the batch's command.
 
 Long prefill uses disposable rolling checkpoints every 4096 tokens; none is
 planned within one prefill chunk (2048 tokens) of where the request resumes or

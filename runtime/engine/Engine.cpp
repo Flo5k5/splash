@@ -139,7 +139,6 @@ void Engine::submit(EngineRequest value) {
   scheduler_.submit(
       {.id = id,
        .priority = stored.request.priority,
-       .constrained = stored.request.constraint == ConstraintMode::TokenMask,
        .prefillTokens = stored.promptTokens,
        .deadlineMilliseconds = stored.request.deadlineMilliseconds,
        .prefillGroupRows = model_.prefillGroupRows(false),

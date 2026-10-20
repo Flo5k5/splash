@@ -29,7 +29,6 @@ enum class Phase : uint8_t {
 struct RequestSpec final {
   uint64_t id = 0;
   RequestPriority priority = RequestPriority::Normal;
-  bool constrained = false;
   // Tokens to prefill: the prompt, and after resumeFromResources the
   // replayed history.
   uint32_t prefillTokens = 0;
@@ -74,9 +73,9 @@ struct SchedulerSnapshot final {
 // arrivals may overtake a lane; a lane that streams its history from the SSD
 // cache runs alone, and so does one whose command runs in passes over the
 // model's layers, which no other prefill interrupts. Decode takes the ready
-// lanes of one priority, constraint mode and stage without waiting for more,
-// so it runs only the four real M8/M16/M24/M32 shapes, between a command's
-// passes too.
+// lanes of one priority and stage, constrained or not, without waiting for
+// more, so it runs only the four real M8/M16/M24/M32 shapes, between a
+// command's passes too.
 class Scheduler final {
 public:
   // Decode time owed for each unit of time a prefill runs while requests of
