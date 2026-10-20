@@ -24,7 +24,7 @@ The paths an assembly links, and what reads each:
                          tokenizer class
   tokenizer/<file>       the MLX tokenizer files, or tokenizer.json,
                          tokenizer_config.json and chat_template.jinja derived
-                         from the GGUF (server.py --tokenizer)
+                         from the GGUF (server.py main)
   draft/config.json, draft/<name>.safetensors
                          the DFlash2 checkpoint (ModelDescriptor.mm,
                          DraftCheckpoint.cpp)
@@ -323,16 +323,34 @@ def _check_metadata(entry):
             raise models.ModelError("prepared GGUF metadata changed: " + name)
 
 
-def hold(link: Path, models_root: Path):
-    """The assembly a selection link serves from, and what holds it: its
-    model.json opened under a shared lock. While that file is open, in this
-    process or one that inherited it, collect_garbage keeps the assembly. The
-    link is read under the installation lock, where collection runs, so there
-    is no moment the assembly is neither linked nor held."""
-    with models.installation_lock(models_root):
-        assembly = link.resolve(strict=True)
-        record = (assembly / "model.json").open("rb")
-        fcntl.flock(record, fcntl.LOCK_SH)
+def hold(path: Path):
+    """The assembly path names, an assembly or a selection link to one, and
+    what holds it: its model.json opened under a shared lock. While that
+    file is open, in this process or one that inherited it, collect_garbage
+    keeps the assembly. path is read under the installation lock of the
+    models root the assembly was built in (MODELS/.resolved/<record>), which
+    may be another checkout's, where collection runs, so there is no moment
+    the assembly is neither linked nor held; the lock needs write access to
+    that root. A ModelError refuses a path that names no assembly, such as
+    one collection removed, and one the file system keeps from being held,
+    such as in a root this process cannot write."""
+    resolved = path.resolve().parent
+    if resolved.name != ".resolved":
+        raise models.ModelError(f"{path} is not a model directory Splash prepared")
+    models_root = resolved.parent
+    try:
+        with models.installation_lock(models_root):
+            assembly = path.resolve(strict=True)
+            record = (assembly / "model.json").open("rb")
+            fcntl.flock(record, fcntl.LOCK_SH)
+    except (FileNotFoundError, NotADirectoryError) as error:
+        raise models.ModelError(
+            f"{path} names no model Splash prepared: prepare the model again"
+        ) from error
+    except OSError as error:
+        raise models.ModelError(
+            f"cannot hold {path} in {models_root}: {error}"
+        ) from error
     return assembly, record
 
 

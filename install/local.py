@@ -12,11 +12,11 @@ with Splash's own Python and this checkout or release on PYTHONPATH:
         mmproj="/models/Qwen3.8-27B-GGUF/mmproj-BF16.gguf",
     )
 
-and then `python -m server.server MODEL --tokenizer MODEL/tokenizer --model
-OWNER/REPO --binary ENGINE`, ENGINE being the engine of the same checkout or
-release (build/splash, or engine/splash in a release). It checks the files
-with the rules the installer and the engine hold a download to, and it makes
-no network request.
+and then `python -m server.server MODEL --model OWNER/REPO --binary ENGINE`,
+ENGINE being the engine of the same checkout or release (build/splash, or
+engine/splash in a release). It checks the files with the rules the
+installer and the engine hold a download to, and it makes no network
+request.
 
 Stability: prepare_local_model and ModelError keep their names, parameters,
 defaults, results and errors across the releases of one major version; a
@@ -47,13 +47,15 @@ def prepare_local_model(
     the directory the server loads, an absolute pathlib.Path.
 
     target: a GGUF file, any part of a split GGUF naming all of them, which
-    lie beside it; or a directory, an MLX model's (config.json, tokenizer
-    files and a safetensors checkpoint) or one holding a single GGUF target,
-    whole or split, beside any vision projector named mmproj.
+    lie beside it; or a directory whose root holds an MLX model (config.json,
+    tokenizer files and a safetensors checkpoint) or else a single GGUF
+    target, whole or split, beside any vision projector named mmproj.
     draft: the directory of a DFlash2 draft (config.json and safetensors
     weights) trained for the target's family. Without one, the draft
     released for the family is taken from the Hugging Face cache
-    (HF_HUB_CACHE), where a download left it.
+    (HF_HUB_CACHE), at the commit a download of its default branch, such as
+    `hf download REPO`, last recorded there; `splash serve` downloads by
+    commit, which records none.
     mmproj: a GGUF target's vision projector, a GGUF file, with which it
     serves images; a GGUF target serves text only without one. An MLX
     target's vision tower is in its checkpoint, and it serves images unless
@@ -67,8 +69,12 @@ def prepare_local_model(
     files again returns it again: that reads their metadata and their sizes
     and times, never their content. The first preparation reads each file
     outside the Hugging Face cache once, for its digest. Once a file
-    changes, the directory no longer verifies: prepare again, and serve the
-    directory that returns; the old one is removed.
+    changes, or a download moves the draft's default branch, preparing again
+    returns another directory: serve that one. The server holds the
+    directory it serves until it exits; one a later preparation no longer
+    returns is removed only once no server holds it. The server takes
+    models_dir's installation lock to hold it when it starts, so it needs
+    write access there.
 
     A ModelError, "cannot prepare TARGET: REASON", refuses the files Splash
     cannot serve without a download (a missing file, an unsupported format,
@@ -97,12 +103,16 @@ def _prepare(target, draft, mmproj, language_only, models_root):
             f"draft {draft} is not a directory: a DFlash2 draft is the "
             "directory of its config.json and safetensors weights"
         )
+    if mmproj and not mmproj.is_file():
+        raise ModelError(
+            f"mmproj {mmproj} is not a file: a vision projector is a GGUF file"
+        )
     link = models.local_selection_link(
         models_root, target, draft, mmproj, language_only
     )
     with tempfile.TemporaryDirectory(prefix="splash-target-") as scratch:
         source, inspected = _inspect(target, mmproj, language_only, Path(scratch))
-        repo = _draft(inspected.family, draft, link)
+        repo = _draft(inspected.family, draft)
         files = upstream.draft_files(repo, inspected)
     files |= {path: source.paths[name] for path, name in inspected.files.items()}
     record = upstream.assembly_record(str(target), inspected, source, repo)
@@ -121,7 +131,9 @@ def _inspect(target, mmproj, language_only, scratch):
     them, its configuration and metadata written into scratch."""
     if target.is_dir():
         repo = hub.Repository.local_directory(target)
-        if any(name.endswith(".safetensors") for name in repo.files):
+        # The files at its root are the target's: a safetensors file in a
+        # subdirectory, a draft's say, makes no MLX model.
+        if any("/" not in n and n.endswith(".safetensors") for n in repo.files):
             if mmproj:
                 raise ModelError(
                     f"{mmproj} is a GGUF target's vision projector; an MLX "
@@ -174,8 +186,8 @@ def _gguf_in(files):
     ]
     if not candidates:
         raise ModelError(
-            "it holds no model: no safetensors checkpoint, and no GGUF file but "
-            "vision projectors (named mmproj)"
+            "it holds no model at its root: no safetensors checkpoint, and no "
+            "GGUF file but vision projectors (named mmproj)"
         )
     if len({_model_of(name) for name in candidates}) > 1:
         raise ModelError(
@@ -205,8 +217,11 @@ def _split_parts(target):
 
 def _projector(mmproj, repo):
     """mmproj's name and header in repo, if it is a vision projector Splash
-    loads (upstream.read_projector)."""
-    header, precision, kind = upstream.read_projector(repo, mmproj.name)
+    loads (upstream.read_projector); a refusal names mmproj."""
+    try:
+        header, precision, kind = upstream.read_projector(repo, mmproj.name)
+    except ModelError as error:
+        raise models.VisionError(f"{mmproj}: {error}") from None
     if precision is None:
         raise models.VisionError(
             f"{mmproj} ({kind}) is not a vision projector Splash loads, a clip "
@@ -215,10 +230,11 @@ def _projector(mmproj, repo):
     return mmproj.name, header
 
 
-def _draft(family, draft, link):
+def _draft(family, draft):
     """The draft's files: the directory draft, or else, without one, the
-    draft released for family as the Hugging Face cache holds it, with no
-    request to the Hub (hub.Repository.resolve)."""
+    draft released for family at the commit the Hugging Face cache records
+    for its default branch, with no request to the Hub
+    (hub.Repository.resolve)."""
     if draft:
         return hub.Repository.local_directory(draft)
     if family.draft_repo is None:
@@ -229,10 +245,10 @@ def _draft(family, draft, link):
     try:
         return hub.Repository.resolve(
             family.draft_repo,
-            installation=link,
             unreachable="no draft was given, and preparing local files asks no Hub",
         )
     except ModelError as error:
         raise ModelError(
-            f"{error}; pass the directory of a {family.name} DFlash2 draft as draft"
+            f"{error}; download {family.draft_repo}, or pass the directory of a "
+            f"{family.name} DFlash2 draft as draft"
         ) from None

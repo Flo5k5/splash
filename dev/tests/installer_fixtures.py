@@ -1,8 +1,8 @@
 """What the installer tests share: model and draft repositories, GGUF
-headers, selections, Hub errors, FakeHub, the stand-in for the Hugging Face
-Hub that the upstream and GGUF tests install from, and link_assembly, what an
-installation leaves for serve. The installer checks a model's configuration
-with the engine, build/splash, which make test-python builds."""
+headers, selections, Hub errors, and FakeHub, the stand-in for the Hugging
+Face Hub that the upstream and GGUF tests install from. The installer checks
+a model's configuration with the engine, build/splash, which make
+test-python builds."""
 
 import hashlib
 import json
@@ -188,18 +188,6 @@ def selection(root, model=MODEL, **options):
         language_only=options.get("language_only", True),
         draft_model=options.get("draft_model"),
     )
-
-
-def link_assembly(selection):
-    """What an installation leaves for serve to hold, in a test that stubs
-    the installation: the selection's link to an assembly under its models
-    root."""
-    assembly = selection.models_root / ".resolved" / "assembly"
-    assembly.mkdir(parents=True, exist_ok=True)
-    (assembly / "model.json").write_text("{}")
-    if not selection.link.is_symlink():
-        selection.link.parent.mkdir(parents=True, exist_ok=True)
-        selection.link.symlink_to(assembly, target_is_directory=True)
 
 
 def http_error(status):

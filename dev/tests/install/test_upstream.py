@@ -797,7 +797,7 @@ class UpstreamTest(unittest.TestCase):
             (
                 "someone/other-patches",
                 {"image_processor": PROCESSOR | {"patch_size": 14}},
-                "unsupported vision preprocessing configuration",
+                "unsupported vision preprocessing configuration; use --language-only",
             ),
         ):
             with self.subTest(model=model):
@@ -959,7 +959,7 @@ class UpstreamTest(unittest.TestCase):
         self.prepare(chosen)
         first = chosen.link.resolve()
         # A server holds the assembly it serves.
-        _, server = assembly.hold(chosen.link, chosen.models_root)
+        _, server = assembly.hold(chosen.link)
         self.addCleanup(server.close)
         # Staging an interrupted installation left behind.
         stale = [
@@ -1526,8 +1526,7 @@ class UpstreamTest(unittest.TestCase):
         with self.assertRaisesRegex(
             models.ModelError,
             "cannot resolve owner/private: 401 Client Error.*; set HF_TOKEN .*; "
-            "neither this installation nor the Hub cache records a commit "
-            "for the default branch",
+            "the Hub cache records no commit for the default branch",
         ):
             hub.Repository.resolve("owner/private")
         # A branch the cache recorded resolves to its cached snapshot.

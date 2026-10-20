@@ -168,10 +168,6 @@ class SmokeRealTests(unittest.TestCase):
                                 ["-m", "server.server", str(model_root.resolve())],
                             )
                             self.assertEqual(
-                                command[command.index("--tokenizer") + 1],
-                                str(model_root.resolve() / "tokenizer"),
-                            )
-                            self.assertEqual(
                                 command[command.index("--binary") + 1],
                                 str(binary.resolve()),
                             )

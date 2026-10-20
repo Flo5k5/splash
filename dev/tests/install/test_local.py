@@ -1,5 +1,6 @@
 import contextlib
 import dataclasses
+import fcntl
 import io
 import json
 import tempfile
@@ -151,9 +152,11 @@ class LocalModelTest(unittest.TestCase):
             40,
         )
         # The GGUF's directory names the same target: the projector beside it
-        # is not loaded unless mmproj names it.
+        # is not loaded unless mmproj names it, and the files of a
+        # subdirectory, such as a draft's, are not the target's.
         self.projector(target.parent / "mmproj-F32.gguf")
-        record = assembly.verify(self.prepare(target.parent, draft))
+        nested = draft_dir(target.parent / "DFlash2", MOE)
+        record = assembly.verify(self.prepare(target.parent, nested))
         self.assertIn("target/model-Q4_K_M.gguf", record["files"])
         self.assertEqual(record["vision_format"], "none")
 
@@ -192,24 +195,48 @@ class LocalModelTest(unittest.TestCase):
 
     def test_without_a_draft_the_familys_is_taken_from_the_hub_cache(self):
         target = self.gguf(self.root / "model" / "model-Q4_K_M.gguf")
+        remedy = (
+            f"download {MOE.draft_repo}, or pass the directory of a {MOE.name} "
+            "DFlash2 draft as draft"
+        )
         with self.assertRaisesRegex(
             models.ModelError,
             f"cannot resolve {MOE.draft_repo}: no draft was given, and preparing "
-            "local files asks no Hub; .*; pass the directory of a "
-            f"{MOE.name} DFlash2 draft as draft",
+            "local files asks no Hub; the Hub cache records no commit for the "
+            f"default branch; {remedy}",
         ):
             self.prepare(target)
         cached_snapshot(
             self.cache, MOE.draft_repo, DRAFT_COMMIT, lambda p: draft_dir(p, MOE)
         )
         self.cache_main(MOE.draft_repo, DRAFT_COMMIT)
-        record = assembly.verify(self.prepare(target))
+        prepared = self.prepare(target)
         self.assertEqual(
-            record["sources"]["draft"],
+            assembly.verify(prepared)["sources"]["draft"],
             {"repo": MOE.draft_repo, "revision": DRAFT_COMMIT},
         )
         # Its snapshot is pinned, as an installation's are.
         self.assertEqual(pins(self.cache), [DRAFT_COMMIT])
+        # A download of a newer draft moves the branch, which preparing again
+        # follows: the newer draft is pinned in place of the older one, and
+        # the directory it replaces is removed.
+        newer = "e" * 40
+        cached_snapshot(self.cache, MOE.draft_repo, newer, lambda p: draft_dir(p, MOE))
+        self.cache_main(MOE.draft_repo, newer)
+        self.assertEqual(
+            assembly.verify(self.prepare(target))["sources"]["draft"],
+            {"repo": MOE.draft_repo, "revision": newer},
+        )
+        self.assertEqual(pins(self.cache), [newer])
+        self.assertFalse(prepared.exists())
+        # A branch naming a commit the cache does not hold is refused: no
+        # other commit stands in for it.
+        missing = "f" * 40
+        self.cache_main(MOE.draft_repo, missing)
+        with self.assertRaisesRegex(
+            models.ModelError, f"the Hub cache has no snapshot of {missing}; {remedy}"
+        ):
+            self.prepare(target)
 
     def test_a_family_without_a_released_draft_needs_a_draft(self):
         target = self.gguf(self.root / "model-Q2_0.gguf", FLASH_NEXT)
@@ -246,7 +273,29 @@ class LocalModelTest(unittest.TestCase):
             "pass language_only=True to serve text only",
         ):
             self.prepare(target, draft)
+        # A processor Splash cannot follow refuses the vision alone, as does
+        # a tower configuration the engine refuses.
+        (target / "preprocessor_config.json").write_text(
+            json.dumps(PROCESSOR | {"patch_size": 14})
+        )
+        with self.assertRaisesRegex(
+            models.VisionError,
+            "unsupported vision preprocessing configuration; pass "
+            "language_only=True to serve text only",
+        ):
+            self.prepare(target, draft)
         (target / "preprocessor_config.json").write_text(json.dumps(PROCESSOR))
+        config = json.loads((target / "config.json").read_text())
+        tower = config["vision_config"] | {"depth": 1}
+        (target / "config.json").write_text(
+            json.dumps(config | {"vision_config": tower})
+        )
+        with self.assertRaisesRegex(
+            models.VisionError,
+            "vision config.*; pass language_only=True to serve text only",
+        ):
+            self.prepare(target, draft)
+        (target / "config.json").write_text(json.dumps(config))
         prepared = self.prepare(target, draft)
         record = assembly.verify(prepared, full=True)
         self.assertEqual(
@@ -340,6 +389,24 @@ class LocalModelTest(unittest.TestCase):
                 self.assertRaisesRegex(models.ModelError, refusal),
             ):
                 self.prepare(*arguments)
+        # A projector is a GGUF file, and a refusal of one names it; one that
+        # is no GGUF refuses the vision alone.
+        absent, junk = self.root / "absent.gguf", self.root / "junk.gguf"
+        junk.write_bytes(b"not a GGUF")
+        for mmproj, refusal, kind in (
+            (absent, f"mmproj {absent} is not a file", models.ModelError),
+            (empty, f"mmproj {empty} is not a file", models.ModelError),
+            (
+                junk,
+                f"{junk}: unsupported GGUF header .*; omit mmproj to serve text only",
+                models.VisionError,
+            ),
+        ):
+            with (
+                self.subTest(mmproj=mmproj.name),
+                self.assertRaisesRegex(kind, f"cannot prepare {target}: {refusal}"),
+            ):
+                self.prepare(target, draft, mmproj=mmproj)
         # A checkpoint whose index names a shard that is not there.
         mlx = mlx_target(self.root / "mlx", DENSE)
         (mlx / "model.safetensors.index.json").write_text(
@@ -369,14 +436,57 @@ class LocalModelTest(unittest.TestCase):
             self.assertEqual(self.prepare(target, draft), prepared)
             self.assertFalse(sources & set(hashed))
             # A new draft is prepared anew, and only its files are read; the
-            # directory it replaces is removed.
+            # directory it replaces stays while a server holds it.
+            _, server = assembly.hold(prepared)
             (draft / "model.safetensors").write_bytes(b"retrained")
             hashed.clear()
             again = self.prepare(target, draft)
         self.assertNotEqual(again, prepared)
-        self.assertFalse(prepared.exists())
         self.assertEqual(sources & set(hashed), {draft / "model.safetensors"})
         assembly.verify(again, full=True)
+        self.assertTrue(prepared.exists())
+        # Released, it goes with the next preparation, and a server started on
+        # it is refused.
+        server.close()
+        self.assertEqual(self.prepare(target, draft), again)
+        self.assertFalse(prepared.exists())
+        with self.assertRaisesRegex(
+            models.ModelError, f"{prepared} names no model Splash prepared"
+        ):
+            assembly.hold(prepared)
+
+    def test_a_files_digest_is_read_before_the_installation_lock(self):
+        # A file's first digest is read before the installation lock, which
+        # installations and starting servers wait for; its record is taken
+        # again under the lock, where a file written since is read again.
+        target = self.gguf(self.root / "model" / "model-Q4_K_M.gguf")
+        draft = draft_dir(self.root / "draft", MOE)
+        weights = draft / "model.safetensors"
+        reads = []
+        hash_file = models.hash_file
+
+        def read(path, digest):
+            with (self.models / ".install.lock").open("a+b") as lock:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    reads.append((path, "locked"))
+                else:
+                    reads.append((path, "free"))
+            value = hash_file(path, digest)
+            if path == weights and (weights, "locked") not in reads:
+                weights.write_bytes(b"written while it was read")
+            return value
+
+        with mock.patch.object(models, "hash_file", read):
+            prepared = self.prepare(target, draft)
+        for path, expected in (
+            (target, ["free"]),
+            (draft / "config.json", ["free"]),
+            (weights, ["free", "locked"]),
+        ):
+            self.assertEqual([lock for read, lock in reads if read == path], expected)
+        assembly.verify(prepared, full=True)
 
     def test_local_files_assemble_as_their_hub_installation_does(self):
         # The same files installed from a FakeHub and prepared from the Hub
@@ -393,13 +503,22 @@ class LocalModelTest(unittest.TestCase):
             upstream.prepare(chosen)
         installed = assembly.verify(chosen.link)
         snapshot = fake.snapshot(GGUF_REPO, "a" * 40)
-        self.cache_main(MOE.draft_repo, DRAFT_COMMIT)
         requests, downloads = list(fake.requests), list(fake.downloads)
-        prepared = assembly.verify(
-            self.prepare(
+
+        def prepare():
+            return self.prepare(
                 snapshot / "model-Q4_K_M.gguf", mmproj=snapshot / "mmproj-F32.gguf"
             )
-        )
+
+        # The installation downloaded its draft by commit, which records no
+        # branch: the family's draft is the one a download of the branch left.
+        with self.assertRaisesRegex(
+            models.ModelError,
+            "the Hub cache records no commit for the default branch",
+        ):
+            prepare()
+        self.cache_main(MOE.draft_repo, DRAFT_COMMIT)
+        prepared = assembly.verify(prepare())
         self.assertEqual((fake.requests, fake.downloads), (requests, downloads))
         for key in ("family", "target_format", "vision_format", "metadata", "files"):
             self.assertEqual(prepared[key], installed[key], key)

@@ -303,12 +303,16 @@ class Repository:
         for commit in commits:
             if snapshot(name, commit).is_dir():
                 return cls.cached(name, commit, unreachable_reason=why)
-        cache = (
-            "the Hub cache has no snapshot of " + ", ".join(commits)
-            if commits
-            else "neither this installation nor the Hub cache records a commit "
-            f"for {revision or 'the default branch'}"
-        )
+        branch = revision or "the default branch"
+        if commits:
+            cache = "the Hub cache has no snapshot of " + ", ".join(commits)
+        elif installation is not None:
+            cache = (
+                "neither this installation nor the Hub cache records a commit "
+                f"for {branch}"
+            )
+        else:
+            cache = f"the Hub cache records no commit for {branch}"
         raise models.ModelError(f"cannot resolve {name}: {why}; {cache}")
 
     def _require(self, name):

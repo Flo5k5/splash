@@ -1974,8 +1974,7 @@ model = prepare_local_model(
 
 ```sh
 PYTHONPATH="$ROOT" "$ROOT/python/bin/python3" -P -m server.server "$MODEL" \
-    --tokenizer "$MODEL/tokenizer" --model unsloth/Qwen3.8-27B-GGUF \
-    --binary "$ROOT/engine/splash" --port 8000
+    --model unsloth/Qwen3.8-27B-GGUF --binary "$ROOT/engine/splash" --port 8000
 ```
 
 `--model` is the ID the API reports, in `OWNER/REPO` form, and `--binary` the
@@ -1985,11 +1984,13 @@ model's source options (`--revision`, `--draft-model`, `--language-only`,
 `--offline`) are `prepare_local_model`'s arguments instead, or have no use.
 
 - `target`: a GGUF file, any part of a split GGUF naming all its parts,
-  which lie beside it; or a directory, an MLX model's or one holding a single
-  GGUF target, whole or split, beside any projectors named `mmproj`.
+  which lie beside it; or a directory whose root holds an MLX model or else
+  a single GGUF target, whole or split, beside any projectors named `mmproj`.
 - `draft`: the directory of a DFlash2 draft ([Drafts](#drafts)). Without
-  one, the family's released draft is taken from the Hugging Face cache,
-  where a download left it.
+  one, the family's released draft is taken from the Hugging Face cache, at
+  the commit a download of its default branch last recorded there, as
+  `hf download incoai/Qwen3.8-27B-DFlash2` does; `splash serve` downloads by
+  commit, which records none.
 - `mmproj`: a GGUF target's vision projector ([Vision](#vision)); without
   one, a GGUF target serves text only. An MLX target serves images with the
   tower in its checkpoint unless `language_only=True`.
@@ -2004,8 +2005,12 @@ another model), a `ModelError` names the file and the reason. The directory
 returned is an assembly of links to the files ([Installation](#installation)),
 which never changes. Preparing the same files again returns it, reading only
 their metadata, sizes and times; the first preparation reads each file
-outside the Hugging Face cache once, for its digest. Once a file changes,
-prepare again and restart the server on the directory returned.
+outside the Hugging Face cache once, for its digest. Once a file changes, or
+a download moves the draft's default branch, preparing again returns another
+directory: restart the server on it. The server holds the directory it
+serves until it exits; one that no preparation returns any more is removed
+only once no server holds it. The server takes the installation lock of
+`models_dir` to hold it when it starts, so it needs write access there.
 
 `prepare_local_model` and `ModelError` keep their names, parameters,
 defaults, results and errors across the releases of one major version; a
@@ -2104,13 +2109,14 @@ engine's checks. Since the installer checks a model with the engine, a source
 checkout builds the engine before it installs, as `make install` and the first
 `./splash serve` do, and a packaged install ships it. The assembly's
 `model.json` records the resolved sources and selected formats. The native
-loader reads it, and `splash serve`, `test-http-real` and the HTTP regression
-benchmark hold it while they run, so a concurrent installation cannot collect
-the assembly they serve. It is local installation metadata, not a file model
-publishers supply. It records each file's path, size, times and digest: a Hub
-cache file's is the blob's name, any other file's its SHA-256, which an
-assembly that replaces another keeps for each file it still links unchanged
-in path, size and times, so only a new or changed file is read for it.
+loader reads it, and the server holds it while it runs, as `test-http-real`
+and the HTTP regression benchmark do across the servers they start, so a
+concurrent installation cannot collect the assembly they serve. It is local
+installation metadata, not a file model publishers supply. It records each
+file's path, size, times and digest: a Hub cache file's is the blob's name,
+any other file's its SHA-256, which an assembly that replaces another keeps
+for each file it still links unchanged in path, size and times, so only a
+new or changed file is read for it, before the installation lock is taken.
 
 Installation resolves each source's revision to a commit once, downloads by
 that commit and records it in `model.json`, so a repository update cannot mix

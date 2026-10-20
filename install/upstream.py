@@ -331,12 +331,20 @@ def mlx_target(repo, language_only):
     files |= {"tokenizer/" + n: n for n in TOKENIZER_FILES if n in repo.files}
     vision_format = "none"
     if not language_only:
-        _validate_processor(_image_processor(repo))
+        # A refusal of the tower's processor or configuration refuses the
+        # vision alone; its shards are the checkpoint's, read as the text's.
+        try:
+            _validate_processor(_image_processor(repo))
+        except models.ModelError as error:
+            raise models.VisionError(str(error)) from None
         shards = _weight_files(repo, VISION_TOWER)
         if not shards:
             raise models.VisionError(f"{repo.name} has no vision tower")
         vision_format = "safetensors"
-        check_model("mlx-affine", vision_format, config)
+        try:
+            check_model("mlx-affine", vision_format, config)
+        except models.ModelError as error:
+            raise models.VisionError(str(error)) from None
         files["vision/config.json"] = "config.json"
         files |= {"vision/" + n: n for n in shards}
     # The target's shards: those holding a tensor other than the tower's. A
@@ -614,27 +622,26 @@ def publish(models_root, link, record, files):
     """Publish the assembly of record and files (assembly path -> source
     file) at link, a selection link under models_root, and return it. A file
     the assembly it replaces records, unchanged since, is not read again for
-    its digest (assembly.file_record)."""
+    its digest (assembly.file_record); any other is read before the
+    installation lock is taken, which other installations and starting
+    servers wait for, and its record is taken again under the lock."""
     models_root.mkdir(parents=True, exist_ok=True)
+    # One record per linked file, however many assembly paths link it.
+    records = _file_records(assembly.recorded(link), set(files.values()))
     # Everything written under the models root is written under the lock.
     with models.installation_lock(models_root):
         # The record of the assembly the link names, which this one replaces.
         previous = assembly.recorded(link)
-        recorded = {}
-        for entry in previous["files"].values() if previous else ():
-            recorded[entry["path"]] = entry
-
-        def file_record(path):
-            return assembly.file_record(path, recorded.get(str(path.absolute())))
-
-        # One record per linked file, however many assembly paths link it.
-        records = {path: file_record(path) for path in set(files.values())}
+        # A file changed since its record was taken is read again.
+        records = {
+            path: assembly.file_record(path, entry) for path, entry in records.items()
+        }
         if record["target_format"] == "gguf":
             record["metadata"], derived = assembly.derived_metadata(
                 models_root, files, records
             )
             files = files | derived
-            records |= {path: file_record(path) for path in derived.values()}
+            records |= _file_records(previous, derived.values())
         record["files"] = {name: records[path] for name, path in sorted(files.items())}
         # A new installation requires its pins before it is published; its
         # older pins are retired once it is, in the repositories the
@@ -652,6 +659,19 @@ def publish(models_root, link, record, files):
         hub.retire_other_pins(pins, replaced)
         assembly.collect_garbage(models_root)
     return published
+
+
+def _file_records(previous, paths):
+    """The record of each of paths (assembly.file_record), keeping the
+    digest previous, an assembly's record or None, holds of one unchanged
+    since."""
+    recorded = {}
+    for entry in previous["files"].values() if previous else ():
+        recorded[entry["path"]] = entry
+    return {
+        path: assembly.file_record(path, recorded.get(str(path.absolute())))
+        for path in paths
+    }
 
 
 def _changes(installed, family, draft):
