@@ -122,7 +122,9 @@ window. To set your own limits or cache options, add these to `splash serve`:
 | `--expert-memory 16G` | MoE models: hold routed experts in 16 GiB and read the others from the SSD when a token routes them (default: auto, all loaded where memory holds them; `off` loads them all). |
 | `--verify-rows all` | MoE models: verify every row of each draft block, so a greedy or seeded request [repeats its output](DEVELOPMENT.md#sampling) when it runs alone with the same cached prefixes (default: auto, which lets a learned verify budget choose the rows, a few percent faster). |
 
-Use `--max-memory` to leave room for other applications.
+The automatic plan takes the whole Metal budget, so on a Mac that also runs
+other applications, `--max-memory` (or `--expert-memory` for a model whose
+experts stream) leaves them room.
 The server listens on localhost without authentication by default. For LAN
 access, authentication, browser apps on other origins, and other options, see
 [server configuration](DEVELOPMENT.md#server-configuration) or
