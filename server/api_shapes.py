@@ -119,8 +119,11 @@ def _call_arguments(arguments):
     return arguments if isinstance(arguments, dict) else json_codec.dumps(arguments)
 
 
-def normalize_messages(messages, *, vision, deadline):
-    document_budget = DocumentBudget(deadline=deadline)
+def normalize_messages(messages, *, vision, deadline, without_slot):
+    """`messages` checked and in canonical form, each PDF rendered to its
+    pages under `without_slot`, which gives a request in preparation its
+    slot back meanwhile."""
+    document_budget = DocumentBudget(deadline=deadline, without_slot=without_slot)
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "messages must be a non-empty array")
     normalized = []

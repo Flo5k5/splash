@@ -2,6 +2,7 @@ import json
 import random
 import re
 import unittest
+from contextlib import nullcontext
 from unittest import mock
 
 from dev.tests.server_fixtures import (
@@ -604,6 +605,7 @@ class PartialToolOutputTests(unittest.TestCase):
                             ],
                             vision=True,
                             deadline=FOREVER,
+                            without_slot=nullcontext,
                         )
                         actual = normalized[0]["tool_calls"][0]["function"]
                         self.assertEqual(actual["arguments"], arguments)
@@ -1033,7 +1035,9 @@ class PartialToolOutputTests(unittest.TestCase):
             if chunk["choices"]
         )
         self.assertEqual(chat_message["content"], expected)
-        self.assertEqual(chat_message["tool_calls"][0]["function"]["arguments"], "{")
+        self.assertEqual(
+            chat_message["tool_calls"][0]["function"]["arguments"], '{"city":"Par'
+        )
         self.assertEqual(chat_streamed, expected)
         self.assertEqual(chat_chunks[-1]["choices"][0]["finish_reason"], "length")
 
@@ -1089,6 +1093,7 @@ class PartialToolOutputTests(unittest.TestCase):
                 ],
                 vision=True,
                 deadline=FOREVER,
+                without_slot=nullcontext,
             )
             return messages[1]["tool_calls"][0]["function"]["arguments"]
 
