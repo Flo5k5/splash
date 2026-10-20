@@ -35,11 +35,11 @@ namespace splash::model {
 //
 // Active KV, the slots of blocks requests hold and the quota Spill requests
 // committed for the pages they will write, is bounded by the active limit
-// instead, which leaves it the volume's whole room rather than a quarter of
-// it (engine::DiskSpace): a commitment locks quota without taking a slot or
-// giving a copy up, and a committed page's slot draws on it
-// (Draw::Commitment). Every draw checks what the files hold against its
-// limit, so none passes a full volume.
+// instead, which leaves it the volume's whole room where the automatic
+// quota's copies keep a quarter of it (engine::DiskSpace): a commitment
+// locks quota without taking a slot or giving a copy up, and a committed
+// page's slot draws on it (Draw::Commitment). Every draw checks what the
+// files hold against its limit, so none passes a full volume.
 //
 // A write budget that spares the drive is the user's to set
 // (setWriteBudget, --max-cache-disk-writes); without one, the default, every

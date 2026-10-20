@@ -5087,8 +5087,8 @@ void testUnreadableCopyLeavesBeforeTheCommandThatReadIt() {
 // copy already, so two requests on one prefix hold one commitment for it.
 // When the active limit falls, the newest request's commitment goes first,
 // and the request runs on. A write that found the volume full holds
-// write-through back until the active limit has room again, and every exit
-// returns what a request still holds.
+// write-through back until the active limit has room again beside the blocks
+// requests hold, and every exit returns what a request still holds.
 void testCommitmentsLockQuotaUntilWritten() {
   Spilling spill({1, 1}, 10);
   const std::vector<uint32_t> cached = Spilling::prompt(1000, 4);
@@ -5145,7 +5145,7 @@ void testCommitmentsLockQuotaUntilWritten() {
   require(spill.cache.writeThrough() == 1, "the page was not written");
   spill.tier.complete(false);
   static_cast<void>(spill.cache.pollTransfers());
-  spill.budget->setActiveLimitBytes(spill.budget->usedBytes());
+  spill.budget->setActiveLimitBytes(spill.cache.spillSnapshot().heldBytes);
   require(spill.cache.spillSnapshot().writeThroughPaused && spill.cache.writeThrough() == 0,
           "write-through went on after the volume filled");
   spill.budget->setActiveLimitBytes(1000);
@@ -5156,6 +5156,51 @@ void testCommitmentsLockQuotaUntilWritten() {
   static_cast<void>(spill.cache.pollTransfers());
   spill.cache.checkInvariants();
   spill.cache.endRequest(7);
+}
+
+// A size's cached copies may take all the room active KV may
+// (engine::DiskSpace). When a write finds the volume full, the measure that
+// follows can take every commitment back and leave the copies within a slot
+// of the limit they share: write-through resumes all the same where the
+// blocks requests hold leave a slot of room, the page's slot giving a cached
+// copy up.
+void testWriteThroughResumesBesideCopiesThatFillTheRoom() {
+  // Every page stays Full, so that each cached copy is a redundant one.
+  Spilling spill({8, 1}, 10);
+  spill.start(1, Spilling::prompt(5000, 4), 4);
+  require(spill.cache.writeThrough() == 4, "the cached copies were not written");
+  spill.tier.complete();
+  static_cast<void>(spill.cache.pollTransfers());
+  spill.cache.endRequest(1);
+
+  // A request whose three pages have copies commits two more, and the first
+  // page past them finds the volume full.
+  spill.start(2, Spilling::prompt(1000, 3), 3);
+  require(spill.cache.writeThrough() == 3, "the request's pages were not written");
+  spill.tier.complete();
+  static_cast<void>(spill.cache.pollTransfers());
+  require(spill.cache.commitSpill(2, 2), "the request's commitment was refused");
+  spill.grow(2, Spilling::prompt(1000, 4), 4);
+  require(spill.cache.writeThrough() == 1, "the page was not written");
+  spill.tier.complete(false);
+  static_cast<void>(spill.cache.pollTransfers());
+  require(spill.cache.spillSnapshot().writeThroughPaused, "a full volume did not pause write-through");
+
+  // The volume measured again leaves the size's limits 450 bytes: the
+  // commitment goes, and the copies keep within a slot of the limit.
+  spill.budget->setLimitBytes(450);
+  spill.budget->setActiveLimitBytes(450);
+  spill.cache.keepDiskLimit();
+  const KvSpillSnapshot measured = spill.cache.spillSnapshot();
+  require(measured.committedBytes == 0 && measured.heldBytes == 300 && spill.budget->usedBytes() == 400,
+          "the measure did not take the commitment back and cut the copies to the limit");
+  require(spill.cache.writeThrough() == 1 && !spill.cache.spillSnapshot().writeThroughPaused &&
+              spill.budget->usedBytes() == 400,
+          "write-through stayed paused while the blocks requests hold left a slot of room");
+  spill.tier.complete();
+  static_cast<void>(spill.cache.pollTransfers());
+  spill.cache.checkInvariants();
+  spill.cache.endRequest(2);
 }
 
 // A write through that fails gives its slot back, and its request commits
@@ -5493,6 +5538,7 @@ int main() {
     testCommittedPagesTakeTheSpilledChainOfAStateInRam();
     testUnreadableCopyLeavesBeforeTheCommandThatReadIt();
     testCommitmentsLockQuotaUntilWritten();
+    testWriteThroughResumesBesideCopiesThatFillTheRoom();
     testFailedWritesKeepTheirCommitment();
     testPagesPastTheCommitmentCommitTheirSlots();
     testConversionSpillsTheHistoryWithCopiesAtOnce();

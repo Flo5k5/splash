@@ -86,10 +86,10 @@ std::string gibibytes(uint64_t bytes) {
   return text;
 }
 
-DiskSpace::DiskSpace(std::shared_ptr<model::DiskBudget> budget,
+DiskSpace::DiskSpace(std::shared_ptr<model::DiskBudget> budget, bool automatic,
                      std::vector<std::shared_ptr<model::SlotFile>> files,
                      std::vector<CacheDirectory::Idle> others)
-    : budget_(std::move(budget)), files_(std::move(files)),
+    : budget_(std::move(budget)), automatic_(automatic), files_(std::move(files)),
       others_(std::make_move_iterator(others.begin()), std::make_move_iterator(others.end())) {
   if (!budget_ || files_.empty())
     throw std::invalid_argument("a disk tier's space needs its budget and a file");
@@ -131,9 +131,12 @@ void DiskSpace::measure(std::optional<DiskVolume> volume) {
               gibibytes(heldCapBytes_), " it holds while this server runs.");
   }
   const uint64_t quota = budget_->capacityBytes();
-  const uint64_t rootLimit =
-      followed() ? diskLimitBytes(quota, volume_->availableBytes, heldBytes_, floor) : quota;
   const uint64_t activeLimit = volumeActiveLimitBytes(quota, volume_, heldBytes_);
+  // The automatic quota's copies keep a quarter of the room; a size's may
+  // take all of it, as active KV may.
+  const uint64_t rootLimit = automatic_ && followed()
+                                 ? diskLimitBytes(quota, volume_->availableBytes, heldBytes_, floor)
+                                 : activeLimit;
   // The root holds more than its limit: another model's cache nobody holds
   // goes, the oldest first, before a copy of this one's. One someone took
   // meanwhile is that process's to count.
