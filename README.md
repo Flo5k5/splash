@@ -120,14 +120,17 @@ access, authentication, browser apps on other origins, and other options, see
 
 Measured with Splash 1.0 on an M5 Pro (16-core GPU, 48 GB), using its model
 packages and selected SPEED-Bench coding prompts over HTTP. Ratios compare
-with the next-fastest engine measured in that benchmark.
+with the next-fastest engine measured in that benchmark. Qwen3.8-Flash-Next
+(`ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:Q2_0`) was measured the same way
+with this release on an M5 Pro (20-core GPU, 64 GB); its ratios compare with
+another engine serving the same GGUF on that Mac.
 
-| Metric | Qwen3.6-35B-A3B | Qwen3.8-27B |
-| --- | ---: | ---: |
-| Decode · short prompt | 210 tok/s (1.7×) | 74 tok/s (2.0×) |
-| Prefill · 32K prompt | 2,011 tok/s (1.3×) | 363 tok/s (1.2×) |
-| Cached time to first token · 32K replay | 123 ms (6.6×) | 282 ms (7.3×) |
-| Aggregate decode · 4 concurrent short prompts | 357 tok/s (2.0×) | 170 tok/s (3.9×) |
+| Metric | Qwen3.6-35B-A3B | Qwen3.8-27B | Qwen3.8-Flash-Next |
+| --- | ---: | ---: | ---: |
+| Decode · short prompt | 210 tok/s (1.7×) | 74 tok/s (2.0×) | 95 tok/s (1.3×) |
+| Prefill · 32K prompt | 2,011 tok/s (1.3×) | 363 tok/s (1.2×) | 1,312 tok/s (1.3×) |
+| Cached time to first token · 32K replay | 123 ms (6.6×) | 282 ms (7.3×) | 171 ms (212×) |
+| Aggregate decode · 4 concurrent short prompts | 357 tok/s (2.0×) | 170 tok/s (3.9×) | 171 tok/s (2.4×) |
 
 [Launch benchmarks](https://inco.ai/blog/splash/) ·
 [Measurement details](docs/performance.md#splash-10-launch-benchmarks) ·
