@@ -59,6 +59,15 @@ inline constexpr uint64_t kAutomaticCacheDiskBytes = uint64_t{32} << 30;
 // frees them cost it at most a third more than it freed.
 [[nodiscard]] uint64_t diskLimitBytes(uint64_t quotaBytes, uint64_t availableBytes,
                                       uint64_t heldBytes, uint64_t floorBytes) noexcept;
+// The most active KV may take there (model::DiskBudget::activeLimitBytes):
+// all of its room, and at most the quota:
+//   min(quota, max(0, available + held - floor)).
+[[nodiscard]] uint64_t diskActiveLimitBytes(uint64_t quotaBytes, uint64_t availableBytes,
+                                            uint64_t heldBytes, uint64_t floorBytes) noexcept;
+// That limit on `volume`, where the tier's files hold `heldBytes`; the quota
+// on a volume the tier does not follow, one not local or not measured.
+[[nodiscard]] uint64_t volumeActiveLimitBytes(uint64_t quotaBytes, const std::optional<DiskVolume> &volume,
+                                              uint64_t heldBytes) noexcept;
 
 // Why the automatic quota leaves the tier off on this volume, where the
 // tier's files would already hold `heldBytes`: it cannot be measured, it is
@@ -75,19 +84,19 @@ automaticDiskRefusal(const std::optional<DiskVolume> &volume, uint64_t heldBytes
 // control pass and when a write found the volume full, reads the volume
 // through the first file's descriptor, which names the right volume however
 // the file was made, adds the blocks the tier's files hold, and sets the
-// budget's limit (diskLimitBytes); off a local volume the quota is the
-// limit. In a persistent cache's root one limit bounds every namespace
-// together, and the tier may use all of it: the others nobody holds count
-// among what the tier holds, and while the root holds more than its limit,
-// as the tier grows or the volume shrinks, they go, oldest first, before
-// the tier gives up a copy of its own. A write that found the volume full
-// while the volume shows room above the floor, or on a volume whose free
-// space the tier does not follow, met a limit the measure cannot see, such as
-// a volume quota or a disk image whose host is full, or a volume that filled
-// and freed again before the measure. A second such write says it was a
-// limit: the tier then keeps within what it holds, its live slots, for the
-// rest of the process. It goes on serving and replacing its copies within
-// that, and a later such write lowers it again.
+// budget's limit (diskLimitBytes) and active limit (diskActiveLimitBytes);
+// off a local volume the quota is both. In a persistent cache's root one
+// limit bounds every namespace together, and the tier may use all of it: the
+// others nobody holds count among what the tier holds, and while the root
+// holds more than its limit, as the tier grows or the volume shrinks, they
+// go, oldest first, before the tier gives up a copy of its own. A write that
+// found the volume full while the volume shows room above the floor, or on a
+// volume whose free space the tier does not follow, met a limit the measure
+// cannot see, such as a volume quota or a disk image whose host is full, or a
+// volume that filled and freed again before the measure. A second such write
+// says it was a limit: the tier then keeps within what it holds, its live
+// slots, both limits, for the rest of the process. It goes on serving and
+// replacing its copies within that, and a later such write lowers it again.
 class DiskSpace final {
 public:
   // The files live on one volume; `others` are the root's namespaces nobody

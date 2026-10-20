@@ -1,29 +1,34 @@
 #pragma once
 
-// The reader threads of the weights that stay in their source files and are
-// read as steps need them (model::ExpertStore, model::SparseRowStore), which
-// a model's stores share: batches of tasks, each reading into memory of its
-// own.
+// The engine's one pool of SSD readers, which RuntimeResources owns: the
+// stores of the weights that stay in their source files and are read as
+// steps need them (model::ExpertStore, model::SparseRowStore) read on them,
+// and so does whatever else reads the SSD for a step. Batches of tasks, each
+// reading into memory of its own.
 //
-// A batch either runs now (run, finish), on the calling thread and every
+// A batch either runs now (run, runBatch, finish), on the calling thread and every
 // reader, ahead of every background batch, because a step waits for it; or
 // in the background (start), on at most the readers it was given, and only
-// while no batch runs now, so a read ahead never delays a step's reads. The
-// store that started a background batch ends it: finish() runs the rest of it
+// while no batch runs now, so a read ahead never delays a step's reads.
+// A reader takes the oldest background batch with room for it. While a
+// batch runs now, writes to the drive hold back (criticalBusy). The store
+// that started a background batch ends it: finish() runs the rest of it
 // now, and stop() leaves the rest unread and returns once the tasks readers
 // took ended, the batch's first taken() tasks; halt() leaves the rest unread
 // at once, and its taken tasks end on their own (Batch::ended).
 //
 // A task that throws is tried once more, for a transient I/O error; a second
-// failure is the task's. A batch that runs now throws its first failure once
-// every task ended; a background batch keeps its failures for its store
-// (failed), which decides whether the read was needed: a read ahead of what
-// no step routed is no failure.
+// failure is the task's. A batch run() runs throws its first failure once
+// every task ended; one runBatch() runs, and a background batch, keep their
+// failures for their store (failed), which decides what a failure fails: a
+// read ahead of what no step routed is no failure.
 //
 // Threads: any thread runs, starts, stops and finishes batches; a batch's
 // tasks run on the readers and on the threads that run it now, each once.
 // A store stops or finishes its background batches before the memory they
-// read into goes, and the readers before they go.
+// read into goes, and the readers before they go. A batch, and what its
+// tasks hold, may go on a reader that holds the readers' lock, so a task
+// owns nothing that owns the readers.
 
 #include <atomic>
 #include <condition_variable>
@@ -40,12 +45,13 @@
 
 namespace splash::model {
 
-// A model's readers: an SSD reads small pieces at full speed only with many
-// in flight (an M5 Pro's reads 460 KiB pieces at 8.1 GB/s from four threads
-// and at 12.5 GB/s from sixteen).
-inline constexpr unsigned kWeightReaders = 16;
+// The engine's readers: an SSD reads small pieces at full speed only with
+// many in flight (an M5 Pro reads 460 KiB pieces at 8.1 GB/s from four
+// threads and at 12.5 GB/s from sixteen, and random 4 KiB pieces 168K times
+// a second from sixteen and 230K from thirty-two, as the other Macs do).
+inline constexpr unsigned kSsdReaders = 32;
 
-class WeightReaders final {
+class SsdReaders final {
 public:
   using Task = std::function<void(size_t index)>;
   // A batch's tasks tried again after a failure, and those that failed again.
@@ -67,7 +73,7 @@ public:
     [[nodiscard]] Tally tally() const;
 
   private:
-    friend class WeightReaders;
+    friend class SsdReaders;
     Batch(size_t count, Task task, unsigned readers, std::function<void(const Batch &)> ended)
         : count_(count), task_(std::move(task)), readers_(readers), ended_(std::move(ended)),
           ends_(std::make_unique<std::atomic<bool>[]>(count)), limit_(count) {}
@@ -81,7 +87,7 @@ public:
     const size_t count_;
     const Task task_;
     // The most readers on it at once while it runs in the background, and
-    // those on it (under WeightReaders::mutex_).
+    // those on it (under SsdReaders::mutex_).
     const unsigned readers_;
     unsigned working_ = 0;
     // Runs on the thread that ended its last task, when every task ran;
@@ -100,17 +106,20 @@ public:
   };
 
   // Starts `readers` threads.
-  explicit WeightReaders(unsigned readers);
+  explicit SsdReaders(unsigned readers);
   // Ends the readers once the tasks they took ended; every background batch
   // was stopped or finished.
-  ~WeightReaders();
-  WeightReaders(const WeightReaders &) = delete;
-  WeightReaders &operator=(const WeightReaders &) = delete;
+  ~SsdReaders();
+  SsdReaders(const SsdReaders &) = delete;
+  SsdReaders &operator=(const SsdReaders &) = delete;
 
   // Runs task(i) for every i below count now (see above); throws the first
   // failure once every task ended, and counts its retries and failures in
   // `tally`, if any.
   void run(size_t count, const Task &task, Tally *tally = nullptr);
+  // Runs task(i) for every i below count now, as run() does, and returns the
+  // batch once every task ended, its failures its own (Batch::failed).
+  [[nodiscard]] std::shared_ptr<Batch> runBatch(size_t count, Task task);
   // Starts task(i) for every i below count in the background, in order, on
   // at most `readers` readers at once; `ended`, if any, runs with the batch
   // on the thread that ends its last task once every task ran (never when
@@ -130,6 +139,16 @@ public:
   void finish(Batch &batch);
 
   [[nodiscard]] unsigned readers() const noexcept { return static_cast<unsigned>(threads_.size()); }
+  // A batch runs now, from its start until its last task ended: a step waits
+  // for reads, which writes to the same drive yield to.
+  [[nodiscard]] bool criticalBusy() const noexcept { return running_->load(std::memory_order_acquire) != 0; }
+  // criticalBusy() for what may outlive the readers, a slot file's writes
+  // (model::SlotFile::Options::deferWrites): it shares their count of
+  // batches running now and nothing else, so it keeps no reader alive, and
+  // once they are gone it is false.
+  [[nodiscard]] std::function<bool()> criticalBusyProbe() const {
+    return [running = running_] { return running->load(std::memory_order_acquire) != 0; };
+  }
 
 private:
   void readerLoop();
@@ -146,8 +165,9 @@ private:
   std::mutex mutex_;
   std::condition_variable wake_;
   std::deque<std::shared_ptr<Batch>> now_, background_;
-  // Batches running now, from their start until their last task ended.
-  std::atomic<unsigned> running_{0};
+  // Batches running now, from their start until their last task ended,
+  // shared with criticalBusyProbe().
+  const std::shared_ptr<std::atomic<unsigned>> running_ = std::make_shared<std::atomic<unsigned>>(0);
   bool stopping_ = false;
   std::vector<std::thread> threads_;
 };
