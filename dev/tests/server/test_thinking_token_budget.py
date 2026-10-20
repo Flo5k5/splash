@@ -363,8 +363,6 @@ class ThinkingEndTextTests(unittest.TestCase):
         args = server.parse_args(
             [
                 "model",
-                "--tokenizer",
-                "tokenizer",
                 "--model",
                 "owner/model",
                 "--thinking-end-text=Time is up.",
@@ -373,6 +371,7 @@ class ThinkingEndTextTests(unittest.TestCase):
         http = mock.Mock()
         with (
             mock.patch.object(server, "parse_args", return_value=args),
+            fixtures.unprepared_hold(),
             mock.patch.object(server.signal, "signal"),
             mock.patch.object(server, "load_thinking_key", return_value=None),
             mock.patch.object(

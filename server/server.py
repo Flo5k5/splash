@@ -22,6 +22,9 @@ from urllib.parse import unquote
 
 from transformers import AutoTokenizer
 
+from install import assembly
+from install.models import ModelError
+
 from . import images as image_input
 from . import json_codec, judgments, serve_options
 from . import protocol as wire
@@ -1633,9 +1636,9 @@ def parse_args(argv=None):
     parser.add_argument(
         "model_root",
         metavar="MODEL_DIRECTORY",
-        help="installed model directory holding target/ and draft/",
+        help="the directory of a model Splash prepared, or a selection link to "
+        "one: the server holds and serves the directory it names at startup",
     )
-    parser.add_argument("--tokenizer", required=True)
     parser.add_argument(
         "--model",
         type=serve_options.parse_model_id,
@@ -1652,14 +1655,15 @@ def parse_args(argv=None):
     return args
 
 
-def _native_command(args, relaunch_context=None):
-    """The engine's command line, a relaunch's with `relaunch_context`, the
-    context the first engine served: without --max-context the relaunch keeps
-    it, where its own would follow a Neural Engine split calibrated anew."""
+def _native_command(args, model_root, relaunch_context=None):
+    """The engine's command line serving model_root, a relaunch's with
+    `relaunch_context`, the context the first engine served: without
+    --max-context the relaunch keeps it, where its own would follow a Neural
+    Engine split calibrated anew."""
     command = [
         args.binary,
         "serve-native",
-        args.model_root,
+        str(model_root),
         "auto" if args.max_context is None else str(args.max_context),
         "auto" if args.max_memory is None else str(args.max_memory),
     ]
@@ -1758,17 +1762,21 @@ def main():
             )
         thinking_codec = ThinkingCodec(load_thinking_key())
         print_status(f"Loading · {args.model}")
+        # Nothing reads `held`: it keeps the assembly held until the server
+        # exits, so that no installation collects the assembly its tokenizer
+        # and engines, a relaunched one too, serve.
+        model_root, held = assembly.hold(Path(args.model_root))
         tokenizer = AutoTokenizer.from_pretrained(
-            args.tokenizer, local_files_only=True, trust_remote_code=False
+            model_root / "tokenizer", local_files_only=True, trust_remote_code=False
         )
         validate_tokenizer(tokenizer)
         thinking_end = thinking_end_tokens(tokenizer, args.thinking_end_text)
         chat_templates = ChatTemplates(tokenizer)
         print_status(f"Chat template · {chat_templates.describe()}")
         runtime = engine_runtime.MultiplexedRuntime(
-            _native_command(args),
+            _native_command(args, model_root),
             relaunch_command=lambda first: _native_command(
-                args, first.max_context_tokens
+                args, model_root, first.max_context_tokens
             ),
             startup_timeout=NATIVE_START_TIMEOUT,
             pending_limit=args.queue_size,
@@ -1829,6 +1837,7 @@ def main():
         server.serve_forever()
     except (
         engine_runtime.EngineRuntimeError,
+        ModelError,
         ThinkingKeyError,
         ChatTemplateError,
         ThinkingEndError,

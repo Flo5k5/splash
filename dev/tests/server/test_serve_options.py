@@ -14,7 +14,7 @@ from server.origins import ANY_ORIGIN
 
 ROOT = Path(__file__).resolve().parents[3]
 # Each parser, with the arguments it requires.
-SERVER_ARGS = ["model", "--tokenizer", "tokenizer", "--model", "owner/repo"]
+SERVER_ARGS = ["model", "--model", "owner/repo"]
 LAUNCHER_ARGS = ["serve", "--model", "owner/repo"]
 PARSERS = ((api.parse_args, SERVER_ARGS), (launcher.parse_args, LAUNCHER_ARGS))
 
@@ -405,13 +405,7 @@ class ServeOptionsTests(unittest.TestCase):
     def test_server_requires_explicit_model_and_paths(self):
         model = "community/custom-splash"
         package = api.ROOT / "install/models" / model
-        required = [
-            str(package),
-            "--tokenizer",
-            str(package / "tokenizer"),
-            "--model",
-            model,
-        ]
+        required = [str(package), "--model", model]
         for arguments in (
             [],
             required[:-2],
@@ -428,7 +422,6 @@ class ServeOptionsTests(unittest.TestCase):
                 api.parse_args(arguments)
         args = api.parse_args(required)
         self.assertEqual(Path(args.model_root), package)
-        self.assertEqual(Path(args.tokenizer), package / "tokenizer")
         self.assertIsNone(args.request_timeout)
         self.assertEqual(args.model, model)
         self.assertEqual(Path(args.binary).name, "splash")
@@ -440,13 +433,7 @@ class ServeOptionsTests(unittest.TestCase):
     def test_native_command_passes_each_serve_option(self):
         model = "community/custom-splash"
         package = api.ROOT / "install/models" / model
-        required = [
-            str(package),
-            "--tokenizer",
-            str(package / "tokenizer"),
-            "--model",
-            model,
-        ]
+        required = [str(package), "--model", model]
         args = api.parse_args(required)
         # The engine's command line for each option, which the engine reads as
         # the server means it (native_arguments_test.cpp). The engine keeps
@@ -459,6 +446,7 @@ class ServeOptionsTests(unittest.TestCase):
                 self.assertEqual(
                     api._native_command(
                         api.parse_args([*required, *options]),
+                        args.model_root,
                         61433 if name.startswith("relaunch") else None,
                     ),
                     [args.binary, "serve-native", args.model_root, *arguments],

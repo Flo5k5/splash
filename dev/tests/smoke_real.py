@@ -113,8 +113,6 @@ class RealServer:
             str(self.port),
             "--binary",
             str(binary),
-            "--tokenizer",
-            str(model_root / "tokenizer"),
             "--model",
             arguments.model,
         ]
@@ -1743,21 +1741,11 @@ def resolve_server_arguments(arguments):
 
 
 def hold_model_root(arguments):
-    """As splash serve does, serve every server this process starts, and its
-    tokenizer, from one assembly, which installations keep while it is held:
-    point arguments.model_root at the assembly it links now, held until the
-    process exits by arguments.held_record. The installation that collects an
-    assembly is the one of the models root it was built in
-    (models/.resolved/<record>), which may be another checkout's."""
-    resolved = arguments.model_root.resolve()
-    models_root = (
-        resolved.parent.parent
-        if resolved.parent.name == ".resolved"
-        else model_artifacts.MODELS
-    )
-    arguments.model_root, arguments.held_record = assembly.hold(
-        arguments.model_root, models_root
-    )
+    """Serve every server this process starts, and its tokenizer, from one
+    assembly, which installations keep while it is held, between servers
+    too: point arguments.model_root at the assembly it links now, held until
+    the process exits by arguments.held_record."""
+    arguments.model_root, arguments.held_record = assembly.hold(arguments.model_root)
 
 
 def parse_args(argv=None):

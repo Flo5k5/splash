@@ -780,7 +780,6 @@ def main_args(**overrides):
     return SimpleNamespace(
         **{
             "model_root": "model",
-            "tokenizer": "tokenizer",
             "model": "test-model",
             "served_model_name": [],
             "announce_served_name": False,
@@ -817,6 +816,14 @@ def main_args(**overrides):
             "state_format": "fp32",
             **overrides,
         }
+    )
+
+
+def unprepared_hold():
+    """main()'s hold of its model directory, for a test of a directory Splash
+    did not prepare: the directory as it is, held by nothing."""
+    return mock.patch.object(
+        api.assembly, "hold", side_effect=lambda path: (path, None)
     )
 
 
