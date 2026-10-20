@@ -232,3 +232,34 @@ class SchemaCheckCacheTests(unittest.TestCase):
             tool_schema.normalize_response_format(
                 {"type": "json_schema", "json_schema": {"schema": schema}}
             )
+
+
+class PatternCheckCacheTests(unittest.TestCase):
+    def test_pattern_checks_are_kept_within_a_byte_budget(self):
+        # A request's patterns may be as large as its body. The checks of
+        # those the grammar compiler takes are kept within a budget of the
+        # patterns' bytes as well as of their count: one larger than the
+        # budget is not kept, and one that would outgrow it drops the least
+        # recently used.
+        validate = tool_schema.LLMatcher.validate_grammar
+        with (
+            mock.patch.object(
+                tool_schema,
+                "_pattern_checks",
+                LRUCache(4096, tool_schema.PATTERN_CHECK_CACHE_SIZE),
+            ),
+            mock.patch.object(tool_schema, "LLMatcher") as matcher,
+        ):
+            matcher.validate_grammar.side_effect = validate
+            for pattern, checks in (
+                ("a" * 1500, 1),
+                ("a" * 1500, 1),
+                ("b" * 5000, 2),
+                ("b" * 5000, 3),
+                ("a" * 1500, 3),
+                ("c" * 1500, 4),
+                ("d" * 1500, 5),
+                ("a" * 1500, 6),
+            ):
+                self.assertTrue(tool_schema._grammar_takes_pattern(pattern))
+                self.assertEqual(matcher.validate_grammar.call_count, checks)

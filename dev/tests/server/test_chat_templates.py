@@ -2,6 +2,7 @@ import copy
 import json
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from jinja2 import TemplateError
 from tokenizers import AddedToken, Tokenizer, decoders, models, pre_tokenizers, trainers
@@ -722,12 +723,18 @@ class ChatTemplateFrontendTests(unittest.TestCase):
         )
         app = chat_frontend(switch)
         body = {"model": "test-model", "messages": messages}
-        for kwargs, expected in ((None, False), ({"thinking": True}, True)) * 2:
-            job = app.prepare(
-                {**body, "chat_template_kwargs": kwargs}, deadline=fixtures.FOREVER
-            )
-            self.assertEqual(job.thinking, expected)
-        self.assertEqual(app.chat_templates.select(None).probe.cache_info().misses, 1)
+        with mock.patch.object(
+            chat_templates,
+            "_generation_prompt",
+            wraps=chat_templates._generation_prompt,
+        ) as probe:
+            for kwargs, expected in ((None, False), ({"thinking": True}, True)) * 2:
+                job = app.prepare(
+                    {**body, "chat_template_kwargs": kwargs},
+                    deadline=fixtures.FOREVER,
+                )
+                self.assertEqual(job.thinking, expected)
+        self.assertEqual(probe.call_count, 1)
         for kwargs, error in (
             ("on", "must be an object"),
             ({"tools": []}, "cannot set tools"),
@@ -739,6 +746,74 @@ class ChatTemplateFrontendTests(unittest.TestCase):
                 app.prepare(
                     {**body, "chat_template_kwargs": kwargs}, deadline=fixtures.FOREVER
                 )
+
+    def test_probed_generation_prompts_are_kept_within_a_byte_budget(self):
+        """A request may set template variables as large as its body, which
+        BY_EFFORT does not even read. The generation prompts probed for them
+        are kept within a budget of the bytes they keep as well as of their
+        count: one larger than the budget is not kept, and one that would
+        outgrow it drops the least recently used."""
+        with mock.patch.object(chat_templates, "_PROBED_OPTIONS_BYTES", 4096):
+            template = ChatTemplates(tokenizer(BY_EFFORT)).select(None)
+        options = template_options(
+            reasoning_effort=None,
+            preserve_thinking=None,
+            tools=None,
+            add_generation_prompt=True,
+        )
+        with mock.patch.object(
+            chat_templates,
+            "_generation_prompt",
+            wraps=chat_templates._generation_prompt,
+        ) as probe:
+            for context, probes in (
+                ("a" * 1500, 1),
+                ("a" * 1500, 1),
+                ("b" * 5000, 2),
+                ("b" * 5000, 3),
+                ("a" * 1500, 3),
+                ("c" * 1500, 4),
+                ("d" * 1500, 5),
+                ("a" * 1500, 6),
+            ):
+                text, _ = template.generation_prompt({**options, "context": context})
+                self.assertEqual(text, "<|im_start|>assistant\n<think>")
+                self.assertEqual(probe.call_count, probes)
+
+    def test_probed_generation_prompts_count_their_text_and_tokens(self):
+        """A template may render a request's variable into its generation
+        prompt, whose text and tokens then outweigh the variable. The budget
+        counts them: a prompt that alone outgrows it is probed every time,
+        however little its variables take."""
+        prefixed = BY_EFFORT.replace(
+            "<|im_start|>assistant\n", "<|im_start|>assistant\n{{ prefix }}", 1
+        )
+        with mock.patch.object(chat_templates, "_PROBED_OPTIONS_BYTES", 4096):
+            template = ChatTemplates(
+                chat_tokenizer(prefixed, "<|im_start|>", "<|im_end|>")
+            ).select(None)
+        options = template_options(
+            reasoning_effort=None,
+            preserve_thinking=None,
+            tools=None,
+            add_generation_prompt=True,
+        )
+        with mock.patch.object(
+            chat_templates,
+            "_generation_prompt",
+            wraps=chat_templates._generation_prompt,
+        ) as probe:
+            for prefix, probes in (
+                ("p" * 10, 1),
+                ("p" * 10, 1),
+                ("p" * 1000, 2),
+                ("p" * 1000, 3),
+                ("p" * 10, 3),
+            ):
+                text, tokens = template.generation_prompt({**options, "prefix": prefix})
+                self.assertEqual(text, f"<|im_start|>assistant\n{prefix}<think>")
+                self.assertGreater(len(tokens), len(prefix))
+                self.assertEqual(probe.call_count, probes)
 
     def test_both_template_switches_follow_the_thinking_mode(self):
         """Thinking off reaches the template as enable_thinking false and as

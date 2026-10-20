@@ -5,15 +5,17 @@ from __future__ import annotations
 import copy
 import json
 import re
+import threading
 import unicodedata
 from dataclasses import dataclass, field
-from functools import cached_property, lru_cache
+from functools import cached_property
 from urllib.parse import unquote
 
 from jsonschema.exceptions import SchemaError
 from llguidance import LLMatcher
 
 from .errors import APIError
+from .lru import LRUCache, memoized
 from .schema_validation import (
     build_validator,
     check_schema,
@@ -218,8 +220,13 @@ GRAMMAR_BOUND_KEYWORDS = ("minItems", "maxItems", "multipleOf")
 MAX_GRAMMAR_BOUND = 64
 
 # Checking a pattern compiles a grammar, and a client sends the same tools and
-# output schema on every turn, so the answers for this many patterns are kept.
+# output schema on every turn, so the answers for this many patterns are kept,
+# within this many bytes of them, as the server's other caches of request text
+# are.
 PATTERN_CHECK_CACHE_SIZE = 1024
+PATTERN_CHECK_CACHE_BYTES = 8 * 1024 * 1024
+_pattern_checks_lock = threading.Lock()
+_pattern_checks = LRUCache(PATTERN_CHECK_CACHE_BYTES, PATTERN_CHECK_CACHE_SIZE)
 
 # The whitespace a model chooses between the tokens of constrained output, in
 # JSON and around tool calls, is bounded: a model that prefers whitespace to
@@ -233,14 +240,20 @@ WHITESPACE = rf"[ \t\n\r]{{0,{MAX_WHITESPACE}}}"
 WHITESPACE_RULE = f"WS: /{WHITESPACE}/"
 
 
-@lru_cache(maxsize=PATTERN_CHECK_CACHE_SIZE)
 def _grammar_takes_pattern(pattern):
     """Whether the grammar compiler takes a JSON Schema ``pattern``. It keeps
     the pattern's search semantics but rejects look-around, word boundaries
     and backreferences, which a response format checks on the complete
     output."""
-    string = json.dumps({"type": "string", "pattern": pattern})
-    return not LLMatcher.validate_grammar(f"%llguidance {{}}\nstart: %json {string}\n")
+
+    def check():
+        string = json.dumps({"type": "string", "pattern": pattern})
+        grammar = f"%llguidance {{}}\nstart: %json {string}\n"
+        # json.dumps uses ASCII escapes, so its length bounds the pattern's
+        # bytes.
+        return not LLMatcher.validate_grammar(grammar), len(string)
+
+    return memoized(_pattern_checks, _pattern_checks_lock, pattern, check)
 
 
 def _grammar_compatible_schema(schema):
