@@ -786,6 +786,8 @@ void testFailedStepIsNamed(const char *metallibPath) {
               before.resourceFailure == RuntimeResourceFailure::HostCapacity &&
               before.message.find("not enough free memory to start") != std::string::npos,
           "a start the host refused before the weights loaded named another step");
+  require(before.message.find("--max-memory") != std::string::npos,
+          "a start the host refused did not name --max-memory as a remedy");
   const auto first = StartupRetryWindow::Clock::time_point{};
   require(StartupRetryWindow(30s).retryUntil(before, first) == first + 30s,
           "a start the host refused was not retried");
