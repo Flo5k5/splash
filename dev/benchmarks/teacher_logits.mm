@@ -3,7 +3,7 @@
 //
 //   teacher-logits METALLIB MODEL_ROOT TOKENS OUTPUT --window END:ROWS [--window END:ROWS...]
 //                  [--kv-format int8|bf16] [--state-format fp32|bf16]
-//                  [--expert-memory BYTES] [--ple-memory BYTES]
+//                  [--expert-memory SIZE] [--ple-memory SIZE]
 //
 // TOKENS holds little-endian uint32 token ids, read as they are: no BOS, no
 // chat template. For each window a cold request prefills ids [0, END - ROWS)
@@ -26,6 +26,7 @@
 #include "model/RuntimeInstrumentation.hpp"
 #include "model/SsdReaders.hpp"
 #include "ops/PageStorage.hpp"
+#include "tools/LoadOptions.hpp"
 
 #import <Foundation/Foundation.h>
 
@@ -205,7 +206,7 @@ int main(int argc, char **argv) {
       if (argc < 5) {
         std::cerr << "usage: teacher-logits METALLIB MODEL_ROOT TOKENS OUTPUT --window END:ROWS "
                      "[--window END:ROWS...] [--kv-format int8|bf16] [--state-format fp32|bf16] "
-                     "[--expert-memory BYTES] [--ple-memory BYTES]\n";
+                     "[--expert-memory SIZE] [--ple-memory SIZE]\n";
         return 2;
       }
       std::vector<Window> windows;
@@ -227,11 +228,7 @@ int main(int argc, char **argv) {
           if (value != "fp32" && value != "bf16")
             throw std::invalid_argument("--state-format takes fp32 or bf16");
           stateFormat = value == "fp32" ? ops::GdnStateFormat::Float32 : ops::GdnStateFormat::BFloat16;
-        } else if (option == "--expert-memory")
-          loadOptions.expertMemoryBytes = parseNumber(value, "--expert-memory");
-        else if (option == "--ple-memory")
-          loadOptions.streamedTableBytes = parseNumber(value, "--ple-memory");
-        else
+        } else if (!tools::takeLoadOption(option, value, loadOptions))
           throw std::invalid_argument("unknown option " + std::string(option));
       }
       if (windows.empty())

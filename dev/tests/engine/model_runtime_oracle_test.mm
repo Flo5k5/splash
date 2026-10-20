@@ -25,10 +25,10 @@
 #include "ops/PageStorage.hpp"
 #include "ops/Sampling.hpp"
 #include "ops/Vision.hpp"
+#include "tools/LoadOptions.hpp"
 
 #include <algorithm>
 #include <array>
-#include <charconv>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -45,7 +45,6 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <system_error>
 #include <thread>
 #include <tuple>
 #include <type_traits>
@@ -68,22 +67,6 @@ using splash::test::require;
 
 std::string mebibytes(uint64_t bytes) {
   return std::to_string(bytes >> 20) + " MiB";
-}
-
-// A positive byte count with an optional K, M or G suffix, of 1024, 1024^2 or
-// 1024^3, as splash serve takes sizes; zero for anything else.
-uint64_t parseBytes(std::string_view value) {
-  uint64_t unit = 1;
-  if (!value.empty())
-    if (const size_t power = std::string_view("KMG").find(value.back()); power != std::string_view::npos) {
-      unit = uint64_t{1} << (10 * (power + 1));
-      value.remove_suffix(1);
-    }
-  uint64_t count = 0;
-  const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), count);
-  if (error != std::errc{} || end != value.data() + value.size() || count > UINT64_MAX / unit)
-    return 0;
-  return count * unit;
 }
 
 // The oracle loads and allocates without production's memory guard, and it
@@ -3595,11 +3578,10 @@ int main(int argc, char **argv) {
     // The evaluation of the split's program that fails, counted from 1 as
     // ane::ProgramInstrumentation counts them; 0 for none.
     uint64_t aneFfnFault = 0;
-    // --ple-memory SIZE: a Qwen3.8-Flash-Next target's PLE table streams
-    // from its file through a cache of BYTES, as splash serve's option does;
-    // its TOKENS line equals the resident table's. --expert-memory SIZE: its
-    // routed experts stream from the file into an arena of SIZE, as splash
-    // serve's --expert-memory does. --prefill-groups-only: a prefill group
+    // --ple-memory SIZE and --expert-memory SIZE stream a Qwen3.8-Flash-Next
+    // target's PLE table and a MoE target's routed experts
+    // (tools/LoadOptions.hpp); a streamed table's TOKENS line equals the
+    // resident table's. --prefill-groups-only: a prefill group
     // against its chunks' commands (requirePrefillGroupMatchesItsChunks),
     // and a command in passes against it whole
     // (requirePrefillPassesMatchWhole), then stop. A block-sparse target's K/V that spilled reads what its
@@ -3650,12 +3632,8 @@ int main(int argc, char **argv) {
         char *end = nullptr;
         aneFfnFault = std::strtoull(value, &end, 10);
         if (end == value || *end || !aneFfnFault) fail("--ane-ffn-fault takes an evaluation from 1");
-      } else if (option == "--ple-memory" && i + 1 < argc) {
-        loadOptions.streamedTableBytes = parseBytes(argv[++i]);
-        if (!loadOptions.streamedTableBytes) fail("--ple-memory takes a size such as 2G");
-      } else if (option == "--expert-memory" && i + 1 < argc) {
-        loadOptions.expertMemoryBytes = parseBytes(argv[++i]);
-        if (!loadOptions.expertMemoryBytes) fail("--expert-memory takes a size such as 16G");
+      } else if (i + 1 < argc && tools::takeLoadOption(option, argv[i + 1], loadOptions)) {
+        ++i;
       } else if (option == "--yarn-factor" && i + 1 < argc) {
         const char *value = argv[++i];
         char *end = nullptr;

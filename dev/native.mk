@@ -424,13 +424,16 @@ $(TEST_HANDOFF_TEST): dev/tests/engine/handoff_test.mm $(ENGINE_LIBRARY)
 $(TEST_VISION_ENCODER_TEST): dev/tests/engine/vision_encoder_test.mm \
 		$(ENGINE_LIBRARY)
 $(TEST_MODEL_RUNTIME_ORACLE): dev/tests/engine/model_runtime_oracle_test.mm \
+		dev/tools/LoadOptions.hpp \
 		$(ENGINE_INSTRUMENTED_METAL_OBJECT) $(ENGINE_INSTRUMENTED_ANE_OBJECT) \
 		$(ENGINE_INSTRUMENTED_RUNTIME_OBJECT) $(ENGINE_LIBRARY) $(LIB) $(BUILD_ID_HEADER)
 # The oracle remembers the split's calibration under the build, as the engine does.
 $(TEST_MODEL_RUNTIME_ORACLE): ENGINE_TEST_CXXFLAGS += -include $(BUILD_ID_HEADER)
 $(TEST_DECODE_PROFILE): dev/benchmarks/decode_profile.mm \
+		dev/tools/LoadOptions.hpp \
 		$(ENGINE_INSTRUMENTED_METAL_OBJECT) $(ENGINE_LIBRARY) $(LIB)
 $(TEST_TEACHER_LOGITS): dev/benchmarks/teacher_logits.mm \
+		dev/tools/LoadOptions.hpp \
 		$(ENGINE_INSTRUMENTED_RUNTIME_OBJECT) $(ENGINE_LIBRARY) $(LIB)
 $(TEST_ATTENTION_SWEEP): dev/benchmarks/attention_sweep.mm \
 		dev/benchmarks/DispatchReplay.hpp \
@@ -461,10 +464,11 @@ $(TEST_DRAFT_PREPARATION) $(TEST_GGUF_PROJECTION) $(TEST_ANE_FFN) \
 		$(ENGINE_LINKFLAGS) -o $@
 
 # Tools built with the production flags.
-$(WEIGHT_DIGESTS): dev/tools/weight_digests.mm $(ENGINE_LIBRARY)
+$(WEIGHT_DIGESTS): dev/tools/weight_digests.mm \
+		dev/tools/LoadOptions.hpp $(ENGINE_LIBRARY)
 
 $(WEIGHT_DIGESTS): | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_OBJCXXFLAGS) $(TEST_INPUTS) \
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_OBJCXXFLAGS) -Idev $(TEST_INPUTS) \
 		$(ENGINE_LINKFLAGS) -o $@
 
 $(TEST_BACKEND_BENCHMARK): dev/benchmarks/backend_benchmark.mm \
