@@ -4947,6 +4947,73 @@ void testQuotaGivesUpOnlyCopiesNothingReads() {
   spill.cache.checkInvariants();
 }
 
+// Quota never gives up the KV of a state in RAM, which a spilled leaf can
+// hold: here the ended request's replay point, on its last spilled page,
+// once the tail below it has left. At a limit of nothing quota gives up
+// every other copy and keeps that leaf's, and the chain above it. When the
+// state's own write finds no room, reclaim drops the state, not the leaf
+// under it, whose copy then goes with the rest.
+void testQuotaKeepsTheSpilledLeafOfAStateInRam() {
+  Spilling spill;
+  const std::vector<uint32_t> prompt = Spilling::prompt(1000, 6);
+  spill.start(1, prompt, 6);
+  static_cast<void>(test::spillRound(spill.cache, spill.tier));
+  const uint64_t leaf = spill.block(1, 4);
+  auto noRoom = std::make_shared<TransferControl>();
+  noRoom->capacity = 0;
+  spill.cache.publishCompositeState(leaf, std::make_shared<TieredState>(noRoom), false);
+  spill.cache.endRequest(1);
+  require(spill.cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::Ordinary).madeProgress &&
+              spill.cache.snapshot().pool.pagesPrefix == 5,
+          "the tail below the state did not leave RAM");
+  const auto resume = std::span<const uint32_t>(prompt).first(5 * KvCache::pageTokens + 1);
+  spill.budget->setLimitBytes(0);
+  spill.cache.keepDiskLimit();
+  require(spill.tier.slots == 4 && spill.cache.stateResident(leaf) &&
+              spill.cache.lookup(resume, {}).resumeBoundary() == 5 * KvCache::pageTokens,
+          "quota gave up the spilled leaf of a state in RAM");
+  const CacheReclaimResult reclaimed = spill.cache.reclaimStateForLane(ReclaimClass::Ordinary);
+  require(reclaimed.madeProgress && !spill.cache.stateResident(leaf) && spill.tier.slots == 4 &&
+              spill.cache.lookup(resume, {}).kvBoundary == 5 * KvCache::pageTokens,
+          "making room for the state's write gave up its own leaf");
+  spill.cache.keepDiskLimit();
+  require(spill.tier.slots == 0 && spill.cache.snapshot().pool.pagesPrefix == 1,
+          "quota kept the spilled chain once its state was gone");
+  spill.cache.checkInvariants();
+}
+
+// A committed page is a request's KV, which comes before any cached copy:
+// once nothing else is left, its slot takes the spilled chain of a state in
+// RAM, the state first, which the quota otherwise keeps. Here the ended
+// request's replay point holds its chain, and a Spill request draws on the
+// room its commitment found: its first pages take the other copies, and the
+// rest the chain.
+void testCommittedPagesTakeTheSpilledChainOfAStateInRam() {
+  Spilling spill({1, 1}, 6);
+  const std::vector<uint32_t> prompt = Spilling::prompt(1000, 6);
+  spill.start(1, prompt, 6);
+  static_cast<void>(test::spillRound(spill.cache, spill.tier));
+  const uint64_t leaf = spill.block(1, 4);
+  spill.publishState(leaf);
+  spill.cache.endRequest(1);
+  require(spill.cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::Ordinary).madeProgress &&
+              spill.cache.snapshot().pool.pagesPrefix == 5 && spill.tier.slots == 6,
+          "the tail below the state did not leave RAM");
+  const auto resume = std::span<const uint32_t>(prompt).first(5 * KvCache::pageTokens + 1);
+  spill.start(2, Spilling::prompt(5000, 2), 2);
+  require(spill.cache.writeThrough() == 2 && spill.cache.stateResident(leaf) &&
+              spill.cache.lookup(resume, {}).resumeBoundary() == 5 * KvCache::pageTokens,
+          "the first pages did not take the copies no state in RAM holds first");
+  spill.grow(2, Spilling::prompt(5000, 6), 6);
+  require(spill.cache.writeThrough() == 4 && !spill.cache.stateResident(leaf) &&
+              spill.tier.slots == 6 && spill.cache.spillSnapshot().heldBytes == 600 &&
+              spill.cache.lookup(resume, {}).kvBoundary == KvCache::pageTokens,
+          "a committed page did not take the spilled chain of a state in RAM");
+  spill.tier.complete();
+  static_cast<void>(spill.cache.pollTransfers());
+  spill.cache.checkInvariants();
+}
+
 // A lane that read an unreadable copy ends, and the copy is poisoned, while
 // the engine applies the results of the command that read it, whose cut
 // still names it: before the lane ends or after, the block at the start of
@@ -5381,6 +5448,8 @@ int main() {
     testUnspillOnlyAsTheOnlyHolder();
     testWritersMoveOntoPagesBeingWritten();
     testQuotaGivesUpOnlyCopiesNothingReads();
+    testQuotaKeepsTheSpilledLeafOfAStateInRam();
+    testCommittedPagesTakeTheSpilledChainOfAStateInRam();
     testUnreadableCopyLeavesBeforeTheCommandThatReadIt();
     testCommitmentsLockQuotaUntilWritten();
     testFailedWritesKeepTheirCommitment();

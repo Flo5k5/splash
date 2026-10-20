@@ -3176,7 +3176,9 @@ start takes back: a full quota drops a KV copy that no state needs first, then
 the oldest state copy, redundant or not, after which the copies of its chain
 that no other state needs go first in turn; the only copy of a state in use
 makes room only for a copy in use, and last. Either way an ordinary state that
-finds no other room is dropped. A freed slot returns its quota at once and its
+finds no other room is dropped. Before reclaim takes a state in RAM, only a
+spilling request's page takes the spilled KV under it, the state first,
+once nothing else is left. A freed slot returns its quota at once and its
 blocks to the volume (`F_PUNCHHOLE`) once its file's IO worker finishes the
 transfer it is in, so the two files together occupy about the live slots instead
 of each keeping its high-water mark; `/status` reports that as `disk.file_bytes`
