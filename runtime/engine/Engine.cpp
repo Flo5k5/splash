@@ -2009,9 +2009,10 @@ auto Engine::allocate(Attempt &&attempt, bool inService, ReclaimClass upTo,
     else
       // The model's memory for reads of spilled KV (a hot block cache floor,
       // a history's staging) takes what a state takes; while the host
-      // refuses growth, idle model memory alone, and memory for later (that
+      // refuses growth, idle buffers alone, and memory for later (that
       // cache's optional growth) nothing.
-      reclaimed = paused ? CacheReclaimResult{!optional && reclaimIdleState(true)}
+      reclaimed = paused ? CacheReclaimResult{!optional &&
+                                              reclaimIdleState(true, model::IdleMemory::Buffers)}
                          : reclaimForState(upTo, optional);
     if (reclaimed.madeProgress) {
       admission = tryOnce();
@@ -2053,8 +2054,8 @@ auto Engine::allocate(Attempt &&attempt, bool inService, ReclaimClass upTo,
 // its floor are, nor the empty extent kept for the next request.
 // A host refusal comes to neither step but to the reuse path (allocate()):
 // the pressure controller owns that shrink, and evicting for an allocator
-// that refuses all the same would drain the cache before macOS can
-// acknowledge any reclaimed bytes.
+// that refuses all the same would drain the cache, and the caches the model
+// can rebuild, before macOS can acknowledge any reclaimed bytes.
 CacheReclaimResult Engine::reclaimForState(ReclaimClass upTo, bool forLater) {
   if (reclaimIdleState(true, forLater ? model::IdleMemory::Buffers
                                       : model::IdleMemory::BuffersThenCaches))
@@ -2069,7 +2070,7 @@ CacheReclaimResult Engine::reclaimForState(ReclaimClass upTo, bool forLater) {
 // stay for the pages to reuse; idle state memory goes first, then the cache
 // gives up what covers the shortfall, of the pages' form, in one step.
 CacheReclaimResult Engine::reclaimForKv(const TokenAdmission &admission, ReclaimClass upTo) {
-  if (reclaimIdleState(false))
+  if (reclaimIdleState(false, model::IdleMemory::BuffersThenCaches))
     return {true, 0};
   const CacheReclaimResult reclaimed = cache_.reclaimForPages(
       admission.additionalPages, CacheReclaimMode::KeepExtents, upTo, admission.form);
@@ -2091,9 +2092,12 @@ bool Engine::reclaimIdleState(bool keepLane, model::IdleMemory scope) noexcept {
 // lane draws from, and nothing is allocated. A state goes only when those in
 // RAM cover what the pool lacks, which they never do for the draft rings no
 // cached state holds; otherwise the cache survives, and the request grows if
-// it is in service and waits if it is not.
+// it is in service and waits if it is not. Idle buffers beyond the lane's go
+// back to the host first, but no cache the model can rebuild: freeing one
+// would not let the lane start, and the paced pass takes those caches toward
+// what the host lacks.
 CacheReclaimResult Engine::reuseCachedStateWhilePaused(ReclaimClass upTo) {
-  if (reclaimIdleState(true))
+  if (reclaimIdleState(true, model::IdleMemory::Buffers))
     return {true, 0};
   const uint32_t lacked = model_.statesToActivate();
   if (!lacked || cache_.evictableStates(upTo) < lacked)
@@ -2115,12 +2119,14 @@ CacheReclaimResult Engine::reuseCachedStateWhilePaused(ReclaimClass upTo) {
 // state's buffers give no page while the host refuses growth, unless the
 // state sits on the leaf that goes next (CacheReclaimMode::ReusePages). A
 // reclaim that must wait for the transfer in flight makes the request wait
-// with it, as it does without the pause. Idle model state goes first, but
-// not the pooled buffers the next lane starts from: they would not let this
-// request grow, and the paced pass keeps them for the next one.
+// with it, as it does without the pause. Idle buffers go first, but neither
+// the pooled buffers the next lane starts from nor the caches the model can
+// rebuild: they would not let this request grow, and the paced pass keeps
+// the buffers for the next lane and takes the caches toward what the host
+// lacks.
 CacheReclaimResult Engine::reuseCachedPagesWhilePaused(const TokenAdmission &admission,
                                                        ReclaimClass upTo) {
-  if (reclaimIdleState(true))
+  if (reclaimIdleState(true, model::IdleMemory::Buffers))
     return {true, 0};
   if (cache_.reusablePages(upTo, admission.form) < admission.additionalPages)
     return {};

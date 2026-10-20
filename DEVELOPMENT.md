@@ -2858,7 +2858,10 @@ and `host_headroom_bytes` is the room above them). A request in service keeps
 growing through host pressure and macOS's warning, short of critical pressure,
 within `--max-memory`, first into cached pages no request holds:
 it takes cached KV, and a cached state only where it sits on the KV that goes
-next, since a state's buffers give it no page. A new request waits while another
+next, since a state's buffers give it no page. An allocation the host refuses
+takes none of the caches the model can rebuild (the vision encoder's scratch,
+images' encoded rows, the readers of spilled KV), which would not get it past
+the host; the paced passes take them. A new request waits while another
 is in service unless it can start from what the engine already holds, and with
 none in service it starts. A request whose start was refused memory, under host
 pressure or at `--max-memory`, holds back the requests that arrived after it

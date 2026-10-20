@@ -2642,6 +2642,41 @@ void testFirstRequestStartsThroughTheHostPause() {
           "the waiting request did not start once nothing was in service");
 }
 
+// An allocation the host refuses takes no cache the model can rebuild, such
+// as the vision arena or an image's encoded rows: freeing one would not get
+// it past the host, which refuses the ordinary attempt all the same and
+// grants the one a request in service makes (Serving), and the paced pass
+// takes those caches toward what the host lacks. A request that starts and
+// grows through the pause leaves them all.
+void testHostRefusalTakesNoModelCache() {
+  test::TestKvStorage storage(64, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, nullptr, nullptr);
+  Executor executor;
+  Events events;
+  HostPause host;
+  host.paused = true;
+  EngineConfig config = test::engineConfig();
+  host.attach(config, storage, pool);
+  host.attach(executor);
+  engine::Engine engine(config, resources, executor, events);
+  guardReleases(storage, engine);
+  executor.cacheUnits = {100, 100};
+  auto alone = request(1, std::vector<uint32_t>(65, 1));
+  alone.maxNewTokens = 40;
+  alone.deadlineMilliseconds = 1'000'000;
+  engine.submit(std::move(alone));
+  double now = 1;
+  while (now < 1000 && events.completedCount < 1)
+    static_cast<void>(engine.tick(now++));
+  require(events.completedCount == 1 && events.failedCount == 0 && !host.reusableAtGrowth.empty(),
+          "the request did not start and grow through the host pause");
+  // One ordinary start and one as a request in service, no retry between.
+  require(executor.cacheReclaims == 0 && executor.cacheUnits.size() == 2 &&
+              executor.beginAttempts == 2,
+          "an allocation the host refused took the model's caches");
+}
+
 // A request whose start needs no new memory still starts beside one in
 // service, as before, and then grows like it.
 void testRequestThatNeedsNoGrowthStartsUnderTheHostPause() {
@@ -9031,6 +9066,25 @@ void testHotCacheGrowthTakesNoModelCache() {
   }
 }
 
+// A decoding lane's floor of the hot block cache that the host refuses takes
+// no cache the model can rebuild either, as no allocation the host refuses
+// does: the lane takes the floor as memory a request in service needs, and
+// decodes.
+void testHostRefusedHotFloorTakesNoModelCache() {
+  Spilling spill(64);
+  spill.model.cacheUnits = {100};
+  spill.model.spilledReadsRefusal = metal::AllocationFailure::HostPressure;
+  spill.model.spilledReadsRoom = [&](uint64_t) { return !spill.paused || spill.serving; };
+  spill.paused = true;
+  spill.engine.submit(Spilling::prompt(1, 1, 5, 20));
+  spill.runUntilIdle();
+  require(spill.events.completedCount == 1 && spill.events.failedCount == 0 &&
+              spill.events.usage.at(1).second == 20,
+          "the lane did not decode through the host's refusal of its hot floor");
+  require(spill.model.cacheReclaims == 0 && spill.model.cacheUnits.size() == 1,
+          "a hot floor the host refused took a cache the model can rebuild");
+}
+
 // A Spill lane past its dense history and tail window streams its history
 // in each prefill command. Beside a decoding lane its commands take the
 // rows of any contended command until one has read Index pages; that one's
@@ -11851,6 +11905,7 @@ int main() {
     testAConversionLeavesNoLaneWithoutItsFloor();
     testLoneSpillLaneEndsAtTheWall();
     testHotCacheGrowthTakesNoModelCache();
+    testHostRefusedHotFloorTakesNoModelCache();
     testStreamingLaneSizesItsCommandsByItsReads();
     testUnreadableKvEndsOnlyItsLane();
     testProjectionClipsTheOutput();
@@ -11906,6 +11961,7 @@ int main() {
     testRequestInServiceGrowsThroughTheHostPause();
     testPausedPageShortfallKeepsTheLaneRunway();
     testFirstRequestStartsThroughTheHostPause();
+    testHostRefusalTakesNoModelCache();
     testRequestThatNeedsNoGrowthStartsUnderTheHostPause();
     testSuspendedRequestWaitsForTheHostBesideOneInService();
     testEngineLimitBindsThroughTheHostPause();

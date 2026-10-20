@@ -667,8 +667,7 @@ private:
   [[nodiscard]] CacheReclaimResult reclaimForState(ReclaimClass upTo, bool forLater = false);
   [[nodiscard]] CacheReclaimResult reclaimForKv(const TokenAdmission &admission,
                                                 ReclaimClass upTo);
-  [[nodiscard]] bool reclaimIdleState(
-      bool keepLane, model::IdleMemory scope = model::IdleMemory::BuffersThenCaches) noexcept;
+  [[nodiscard]] bool reclaimIdleState(bool keepLane, model::IdleMemory scope) noexcept;
   [[nodiscard]] CacheReclaimResult reuseCachedStateWhilePaused(ReclaimClass upTo);
   [[nodiscard]] CacheReclaimResult reuseCachedPagesWhilePaused(
       const TokenAdmission &admission, ReclaimClass upTo);
