@@ -241,10 +241,12 @@ private:
     static_cast<void>(cache_.reclaimOne(mode, chance(50) ? ReclaimClass::InUse : ReclaimClass::Ordinary));
   }
 
-  // The volume's room changes, and the quota follows it.
+  // The volume's room changes, and the quota follows it; so does the state
+  // file's, whose writes then make room or are refused.
   void keepQuota() {
     budget_->setLimitBytes(pick(0, kSlots) * 100);
     budget_->setActiveLimitBytes(pick(0, kSlots) * 100);
+    shelf_->slots = pick(0, 64);
     cache_.keepDiskLimit();
     const KvSpillSnapshot spilled = cache_.spillSnapshot();
     require(!spilled.committedBytes || spilled.heldBytes + spilled.committedBytes <= spilled.activeLimitBytes,

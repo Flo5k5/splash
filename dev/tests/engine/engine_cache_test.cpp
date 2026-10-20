@@ -5357,6 +5357,42 @@ void testBlocksAreWrittenOnce() {
   spill.cache.endRequest(2);
 }
 
+// A Resident request that computes a chain on disk again keeps the blocks'
+// copies, which hold what another command computed, and writes nothing. A
+// Spill request that holds those blocks later owes copies of their pages,
+// whose writes replace the old ones, and its pages spill only once those
+// have landed: a block spills to what its page holds.
+void testRecomputedBlocksSpillToCopiesOfTheirPages() {
+  Spilling spill;
+  const std::vector<uint32_t> prompt = Spilling::prompt(1000, 6);
+  spill.start(1, prompt, 6);
+  static_cast<void>(test::spillRound(spill.cache, spill.tier));
+  spill.publishState(spill.block(1, 5));
+  spill.cache.endRequest(1);
+  spill.toDisk();
+  const size_t written = spill.tier.writes.size();
+  spill.start(2, prompt, 6, KvMode::Resident);
+  const uint64_t chainEnd = spill.block(2, 5);
+  require(spill.tier.writes.size() == written && spill.cache.snapshot().kvTier.diskBlocks == 6 &&
+              !spill.cache.copiedBlocks(chainEnd),
+          "a Resident request that computed a chain again wrote it, gave its copies up, or took them "
+          "for copies of its pages");
+  spill.cache.endRequest(2);
+  spill.start(3, prompt, 6);
+  require(spill.cache.writeThrough() == 6 && spill.cache.spillWritten().granted() &&
+              spill.spilled(3) == std::vector<bool>(7, false),
+          "a Spill request did not write copies of its pages, or a page spilled to another's copy");
+  spill.tier.complete();
+  static_cast<void>(spill.cache.pollTransfers());
+  require(spill.cache.spillWritten().granted() &&
+              spill.spilled(3) == std::vector<bool>{false, true, true, true, true, false, false} &&
+              spill.cache.copiedBlocks(chainEnd) == 6 && spill.cache.spillSnapshot().rewrites == 6 &&
+              spill.cache.snapshot().kvTier.diskBlocks == 6,
+          "the pages did not spill to the copies that replaced the old ones");
+  spill.cache.checkInvariants();
+  spill.cache.endRequest(3);
+}
+
 // A copy that could not be read matches nothing any more; the requests that
 // hold its block still hold the copy, which leaves with the block once they
 // have ended.
@@ -5544,6 +5580,7 @@ int main() {
     testConversionSpillsTheHistoryWithCopiesAtOnce();
     testEveryHolderDecidesWhetherAPageSpills();
     testBlocksAreWrittenOnce();
+    testRecomputedBlocksSpillToCopiesOfTheirPages();
     testUnreadableCopyLeavesWithItsHolders();
     testCutsShareUnchangedChunks();
     std::cout << "engine cache tests passed\n";

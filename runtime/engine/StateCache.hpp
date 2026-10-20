@@ -321,11 +321,13 @@ private:
   // Starts the write of the block's state, giving up quota through makeRoom
   // while the tier refuses one; null while the one write in flight holds the
   // staging buffer. makeRoom leaves states in RAM alone: reclaim holds the
-  // entry it writes.
+  // entry it writes. The disk copy counts for the KV from the first attempt
+  // (KvCache::countDiskState), and no longer once none starts.
   [[nodiscard]] std::unique_ptr<StateOffload> startWrite(uint64_t kvBlock,
                                                          const StateWriter &write);
-  // The disk copy this write carries becomes the entry's; the write is the
-  // one in flight, reading `source` in place when given.
+  // The disk copy this write carries, counted since startWrite, becomes the
+  // entry's; the write is the one in flight, reading `source` in place when
+  // given.
   void beginWrite(uint64_t kvBlock, Entry &entry, std::unique_ptr<StateOffload> transfer,
                   std::shared_ptr<const CompositeState> source);
   // In a persistent tier, labels the entry's disk copy with its block,
@@ -339,9 +341,10 @@ private:
   // Places the entry in the orders its copies call for.
   void reindex(uint64_t kvBlock, Entry &entry) noexcept;
   void discardRam(Entry &entry) noexcept;
-  void discardDisk(Entry &entry) noexcept;
+  void discardDisk(uint64_t kvBlock, Entry &entry) noexcept;
   // An ordinary publication or reuse: the block has held a reusable state,
-  // and a checkpoint is upgraded.
+  // and a checkpoint is upgraded, its disk copy labelled with its new class
+  // at once.
   void makeOrdinary(uint64_t kvBlock, Entry &entry);
   [[nodiscard]] bool writing(uint64_t kvBlock) const noexcept {
     return pending_ && pending_->kvBlock == kvBlock;

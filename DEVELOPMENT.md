@@ -573,15 +573,19 @@ nothing of it written; once the budget admits its state, the state is written
 and then the pages of its chain. A point larger than what the cache may hold
 now, its quota or what the volume leaves it, is not written. A full quota
 keeps restore points whole: it drops copies no point needs first, then the
-oldest point.
+oldest point. A request that computes blocks of a point's chain again
+leaves their copies to the point: they count as its copies, not as the
+request's KV. One whose KV spills writes its own over them before its pages
+spill.
 
 A start takes back every recorded point whose chain is whole. A clean stop
 writes the waiting points (newest first, up to 6 s, whatever the write budget)
 and syncs the files. After a crash the next start takes back what reached the
-disk. Every start serves its first minute on probation: after two starts in a
-row fail within it, or one whose engine reports its own failure, the next
-start begins empty. `/status` reports all this under `disk` (`persistent`,
-`kv_copies`, `taken_back`, `write_behind`).
+disk, each state with the class it had last: a checkpoint a request went on to
+reuse as an ordinary state comes back as one. Every start serves its first
+minute on probation: after two starts in a row fail within it, or one whose
+engine reports its own failure, the next start begins empty. `/status` reports
+all this under `disk` (`persistent`, `kv_copies`, `taken_back`, `write_behind`).
 
 ### KV on the SSD
 
@@ -3134,7 +3138,7 @@ file's descriptor, which names the right volume however the file was made, and
 sets the budget's limit to min(quota, max(0, available + held - floor) / 4) for
 the automatic quota and to min(quota, max(0, available + held - floor)) for a
 size, held being the blocks the tier's files take (`st_blocks`). The KV of
-requests in service, the slots of the blocks they hold and the commitments of
+requests in service, the copies of the KV they hold and the commitments of
 spilling requests, may use the latter under either
 (`DiskBudget::activeLimitBytes`, [KV on the SSD](#kv-on-the-ssd)). The tier's
 own writes and punches move bytes between available and held, so they leave the
@@ -3242,8 +3246,10 @@ make room only for a copy that is itself in use, and last. A persistent tier
 keeps restore points whole instead, since its redundant copies are what the next
 start takes back: a full quota drops a KV copy that no state needs first, then
 the oldest state copy, redundant or not, after which the copies of its chain
-that no other state needs go first in turn; the only copy of a state in use
-makes room only for a copy in use, and last. Either way an ordinary state that
+that no other state needs go first in turn. A state in RAM restores through the
+K/V RAM holds, not its copies: a copy of K/V that RAM holds too goes once no
+state on disk restores through it. The only copy of a state in use makes room
+only for a copy in use, and last. Either way an ordinary state that
 finds no other room is dropped. Before reclaim takes a state in RAM, only a
 spilling request's page takes the spilled KV under it, the state first,
 once nothing else is left. A freed slot returns its quota at once and its

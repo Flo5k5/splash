@@ -32,7 +32,7 @@ bool older(const std::optional<CacheEvictionCandidate> &left,
 Cache::Cache(KvPool &pool, KvTier *kvTier, std::shared_ptr<model::DiskBudget> diskBudget,
              std::optional<CacheSpillPolicy> spill)
     : pool_(pool), tier_(kvTier), spill_(spill), persistent_(kvTier && kvTier->persistent()),
-      diskBudget_(std::move(diskBudget)), kv_(pool, recency_, spill.has_value()),
+      diskBudget_(std::move(diskBudget)), kv_(pool, recency_, spill.has_value(), persistent_),
       states_(kv_, recency_, [this](bool inUse) { return freeDiskSpace(inUse); }, persistent_) {
   // Spilled K/V lives in the tier's copies, within its quota.
   if (spill_ && (!tier_ || !diskBudget_))
@@ -401,7 +401,7 @@ uint32_t Cache::publishCommittedBlocks(uint64_t requestId,
     // A Spill request's page draws its commitment when it is written, or
     // returns it when the block has a copy already.
     if (active.mode == KvMode::Spill) {
-      if (kv_.slot(inserted.id))
+      if (kv_.kvCopied(inserted.id))
         returnCommitment(active, 1);
       else
         active.owedCopies.push_back(inserted.id);
@@ -965,7 +965,7 @@ uint32_t Cache::copiedBlocks(uint64_t block) const {
     return 0;
   const KvCache::Chain chain = kv_.chain(block);
   return static_cast<uint32_t>(std::count_if(chain.blocks.begin(), chain.blocks.end(),
-                                             [&](uint64_t id) { return kv_.slot(id) != nullptr; }));
+                                             [&](uint64_t id) { return kv_.kvCopied(id); }));
 }
 
 bool Cache::commit(Request &active, uint32_t pages) {
@@ -990,7 +990,7 @@ void Cache::returnCommitment(Request &active, uint32_t pages) noexcept {
 
 void Cache::oweCopies(Request &active, std::span<const uint64_t> blocks) {
   for (uint64_t block : blocks)
-    if (!kv_.slot(block))
+    if (!kv_.kvCopied(block))
       active.owedCopies.push_back(block);
 }
 
@@ -999,10 +999,10 @@ uint32_t Cache::writeThrough() {
   if (!spill_ || !kvTierWritable())
     return started;
   // After a write found the volume full, until the volume, measured again,
-  // leaves the blocks requests hold room for another slot. A write draws its
-  // request's commitment, or commits its slot, within the active limit, and
-  // gives up cached copies for it (acquireDiskSlot), which a size's quota
-  // lets fill all of that room.
+  // leaves the copies of the KV requests hold room for another slot. A write
+  // draws its request's commitment, or commits its slot, within the active
+  // limit, and gives up cached copies for it (acquireDiskSlot), which a
+  // size's quota lets fill all of that room.
   if (writeThroughPaused_) {
     if (heldSlotBytes() + tier_->slotBytes() > diskBudget_->activeLimitBytes())
       return started;
@@ -1025,7 +1025,7 @@ bool Cache::writeThrough(Request &active, uint32_t &started) {
   while (!active.owedCopies.empty()) {
     const uint64_t block = active.owedCopies.front();
     // Another request's write, or a restore, gave it a copy meanwhile.
-    if (kv_.slot(block)) {
+    if (kv_.kvCopied(block)) {
       active.owedCopies.pop_front();
       returnCommitment(active, 1);
       continue;
@@ -1108,7 +1108,7 @@ TokenAdmission Cache::moveLandedPages(bool allocate, SpilledExtents extents) {
       // keeps it Full.
       Eligibility eligibility = Eligibility::KeptFull;
       if (pool_.form(page) == kv::PageForm::Full && kv_.page(block) == page) {
-        if (!kv_.slot(block) || kv_.transfer(block) != KvCache::Transfer::None)
+        if (!kv_.kvCopied(block) || kv_.transfer(block) != KvCache::Transfer::None)
           break;
         eligibility = spillEligibility(block);
       }
@@ -1198,7 +1198,7 @@ void Cache::checkInvariants() const {
     if (!holds)
       throw std::logic_error(std::string("cache invariant broken: ") + what);
   };
-  kv_.checkInvariants();
+  kv_.checkInvariants([this](uint64_t block) { return states_.onDisk(block); });
   uint64_t committed = 0;
   for (const auto &[_, active] : requests_) {
     check(active.cachedBlocks.size() <= active.pages.size(),
@@ -1233,7 +1233,7 @@ void Cache::checkInvariants() const {
       const std::unordered_set<uint64_t> owed(active.owedCopies.begin(), active.owedCopies.end());
       for (uint32_t index = 0; index < active.cachedBlocks.size(); ++index) {
         const uint64_t block = active.cachedBlocks[index];
-        check(kv_.page(block) != active.pages[index] || kv_.slot(block) || owed.contains(block),
+        check(kv_.page(block) != active.pages[index] || kv_.kvCopied(block) || owed.contains(block),
               "a Spill request owes the copy of each block on its pages without one");
       }
     }
@@ -1509,8 +1509,8 @@ bool Cache::dropOldestPoint(bool inUse) {
 uint32_t Cache::fitDiskLimit() {
   if (!diskBudget_)
     return 0;
-  // Active KV first, the copies of held blocks and the commitments: a
-  // commitment goes while they exceed their limit, the newest Spill
+  // Active KV first, the copies of the KV requests hold and the commitments:
+  // a commitment goes while they exceed their limit, the newest Spill
   // request's first, and the request runs on with what it has.
   while (diskBudget_->committedBytes() &&
          heldSlotBytes() + diskBudget_->committedBytes() > diskBudget_->activeLimitBytes()) {

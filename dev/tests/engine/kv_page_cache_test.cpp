@@ -674,10 +674,12 @@ void testSpilledBlocksTakeTheirPagesForm() {
 }
 
 // A writer moves onto its block's page while a write reads it, whose bytes
-// are final, and keeps its own while a restore fills it. In a cache that
-// may spill, a disk-only block that adopts the writer's page gives its copy
-// up, so the block has the writer's content alone; without a spill policy
-// it keeps the copy.
+// are final, and keeps its own while a restore fills it. A disk-only block
+// that adopts the writer's page keeps its copy, which holds what another
+// command computed: the block's K/V has no copy until one of the page
+// replaces it, or the page goes and the copy holds the block's only K/V.
+// No request reads that copy, so it is no active KV, and quota may take it
+// beside the page the writer holds.
 void testWritersAndTheContentOfABlock() {
   for (const bool spill : {true, false}) {
     test::TestKvStorage storage(8, 100, 1, 10);
@@ -702,11 +704,26 @@ void testWritersAndTheContentOfABlock() {
     cache.unholdPage(acquired.pages[2]);
     cache.dropPage(leaf.id);
     const auto adopted = cache.insert(root.id, page(72), acquired.pages[3], {});
-    require(adopted.id == leaf.id && adopted.physicalPage == acquired.pages[3] &&
-                (cache.slot(leaf.id) == nullptr) == spill && cache.diskBlocks() == (spill ? 1u : 2u),
-            "a disk-only block a writer filled kept another content's copy, or gave up a dense one's");
-    for (uint32_t index : {0, 1, 3})
-      cache.unholdPage(acquired.pages[index]);
+    require(adopted.id == leaf.id && adopted.physicalPage == acquired.pages[3] && cache.slot(leaf.id) &&
+                !cache.kvCopied(leaf.id) && cache.diskBlocks() == 2,
+            "a disk-only block a writer filled gave its copy up, or took it for a copy of the page");
+    const auto redundant = cache.diskCandidate(true);
+    require(cache.held(leaf.id) == spill && cache.heldCopies() == (spill ? 1u : 0u) && redundant &&
+                redundant->id == (spill ? leaf.id : root.id),
+            "a copy of another command's K/V beside a held page was active KV, or quota could not take it");
+    cache.checkInvariants();
+    cache.unholdPage(acquired.pages[3]);
+    cache.dropPage(leaf.id);
+    require(cache.kvCopied(leaf.id), "the copy of a block without its page did not hold its K/V");
+    const auto writer = pool.acquirePages(1);
+    require(writer.granted() && cache.insert(root.id, page(72), writer.pages[0], {}).id == leaf.id &&
+                !cache.kvCopied(leaf.id),
+            "a disk-only block a writer filled again took its copy for one of the page");
+    cache.setSlot(leaf.id, std::make_shared<FakeSlot>());
+    require(cache.kvCopied(leaf.id) && cache.rewrites() == 1 && cache.heldCopies() == (spill ? 2u : 0u),
+            "a copy of the page did not replace the copy of another command's K/V as active KV");
+    for (const uint32_t held : {acquired.pages[0], acquired.pages[1], writer.pages[0]})
+      cache.unholdPage(held);
     cache.checkInvariants();
   }
 }

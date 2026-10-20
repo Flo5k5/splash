@@ -33,7 +33,7 @@ namespace splash::model {
 // punches them, after the transfer that worker is in, so the files' blocks
 // can briefly exceed the limit by the slots freed but not yet punched.
 //
-// Active KV, the slots of blocks requests hold and the quota Spill requests
+// Active KV, the copies of the KV requests hold and the quota Spill requests
 // committed for the pages they will write, is bounded by the active limit
 // instead, which leaves it the volume's whole room where the automatic
 // quota's copies keep a quarter of it (engine::DiskSpace): a commitment
@@ -88,7 +88,7 @@ public:
     return used_.load(std::memory_order_relaxed);
   }
 
-  // Active KV, the slots of blocks requests hold and what Spill requests
+  // Active KV, the copies of the KV requests hold and what Spill requests
   // committed, may use more of the volume than cached copies may: its limit
   // (engine::DiskSpace sets it), at most the quota, which it is until set.
   [[nodiscard]] uint64_t activeLimitBytes() const noexcept {
@@ -98,7 +98,7 @@ public:
     activeLimit_.store(std::min(bytes, capacity_), std::memory_order_relaxed);
   }
   // Quota a Spill request's pages will take, locked without taking a slot
-  // or giving any copy up: granted iff heldBytes (the slots of blocks
+  // or giving any copy up: granted iff heldBytes (the copies of the KV
   // requests hold, the cache's count) plus what is committed plus `bytes`
   // stays within the active limit. Engine thread.
   [[nodiscard]] bool commit(uint64_t bytes, uint64_t heldBytes) noexcept {

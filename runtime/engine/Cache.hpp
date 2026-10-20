@@ -133,8 +133,8 @@ struct CacheAdoption final {
 // failed, and a pause after the volume filled; pages that moved to the index
 // form and back, and blocks written again once their copy had gone;
 // restores of a page's index and of a whole page, and how long they took;
-// the quota of active KV, the slots of held blocks and the commitments of
-// Spill requests within it, and commitments revoked.
+// the quota of active KV, the copies of the KV requests hold and the
+// commitments of Spill requests within it, and commitments revoked.
 struct KvSpillSnapshot final {
   uint32_t spilledPages = 0;
   uint64_t spilledBytes = 0;
@@ -341,9 +341,10 @@ public:
   // is every point once a file stopped taking writes.
   [[nodiscard]] PersistStatus persist(uint64_t block);
   // At a clean stop: the label of each state copy a persistent tier keeps
-  // takes its state's current recency and class, which the next process
-  // keeps and orders them by. KV copies keep the labels of their writes: a
-  // chain goes with the states that need it (dropOldestPoint).
+  // takes its state's current recency, which the next process orders them
+  // by; a copy takes its state's class as soon as a checkpoint becomes
+  // ordinary, which a crash keeps too. KV copies keep the labels of their
+  // writes: a chain goes with the states that need it (dropOldestPoint).
   void relabelStates() const;
   // Measures the volume the disk tier lives on and sets the budget's limit
   // (DiskSpace::measure), for keepDiskLimit(); none without such a tier.
@@ -399,10 +400,10 @@ public:
       return SpillGate::WriteBudget;
     return SpillGate::Open;
   }
-  // The quota of active KV, the slots of blocks requests hold and what Spill
-  // requests committed (DiskBudget::activeLimitBytes); none without
+  // The quota of active KV, the copies of the KV requests hold and what
+  // Spill requests committed (DiskBudget::activeLimitBytes); none without
   // spilling. What it leaves for new commitments, without giving any copy
-  // up: activeLimit - held slots - committed.
+  // up: activeLimit - held copies - committed.
   [[nodiscard]] uint64_t spillLimit() const noexcept {
     return spill_ ? diskBudget_->activeLimitBytes() : 0;
   }
@@ -421,8 +422,9 @@ public:
   // has a copy, landed or being written: pages of a Spill request that
   // holds them need no commitment.
   [[nodiscard]] uint32_t copiedBlocks(uint64_t block) const;
-  // Starts writing Spill requests' published pages that have no copy, as
-  // the tier's share for them allows; returns the writes started.
+  // Starts writing Spill requests' published pages that have no copy of
+  // what they hold (KvCache::kvCopied), as the tier's share for them allows;
+  // returns the writes started.
   uint32_t writeThrough();
   // Between commands: moves the eligible pages whose copies landed to the
   // index form, into free Index pages, the runway's among them, and the
@@ -870,12 +872,15 @@ private:
   // exceed what active KV leaves of the limit; returns how many copies went.
   uint32_t fitDiskLimit();
   // In a persistent tier a redundant copy is what the next process takes
-  // back, and the unit worth keeping is a restore point, a state and its
-  // chain. A copy no state needs goes first (dropUnneededCopy), then the
+  // back, and the unit worth keeping is a restore point, a state on disk and
+  // its chain. A copy no state needs goes first (dropUnneededCopy), then the
   // oldest state copy, redundant or not: the copies of its chain that no
   // other state needs become unneeded and go on later calls, so a chain
-  // stays whole while a state needs it. The only copy of a state in use goes
-  // only for a copy in use, and last. False when no state copy can go.
+  // stays whole while a state on disk needs it. A state in RAM needs only
+  // the copies that hold the only K/V of its chain's blocks: a redundant
+  // copy goes once no state on disk restores through it. The only copy of a
+  // state in use goes only for a copy in use, and last. False when no state
+  // copy can go.
   [[nodiscard]] bool dropOldestPoint(bool inUse);
   [[nodiscard]] bool dropUnneededCopy();
   // A persistent tier's label for the block's disk copy.
@@ -967,7 +972,8 @@ private:
   // for (pendingPages); copies persist() keeps hold only their blocks.
   std::vector<Write> writes_;
   // Write-through waits after a write found the volume full, until the
-  // active limit holds another slot beside the blocks requests hold.
+  // active limit holds another slot beside the copies of the KV requests
+  // hold.
   bool writeThroughPaused_ = false;
   // The order requests began to spill in (Request::spillOrder).
   uint64_t spillSequence_ = 0;
