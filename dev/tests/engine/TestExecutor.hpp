@@ -163,7 +163,6 @@ public:
 
 struct MaskOverlapState final {
   uint64_t requestId = 0;
-  bool finishes = true;
   bool emitted = false;
   bool provided = false;
   bool abandoned = false;
@@ -171,10 +170,12 @@ struct MaskOverlapState final {
   bool held = false;
 };
 
+// A decode command that waits for the verify mask of its one constrained
+// lane; `results` are its lanes', in order.
 class MaskOverlapTicket final : public ModelBatchTicket {
 public:
-  explicit MaskOverlapTicket(std::shared_ptr<MaskOverlapState> state)
-      : state_(std::move(state)) {}
+  MaskOverlapTicket(std::shared_ptr<MaskOverlapState> state, std::vector<ModelStepResult> results)
+      : state_(std::move(state)), results_(std::move(results)) {}
 
   std::vector<ModelMaskRequest> takeMaskRequests() override {
     if (state_->emitted)
@@ -195,13 +196,13 @@ public:
   std::vector<ModelStepResult> wait() override {
     if (!ready())
       throw std::logic_error("mask-overlap ticket completed without input");
-    return {{state_->requestId, 0, {42}, state_->finishes,
-             DecodeStage::Regular, 7, 0}};
+    return std::move(results_);
   }
   double wallMilliseconds() const noexcept override { return 1.0; }
 
 private:
   std::shared_ptr<MaskOverlapState> state_;
+  std::vector<ModelStepResult> results_;
 };
 
 // A model that runs no kernels, for the engine, native loop and transport
@@ -209,13 +210,14 @@ private:
 // request takes the first free one of maximumLanes lanes; a prefill step that
 // commits returns the states it captures, in their reserved buffers; the
 // prefill step that completes a prompt asks for a constrained request's first
-// mask, or returns a score request's option logits; every constrained decode
-// cycle after the first token waits for its verify mask inside its command
-// (MaskOverlapTicket); a decode step throws for a lane whose output limit,
-// lowered by a resume after its anchor was selected, leaves it only that
-// anchor, which the runtime emits only as it selects it; and provideMask
-// throws for a request that waits for no mask and refuses one that permits
-// no token. Its other members are the tests' knobs and records.
+// mask, or returns a score request's option logits; every decode cycle of a
+// constrained lane after its first token waits for its verify mask inside its
+// command (MaskOverlapTicket), beside the command's unconstrained lanes; a
+// decode step throws for a lane whose output limit, lowered by a resume after
+// its anchor was selected, leaves it only that anchor, which the runtime emits
+// only as it selects it; and provideMask throws for a request that waits for
+// no mask and refuses one that permits no token. Its other members are the
+// tests' knobs and records.
 class Executor final : public model::Model {
 public:
   explicit Executor(
@@ -505,14 +507,26 @@ public:
         throw std::logic_error("a lane reads spilled K/V without memory reserved for its reads");
     }
     std::unique_ptr<ModelBatchTicket> ticket;
-    if (plan.kind == WorkKind::Decode && plan.constrained &&
-        plan.decodeStage == DecodeStage::Regular) {
-      // Every constrained cycle after the first token waits for its mask
-      // inside the ticket, as the production constrained ticket does.
+    const auto constrained = [&](const ModelBatchItem &item) { return requests.at(item.requestId).constrained; };
+    if (plan.kind == WorkKind::Decode && plan.decodeStage == DecodeStage::Regular &&
+        std::ranges::any_of(items, constrained)) {
+      // A cycle with a constrained lane after its first token waits for that
+      // lane's mask inside the ticket, as the production constrained ticket
+      // does, and its other lanes decode as they do in a command of their
+      // own.
+      if (std::ranges::count_if(items, constrained) > 1)
+        throw std::logic_error("the test model takes the verify mask of one lane per command");
       overlap = std::make_shared<MaskOverlapState>();
-      overlap->requestId = items.front().requestId;
-      overlap->finishes = decodeFinishes;
-      ticket = std::make_unique<MaskOverlapTicket>(overlap);
+      std::vector<ModelStepResult> results;
+      for (const ModelBatchItem &item : items) {
+        if (constrained(item)) {
+          overlap->requestId = item.requestId;
+          results.push_back({item.requestId, 0, {42}, decodeFinishes, DecodeStage::Regular, 7, 0});
+        } else {
+          results.push_back(std::move(decode(plan, std::span(&item, 1)).front()));
+        }
+      }
+      ticket = std::make_unique<MaskOverlapTicket>(overlap, std::move(results));
     } else if (plan.kind == WorkKind::Decode && holdDecodeUntil) {
       heldCompletion = std::move(completion);
       ticket = std::make_unique<HeldTicket>(decode(plan, items), holdDecodeUntil,

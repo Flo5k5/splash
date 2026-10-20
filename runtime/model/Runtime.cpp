@@ -2157,10 +2157,11 @@ struct Runtime::Impl {
   }
 
   // A cycle's results once its command completed, which ends the command's
-  // reads of spilled K/V.
+  // reads of spilled K/V; `constrained` for a cycle that waited for host
+  // masks, whose costs the verify budget fits apart.
   std::vector<ModelStepResult> finalizeDecode(
       std::span<DecodeLaneResult> lanes, std::span<const ModelBatchItem> items,
-      CommandTiming timing, SpilledKvReads &reads) {
+      CommandTiming timing, SpilledKvReads &reads, bool constrained) {
     reads.end();
     std::array<std::vector<uint64_t>, kLaneCount> unreadable = unreadableBlocks(reads);
     for (uint32_t lane = 0; lane < items.size(); ++lane) {
@@ -2204,8 +2205,7 @@ struct Runtime::Impl {
         observed[lane].accepted = lanes[lane].accepted;
         observed[lane].labels = lanes[lane].endDrafts == 0;
       }
-      verifyBudget->observe(std::span(observed).first(items.size()),
-                            lanes[0].request->constraint == ConstraintMode::TokenMask,
+      verifyBudget->observe(std::span(observed).first(items.size()), constrained,
                             timing.wallSeconds * 1000.0);
     }
 
@@ -2279,13 +2279,16 @@ struct Runtime::Impl {
     return results;
   }
 
-  // A constrained DFlash cycle has one host dependency between three Metal
-  // commands: draft proposals define the grammar simulation, while the target
-  // forward is independent of the resulting mask.  This ticket keeps the
-  // scheduler batch (and therefore its DecodeArena lanes) owned across that
-  // dependency, and the reads of spilled K/V of its target forward.  All
-  // state transitions run on the engine thread; completion handlers only
-  // wake it, so they capture the wake hook and never the ticket.
+  // A DFlash cycle with constrained lanes has one host dependency between
+  // three Metal commands: a constrained lane's draft proposals define its
+  // grammar simulation, while the target forward is independent of the
+  // resulting masks. The batch's unconstrained lanes run the same commands
+  // and ask for no mask, which their selections never read.  This ticket
+  // keeps the scheduler batch (and therefore its DecodeArena lanes) owned
+  // across that dependency, and the reads of spilled K/V of its target
+  // forward.  All state transitions run on the engine thread; completion
+  // handlers only wake it, so they capture the wake hook and never the
+  // ticket.
   class ConstrainedDecodeTicket final : public ModelBatchTicket {
   public:
     ConstrainedDecodeTicket(Impl &impl, std::vector<DecodeLaneResult> lanes,
@@ -2307,12 +2310,14 @@ struct Runtime::Impl {
         for (uint32_t lane = 0; lane < lanes_.size(); ++lane) {
           DecodeLaneResult &laneResult = lanes_[lane];
           Request &entry = *laneResult.request;
+          entries[lane] = &entry;
+          if (!constrained(lane))
+            continue;
           const uint32_t *proposed = contents<uint32_t>(
               impl_.decodeArena->get(lane, DecodeTensor::ProposedTokens),
               "constrained draft proposals");
           entry.maskWords.clear();
           entry.verifyMaskInFlight = true;
-          entries[lane] = &entry;
 
           if (!abandoned_[lane]) {
             ModelMaskRequest request;
@@ -2348,7 +2353,7 @@ struct Runtime::Impl {
       if (stage_ == Stage::WaitingMask) {
         bool masksReady = true;
         for (uint32_t lane = 0; lane < lanes_.size(); ++lane) {
-          masksReady = masksReady && (abandoned_[lane] ||
+          masksReady = masksReady && (!constrained(lane) || abandoned_[lane] ||
                                       !lanes_[lane].request->maskWords.empty());
         }
         if (masksReady) {
@@ -2363,6 +2368,8 @@ struct Runtime::Impl {
             Request &entry = *laneResult.request;
             entries[lane] = &entry;
             maximumRetained[lane] = laneResult.maximumRetained;
+            if (!constrained(lane))
+              continue;
             if (abandoned_[lane])
               impl_.admitEveryToken(lane);
             else
@@ -2382,10 +2389,10 @@ struct Runtime::Impl {
     bool ownsMaskWait(uint64_t requestId) const noexcept override {
       if (stage_ == Stage::Draft || stage_ == Stage::Done)
         return false;
-      return std::any_of(lanes_.begin(), lanes_.end(),
-                         [requestId](const DecodeLaneResult &lane) {
-                           return lane.request->id == requestId;
-                         });
+      for (uint32_t lane = 0; lane < lanes_.size(); ++lane)
+        if (lanes_[lane].request->id == requestId)
+          return constrained(lane);
+      return false;
     }
 
     void abandonMask(uint64_t requestId) noexcept override {
@@ -2411,14 +2418,15 @@ struct Runtime::Impl {
       stage_ = Stage::Done;
       ModelTelemetry &counters = impl_.counters;
       ++counters.constrainedMaskOverlapBatches;
-      counters.constrainedMaskOverlapRequests += lanes_.size();
+      for (uint32_t lane = 0; lane < lanes_.size(); ++lane)
+        counters.constrainedMaskOverlapRequests += constrained(lane);
       counters.lastConstrainedTargetForwardGpuSeconds =
           targetForwardGpuSeconds_;
       counters.totalConstrainedTargetForwardGpuSeconds +=
           targetForwardGpuSeconds_;
       counters.lastConstrainedMaskWaitSeconds = maskWaitSeconds_;
       counters.totalConstrainedMaskWaitSeconds += maskWaitSeconds_;
-      std::vector<ModelStepResult> results = impl_.finalizeDecode(lanes_, items_, timing_, *reads_);
+      std::vector<ModelStepResult> results = impl_.finalizeDecode(lanes_, items_, timing_, *reads_, true);
       // The page sources of the items and the reads go with the command,
       // before the engine applies its results (DeferredMetalTicket::wait).
       items_.clear();
@@ -2441,6 +2449,11 @@ struct Runtime::Impl {
 
     void submit(const CommandGraph &graph) {
       command_ = impl_.backend.submitCommandAsync(graph.command(), wake_);
+    }
+
+    // Whether the lane's selections read a mask from the host.
+    bool constrained(uint32_t lane) const noexcept {
+      return lanes_[lane].request->constraint == ConstraintMode::TokenMask;
     }
 
     void addTiming(CommandTiming value) noexcept {
@@ -2911,27 +2924,21 @@ Runtime::decodeAsync(const BatchPlan &plan,
                      std::span<const ModelBatchItem> items,
                      std::function<void()> completion) {
   validatePlan(plan, items, WorkKind::Decode);
-  const bool constrained = plan.constrained;
-  if (plan.decodeStage != DecodeStage::Regular) {
-    if (!constrained) {
-      throw std::invalid_argument(
-          "only constrained decode uses a specialized decode stage");
-    }
+  if (plan.decodeStage != DecodeStage::Regular)
     return impl_->submitInitialSelection(items, std::move(completion));
-  }
 
   const uint32_t width = static_cast<uint32_t>(items.size());
   std::vector<Impl::DecodeLaneResult> lanes(width);
   std::array<Impl::Request *, kLaneCount> requests{};
   std::array<uint64_t, kLaneCount> logicalPositions{};
   std::array<uint32_t, kLaneCount> maximumRetained{};
+  // A cycle with a constrained lane waits for the host's masks between its
+  // commands (ConstrainedDecodeTicket).
+  bool constrained = false;
   for (uint32_t lane = 0; lane < width; ++lane) {
     const ModelBatchItem &item = items[lane];
     Impl::Request &entry = impl_->request(item.requestId);
-    if ((entry.constraint == ConstraintMode::TokenMask) != constrained) {
-      throw std::invalid_argument(
-          "request does not belong to the batch's constraint mode");
-    }
+    constrained = constrained || entry.constraint == ConstraintMode::TokenMask;
     if (entry.decodeStage != DecodeStage::Regular) {
       throw std::logic_error("request decode stage does not match decode plan");
     }
@@ -2946,7 +2953,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
       throw std::logic_error("terminal anchor was not emitted on selection");
     }
 
-    if (constrained && !entry.maskWords.empty())
+    if (!entry.maskWords.empty())
       throw std::logic_error("constrained request has stale mask state");
     if (Impl::samplingEnabled(entry)) {
       Impl::stageSamplingCycle(entry);
@@ -3001,7 +3008,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
   Impl *impl = impl_.get();
   auto finish = [impl, lanes = std::move(lanes), reads = std::move(reads),
                  items = std::move(copiedItems)](CommandTiming timing) mutable {
-    return impl->finalizeDecode(lanes, items, timing, *reads);
+    return impl->finalizeDecode(lanes, items, timing, *reads, false);
   };
   CommandTicket command = impl_->backend.submitCommandAsync(
       commandGraph.command(), std::move(completion));

@@ -6059,6 +6059,51 @@ void testConstraintMaskOverlapsInsideOneSchedulerBatch() {
           "overlapped verify mask did not complete the owning batch");
 }
 
+// Once its first token is selected, a constrained lane decodes in the command
+// of an unconstrained lane of its priority. The command asks for the
+// constrained lane's verify mask alone, a mask response for the other lane
+// does not reach the model, and the one mask completes the command for both.
+void testConstrainedLaneSharesDecodeCommand() {
+  test::TestKvStorage storage(8, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, nullptr, nullptr);
+  Executor executor(2);
+  executor.decodeFinishes = false;
+  Events events;
+  engine::Engine engine(test::engineConfig(), resources, executor, events);
+  guardReleases(storage, engine);
+
+  engine.submit(constrainedRequest(1, 100'000));
+  EngineRequest unconstrained = request(2, {2});
+  unconstrained.maxNewTokens = 100;
+  unconstrained.deadlineMilliseconds = 100'000;
+  engine.submit(std::move(unconstrained));
+  double now = 1;
+  tickUntil(engine, now, [&] { return events.maskRequests.size() == 1; },
+            "the constrained prompt did not ask for its first mask");
+  const std::array<uint32_t, 1> mask{1};
+  engine.provideMask(1, mask);
+  tickUntil(engine, now, [&] { return events.maskRequests.size() == 2; },
+            "the constrained lane's first cycle did not ask for its verify mask");
+  require(engine.commandInFlight() && executor.overlap && executor.overlap->requestId == 1 &&
+              events.maskRequests[1].first == 1,
+          "the shared command did not wait for the constrained lane's mask");
+  const uint32_t provided = executor.providedMasks;
+  const size_t unconstrainedTokens = events.outputs[2].size();
+  engine.provideMask(2, mask);
+  require(executor.providedMasks == provided && events.failedCount == 0,
+          "a mask for the lane that asked for none reached the model");
+  engine.provideMask(1, mask);
+  require(engine.tick(now++) && !engine.commandInFlight() && events.outputs[1] == std::vector<uint32_t>{42} &&
+              events.outputs[2].size() > unconstrainedTokens &&
+              engine.snapshot().scheduler.decodeBatchesByWidth[1] != 0,
+          "the constrained lane's mask did not complete the command for both lanes");
+  for (const uint64_t id : {1, 2})
+    engine.cancel(id);
+  tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
+  require(events.failedCount == 0, "a lane failed");
+}
+
 // A command's engine cycle runs from the previous command's retirement while
 // the engine stays busy, so it covers the host work between commands, and
 // from the command's plan after a tick that found nothing to do.
@@ -12190,6 +12235,7 @@ int main() {
     testAllocationCausesRemainDistinct();
     testAdmissionRespectsPriorityBeforeHashOrder();
     testConstraintMaskOverlapsInsideOneSchedulerBatch();
+    testConstrainedLaneSharesDecodeCommand();
     testConstraintMaskWaitHonorsCancelAndDeadline();
     testUnansweredVerifyMaskFailsOnlyItsRequest();
     testUnansweredInitialMaskFails();
