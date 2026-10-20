@@ -641,8 +641,10 @@ runDecodeThroughput(engine::Engine &engine, Driver &driver,
       decodeOutputTokens > completedTokens) {
     throw std::runtime_error("decode throughput work accounting is invalid");
   }
-  if (draftedTokens != uint64_t{width} * decodeBatches *
-                           model::ExecutionLimits::draftProposalTokens ||
+  // A cycle counts the proposals each lane verified: seven, or fewer once the
+  // lane's output budget leaves less than its block to retain.
+  if (draftedTokens > uint64_t{width} * decodeBatches *
+                          model::ExecutionLimits::draftProposalTokens ||
       acceptedDraftTokens > draftedTokens) {
     throw std::runtime_error("decode throughput DFlash accounting is invalid");
   }
@@ -946,6 +948,11 @@ int main(int argc, char **argv) {
     config.model = model::inspectModelRoot(config.modelRoot);
     config.buildId = SPLASH_BUILD_ID;
     config.aneFfn = engine::AneFfnSetting::fromGiven(aneFfnShare, aneFfnMinimumRows);
+    // The verify budget's rows follow the wall times and acceptance of the
+    // cycles before them, so a MoE target's outputs would not repeat from
+    // round to round: every cycle verifies every row (--verify-rows all), and
+    // the times measure the backend, not the budget.
+    config.verifyRows = model::VerifyRows::All;
     bootstrapConfig.nativeLoop.engine.maxContext = maxContext;
     const std::string modelRoot = config.modelRoot.string();
     const auto &capabilities = config.model.capabilities;

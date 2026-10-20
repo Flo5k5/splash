@@ -153,6 +153,9 @@ void testServerCommandLines(const char *path) {
        [](NativeArguments &read) { read.maxImagePatches = 16384; }},
       {"idle_sleep", [](NativeArguments &read) { read.preventIdleSleep = false; }},
       {"disable_ane", [](NativeArguments &read) { read.neuralEngine = false; }},
+      {"verify_rows_all", [](NativeArguments &read) { read.verifyRows = model::VerifyRows::All; }},
+      // Auto is the engine's default, which the server leaves out.
+      {"verify_rows_auto", [](NativeArguments &) {}},
       // A relaunch keeps the first engine's context; with --max-context,
       // which every start holds, its command is the first one's.
       {"relaunch", [](NativeArguments &read) { read.relaunchContext = 61433; }},
@@ -194,7 +197,7 @@ void testServerCommandLines(const char *path) {
            read.preventIdleSleep == meant.preventIdleSleep &&
            read.neuralEngine == meant.neuralEngine && read.pleMemory == meant.pleMemory &&
            read.expertMemory == meant.expertMemory && read.sparseKvMemory == meant.sparseKvMemory &&
-           read.kvSpillAlways == meant.kvSpillAlways;
+           read.kvSpillAlways == meant.kvSpillAlways && read.verifyRows == meant.verifyRows;
   };
   const auto golden = readGolden(path);
   require(golden.size() == changes.size(),
@@ -218,6 +221,14 @@ void testNeuralEngine() {
               parse(model, {"auto", "auto", "--ane", "on"}).neuralEngine &&
               !parse(model, {"auto", "auto", "--ane", "off"}).neuralEngine,
           "--ane did not reach the arguments as given");
+}
+
+// --verify-rows auto, which the server never writes, is the engine's rule.
+void testVerifyRows() {
+  const ModelDirectory model;
+  require(parse(model, {"auto", "auto"}).verifyRows == model::VerifyRows::Auto &&
+              parse(model, {"auto", "auto", "--verify-rows", "auto"}).verifyRows == model::VerifyRows::Auto,
+          "--verify-rows auto was not the engine's rule");
 }
 
 // The stores' memory is the planner's unless set, which the server writes
@@ -261,6 +272,8 @@ void testRefusals() {
   refuses({"auto", "auto", "--idle-sleep", "never"},
           "--idle-sleep requires prevent or allow");
   refuses({"auto", "auto", "--ane", "gpu"}, "--ane requires on or off");
+  for (const char *rows : {"budget", "every", "ALL", ""})
+    refuses({"auto", "auto", "--verify-rows", rows}, "--verify-rows requires auto or all");
   // The server passes bytes, auto or off.
   for (const char *size : {"0", "2G", "OFF", ""})
     refuses({"auto", "auto", "--ple-memory", size}, "--ple-memory requires a positive byte count, auto or off");
@@ -365,6 +378,7 @@ int main(int argc, char **argv) {
   try {
     testServerCommandLines(argv[1]);
     testNeuralEngine();
+    testVerifyRows();
     testStreamedMemoryAndSpill();
     testRefusals();
     std::cout << "native arguments tests passed\n";

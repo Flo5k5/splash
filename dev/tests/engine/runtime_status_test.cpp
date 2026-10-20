@@ -212,6 +212,7 @@ void testCleanRuntimeStatus(const char *goldenPath) {
   executorTelemetry.stateHeldImageBytes = 7;
   executorTelemetry.imageRowsBytes = 8;
   executorTelemetry.aneFfnReruns = 1;
+  executorTelemetry.verifyBudget = true;
   const AneFfnSnapshot aneFfn{AneFfnSnapshot::State::Stopped,
                               "an evaluation did not complete within 2 s",
                               0.235,
@@ -320,6 +321,9 @@ void testCleanRuntimeStatus(const char *goldenPath) {
                           "\"total_gpu_ms\":0,\"total_wall_ms\":0}}") !=
               std::string::npos,
           "status invented model timings from request metrics");
+  require(json.find("\"verify_rows\":\"auto\"") != std::string::npos &&
+              unmeasured.find("\"verify_rows\":\"all\"") != std::string::npos,
+          "status lost the rows decode cycles verify");
   require(json.find("\"kv\":{\"block_tokens\":32,"
                     "\"pages_allocated\":128,\"pages_active\":24,"
                     "\"pages_cache\":32,\"pages_free\":72,") !=

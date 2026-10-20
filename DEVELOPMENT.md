@@ -117,6 +117,7 @@ access.
 | `--queue-size` | `32` | Requests admitted at once, running or waiting; more get 503 with `Retry-After`. |
 | `--decode-share` | `0.5` | Decode time owed per unit of prefill time while other requests generate. Higher keeps their output faster during a long prompt and slows that prompt; `0` alternates one command each. |
 | `--disable-ane` | Off | Prefill on the GPU alone. By default a dense model's long prompts also use the Neural Engine when that is faster. See [Neural Engine prefill](#neural-engine-prefill). |
+| `--verify-rows` | `auto` | The rows of each draft block decode cycles verify: `auto` lets the verify budget choose a MoE target's rows, which is faster but makes its greedy and seeded outputs vary from run to run, and verifies every row of a dense target; `all` verifies every row the output limit leaves on every target, so those outputs repeat. See [drafts](#drafts). |
 | `--allow-idle-sleep` | Off | Let the Mac sleep automatically while requests run; by default it stays awake until they finish (the display may still sleep). |
 
 Sizes (`--max-memory`, `--max-cache-disk`, `--max-cache-disk-writes`,
@@ -368,7 +369,9 @@ expert, as a SIZE that holds them all does.
   chunk's last repack, one more host step reads nearly all of the next
   block's into the whole staging. A load takes the read-ahead over without
   waiting for its reads of experts it does not route, and a read ahead of an
-  expert no load routes may fail without failing anything.
+  expert no load routes may fail without failing anything. A decode step
+  loads and predicts only the experts its lanes' verify rows route
+  ([Drafts](#drafts)); the selector writes those rows before the step's load.
 - Experts of one format share an arena of slots; when it would take more than
   the device's largest buffer (`maxBufferLength`), their layers are split
   between arenas that each fit, each recycling its own slots.
@@ -1077,26 +1080,31 @@ but for equally likely tokens, of which it takes the lowest id.
 A lane's arithmetic can depend on the batch it decodes in and on how its prompt
 is chunked. On a GGUF MoE target's staged expert tiles, an expert that a step
 routes at most two rows to runs them on the column tile, which sums in another
-order than the staged matmul, so a row's result also depends on the rows
-decoded or prefilled beside it. Concurrent requests change both, and chunk
-boundaries also come from
-the cached boundary a request resumes from, from a boundary another request
-waits to resume from, and from one whose state, or the KV past it, memory could
-not hold. With `--state-format bf16` the state is also rounded at each state a
-chunk captures (a replay point, junction or checkpoint). So a greedy or seeded
-request repeats its
-output when it runs alone with the same cached prefixes; alongside other
-requests, or with other prefixes cached, it can differ. A request that restores
-nothing can still read cached KV: once a command completes, each block it
-filled whose prefix, tokens and identity (images and cache salt) match a
-cached block is swapped for that block's page, which another command
-computed, and its later commands read it. A request suspended for memory or
-for a higher priority can also resume from a state another request cached past
-the blocks it had computed, and its replay then reads the KV of the blocks it
-restores there. The Done line of the request log counts the tokens of both, as
-does `metrics.cache.deduplicated_tokens` in Chat Completions and text
-completions responses (in a stream, its usage chunk), and `/status` sums them
-in `cache.deduplicated_kv_tokens`. One case goes uncounted: while a request is
+order than the staged matmul, so a row's result also depends on the rows decoded
+or prefilled beside it. Concurrent requests change both, and chunk boundaries
+also come from the cached boundary a request resumes from, from a boundary
+another request waits to resume from, and from one whose state, or the KV past
+it, memory could not hold. With `--state-format bf16` the state is also rounded
+at each state a chunk captures (a replay point, junction or checkpoint). So on a
+dense target, or a MoE target under `--verify-rows all`, a greedy or seeded
+request repeats its output when it runs alone with the same cached prefixes;
+alongside other requests, or with other prefixes cached, it can differ. By
+default a MoE target's decode cycles verify the rows the verify budget chooses
+([Drafts](#drafts)), which follow the machine's timing and the requests served
+before, and a row's MoE result depends on which rows share its expert tiles:
+there the same greedy (temperature 0) or seeded request can give different text
+from run to run even alone on an idle server, as on other engines that batch
+requests, while sampled outputs keep their exact distribution. A request that
+restores nothing can still read cached KV: once a command completes, each block
+it filled whose prefix, tokens and identity (images and cache salt) match a
+cached block is swapped for that block's page, which another command computed,
+and its later commands read it. A request suspended for memory or for a higher
+priority can also resume from a state another request cached past the blocks it
+had computed, and its replay then reads the KV of the blocks it restores there.
+The Done line of the request log counts the tokens of both, as does
+`metrics.cache.deduplicated_tokens` in Chat Completions and text completions
+responses (in a stream, its usage chunk), and `/status` sums them in
+`cache.deduplicated_kv_tokens`. One case goes uncounted: while a request is
 suspended, blocks it computed can be evicted and computed again by another
 request, and when it resumes it reads those as its own. A request with a
 `cache_salt` no other request uses reads no cached KV, though its images'
@@ -1155,11 +1163,11 @@ contain multiple speculative tokens). Thus rates use tokens processed in the
 measured interval, not the full counts. An unavailable rate is zero, including
 responses completed in one emission. A request that drafted adds
 llama-server's `draft_n` and `draft_n_accepted`: the tokens its draft proposed
-and those verification accepted, but for accepted proposals past the output
-limit or from one of the model's stop tokens on; those a `stop` string then
-cuts still count. The end tokens a [thinking token
-budget](#thinking-token-budget) puts in place of the draft's proposals are
-neither. They count that request alone, so
+that its cycles verified ([Drafts](#drafts)) and those verification accepted,
+but for accepted proposals past the output limit or from one of the model's
+stop tokens on; those a `stop` string then cuts still count. The end tokens a
+[thinking token budget](#thinking-token-budget) puts in place of the draft's
+proposals are neither. They count that request alone, so
 they hold under concurrency. `metrics.speculation` carries them with the
 request's speculative `cycles`, the decode cycles in which its draft proposed
 tokens, and the Done line shows what the draft yields per cycle,
@@ -1428,6 +1436,7 @@ Proxy consumers can use these fields; additional fields may be added:
 | `memory_plan.budget.context_bounds` | What bounds `maximum_context_tokens` ([memory and context](#memory-and-context)): the model's `window`, one request's KV in memory (`resident`), the longest context a block-sparse target's floors hold (`spilled`) and its SSD cache's room holds (`disk`), and the `bound` that sets the limit: `model`, `memory` or `disk` |
 | `ane_ffn.state`, `share`, `minimum_rows`, `reason` | The prefill FFN's [Neural Engine split](#neural-engine-prefill): `split` while it serves, at `share` of the FFN's channels over chunks of `minimum_rows` rows or more; `off` when the start left the GPU alone (`share` and `minimum_rows` 0); `stopped` once it stopped while serving, until the engine restarts. `reason` is the start's outcome, or why the split stopped |
 | `ane_ffn.split_commands`, `evaluations`, `ane_ms`, `reruns` | Prefill commands the split ran since engine start, the Neural Engine's evaluations in them and its milliseconds over them (each evaluation's from the GPU's signal to start it to its report); and the chunks the GPU ran again alone after the split's work for them failed |
+| `verify_rows` | The rows of a draft block decode cycles verify ([drafts](#drafts), `--verify-rows`): `auto` where the verify budget chooses them (a MoE target under the default), `all` where they verify every row the output limit leaves (a dense target, or `--verify-rows all`) |
 | `model_timing.prefill.last_gpu_ms`, `total_gpu_ms` | GPU time of the last prefill command, and of all since engine start, warmup included: each from its first Metal command buffer's start to its last one's end, so with the Neural Engine split it spans the GPU's waits on the Neural Engine; a chunk run again adds the rerun's |
 | `metrics.decode_tokens_per_second` | Aggregate native decode throughput, not a request's end-to-end rate |
 | `metrics.decode_wall_ms` | Total wall time of the decode commands on the GPU, from submission to completion |
@@ -1775,25 +1784,75 @@ A draft's `config.json` states its layers, intermediate size, rotary base and
 the target layers whose outputs it reads (`dflash_config.target_layer_ids`,
 ascending, at most eight); its hidden size, vocabulary and mask token are its
 target's, and its attention (32 query and 8 KV heads of 128), selector (rank
-256, 16 candidates), block of 8 rows and 2048-token window are those the
-kernels are built for (`readDraftLayout` in `ModelDescriptor.mm`); the
-kernels take any hidden width of whole 16-channel convolution groups. Every
-family loads and runs its draft alike: a decode cycle verifies every row of
-the draft's block, the anchor and its seven proposals. The target writes the
-outputs of the layers the draft reads for each row it reads;
-Qwen3.8-Flash-Next's, whose layers carry four hyper-connection streams, as
-the streams' mean, summed in fp32 and stored as bf16, as the draft was
+256, 16 candidates), block of 8 rows and 2048-token window are those the kernels
+are built for (`readDraftLayout` in `ModelDescriptor.mm`); the kernels take any
+hidden width of whole 16-channel convolution groups. Every family loads and runs
+its draft alike: a decode cycle drafts the whole block, the anchor and its seven
+proposals, and the target verifies the block's first rows, as many as the cycle
+chose for the lane (its verify rows, `ops::DraftSelector::addVerifyRows`), never
+more than the lane may still retain: the tokens its output budget leaves, at
+most all eight. A dense target verifies every row up to that limit: its
+projections read their weights once for all of a cycle's rows, so a row costs it
+little. Each row a MoE target verifies routes its own experts, which a rejected
+row reads for nothing (a Qwen3.8-Flash-Next cycle of one lane routes about 43
+experts a layer with all eight rows and 17 with two), from the SSD where they
+stream ([Streamed experts](#streamed-experts)), so by default (`--verify-rows
+auto`) a MoE target's cycles choose their rows by expected accepted tokens per
+unit of cost (the verify budget, `model::VerifyBudget`), whether its experts
+stream or not: on an M5 Max serving Qwen3.6-35B-A3B with its experts all loaded,
+one, two and four concurrent agentic requests of 1000 tokens decoded 8.7%, 8.5%
+and 2.1% faster under the budget than with every row verified in GGUF UD-Q4_K_M,
+and 2.1%, 0.9% and 6.0% faster in MLX 4-bit. `--verify-rows all` has every
+target's cycles verify every row. The startup log says which rows the cycles
+verify and why, and `/status` reports it as `verify_rows`. The selector writes
+each lane's confidence at each position, the largest of its candidates'
+probabilities (the softmax at temperature 1 of their scores), which the lane's
+draw there does not change, so a sampled lane's acceptance stays exact. An
+online model, logit(p) = slope * logit(confidence) + intercept[position], gives
+the probability that the target accepts a proposal once it accepted those before
+it; the engine refits it every 64 cycles on the last 4096 proposals the target
+accepted or rejected (each lane's up to its first rejection, but none whose
+confidence is not a probability, which a draft row that is not finite gives), by
+damped Newton steps under a prior fit to Qwen3.8-Flash-Next's and
+Qwen3.6-35B-A3B's cycles, which also stands before any label. A lane's survival
+at a position, the product of p up to it, is what verifying one more row adds to
+its expected tokens; one GPU step after the selector (`draft_verify_rows`) gives
+every lane its anchor and the rows of the largest survivals over the batch, as
+many as maximize the expected tokens over the cycle's cost at that many rows in
+all. The engine prices those rows from the wall times of the lane count's latest
+cycles, which for streamed experts include the store's reads of its misses: a
+least-squares line in the rows over about the last 30 cycles, its slope shrunk
+toward the shape the measured targets share, since what a row costs follows the
+requests served (a Qwen3.6-35B-A3B cycle with 4 GB of experts adds about 3 ms a
+row on prose and 8 ms on reasoning); constrained cycles are fit apart, and every
+32nd cycle of a lane count verifies every row, which keeps the rows of the fit
+spread. A fixed shorter block would do worse: in agentic use about one cycle in
+six accepts all seven proposals and one in five accepts none. Rows past a lane's
+verify rows still run the target's layers, whose kernels take eight rows a lane,
+but their MoE steps route no expert (`moe_group_routes_verified`) and acceptance
+retains none of them. The budget's costs follow wall time and its acceptance
+model every request's labels, so the rows a cycle verifies depend on the
+machine's timing and on what the server served before, and a MoE row's result
+depends on which rows share its expert tiles ([Kernels](#kernels)): under the
+budget the same greedy (temperature 0) or seeded request can give different text
+from run to run, even alone on an idle server ([Sampling](#sampling)); sampled
+outputs keep their exact distribution. With every row verified (a dense target,
+or `--verify-rows all`), the rows a cycle verifies follow its lanes' output
+budgets alone. The speculation counts ([Output limits and
+streaming](#output-limits-and-streaming)) count the proposals a cycle verified.
+The target writes the outputs of the layers the draft reads for each row it
+reads; Qwen3.8-Flash-Next's, whose layers carry four hyper-connection streams,
+as the streams' mean, summed in fp32 and stored as bf16, as the draft was
 trained on it. `dflash_config.target_hidden_reduction` states that reduction
 (`stream_mean` for a hyper-connected target, `none` for another); a config
-without it takes its target's, and one that names another is refused.
-Native loading validates the
-configuration against the target again and loads the draft like a target
-([Weight loading](#weight-loading)):
-`DraftCheckpointLoader` (`DraftCheckpoint.cpp`) plans the draft's `MDGG0001`
-images, one per layer and one for the rest, and `GgufPreparation` quantizes
-each projection into af4g64 planes, 4 bits in groups of 64 as MLX's affine
-quantization rounds them, and copies every other tensor as stored. The draft
-runs on the block kernels its target's projections run on.
+without it takes its target's, and one that names another is refused. Native
+loading validates the configuration against the target again and loads the draft
+like a target ([Weight loading](#weight-loading)): `DraftCheckpointLoader`
+(`DraftCheckpoint.cpp`) plans the draft's `MDGG0001` images, one per layer and
+one for the rest, and `GgufPreparation` quantizes each projection into af4g64
+planes, 4 bits in groups of 64 as MLX's affine quantization rounds them, and
+copies every other tensor as stored. The draft runs on the block kernels its
+target's projections run on.
 
 ### Vision
 
@@ -1946,8 +2005,10 @@ production code. Before release,
 compare full-model greedy outputs at the same prompts, cached prefixes and
 batch schedule against the base. Repeat seeded sampled requests within each
 build, and explicitly check base-versus-candidate seeded output when preserving
-a drafting policy. These are measured gates, not a guarantee across arbitrary
-compiler versions or GPUs.
+a drafting policy. Run a MoE target with `--verify-rows all` for these
+comparisons: the verify budget its cycles otherwise follow makes greedy and
+seeded outputs vary from run to run ([Drafts](#drafts)). These are measured
+gates, not a guarantee across arbitrary compiler versions or GPUs.
 
 The values the native runtime holds constant (the Metal command timeout, the
 KV tier's transfers, the input queue's bound, the latency window, the
@@ -2225,7 +2286,10 @@ An expert's only tile of at most `MOE_GGUF_COLUMN_ROWS` live rows runs on the co
 (`kernels/common/gguf_column_tile.h`) rather than the staged one, and the two sum a row's
 products in different orders: a route's output depends on how many rows the step routes to its
 expert, so decode results of GGUF MoE targets on the staged tile, the 35B's included, are not
-invariant to the batch (`kernels/common/moe_expert_slab.h`).
+invariant to the batch (`kernels/common/moe_expert_slab.h`). Under the default `--verify-rows
+auto`, which rows a decode step routes also follows the verify budget ([Drafts](#drafts)), which
+learns from timing and earlier requests, so a MoE target's decode results can differ between runs
+of one request.
 The float router and alpha/beta projections run in `kernels/shared/gguf_float.metal`, and the
 token rows are gathered by one template in `kernels/shared/embedding.metal`. These plans are
 fixed rules of GPU family, core count, shape and format.
@@ -3170,7 +3234,7 @@ does, and `REVISION`, `DRAFT_MODEL` and `LANGUAGE_ONLY=1` as its `--revision`,
 | --- | --- |
 | `verify-models` | the installer's restarts without the Hub, `verify --full`, and the record of the weight images (`dev/tools/installer_restarts.py`, `weight-digests`, [Release check](#release-check)) |
 | `test-real` | vision parity with the family's fixture in `dev/tests/fixtures/vision-parity/` when the installation serves vision, and the native model runtime oracle, each of its three runs with `ORACLE_ARGS` added (`ORACLE_ARGS="--kv-format bf16"`, `"--expert-memory 16G"` or `"--yarn-factor 4"`); for a block-sparse target their spill checks take the default prompts, two staging buffers, and 32K tokens with the default window |
-| `test-http-real` | the HTTP frontend on an isolated server (`dev/tests/smoke_real.py`); with `HTTP_SMOKE_ARGS="--persistent-cache --max-cache-disk 8G"`, instead of that smoke, the [persistent cache](#persistent-cache) across a restart in a fresh cache directory: a clean stop, a restart that takes the restore point back, and a next turn that restores the prompt from disk; `release-check` runs both |
+| `test-http-real` | the HTTP frontend on an isolated server (`dev/tests/smoke_real.py`), whose greedy comparisons (a penalized greedy request repeats, `min_p` 1 answers as greedy) run where `/status` reports `verify_rows` `all`, which on any MoE target takes `HTTP_SMOKE_ARGS="--verify-rows all"`; with `HTTP_SMOKE_ARGS="--persistent-cache --max-cache-disk 8G"`, instead of that smoke, the [persistent cache](#persistent-cache) across a restart in a fresh cache directory: a clean stop, a restart that takes the restore point back, and a next turn that restores the prompt from disk; `release-check` runs both |
 | `test-agent-real` | the five official clients through `splash serve` (`dev/tests/agent_real.py`), in `AGENT_SCENARIO` `complete` (the default) or `smoke` |
 | `test-release-real` | the HTTP smoke and all five clients on one `splash serve` |
 | `test-performance-real` | the native decode, partial-prefix and short-prompt benchmark, or with `BASELINE` its ABBA comparison with that build (`dev/benchmarks/backend_regression.py`) |
@@ -3261,7 +3325,9 @@ the other. Per model, `release-check`:
   sources and records in `weights.json` the component, size and SHA-256 of
   every weight image the installation loads (`verify-models`);
 - runs the HTTP smoke, which for a text-only installation checks the 400s
-  instead of images (`test-http-real`);
+  instead of images (`test-http-real`), on the default verify rows: on a MoE
+  target it leaves out the greedy comparisons, which run only with
+  `HTTP_SMOKE_ARGS="--verify-rows all"`, and says so;
 - stops and restarts a server with a [persistent cache](#persistent-cache),
   and requires the conversation's next turn to restore its prompt from disk
   (`test-http-real` with `HTTP_SMOKE_ARGS="--persistent-cache --max-cache-disk 8G"`);
@@ -3270,8 +3336,10 @@ the other. Per model, `release-check`:
   first to report a [Neural Engine share](#neural-engine-prefill) running that
   share when its build takes one: output tokens and acceptance must be
   identical (`EXPECT_OUTPUT_CHANGE=1` allows changed outputs with acceptance
-  within 0.02), and so must the bytes of the weight images both load
-  (`dev/benchmarks/weights.py`); decode and prefill GPU time, with the cold
+  within 0.02; the benchmark verifies every row (`--verify-rows all`), so a
+  MoE target's outputs repeat and its times measure the backend, not the
+  verify budget of [Drafts](#drafts)), and so must the bytes of the weight images
+  both load (`dev/benchmarks/weights.py`); decode and prefill GPU time, with the cold
   prefills of short prompts (480 to 2016 tokens, one chunk each) when both
   builds' benchmarks run them, may regress by at most the larger of 2% and
   twice the run's own ABBA spread, a spread above 5% fails as inconclusive,
@@ -3384,10 +3452,16 @@ checkout, after
 ```
 
 It takes any installed model and, for an upstream one, holds its assembly for
-the whole run, so every round serves the same model. It starts isolated servers
-in ABBA order, compares matched cold, exact-prefix and decode requests by the
-release check's speed rule and weight bytes (decode by `metrics.decode_cycle_ms`
-per output token, so host work between commands counts), and saves
+the whole run, so every round serves the same model. For a MoE target, pass
+`--verify-rows all`: the check requires the two builds' transcripts to match,
+and by default the verify budget chooses a MoE target's rows from cycle wall
+times, so its greedy output can differ between runs (see [drafts](#drafts)).
+Both rounds pass the option to their engine, so a MoE comparison needs a
+baseline built from a checkout that takes it; an older baseline cannot run one.
+It starts isolated servers in ABBA order, compares matched cold, exact-prefix
+and decode requests by the release check's speed rule and weight bytes (decode
+by `metrics.decode_cycle_ms` per output token, so host work between commands
+counts), and saves
 `build/release/http-regression.json`. With `--burst N` it sends N requests of
 each context at once instead, 16 output tokens each, and reports each build's
 replay points lost to the burst (`replay_state_publication_failures`), its

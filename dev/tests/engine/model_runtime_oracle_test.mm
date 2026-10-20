@@ -20,6 +20,7 @@
 #include "model/QwenState.hpp"
 #include "model/SpilledKvReads.hpp"
 #include "model/SsdReaders.hpp"
+#include "model/VerifyBudget.hpp"
 #include "ops/KvSlotFormat.hpp"
 #include "ops/PageStorage.hpp"
 #include "ops/Sampling.hpp"
@@ -2739,6 +2740,149 @@ void requireBatchedLanesMatchReordered(model::Runtime &executor, const model::Qw
   std::cout << "batched_lanes_reordered=PASS widths=2,3,4\n";
 }
 
+// Under --verify-rows auto a MoE target's decode cycles verify the rows its
+// verify budget chooses, which follow the wall times and acceptance of the
+// cycles before them, so that runs need not repeat one another. Each cycle of
+// lanes decoded together must be well formed all the same: no lane fails;
+// each verifies its anchor and at most the rows its output budget leaves,
+// every one of them in the cycles the budget explores (each
+// kExploreCycles-th of a lane count and kind); drafts the proposals past its
+// anchor that it verified, accepts no more of them, and commits the rows it
+// retained, no more than it verified. Greedy and sampled lanes decode for
+// more cycles than the budget's refit period, one of them ending at its
+// output budget within its first cycles, then constrained lanes, whose
+// cycles the budget prices apart.
+void requireBudgetedCyclesAreWellFormed(model::Runtime &executor, const model::QwenStateStorage &states,
+                                        std::span<const uint32_t> seed) {
+  constexpr uint32_t kRows = model::ExecutionLimits::targetVerifyRows;
+  constexpr uint32_t kExplore = model::VerifyBudget::kExploreCycles;
+  constexpr uint32_t kCycles = model::VerifyBudget::kRefitCycles + 1;
+  struct Lane final {
+    EngineRequest request;
+    uint32_t stateLane = 0;
+    std::vector<uint32_t> pages;
+    std::vector<uint32_t> tokens;
+    bool finished = false;
+  };
+  // Each lane count's cycles of each kind so far, as the budget counts them.
+  std::array<std::array<uint32_t, model::ExecutionLimits::maximumBatchWidth>, 2> counted{};
+  uint64_t laneCycles = 0, verifiedRows = 0;
+  const auto decode = [&](std::vector<Lane> &lanes, uint32_t cycles) {
+    for (uint32_t cycle = 0; cycle < cycles; ++cycle) {
+      const bool constrained = lanes.front().request.constraint == ConstraintMode::TokenMask;
+      BatchPlan plan{.kind = WorkKind::Decode, .constrained = constrained, .decodeStage = DecodeStage::Regular};
+      std::vector<ModelBatchItem> items;
+      std::vector<Lane *> active;
+      for (Lane &lane : lanes) {
+        if (lane.finished || lane.tokens.size() == lane.request.maxNewTokens)
+          continue;
+        plan.items.push_back({lane.request.id, 0});
+        items.push_back(withRevision({.requestId = lane.request.id,
+                                      .logicalPosition = lane.request.prompt.size() + lane.tokens.size(),
+                                      .pageTable = lane.pages}));
+        active.push_back(&lane);
+      }
+      if (active.empty())
+        return;
+      std::vector<ModelStepResult> results;
+      if (constrained) {
+        PendingMaskedDecode pending = beginMaskedDecode(executor, plan, items);
+        for (const ModelMaskRequest &request : pending.maskRequests)
+          provideMask(executor, request.requestId,
+                      std::vector<uint32_t>((request.simulationTokens.size() + 1) * kMaskWords, ~0U));
+        results = finishMaskedDecode(std::move(pending));
+      } else {
+        results = executor.decode(plan, items);
+      }
+      require(results.size() == active.size(), "a budgeted cycle lost a lane");
+      const bool explores = counted[constrained][active.size() - 1]++ % kExplore == kExplore - 1;
+      for (uint32_t index = 0; index < active.size(); ++index) {
+        Lane &lane = *active[index];
+        const ModelStepResult &result = results[index];
+        const uint32_t remaining = lane.request.maxNewTokens - static_cast<uint32_t>(lane.tokens.size());
+        const uint32_t room = std::min(remaining, kRows);
+        const uint32_t rows = model::RuntimeInstrumentation::lastVerifyRows(executor, index);
+        const size_t retained = result.outputTokens.size() - result.outputTokensWithoutKv;
+        require(result.failure.empty(), "a budgeted cycle failed a lane: " + result.failure);
+        require(rows >= 1 && rows <= room && (rows == room || !explores),
+                "a budgeted cycle verified rows its lane's output budget does not leave");
+        require(result.draftedTokens == rows - 1 && result.acceptedDraftTokens <= result.draftedTokens &&
+                    retained >= 1 && retained <= rows && result.outputTokens.size() <= remaining &&
+                    states.metadata(lane.stateLane).lengths.targetTokens == items[index].logicalPosition + retained,
+                "a budgeted cycle's counts do not follow the rows it verified");
+        lane.tokens.insert(lane.tokens.end(), result.outputTokens.begin(), result.outputTokens.end());
+        lane.finished = result.finished;
+        ++laneCycles;
+        verifiedRows += rows;
+      }
+    }
+  };
+  const auto begin = [&](Lane &lane) {
+    beginCold(executor, lane.request, lane.stateLane);
+    const ModelStepResult prefilled = prefillChunk(executor, lane.request.id, 0, lane.request.prompt, lane.pages);
+    require(prefilled.outputTokens.empty() &&
+                prefilled.nextDecodeStage == (lane.request.constraint == ConstraintMode::TokenMask
+                                                  ? DecodeStage::ApplyInitialMask
+                                                  : DecodeStage::Regular),
+            "a budgeted lane's prompt did not leave it a first cycle");
+  };
+
+  // Lanes 0-2 outlast the cycles whatever they accept; lane 3 ends at its
+  // budget of 12 tokens.
+  std::vector<Lane> lanes(4);
+  for (uint32_t index = 0; index < lanes.size(); ++index) {
+    Lane &lane = lanes[index];
+    const uint32_t budget = index < 3 ? kCycles * kRows + 1 : 12;
+    std::vector<uint32_t> prompt(64);
+    for (uint32_t token = 0; token < prompt.size(); ++token)
+      prompt[token] = seed[(token + 11 * index) % seed.size()];
+    lane.request = makeRequest(800 + index, std::move(prompt), budget);
+    lane.request.flags = RequestIgnoreEndOfSequence;
+    lane.request.sampling = {.temperature = index % 2 ? 0.8F : 0.0F, .topP = 0.95F, .topK = 20, .seed = 911 + index};
+    lane.stateLane = index;
+    lane.pages = pageRange(20 * index, (64 + budget + kv::kPageTokens - 1) / kv::kPageTokens);
+    begin(lane);
+  }
+  decode(lanes, kCycles);
+  require(lanes[3].tokens.size() == 12 && counted[0][2] >= kExplore,
+          "the budgeted lanes did not reach the cycles the check needs");
+  for (const Lane &lane : lanes)
+    executor.end(lane.request.id);
+
+  // Constrained lanes through a prompt they think on past their budgets, each
+  // mask admitting every token.
+  std::vector<Lane> constrained(2);
+  for (uint32_t index = 0; index < constrained.size(); ++index) {
+    Lane &lane = constrained[index];
+    lane.request = makeRequest(810 + index, kThinkingPrompt, 24);
+    lane.request.constraint = ConstraintMode::TokenMask;
+    lane.request.sampling = {.temperature = index ? 0.7F : 0.0F, .topP = 0.95F, .topK = 20, .seed = 919 + index};
+    lane.stateLane = index;
+    lane.pages = pageRange(80 + 2 * index, 2);
+    begin(lane);
+    provideMask(executor, lane.request.id, std::vector<uint32_t>(kMaskWords, ~0U));
+  }
+  BatchPlan first{.kind = WorkKind::Decode, .constrained = true, .decodeStage = DecodeStage::ApplyInitialMask};
+  std::vector<ModelBatchItem> firstItems;
+  for (const Lane &lane : constrained) {
+    first.items.push_back({lane.request.id, 0});
+    firstItems.push_back(withRevision({.requestId = lane.request.id,
+                                       .logicalPosition = lane.request.prompt.size(),
+                                       .pageTable = lane.pages}));
+  }
+  for (const ModelStepResult &result : executor.decode(first, firstItems))
+    require(result.failure.empty() && result.outputTokens.empty(),
+            "a budgeted constrained lane's first token failed or was emitted");
+  decode(constrained, 24);
+  for (const Lane &lane : constrained) {
+    require(lane.finished || lane.tokens.size() == lane.request.maxNewTokens,
+            "a budgeted constrained lane did not finish");
+    executor.end(lane.request.id);
+  }
+  std::cout << "budgeted_cycles=PASS lane_cycles=" << laneCycles
+            << " mean_verify_rows=" << double(verifiedRows) / double(laneCycles) << '\n';
+}
+
 // The K/V of a block-sparse target whose committed pages hold only their
 // index (kv::PageForm::Index), their K/V in SSD cache tier copies, reaches
 // the attention through the command's reads of spilled K/V
@@ -2829,9 +2973,11 @@ public:
     const model::ModelMemoryPlan plan = model::plannedRuntimeMemory(model, operators, format, stateFormat,
                                                                     model::StreamedParts::loaded(model, true));
     const uint64_t arenaBytes = plan.sharedPrefillPlannedAllocatedBytes + plan.sharedDecodePlannedAllocatedBytes;
+    // Every row verified: the two runs of one schedule that
+    // requireSpilledKvMatchesResident compares must verify the same rows.
     require(static_cast<bool>(admission(arenaBytes, [&] {
               runtime_.emplace(model::RuntimeContext{backend, model, kv_, states_, operators, nullptr, &cache_,
-                                                     &stream_});
+                                                     &stream_, model::VerifyRows::All});
             })),
             "the spill runtime's arenas exceed the oracle Metal budget");
   }
@@ -3655,6 +3801,13 @@ int main(int argc, char **argv) {
                                     admission,
                                     model.stateLayout(stateFormat), nullptr);
     model::RuntimeContext context{backend, model, pages, states, operators, aneFfn.get()};
+    // The checks compare runs of one schedule bit for bit, which every row
+    // verified (--verify-rows all) keeps comparable on a MoE target: the rows
+    // the verify budget chooses follow the cycles before them, and a MoE
+    // row's result the rows that share its expert tiles. A MoE target's
+    // budgeted cycles are checked on a runtime of their own
+    // (requireBudgetedCyclesAreWellFormed).
+    context.verifyRows = model::VerifyRows::All;
     require(executorPlan.sharedDecodePlannedAllocatedBytes <=
                 std::numeric_limits<uint64_t>::max() -
                     executorPlan.sharedPrefillPlannedAllocatedBytes,
@@ -4038,10 +4191,12 @@ int main(int argc, char **argv) {
             "constrained short prefill final hidden is unusable");
     executor.end(56);
 
-    // Every decode executes an anchor plus seven proposal rows. Compare each
-    // budgeted commit with a constrained cycle that retains the same prefix,
-    // rejecting the next proposal unless all eight rows are retained. The
-    // constrained request has a larger budget, so both acceptance paths agree on
+    // Every decode executes an anchor plus seven proposal rows and verifies
+    // as many of them as its output budget leaves. Compare each budgeted
+    // commit with a constrained cycle that retains the same prefix, rejecting
+    // the next proposal unless all eight rows are retained. The constrained
+    // request has the same budget, so it verifies the same rows, which a MoE
+    // target's expert tiles group alike, and both acceptance paths agree on
     // the GDN cell, the retained rows and the exact draft ring. Kernel tests
     // cover the recurrence's FP64 accuracy; this check does not mix prefill and
     // decode summation orders, whose tiny differences can amplify through the
@@ -4058,12 +4213,14 @@ int main(int argc, char **argv) {
                        std::span<const uint32_t>(prompt129).subspan(128, 1),
                        pageTable),
           id, 129, pageTable);
-      require(result.draftedTokens == 7,
-              "oracle prompt ended right after prefill; no cycle to test");
+      // The cycle verifies its anchor and the outputLimit - 1 proposals its
+      // budget leaves room for.
+      require(result.draftedTokens == outputLimit - 1,
+              "oracle prompt ended right after prefill, or its cycle verified other rows than its budget leaves");
       require(!result.outputTokens.empty() &&
                   result.outputTokens.size() <= outputLimit,
               "fixed DFlash-8 decode exceeded its output limit");
-      require(result.acceptedDraftTokens <= 7,
+      require(result.acceptedDraftTokens <= result.draftedTokens,
               "fixed DFlash-8 acceptance accounting mismatch");
       const size_t stored =
           result.outputTokens.size() - result.outputTokensWithoutKv;
@@ -4076,8 +4233,7 @@ int main(int argc, char **argv) {
       // Composite snapshots exclude KV: share sealed history and give the
       // comparison its own writable page for the speculative suffix.
       replayPages[4] = 80;
-      EngineRequest replayRequest =
-          makeRequest(replayId, prompt129, static_cast<uint32_t>(stored + 2));
+      EngineRequest replayRequest = makeRequest(replayId, prompt129, outputLimit);
       replayRequest.constraint = ConstraintMode::TokenMask;
       beginCold(executor, replayRequest, 1);
       restoreActivePrefix(executor, replayId, prompt129.size(), 128,
@@ -4394,20 +4550,23 @@ int main(int argc, char **argv) {
     require(constrainedResults.size() == 1,
             "constrained overlap returned the wrong batch width");
     // The rejected proposal makes the masked successor the next anchor; as
-    // the last budgeted token it is emitted at once, without a KV row.
+    // the last budgeted token it is emitted at once, without a KV row. The
+    // cycle verified the anchor and the one proposal its budget leaves room
+    // for.
     ModelStepResult constrainedFirst = std::move(constrainedResults[0]);
     require(constrainedFirst.nextDecodeStage == DecodeStage::Regular &&
                 constrainedFirst.outputTokens ==
                     std::vector<uint32_t>{anchorA, nextB} &&
                 constrainedFirst.outputTokensWithoutKv == 1 &&
                 !constrainedFirst.finished &&
-                constrainedFirst.draftedTokens == 7 &&
+                constrainedFirst.draftedTokens == 1 &&
                 constrainedFirst.acceptedDraftTokens == 0,
             "constrained verify mask offset is incorrect");
     executor.end(40);
 
-    // Accept two of seven proposals and reject the third. The draft work is
-    // always seven rows and is counted only after target verification.
+    // Accept two of the three proposals a budget of four tokens lets the
+    // cycle verify and reject the third. The draft always proposes seven;
+    // the verified ones are counted only after target verification.
     EngineRequest perfectConstraint = makeRequest(44, prompt129, 4);
     perfectConstraint.constraint = ConstraintMode::TokenMask;
     beginCold(executor, perfectConstraint, 0);
@@ -4448,9 +4607,9 @@ int main(int argc, char **argv) {
     require(perfectResult.nextDecodeStage == DecodeStage::Regular &&
                 perfectResult.outputTokens.size() == 4 &&
                 perfectResult.outputTokensWithoutKv == 1 &&
-                perfectResult.draftedTokens == 7 &&
+                perfectResult.draftedTokens == 3 &&
                 perfectResult.acceptedDraftTokens == 2,
-            "constrained acceptance did not report two of seven");
+            "constrained acceptance did not report two of three");
     executor.end(44);
 
     EngineRequest alternateConstraint = makeRequest(41, prompt129, 1);
@@ -4578,6 +4737,8 @@ int main(int argc, char **argv) {
                   singletonMasks(crossVerify[lane]));
     }
     auto crossResults = finishMaskedDecode(std::move(crossPending));
+    // Each lane's budget leaves the B2 cycle its anchor and one proposal to
+    // verify.
     require(crossResults.size() == 2 &&
                 crossResults[0].outputTokens ==
                     std::vector<uint32_t>{crossNext[0], crossVerify[0][1]} &&
@@ -4585,8 +4746,8 @@ int main(int argc, char **argv) {
                     std::vector<uint32_t>{crossNext[1], crossVerify[1][1]} &&
                 crossResults[0].outputTokensWithoutKv == 1 &&
                 crossResults[1].outputTokensWithoutKv == 1 &&
-                crossResults[0].draftedTokens == 7 &&
-                crossResults[1].draftedTokens == 7 &&
+                crossResults[0].draftedTokens == 1 &&
+                crossResults[1].draftedTokens == 1 &&
                 crossResults[0].acceptedDraftTokens == 0 &&
                 crossResults[1].acceptedDraftTokens == 0,
             "B2 constrained overlap corrupted a lane");
@@ -5815,6 +5976,21 @@ int main(int argc, char **argv) {
               << (aneFfn && aneFfn->retired() ? " ane_ffn_stopped=" + aneFfn->reason() : std::string()) << '\n';
     require(!aneFfnFault || (aneFfn && aneFfn->retired() && historicalTelemetry.aneFfnReruns == 1),
             "an armed fault did not stop the split once");
+    // The verify budget's cycles, on a MoE target's runtime of its own
+    // (--verify-rows auto) admitted in the main one's place. A dense
+    // target keeps no budget under auto (budgetsVerifyRows).
+    if (sparseMoe) {
+      runtime.reset();
+      context.verifyRows = model::VerifyRows::Auto;
+      const metal::AllocationResult budgetArenas =
+          governor.allocationAdmission()(arenaBytes, [&] { runtime.emplace(context); });
+      if (budgetArenas.failure == metal::AllocationFailure::HostPressure)
+        stopForHostMemory(governor, "the budgeted runtime's arenas", arenaBytes);
+      require(static_cast<bool>(budgetArenas), "the budgeted runtime's arenas exceed the oracle Metal budget");
+      requireBudgetedCyclesAreWellFormed(*runtime, states, samplingSeedTokens);
+    } else {
+      std::cout << "budgeted_cycles=SKIP (a dense target verifies every row; the verify budget does not apply)\n";
+    }
     std::cout << "model_runtime_oracle_test: PASS\n";
     return 0;
   } catch (const std::exception &error) {

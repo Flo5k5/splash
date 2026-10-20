@@ -725,6 +725,19 @@ SERVE_OPTIONS = (
         ),
     ),
     ServeOption(
+        "--verify-rows",
+        "requests",
+        dict(
+            choices=("auto", "all"),
+            default="auto",
+            help="rows of each draft block decode verifies: all verifies every "
+            "row, so a MoE model's greedy and seeded outputs repeat as a dense "
+            "model's do (default: auto, where a verify budget learned from "
+            "earlier cycles chooses a MoE model's rows, which is faster but "
+            "lets those outputs differ from run to run)",
+        ),
+    ),
+    ServeOption(
         "--allow-idle-sleep",
         "requests",
         dict(

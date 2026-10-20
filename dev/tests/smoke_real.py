@@ -128,6 +128,8 @@ class RealServer:
             command.extend(("--ple-memory", arguments.ple_memory))
         if arguments.expert_memory is not None:
             command.extend(("--expert-memory", arguments.expert_memory))
+        if arguments.verify_rows is not None:
+            command.extend(("--verify-rows", arguments.verify_rows))
         if arguments.yarn_factor is not None:
             command.extend(("--yarn-factor", str(arguments.yarn_factor)))
         if cache_dir is not None:
@@ -931,7 +933,11 @@ def run_sampling(port: int, model: str) -> None:
     leaves each row its most likely token answers what a greedy one does, and
     penalized greedy, sampled and constrained requests finish side by side with
     an unpenalized one and with sampled ones whose top_k keeps every token or
-    which min_p cuts."""
+    which min_p cuts. Greedy output repeats only where decode cycles verify
+    every row (/status verify_rows all), so on a MoE target, whose rows the
+    verify budget chooses unless it serves with --verify-rows all, the two
+    greedy comparisons are left out."""
+    repeats = runtime_status(port)["verify_rows"] == "all"
     prompt = "Name the days of the week, three times over, separated by commas."
     penalized = chat_body(
         model,
@@ -946,7 +952,10 @@ def run_sampling(port: int, model: str) -> None:
         code, chat = request(port, "POST", "/v1/chat/completions", penalized)
         require(code == 200, f"penalized greedy Chat failed: {chat!r}")
         answers.append(answer_text(chat))
-    require(answers[1] == answers[2], "a penalized greedy request did not repeat")
+    require(
+        not repeats or answers[1] == answers[2],
+        "a penalized greedy request did not repeat",
+    )
 
     code, greedy = request(
         port,
@@ -971,7 +980,7 @@ def run_sampling(port: int, model: str) -> None:
         ),
     )
     require(
-        code == 200 and answer_text(heaviest) == answer_text(greedy),
+        code == 200 and (not repeats or answer_text(heaviest) == answer_text(greedy)),
         f"min_p 1 did not answer as a greedy request: {heaviest!r}",
     )
 
@@ -1039,7 +1048,11 @@ def run_sampling(port: int, model: str) -> None:
         results["ignore_eos"][1]["usage"]["completion_tokens"] == 32,
         "ignore_eos beside penalized requests stopped early",
     )
-    print("sampling penalties, top_k and min_p: PASS", flush=True)
+    print(
+        "sampling penalties, top_k and min_p: PASS"
+        + ("" if repeats else " (greedy answers not compared: verify_rows auto)"),
+        flush=True,
+    )
 
 
 def run_protocol_extensions(port: int, model: str, vision: bool = True) -> None:
@@ -1703,6 +1716,12 @@ def add_server_arguments(parser):
         "--expert-memory",
         help="serve a MoE model's routed experts from RAM slots of this size in "
         "all, reading the others from the SSD (splash serve --expert-memory)",
+    )
+    parser.add_argument(
+        "--verify-rows",
+        choices=("auto", "all"),
+        help="the rows of each draft block decode verifies (splash serve "
+        "--verify-rows); a MoE model's greedy output repeats only with all",
     )
     parser.add_argument(
         "--yarn-factor",

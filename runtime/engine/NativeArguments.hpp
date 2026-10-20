@@ -70,6 +70,9 @@ struct NativeArguments final {
   // KV on the SSD cache, for validation; without it, the requests memory
   // cannot hold (EngineSpillConfig::always).
   bool kvSpillAlways = false;
+  // --verify-rows auto|all: the rows of the draft's block a decode
+  // cycle verifies (RuntimeResourcesConfig::verifyRows).
+  model::VerifyRows verifyRows = model::VerifyRows::Auto;
 };
 
 // Reads `serve-native MODEL_DIRECTORY MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto

@@ -266,7 +266,9 @@ int main(int argc, char **argv) {
         require(static_cast<bool>(pages.allocateExtent(extent)), "could not allocate the KV extents");
       model::QwenStateStorage states(backend, governor.allocationAdmission(), model.stateLayout(stateFormat),
                                      nullptr);
+      // Every cycle verifies, and so retains, every row of its block.
       model::RuntimeContext context{backend, model, pages, states, operators};
+      context.verifyRows = model::VerifyRows::All;
       model::Runtime executor(context);
 
       std::vector<uint32_t> pageTable(lanePages);
