@@ -23,6 +23,8 @@ class AneFfn;
 
 namespace splash::model {
 
+class KvBlockCache;
+class KvHistoryStream;
 class QwenStateStorage;
 class SsdReaders;
 class VisionLoader;
@@ -104,6 +106,11 @@ struct RuntimeContext final {
   const ops::ExecutionPlans &operators;
   // The prefill FFN's Neural Engine split (engine::startAneFfn), if any.
   ops::AneFfn *aneFfn = nullptr;
+  // The readers of a spill-capable target's spilled K/V, both or neither:
+  // the hot block cache its verifies resolve through, and the stream of its
+  // prefills' history (RuntimeGeometry::from's kvSpills).
+  KvBlockCache *blockCache = nullptr;
+  KvHistoryStream *historyStream = nullptr;
 };
 
 // Validates only the interface between independently defined target and draft
@@ -147,10 +154,13 @@ loadModel(metal::MetalBackend &backend,
 void withPrefillArena(
     metal::MetalBackend &backend, const LoadedModel &model, const ops::ExecutionPlans &operators, kv::Format format,
     const std::function<void(const ops::PrefillFfnBuffers &, const std::array<metal::MetalBuffer, 2> &)> &use);
+// The runtime's memory, of one whose K/V spills with `kvSpills`
+// (RuntimeContext's readers): its prefill commands run as groups.
 [[nodiscard]] ModelMemoryPlan
 plannedRuntimeMemory(const LoadedModel &model,
                      const ops::ExecutionPlans &operators,
-                     kv::Format kvFormat, ops::GdnStateFormat stateFormat);
+                     kv::Format kvFormat, ops::GdnStateFormat stateFormat,
+                     bool kvSpills = false);
 [[nodiscard]] std::unique_ptr<RuntimeModel>
 createRuntime(RuntimeContext context);
 
