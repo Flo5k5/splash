@@ -69,14 +69,15 @@ void requireStartupHeadroom(
   if (!available || *available <= reserveBytes ||
       pressure == MemoryPressure::Critical) {
     std::ostringstream message;
-    message << "not enough free memory to start: ";
+    message << "not enough free memory to start (";
     if (!available)
       message << "reclaimable host memory cannot be measured";
     else
       message << mebibytes(*available) << " MiB reclaimable, "
               << mebibytes(reserveBytes) << " MiB protected for macOS, system "
               << "pressure " << memoryPressureName(pressure);
-    message << "; close memory-heavy applications and retry";
+    message << "): close other applications for the best performance, or pass "
+               "--max-memory to limit Splash's memory";
     throw metal::MetalAllocationError(message.str(),
                                       metal::AllocationFailure::HostPressure);
   }
