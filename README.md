@@ -61,27 +61,16 @@ in Chat. Anthropic Messages requests reason only when they set `thinking`.
 
 ## Models
 
-Splash supports these model families, each decoding with a DFlash2 draft: the
-one released for the family, selected automatically, or the one
-`--draft-model` names.
+Splash supports these model families, with a matching DFlash2 draft selected
+automatically:
 
 | Model | GGUF example | MLX 4-bit |
 | --- | --- | --- |
 | Qwen3.8-27B | `unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M` | `mlx-community/Qwen3.8-27B-4bit` |
 | Qwen3.6-35B-A3B | `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M` | `mlx-community/Qwen3.6-35B-A3B-4bit` |
-| Qwen3.8-Flash-Next | `unsloth/Qwen3.8-Flash-Next-GGUF:UD-IQ3_XXS` | — |
+| Qwen3.8-Flash-Next | `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:Q2_0` | — |
 
-Qwen3.8-Flash-Next's routed experts and PLE n-gram table
-stay on the SSD where memory cannot hold them, and so does the KV of its long
-requests ([KV on the SSD](DEVELOPMENT.md#kv-on-the-ssd)): `UD-IQ3_XXS` ran on
-a 36 GB M5 Max with 12 GiB of experts and a 2 GiB PLE cache in memory (about
-23 tokens/s on one request), and on a 64 GB Mac
-`ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:Q2_0` keeps every expert in
-memory.
-
-```bash
-splash serve --model unsloth/Qwen3.8-Flash-Next-GGUF:UD-IQ3_XXS
-```
+Unsloth's Qwen3.8-Flash-Next GGUFs load too.
 
 Unsloth GGUF variants span **1–8 bits**, including mixed-precision UD formats
 up to `UD-Q8_K_XL`, whose BF16 tensors load too. Whole-BF16 and F16 models are
@@ -110,29 +99,22 @@ window. To set your own limits or cache options, add these to `splash serve`:
 | --- | --- |
 | `--max-memory 28G` | Cap Metal memory use. |
 | `--idle-release off` | Keep the model in memory while idle (default: release after 10m). |
-| `--max-context 100K` | Set the context limit (K = 1024 tokens, M = 1,000,000). Up to 1,010,000 tokens: past the 256K native window YaRN stretches it, which changes answers at every length, so go past 256K only when a request needs it. |
+| `--max-context 100K` | Set the context limit. Up to `1M` tokens: past 256K, YaRN stretches the window, which changes answers at every length. |
 | `--language-only` | Skip vision; serve text only. |
 | `--kv-format bf16` | Use BF16 KV cache. Default: 8-bit (INT8). |
 | `--state-format bf16` | Use BF16 recurrent states, half the size. Default: FP32. |
 | `--disable-ane` | Prefill on the GPU alone. Default: the 27B also uses the Neural Engine. |
-| `--max-cache-disk 16G` | Size the SSD cache, held as given while its volume keeps 10 GiB free, or 5% of a volume under 200 GiB (default: auto, a quarter of the free space beyond that, up to 32 GiB; `0` turns it off). |
+| `--max-cache-disk 16G` | Cap the SSD cache (default: auto, up to 32 GiB; `0` turns it off). |
 | `--persistent-cache` | Keep the SSD cache across restarts. Off by default. |
-| `--ple-memory 2G` | Qwen3.8-Flash-Next: read its PLE n-gram table (28.8 GB in IQ4_NL) from the SSD through a 2 GiB RAM cache (default: auto, streamed where memory cannot hold it; `off` holds it all). |
-| `--expert-memory 16G` | MoE models: hold routed experts in 16 GiB and read the others from the SSD when a token routes them (default: auto, all loaded where memory holds them; `off` loads them all). |
-| `--verify-rows all` | MoE models: verify every row of each draft block, so a greedy or seeded request [repeats its output](DEVELOPMENT.md#sampling) when it runs alone with the same cached prefixes (default: auto, which lets a learned verify budget choose the rows, a few percent faster). |
 
-The automatic plan takes the whole Metal budget, so on a Mac that also runs
-other applications, `--max-memory` (or `--expert-memory` for a model whose
-experts stream) leaves them room.
+Use `--max-memory` to leave room for other applications.
 The server listens on localhost without authentication by default. For LAN
 access, authentication, browser apps on other origins, and other options, see
 [server configuration](DEVELOPMENT.md#server-configuration) or
 `splash serve --help`.
 [KV precision](DEVELOPMENT.md#kv-cache-precision) ·
 [SSD cache](DEVELOPMENT.md#ssd-cache) ·
-[PLE table streaming](DEVELOPMENT.md#ple-table-streaming) ·
-[Streamed experts](DEVELOPMENT.md#streamed-experts) ·
-[KV on the SSD](DEVELOPMENT.md#kv-on-the-ssd)
+[Advanced memory settings](DEVELOPMENT.md#memory-and-context)
 
 ## Performance
 
