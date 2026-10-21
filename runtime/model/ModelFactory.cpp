@@ -22,8 +22,8 @@ void requireCompatibleModel(const LoadedModel &model) {
       !std::visit(
           [&](const auto &target) {
             return model.descriptor.target == TargetLayout{target.layout} &&
-                   target.layout.vocabularySize ==
-                       model.draft.layout.vocabularySize;
+                   (!model.draft.layout.present() ||
+                    target.layout.vocabularySize == model.draft.layout.vocabularySize);
           },
           model.target)) {
     throw std::invalid_argument(
@@ -109,9 +109,11 @@ LoadedModel loadModel(metal::MetalBackend &backend,
   result.images = std::make_shared<WeightImages>(backend, result.descriptor.sourceIdentity);
   WeightImages &images = *result.images;
   // Every source's metadata is checked before the first image is written:
-  // the vision tower's and the draft's here, the target's by its loader.
+  // the vision tower's and any draft's here, the target's by its loader.
   const auto vision = planVisionLoader(root, result.descriptor);
-  DraftCheckpointLoader draft(backend, images, root / "draft", result.descriptor.draft);
+  std::optional<DraftCheckpointLoader> draft;
+  if (result.descriptor.draft.present())
+    draft.emplace(backend, images, root / "draft", result.descriptor.draft);
   // The weights that stream from their files read on the engine's readers.
   const ExpertStoreOptions experts{
       .memoryBytes = options.expertMemoryBytes, .floorBytes = options.expertFloorBytes, .readers = options.readers};
@@ -151,7 +153,7 @@ LoadedModel loadModel(metal::MetalBackend &backend,
         },
         result.target);
   }
-  result.draft = loadDFlashDraftWeights(backend, draft, result.descriptor.draft);
+  if (draft) result.draft = loadDFlashDraftWeights(backend, *draft, result.descriptor.draft);
   result.vision = loadVisionWeights(backend, images, vision.get());
 
   std::vector<WeightFileRecord> records(result.targetFiles().begin(),
