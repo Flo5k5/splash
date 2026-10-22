@@ -545,9 +545,9 @@ void requireQuantization(NSDictionary *config, const QwenTargetDimensions &geome
 // A DFlash2 checkpoint's config: the draft's layout. Its attention widths,
 // window, convolutions and selector must be those the draft kernels are built
 // for, and its block at least their rows; its hidden size, vocabulary and
-// mask token the target's;
-// and the target layers it reads (target_layer_ids) some of the target's,
-// ascending. Its layers, intermediate size and rotary base are its own.
+// mask token the target's; and the target layers it reads (target_layer_ids)
+// some of the target's, ascending. Its layers, intermediate size and rotary
+// base are its own.
 DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimensions &target) {
   NSArray *architectures =
       requireArray(draft, @"architectures", "draft architectures");

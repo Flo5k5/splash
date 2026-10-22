@@ -117,8 +117,8 @@ void testFamilies(const std::filesystem::path &fixtures) {
               moeDescriptor.visionSource == model::VisionSource::Safetensors &&
               moeDescriptor.draft == test::qwen3_6MoeDraft(),
           "an MLX Qwen3.6-35B-A3B made another descriptor");
-  // Qwen3.5-122B-A10B's model type is the Qwen3.6-35B-A3B's: its hidden size
-  // names its family.
+  // Qwen3.5-122B-A10B's model type is the Qwen3.6-35B-A3B's: its sizes
+  // name its family (describeSourceModel).
   const model::ModelDescriptor largeMoeDescriptor =
       inspect(mlxModel(fixtures, "qwen3.5-122b-a10b").with(&SourceModel::record, R"("none")", R"("safetensors")"));
   require(largeMoeDescriptor.target == model::TargetLayout{model::kQwen3_5_122BLayout} &&

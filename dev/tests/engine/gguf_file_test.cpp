@@ -97,6 +97,7 @@ void checkSplit(const std::filesystem::path &directory) {
                         "the GGUF's split files hold another number of tensors than split.tensors.count",
                         "accepted a split.tensors.count the parts do not hold");
 }
+
 // A split GGUF whose first part holds the metadata alone and ends at its
 // header, unpadded (its data section is empty), and whose tensors are in the
 // parts after it.
