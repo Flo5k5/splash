@@ -665,6 +665,28 @@ class UpstreamTest(unittest.TestCase):
                 self.assertFalse(chosen.models_root.exists())
                 shutil.rmtree(fake.remote)
 
+    def test_a_draft_that_ships_its_mask_embedding_installs_it(self):
+        # A release may ship its mask token's embedding beside its weights,
+        # which the draft reads in place of the target's token table row.
+        fake = FakeHub(self, self.cache)
+        fake.publish(MODEL, "a" * 40, lambda p: mlx_target(p, DENSE))
+
+        def release(root):
+            draft_dir(root, DENSE)
+            (root / upstream.DRAFT_MASK_EMBEDDING).write_bytes(b"mask")
+
+        fake.publish(DENSE.draft_repo, DRAFT_COMMIT, release)
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        self.assertEqual(
+            (chosen.link / "draft" / upstream.DRAFT_MASK_EMBEDDING).read_bytes(),
+            b"mask",
+        )
+        self.assertIn(
+            "draft/" + upstream.DRAFT_MASK_EMBEDDING,
+            assembly.verify(chosen.link)["files"],
+        )
+
     def test_source_assembly_pairs_the_draft_by_architecture(self):
         fake = FakeHub(self, self.cache)
         fake.publish(

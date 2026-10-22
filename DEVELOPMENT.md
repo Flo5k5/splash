@@ -1857,12 +1857,19 @@ target's, and its attention (32 query and 8 KV heads of 128), selector (rank
 and its block at least their 8 rows, of which a cycle drafts the first (the
 Qwen3.5-122B-A10B draft was trained to fill 16; `readDraftLayout` in
 `ModelDescriptor.mm`); the kernels take any hidden width of whole 16-channel
-convolution groups. Every family loads and runs its draft alike: a decode cycle
-drafts eight rows, the anchor and its seven proposals, and the target verifies
-their first rows, as many as the cycle chose for the lane (its verify rows,
-`ops::DraftSelector::addVerifyRows`), never more than the lane may still retain:
-the tokens its output budget leaves, at most all eight. A dense target verifies
-every row up to that limit: its
+convolution groups. A draft's rows after its anchor read the target's token
+table row of the mask token, unless its release ships that token's BF16
+embedding beside its weights: `mask_embedding.safetensors`, one tensor
+`mask_embedding` of the hidden size, which installation fetches with the weights
+(`DFlashDraft::addMaskRows`). A quantized table can lose the row:
+Qwen3.5-122B-A10B's is of order 1e-6, below what the fp16 block scales of Q8_0
+and the K-quants hold, so its GGUFs read zeros there, and its draft accepted 2.3
+tokens a cycle on code without the embedding, 4.7 with it. Every family loads
+and runs its draft alike: a decode cycle drafts eight rows, the anchor and its
+seven proposals, and the target verifies their first rows, as many as the cycle
+chose for the lane (its verify rows, `ops::DraftSelector::addVerifyRows`), never
+more than the lane may still retain: the tokens its output budget leaves, at
+most all eight. A dense target verifies every row up to that limit: its
 projections read their weights once for all of a cycle's rows, so a row costs it
 little. Each row a MoE target verifies routes its own experts, which a rejected
 row reads for nothing (a Qwen3.8-Flash-Next cycle of one lane routes about 43
