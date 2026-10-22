@@ -491,12 +491,12 @@ void QwenTarget::addCapture(metal::CommandGraph &graph, uint32_t slot, metal::Me
 }
 
 void QwenTarget::addResidualSteer(metal::CommandGraph &graph, metal::MetalBuffer residual, uint32_t index,
-                                  uint32_t rows) const {
+                                  uint32_t firstRow, uint32_t rows) const {
   const std::optional<ControlVector> &vector = weightsBase_.controlVector;
   if (!vector || !vector->steers(index)) return;
   ops::addResidualSteer(graph, std::move(residual), vector->directions,
                         {index, vector->mode == ControlVectorMode::Project, vector->scale}, geometry_.hiddenSize,
-                        rows);
+                        rows, firstRow);
 }
 
 namespace {
@@ -551,7 +551,9 @@ public:
           },
           layer.mixer);
       addVerifyFfn(step, layer, residual, output);
-      addResidualSteer(step.graph, output, index, step.rows);
+      for (uint32_t lane = 0; lane < step.lanes; ++lane)
+        if (step.buffers.steerLanes[lane])
+          addResidualSteer(step.graph, output, index, lane * kVerifyRows, kVerifyRows);
       if (const auto slot = geometry_.captureSlot(index))
         addCapture(step.graph, *slot, output, 0, buffers.capturedTargetHidden, 0, step.rows);
     }
@@ -597,7 +599,9 @@ private:
     const QwenTargetPrefillBuffers &b = step.buffers;
     if (const ops::BlockMoeWeights *ffn = moe(index)) ops::MoE::addRouted(step.graph, step.ffn, *ffn, *step.moe);
     addReadRows(step, b.hidden[index & 1], b.hidden[(index & 1) ^ 1]);
-    addResidualSteer(step.graph, b.hidden[(index & 1) ^ 1], index, step.rows);
+    for (const QwenTargetPrefillSequence &sequence : step.sequences)
+      if (sequence.request.steered)
+        addResidualSteer(step.graph, b.hidden[(index & 1) ^ 1], index, sequence.rowBegin, sequence.rows);
     forEachPrefillCapture(step, index, [&](uint32_t slot, uint32_t source, uint32_t destination, uint32_t rows) {
       addCapture(step.graph, slot, b.hidden[(index & 1) ^ 1], source, b.captured, destination, rows);
     });

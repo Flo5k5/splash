@@ -1671,7 +1671,8 @@ struct Runtime::Impl {
   // A request as the target reads it beyond a step's rows: its tokens, a
   // prefill's its prompt, and their RoPE positions.
   static QwenTargetRequest targetRequest(const Request &entry) {
-    return {entry.tokens, [&entry](uint64_t logical) { return ropePosition(entry, logical); }};
+    return {entry.tokens, [&entry](uint64_t logical) { return ropePosition(entry, logical); },
+            (entry.flags & RequestNoSteer) == 0};
   }
 
   // The states a sequence of `rows` rows captures inside them, in their
@@ -2237,6 +2238,8 @@ struct Runtime::Impl {
     buffers.chunkValues = chunkValues;
     buffers.moe = decodeArena->moeScratch(storage);
     buffers.verifyRows = decodeArena->batchSlice(DecodeTensor::VerifyRows, lanes);
+    for (uint32_t lane = 0; lane < lanes; ++lane)
+      buffers.steerLanes[lane] = (entries[lane]->flags & RequestNoSteer) == 0;
     for (uint32_t lane = 0; lane < lanes; ++lane)
       chunks[lane] = ops::PagedAttention::verifyParams(
           items[lane].logicalPosition,

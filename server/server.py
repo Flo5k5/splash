@@ -4,6 +4,7 @@ module in dialects/."""
 
 import argparse
 import errno
+import hashlib
 import json
 import math
 import os
@@ -1393,6 +1394,14 @@ def main():
         # --max-context it cannot serve.
         served = runtime.capabilities
         check_capabilities(tokenizer, family.chat_format, served)
+        control_vector_identity = None
+        if args.control_vector is not None:
+            with open(args.control_vector, "rb") as vector_file:
+                vector_digest = hashlib.sha256(vector_file.read()).hexdigest()
+            control_vector_identity = (
+                f"{vector_digest}:{args.control_vector_mode}:{args.control_vector_scale}"
+                f":{args.control_vector_layer_range}"
+            )
         app = Frontend(
             tokenizer,
             backend,
@@ -1411,6 +1420,7 @@ def main():
             announce_served_name=args.announce_served_name,
             default_reasoning_effort=args.default_reasoning_effort,
             default_thinking_token_budget=args.thinking_token_budget,
+            control_vector_identity=control_vector_identity,
         )
         server.app = app
         server.server_activate()

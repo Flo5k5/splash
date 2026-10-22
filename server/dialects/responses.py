@@ -535,6 +535,7 @@ def to_chat_body(body, items):
         "max_output_tokens",
         "ignore_eos",
         "chat_template_kwargs",
+        "control_vector",
         "preserve_thinking",
         "thinking_token_budget",
     ):

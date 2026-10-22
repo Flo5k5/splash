@@ -1163,6 +1163,51 @@ void residualSteerTest(MetalBackend &backend) {
         }
 }
 
+
+// A control vector's row window (firstRow): a steered process steers one
+// lane's or one sequence's rows of a larger residual, and the rows outside
+// the window are not read or written.
+void residualSteerWindowTest(MetalBackend &backend) {
+  std::mt19937 rng(37);
+  const uint32_t layers = 3, layer = 2, total = 12, first = 2, rows = 5;
+  for (const uint32_t hidden : {2048u, 5120u}) {
+    std::vector<float> directions = randoms(rng, layers * hidden, 0.05f);
+    double squares = 0.0;
+    for (uint32_t d = 0; d < hidden; ++d)
+      squares += double(directions[layer * hidden + d]) * directions[layer * hidden + d];
+    for (uint32_t d = 0; d < hidden; ++d)
+      directions[layer * hidden + d] = float(directions[layer * hidden + d] / std::sqrt(squares));
+    const auto values = bf16s(randoms(rng, total * hidden, 3.0f));
+    MetalBuffer residual = upload(backend, values);
+    CommandGraph graph;
+    ops::addResidualSteer(graph, residual, upload(backend, directions), {layer, true, 1.0f}, hidden, rows, first);
+    run(backend, graph);
+    const auto got = download<uint16_t>(residual, values.size());
+    const float *v = directions.data() + layer * hidden;
+    bool ok = true, orthogonal = true;
+    for (uint32_t r = 0; r < total; ++r) {
+      const uint16_t *x = values.data() + r * hidden;
+      const uint16_t *y = got.data() + r * hidden;
+      if (r < first || r >= first + rows) {
+        ok &= std::memcmp(x, y, hidden * sizeof(uint16_t)) == 0;
+        continue;
+      }
+      double dot = 0.0, after = 0.0, rowSquares = 0.0;
+      for (uint32_t d = 0; d < hidden; ++d) dot += double(f32(x[d])) * v[d];
+      for (uint32_t d = 0; d < hidden; ++d) {
+        const double in = f32(x[d]);
+        ok &= closeBf16(f32(y[d]), in - dot * v[d], 1e-2);
+        after += double(f32(y[d])) * v[d];
+        rowSquares += in * in;
+      }
+      orthogonal &= std::fabs(after) <= 0.02 * std::sqrt(rowSquares);
+    }
+    check(ok && orthogonal, "residual steer window, " + std::to_string(hidden) + " values x rows " +
+                                std::to_string(first) + ".." + std::to_string(first + rows - 1) + " of " +
+                                std::to_string(total));
+  }
+}
+
 // The control vector after a steered layer: each stream of each of the
 // dispatch's rows loses scale times its component along the unit direction
 // (project) or gains the scaled direction (add), against an fp64 reference,
@@ -1365,6 +1410,7 @@ int main(int argc, const char *argv[]) {
         pleExtentsTest(backend);
         steerTest(backend);
         residualSteerTest(backend);
+        residualSteerWindowTest(backend);
         controlVectorFileTest(backend);
       }
     } catch (const std::exception &error) {
