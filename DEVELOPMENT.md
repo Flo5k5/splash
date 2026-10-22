@@ -3492,7 +3492,11 @@ memory pressure, which the smaller GGUF variants such a Mac uses can reach under
 an agent's load; `SPLASH_TEST_PRESSURE_STOP=4` stops only at critical pressure,
 to observe how the engine sheds its cache. The runtime oracle in `test-real` has
 no production memory guard: the weights must fit in what macOS has available
-above its reserve. Its checks can neither wait for memory nor yield it, so the
+above its reserve. When they do not, it measures again every second for up to
+30 s before it stops, as a start waits for memory macOS refuses it: macOS can
+return the memory of a process that has just exited a moment later (on a 36 GB
+M5 Max, a server engine's memory came back within a second of its exit).
+Once it has loaded, its checks can neither wait for memory nor yield it, so the
 governor a start builds admits all the runtime then allocates, its arenas and
 the lanes, KV and cached states of the requests the oracle runs together, as
 memory a request in service needs: only the memory plan's budget and macOS's
