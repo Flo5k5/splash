@@ -2319,10 +2319,10 @@ reports (`loaded_model_layout_sha256`, `target_model_sha256`) cover it, so
 models of one layout from different sources never share a fingerprint.
 
 Runtime admission counts the images exactly once (`streamableWeights`, which
-the runtime oracle uses too). Before loading, startup refuses
-a model whose images, with the pipeline and runtime reserves, one lane's state,
-the KV runway and any disk tier state staging, exceed the hard budget, so a
-model that can never fit is not loaded.
+the runtime oracle and `weight-digests` use too). Before loading, startup
+refuses a model whose images, with the pipeline and runtime reserves, one
+lane's state, the KV runway and any disk tier state staging, exceed the hard
+budget, so a model that can never fit is not loaded.
 
 When the idle release passes without a request, the memory control between
 commands releases the images' memory (`WeightImages::release`): their buffers
@@ -3589,7 +3589,9 @@ as `7G`, in `verify-models` and in both builds of the comparison with
 leave out their routed experts, and a PLE table that streams has no image
 (`ple.bin`): the engine reads those bytes from the source files, which
 `verify --full` hashes, and the digests do not cover them. Any size a store
-takes records the same images.
+takes records the same images. Where the images and stores of a load exceed
+the engine's Metal memory budget, `weight-digests` refuses it before loading
+any image and names the options.
 
 Results go to `build/release/<owner>--<repo>[--VARIANT]/`. The weight images
 do not depend on the GPU, so each model's `weights.json`, recorded with the

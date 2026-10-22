@@ -13,7 +13,6 @@
 #include "model/KvBlockCache.hpp"
 #include "model/KvCopyRead.hpp"
 #include "model/KvHistoryStream.hpp"
-#include "model/ModelSizing.hpp"
 #include "model/Runtime.hpp"
 #include "model/Qwen4Exp.hpp"
 #include "model/Qwen4Steps.hpp"
@@ -3925,11 +3924,7 @@ int main(int argc, char **argv) {
     // Metal operation while loading. This oracle has no such guard, so the
     // weights must fit in reclaimable memory above the macOS reserve before
     // any is loaded; it can refuse a model production starts.
-    const model::StreamableWeights streamable = model::streamableWeights(
-        modelRoot, descriptor,
-        {.streamExperts = loadOptions.expertMemoryBytes != 0, .streamTable = loadOptions.streamedTableBytes != 0});
-    const uint64_t weightBytes = streamable.loadedBytes + (streamable.expertBytes ? loadOptions.expertMemoryBytes : 0) +
-                                 (streamable.tableBytes ? loadOptions.streamedTableBytes : 0);
+    const uint64_t weightBytes = tools::weightBytes(modelRoot, descriptor, loadOptions);
     if (*hostAvailableBytes <= hostReserveBytes ||
         weightBytes > *hostAvailableBytes - hostReserveBytes)
       stopForHostMemory("the weights need " + mebibytes(weightBytes) + ", and macOS has " +
