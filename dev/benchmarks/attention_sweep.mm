@@ -12,7 +12,7 @@
 // case prints a digest of its output: two builds that fill the same pages must
 // print the same digests, whatever their storage.
 //
-// usage: attention-sweep METALLIB [--histories 0,2048,...] [--shapes 27b,35b,fn]
+// usage: attention-sweep METALLIB [--histories 0,2048,...] [--shapes 27b,35b,122b,fn]
 //                        [--lanes 1,4] [--repeat N] [--phases both|verify|prefill]
 //                        [--compare-metallib PATH] [--kv-format int8|bf16]
 //                        [--extent-pages N] [--qsa shared|independent|overlapping|pages|indexer]
@@ -94,7 +94,7 @@ constexpr uint32_t kPrefillRows = SPLASH_PREFILL_TOKEN_BUDGET;
 constexpr uint32_t kLayer = 1;
 // The memory plan's extents of the full models: 16, 10 and 12 attention
 // layers.
-constexpr uint32_t kModelLayers27b = 16, kModelLayers35b = 10, kModelLayersFn = 12;
+constexpr uint32_t kModelLayers27b = 16, kModelLayers35b = 10, kModelLayers122b = 12, kModelLayersFn = 12;
 // Qwen3.8-Flash-Next's QSA: the indexer's top_k of 2048 tokens in blocks of 4.
 constexpr uint32_t kQsaTopBlocks = 512, kQsaBlockTokens = SPLASH_ATTENTION_BLOCK_TOKENS;
 // --qsa overlapping: the blocks a tile's rows choose theirs from, three times
@@ -104,16 +104,23 @@ constexpr uint32_t kQsaOverlapBlocks = 3 * kQsaTopBlocks;
 
 AttentionShape shapeOf(const std::string &shape, kv::Format format) {
   if (shape == "fn") return AttentionShape{24, 2, 256, format, true};
+  if (shape == "122b") return AttentionShape{32, 2, 256, format};
   return shape == "27b" ? AttentionShape{24, 4, 256, format}
                         : AttentionShape{16, 2, 256, format};
 }
 
 uint32_t modelLayers(const std::string &shape) {
-  return shape == "27b" ? kModelLayers27b : shape == "35b" ? kModelLayers35b : kModelLayersFn;
+  return shape == "27b"    ? kModelLayers27b
+         : shape == "35b"  ? kModelLayers35b
+         : shape == "122b" ? kModelLayers122b
+                           : kModelLayersFn;
 }
 
 std::string modelName(const std::string &shape) {
-  return shape == "27b" ? "qwen3.8-27b" : shape == "35b" ? "qwen3.6-35b-a3b" : "qwen3.8-flash-next";
+  return shape == "27b"    ? "qwen3.8-27b"
+         : shape == "35b"  ? "qwen3.6-35b-a3b"
+         : shape == "122b" ? "qwen3.5-122b-a10b"
+                           : "qwen3.8-flash-next";
 }
 
 // A 32-bit mix of a block (and a row), uniform enough to scatter selections.
@@ -560,7 +567,7 @@ std::string json(const Case &item, const std::string &shape, uint32_t history,
 int main(int argc, const char *argv[]) {
   try {
     if (argc < 2) {
-      std::cerr << "usage: attention-sweep METALLIB [--histories LIST] [--shapes 27b,35b,fn] "
+      std::cerr << "usage: attention-sweep METALLIB [--histories LIST] [--shapes 27b,35b,122b,fn] "
                    "[--lanes LIST] [--repeat N] [--phases both|verify|prefill] "
                    "[--compare-metallib PATH] [--kv-format int8|bf16] "
                    "[--extent-pages N] [--qsa shared|independent|overlapping|pages|indexer] "
@@ -617,8 +624,8 @@ int main(int argc, const char *argv[]) {
           const size_t comma = value.find(',', start);
           const std::string shape =
               value.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
-          if (shape != "27b" && shape != "35b" && shape != "fn")
-            throw std::invalid_argument("--shapes takes 27b, 35b or fn");
+          if (shape != "27b" && shape != "35b" && shape != "122b" && shape != "fn")
+            throw std::invalid_argument("--shapes takes 27b, 35b, 122b or fn");
           shapes.push_back(shape);
           if (comma == std::string::npos) break;
           start = comma + 1;

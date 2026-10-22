@@ -1631,10 +1631,20 @@ weight file is downloaded for either. Tensor shapes, and an MLX vision tower's
 weights, which must not be quantized (`VisionLoader.cpp`), are checked only
 when the model loads.
 `families.FAMILIES` names the draft trained for each family; repository names
-and model-card `base_model` fields play no part. An MLX target must declare
-`quantization` in `config.json` in formats it loads ([MLX
-targets](#mlx-targets)). Every start checks the configuration again. Remote
-Python code is not loaded.
+and model-card `base_model` fields play no part. Families of one model type,
+Qwen3.6-35B-A3B and Qwen3.5-122B-A10B (`qwen3_5_moe_text`, GGUF `qwen35moe`),
+are told apart by their sizes, and a fine-tune of either, such as
+Ornith-1.5-35B-A3B or Ornith-1.5-122B, is its family. A layout type
+(`Qwen3_8.hpp`, `Qwen3_6Moe.hpp`, `Qwen4Exp.hpp` in `runtime/model/`) is an
+architecture, whose code its families share, and each family is a value of it in
+one list, `model::kFamilies` (`ModelDescriptor.hpp`): another size of an
+architecture is one more value there, its draft in `families.FAMILIES`, and, for
+a GDN or attention shape no family had, its kernel instances and a row of the
+compiled shapes in `ops/GDN.cpp` or `ops/PagedAttention.cpp`. The kernel tests
+take every family's shapes from that list (`dev/tests/engine/TestFamilies.hpp`).
+An MLX target must declare `quantization` in `config.json` in formats it loads
+([MLX targets](#mlx-targets)). Every start checks the configuration again.
+Remote Python code is not loaded.
 
 ```bash
 splash serve --model mlx-community/Qwen3.6-35B-A3B-4bit
@@ -1843,14 +1853,16 @@ A draft's `config.json` states its layers, intermediate size, rotary base and
 the target layers whose outputs it reads (`dflash_config.target_layer_ids`,
 ascending, at most eight); its hidden size, vocabulary and mask token are its
 target's, and its attention (32 query and 8 KV heads of 128), selector (rank
-256, 16 candidates), block of 8 rows and 2048-token window are those the kernels
-are built for (`readDraftLayout` in `ModelDescriptor.mm`); the kernels take any
-hidden width of whole 16-channel convolution groups. Every family loads and runs
-its draft alike: a decode cycle drafts the whole block, the anchor and its seven
-proposals, and the target verifies the block's first rows, as many as the cycle
-chose for the lane (its verify rows, `ops::DraftSelector::addVerifyRows`), never
-more than the lane may still retain: the tokens its output budget leaves, at
-most all eight. A dense target verifies every row up to that limit: its
+256, 16 candidates) and 2048-token window are those the kernels are built for,
+and its block at least their 8 rows, of which a cycle drafts the first (the
+Qwen3.5-122B-A10B draft was trained to fill 16; `readDraftLayout` in
+`ModelDescriptor.mm`); the kernels take any hidden width of whole 16-channel
+convolution groups. Every family loads and runs its draft alike: a decode cycle
+drafts eight rows, the anchor and its seven proposals, and the target verifies
+their first rows, as many as the cycle chose for the lane (its verify rows,
+`ops::DraftSelector::addVerifyRows`), never more than the lane may still retain:
+the tokens its output budget leaves, at most all eight. A dense target verifies
+every row up to that limit: its
 projections read their weights once for all of a cycle's rows, so a row costs it
 little. Each row a MoE target verifies routes its own experts, which a rejected
 row reads for nothing (a Qwen3.8-Flash-Next cycle of one lane routes about 43

@@ -132,12 +132,16 @@ struct QwenTargetDimensions {
   bool operator==(const QwenTargetDimensions &) const = default;
 };
 
-// A family's layout: its dimensions and the cache layouts they make. A
-// family sets every value its FFN uses and states what names it among the
-// families: its name, its config's model type, the architecture of its GGUFs
-// and whether a safetensors checkpoint of it loads (family, modelType,
+// A family's layout: its name, its dimensions and the cache layouts they
+// make. A layout type is an architecture, whose code its families share; each
+// family is a value of it (model::kFamilies) that sets every value its FFN
+// uses. The type states its config's model type, the architecture of its GGUFs
+// and whether a safetensors checkpoint of it loads (modelType,
 // ggufArchitecture, loadsSafetensors).
 struct QwenHybridLayout : QwenTargetDimensions {
+  // The family's name, as the installer pairs its draft (install/families.py).
+  std::string_view family;
+
   // The KV pages, which also hold a QSA indexer's pooled keys; a QSA target's
   // sparse attention gathers blocks of tokens, so its values are token-major.
   [[nodiscard]] constexpr kv::Layout kvLayout() const noexcept {

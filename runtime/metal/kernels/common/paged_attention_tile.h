@@ -14,9 +14,10 @@ using namespace mpp::tensor_ops;
 // store writes current rows to their final slots; committed_tokens controls
 // visibility, and the next command overwrites rejected verify rows.
 //
-// A threadgroup owns one KV head, query tile and history split. It processes
-// the tile's GQA group as M = rows x query heads per KV head. Each split writes
-// fp32 partials and statistics for a fixed-order reduce.
+// A threadgroup owns one KV head, query tile (or a part of one,
+// splash_attention_tile_part) and history split. It processes the GQA group
+// as M = rows x query heads per KV head, at most 64. Each split writes fp32
+// partials and statistics for a fixed-order reduce.
 //
 // Prefill and verify share this device-operand page loop.
 constant uint SplashVerifyMaximumSplits =
@@ -95,6 +96,26 @@ inline SplashAttentionTile splash_prefill_attention_tile(
           (ulong(tile) * KVHeads + kv_head) * params.split_count,
           params.committed_tokens + start, min(SplashPrefillTileRows, params.rows - start),
           params.split_count, true};
+}
+
+// Part `part` of a tile run as Parts parts of RowsPerTile / Parts rows each
+// (SPLASH_ATTENTION_TILE_PARTS: at most 64 fused rows each, the 256-thread page
+// loop's), each a threadgroup of the split over the same pages. A part is a
+// tile of its own rows: their queries and output, positions and active rows,
+// and partial slots of its own, slot_stride (the slot splits of each of the
+// tile's slots) apart. A part past the tile's active rows is inactive. One
+// part is the tile.
+template <uint QueryHeadsPerKVHead, uint RowsPerTile, uint Parts>
+inline SplashAttentionTile splash_attention_tile_part(SplashAttentionTile tile, uint part,
+                                                      uint slot_stride) {
+  static_assert(Parts > 0 && RowsPerTile % Parts == 0, "parts of whole rows");
+  constexpr uint Rows = RowsPerTile / Parts;
+  const uint first = part * Rows;
+  if (!tile.active || first >= tile.active_rows)
+    return {};
+  return {tile.offset + ulong(first) * QueryHeadsPerKVHead * SplashKvHeadDimension,
+          tile.first_slot * Parts + ulong(part) * slot_stride, tile.first_position + first,
+          min(Rows, tile.active_rows - first), tile.splits, true};
 }
 
 // Split and reduce derive the same balanced partition of each query tile's

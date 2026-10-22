@@ -13,7 +13,8 @@ namespace splash::test {
 
 // The DFlash2 drafts the configs in dev/tests/fixtures/model-configs
 // describe (model/ModelDescriptor.mm readDraftLayout): the released drafts
-// of Qwen3.8-27B and Qwen3.6-35B-A3B, and one of made-up sizes for
+// of Qwen3.8-27B, Qwen3.6-35B-A3B and Qwen3.5-122B-A10B (Ornith-1.5-122B's,
+// trained to fill a block of 16), and one of made-up sizes for
 // Qwen3.8-Flash-Next.
 [[nodiscard]] inline model::DFlashDraftLayout qwen3_8Draft() {
   constexpr model::Qwen3_8Layout target;
@@ -24,6 +25,11 @@ namespace splash::test {
   constexpr model::Qwen3_6MoeLayout target;
   constexpr std::array<uint32_t, 8> targetLayers{1, 6, 11, 16, 22, 27, 32, 37};
   return model::draftLayout(target.hiddenSize, target.vocabularySize, 6, 6144, 10'000'000.0F, targetLayers);
+}
+[[nodiscard]] inline model::DFlashDraftLayout qwen3_5_122BDraft() {
+  constexpr model::Qwen3_6MoeLayout target = model::kQwen3_5_122BLayout;
+  constexpr std::array<uint32_t, 8> targetLayers{1, 7, 14, 20, 26, 32, 39, 45};
+  return model::draftLayout(target.hiddenSize, target.vocabularySize, 6, 9216, 10'000'000.0F, targetLayers);
 }
 [[nodiscard]] inline model::DFlashDraftLayout flashNextDraft() {
   constexpr model::Qwen4ExpLayout target;
