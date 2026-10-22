@@ -339,6 +339,10 @@ class GenerationOptions:
     # The thinking tokens of a request that thinks, after which its thinking
     # closes; None for no cap.
     thinking_token_budget: int | None
+    # The process's control vector is loaded and this request opted out of
+    # steering (control_vector: false); False steers, as does every request
+    # of a process without a vector.
+    control_vector_off: bool
 
 
 class Frontend:
@@ -361,6 +365,7 @@ class Frontend:
         announce_served_name=False,
         default_reasoning_effort=None,
         default_thinking_token_budget=None,
+        control_vector_identity=None,
     ):
         if not isinstance(preparation_capacity, int) or preparation_capacity <= 0:
             raise ValueError("frontend preparation capacity must be positive")
@@ -386,6 +391,10 @@ class Frontend:
         # The model id the engine loaded. /status reports it, so an alias
         # can never hide what served a request (#81).
         self.model = model
+        # The loaded control vector's identity (file digest, mode, scale,
+        # range) when --control-vector armed one: requests share cached
+        # prompts only within a steering state, which _cache_salt names.
+        self.control_vector_identity = control_vector_identity
         served = tuple(parse_served_model_name(name) for name in served_model_names)
         if announce_served_name and not served:
             raise ValueError("announce_served_name needs a served model name")
@@ -754,18 +763,34 @@ class Frontend:
             raise APIError(400, "priority must be foreground, normal, or background")
         return _PRIORITIES[priority_name]
 
-    @staticmethod
-    def _cache_salt(body):
+    def _cache_salt(self, body, *, unsteered=False):
         """The request's cache_salt as the engine keys its cache: 128 bits of
         its hash, zero without one. A request shares cached prompts only with
-        requests of the same salt."""
+        requests of the same salt. A process with a control vector steers its
+        cache by steering state too: the vector's identity and whether this
+        request steers enter the hash, so a steered prefix is never read for
+        an unsteered request, or another vector's."""
         salt = body.get("cache_salt")
-        if salt is None:
-            return 0
-        if not isinstance(salt, str) or not salt:
-            raise APIError(400, "cache_salt must be a non-empty string")
+        base = 0
+        if salt is not None:
+            if not isinstance(salt, str) or not salt:
+                raise APIError(400, "cache_salt must be a non-empty string")
+            base = int.from_bytes(
+                hashlib.blake2b(
+                    salt.encode("utf-8", "surrogatepass"),
+                    digest_size=16,
+                    person=b"splash-salt",
+                ).digest(),
+                "little",
+            )
+        if self.control_vector_identity is None:
+            return base
         digest = hashlib.blake2b(
-            salt.encode("utf-8", "surrogatepass"), digest_size=16, person=b"splash-salt"
+            base.to_bytes(16, "little")
+            + self.control_vector_identity.encode("utf-8")
+            + (b"\x00" if unsteered else b"\x01"),
+            digest_size=16,
+            person=b"splash-salt",
         ).digest()
         return int.from_bytes(digest, "little")
 
@@ -1343,14 +1368,25 @@ class Frontend:
             )
         elif budget == -1:
             budget = None
+        control_vector = body.get("control_vector")
+        if control_vector is not None and not isinstance(control_vector, bool):
+            raise APIError(400, "control_vector must be a boolean")
+        if control_vector and self.control_vector_identity is None:
+            raise APIError(
+                400, "control_vector: true, but this process loaded no control vector"
+            )
+        control_vector_off = (
+            self.control_vector_identity is not None and control_vector is False
+        )
         return GenerationOptions(
             wire.SamplingParameters(top_k=top_k, **numbers),
             stop_sequences,
             ignore_eos,
             seed,
             self._priority(body),
-            self._cache_salt(body),
+            self._cache_salt(body, unsteered=control_vector_off),
             budget,
+            control_vector_off,
         )
 
     def _output_budget(self, requested, prompt_tokens, field):
@@ -1377,10 +1413,9 @@ class Frontend:
             priority=options.priority,
             cache_salt=options.cache_salt,
             stop_sequences=options.stop_sequences,
-            flags=(
-                wire.RequestFlag.IGNORE_END_OF_SEQUENCE
-                if options.ignore_eos
-                else wire.RequestFlag(0)
+            flags=wire.RequestFlag(
+                (wire.RequestFlag.IGNORE_END_OF_SEQUENCE if options.ignore_eos else 0)
+                | (wire.RequestFlag.NO_STEER if options.control_vector_off else 0)
             ),
             public_id=secrets.token_hex(16),
             **fields,

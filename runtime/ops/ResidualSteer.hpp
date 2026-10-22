@@ -20,11 +20,11 @@ struct ResidualSteer final {
   float scale = 1.0F;
 };
 
-// Steers `rows` rows of `residual`, rows of `hiddenSize` bf16 values, by row
-// `steer.layer` of `directions`, a table of fp32 rows of `hiddenSize` values
-// the target owns (model/ControlVector.hpp). The rows past `rows` are not
-// read or written.
+// Steers `rows` rows of `residual` from row `firstRow` on, rows of
+// `hiddenSize` bf16 values, by row `steer.layer` of `directions`, a table of
+// fp32 rows of `hiddenSize` values the target owns (model/ControlVector.hpp).
+// The rows outside [firstRow, firstRow + rows) are not read or written.
 void addResidualSteer(metal::CommandGraph &graph, metal::MetalBuffer residual, metal::MetalBuffer directions,
-                      ResidualSteer steer, uint32_t hiddenSize, uint32_t rows);
+                      ResidualSteer steer, uint32_t hiddenSize, uint32_t rows, uint32_t firstRow = 0);
 
 }  // namespace splash::ops

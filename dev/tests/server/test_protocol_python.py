@@ -758,11 +758,13 @@ class ProtocolPythonTests(unittest.TestCase):
             struct.unpack_from("<I", wire, p.FRAME_HEADER_BYTES + OFFSET["flags"])[0], 1
         )
         self.assertEqual(decode_client(wire), request)
+        unsteered = replace(request, flags=request.flags | p.RequestFlag.NO_STEER)
+        self.assertEqual(decode_client(p.serialize_message(unsteered)), unsteered)
         # An undefined bit, or ignoring end-of-sequence where a grammar or
         # scoring decides the output, fails the request.
         cases = [
             (replace(request, flags=flags), p.IssueCode.INVALID_ENUM_VALUE)
-            for flags in (1 << 2, 1 << 31, 0xFFFFFFFF, True, -1, 1 << 32, 1.0)
+            for flags in (1 << 3, 1 << 31, 0xFFFFFFFF, True, -1, 1 << 32, 1.0)
         ] + [
             (
                 replace(base, flags=p.RequestFlag.IGNORE_END_OF_SEQUENCE),

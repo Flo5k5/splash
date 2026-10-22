@@ -12,21 +12,22 @@
 #endif
 
 // A control vector's change to `rows` rows of `hidden` bf16 values of the
-// residual after a steered layer, with row `layer` of a table of directions
-// of `hidden` fp32 values: every value h becomes h + scale v (add), or
-// h - scale (h . v) v (project, v of unit length). A threadgroup of
-// RESIDUAL_STEER_THREADS threads steers one row.
+// residual after a steered layer, starting at row `firstRow`, with row
+// `layer` of a table of directions of `hidden` fp32 values: every value h
+// becomes h + scale v (add), or h - scale (h . v) v (project, v of unit
+// length). A threadgroup of RESIDUAL_STEER_THREADS threads steers one row.
 #define RESIDUAL_STEER_THREADS 256u
 #define RESIDUAL_STEER_ADD 0u
 #define RESIDUAL_STEER_PROJECT 1u
 
 struct ResidualSteerParams {
   uint32_t rows;
+  uint32_t firstRow;
   uint32_t hidden;
   uint32_t layer;
   uint32_t mode;
   float scale;
 };
 
-static_assert(sizeof(ResidualSteerParams) == 20,
-              "residual steer parameters are 20 bytes on both sides");
+static_assert(sizeof(ResidualSteerParams) == 24,
+              "residual steer parameters are 24 bytes on both sides");

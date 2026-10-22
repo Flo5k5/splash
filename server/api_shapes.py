@@ -595,6 +595,7 @@ def responses_to_chat_body(body, items):
         "stop",
         "max_output_tokens",
         "ignore_eos",
+        "control_vector",
         "chat_template_kwargs",
         "preserve_thinking",
         "thinking_token_budget",
