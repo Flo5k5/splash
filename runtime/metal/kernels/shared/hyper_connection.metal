@@ -302,7 +302,7 @@ kernel void hyper_connection_steer(device float *streams [[buffer(0)]],
   threadgroup float partial[kSimdgroups];
   const uint row = group.x, stream = group.y;
   if (row >= p.rows || stream >= p.streams) return;
-  device float *x = streams + (ulong(row) * p.streams + stream) * p.hidden;
+  device float *x = streams + ((ulong(p.firstRow + row)) * p.streams + stream) * p.hidden;
   device const float *v = directions + ulong(p.layer) * p.hidden;
   if (p.mode == HYPER_CONNECTION_STEER_ADD) {
     for (uint d = tid; d < p.hidden; d += kRowThreads) x[d] = fma(p.scale, v[d], x[d]);
