@@ -170,8 +170,15 @@ FIRST-LAST` limits it to those layers; a layer without a direction, or with a
 zero one, is left alone. The engine logs what it runs, e.g. `Control vector:
 project, layers 4..44 (41 steered), scale 1`.
 
-The vector is fixed for the process: every request, prefill and decode, runs
-on it. The DFlash2 draft reads the steered layer outputs it captures, and the
+A request opts out of a loaded vector with `"control_vector": false` in its
+body: its prefill rows and decode lanes run unsteered in the same process,
+and its cached prompts are salted apart from steered ones, so a prefix
+computed one way is never read for the other. `true` is the default; without
+a vector armed, `true` is a request error and everything else behaves exactly
+as before the field existed.
+
+The vector is fixed for the process: every request that does not opt out,
+prefill and decode, runs on it. The DFlash2 draft reads the steered layer outputs it captures, and the
 target verifies its proposals, so outputs are the steered target's. The
 vector's mode, scale, layers and directions name the persistent cache's
 directory: caches computed with one vector are never read without it, or with

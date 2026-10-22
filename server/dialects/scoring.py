@@ -635,7 +635,7 @@ def prepare_judgment(app, body, *, deadline, disconnected):
     except ValueError as error:
         raise APIError(400, str(error)) from error
     priority = request_fields.priority(body)
-    cache_salt = request_fields.cache_salt(body)
+    cache_salt = app.cache_salt(body)
     checkpoint = _preparation_checkpoint(deadline, disconnected)
     with app.preparation(deadline):
 
@@ -675,7 +675,7 @@ def prepare_systemone(app, body, *, deadline, disconnected):
     except APIError as error:
         details.append(field_error(["priority"], error.message))
     try:
-        cache_salt = request_fields.cache_salt(body)
+        cache_salt = app.cache_salt(body)
     except APIError as error:
         details.append(field_error(["cache_salt"], error.message))
     if details:

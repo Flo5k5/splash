@@ -221,6 +221,10 @@ struct QwenTargetStateCapture final {
 struct QwenTargetRequest final {
   std::span<const uint32_t> tokens;
   std::function<std::array<uint32_t, 3>(uint64_t)> rotary;
+  // The request's rows steer with the process's control vector, which every
+  // request does unless it opted out (RequestNoSteer); a target without one
+  // ignores it.
+  bool steered = false;
 };
 
 // A lane's rows of a prefill chunk: `tokens`, of positions from
@@ -314,6 +318,10 @@ struct QwenPrefillLayers final {
 };
 
 struct QwenTargetVerifyBuffers final {
+  // Whether each lane's request steers with the process's control vector;
+  // a request that opted out (RequestNoSteer) does not. A target without a
+  // vector ignores the bits.
+  std::array<bool, ExecutionLimits::maximumBatchWidth> steerLanes{};
   ops::LinearScratch linearScratch{};
   std::array<metal::MetalBuffer, 2> hidden;
   metal::MetalBuffer normalized;
@@ -684,12 +692,14 @@ protected:
   void addCapture(metal::CommandGraph &graph, uint32_t slot, metal::MetalBuffer output, uint32_t sourceRow,
                   metal::MetalBuffer captured, uint32_t destinationRow, uint32_t rows) const;
   // The target's control vector (QwenTargetWeightsBase::controlVector) after
-  // layer `index`, where it steers it: on `rows` rows of `residual`, the
-  // layer's output of one row of hiddenSize values its FFN has just written,
-  // before the draft's capture, so the DFlash2 draft reads the outputs the
-  // target runs on. Nothing without a vector or for a layer it leaves alone.
+  // layer `index`, where it steers it: on `rows` rows of `residual` from row
+  // `firstRow`, the layer's output of one row of hiddenSize values its FFN has
+  // just written, before the draft's capture, so the DFlash2 draft reads the
+  // outputs the target runs on. Nothing without a vector or for a layer it
+  // leaves alone. A family steers only the rows of a request that did not opt
+  // out (RequestNoSteer): a verify lane's or a prefill sequence's at a time.
   void addResidualSteer(metal::CommandGraph &graph, metal::MetalBuffer residual, uint32_t index,
-                        uint32_t rows) const;
+                        uint32_t firstRow, uint32_t rows) const;
   // Each of a prefill step's captures of layer `index`'s output rows, when
   // the draft reads the layer: capture(slot, source row, destination row,
   // rows) of the captured hidden rows' slot `slot`.

@@ -277,6 +277,10 @@ class GenerationOptions:
     # The thinking tokens of a request that thinks, after which its thinking
     # closes; None for no cap.
     thinking_token_budget: int | None
+    # The process's control vector is loaded and this request opted out of
+    # steering (control_vector: false); False steers, as does every request
+    # of a process without a vector.
+    control_vector_off: bool
 
 
 class Frontend:
@@ -298,6 +302,7 @@ class Frontend:
         default_reasoning_effort=None,
         default_thinking_token_budget=None,
         sampling_defaults=None,
+        control_vector_identity=None,
     ):
         # What the engine serves, from its Ready (backend.runtime.capabilities):
         # the context follows the latest engine (max_context); its lanes and
@@ -328,6 +333,10 @@ class Frontend:
         # The model id the engine loaded. /status reports it, so an alias
         # can never hide what served a request.
         self.model = model
+        # The loaded control vector's identity (file digest, mode, scale,
+        # range) when --control-vector armed one: requests share cached
+        # prompts only within a steering state, which _cache_salt names.
+        self.control_vector_identity = control_vector_identity
         names = tuple(served_model_names)
         if announce_served_name and not names:
             raise ValueError("announce_served_name needs a served model name")
@@ -715,6 +724,24 @@ class Frontend:
                 raise APIError(400, "content could not be tokenized") from error
             remaining_request_time(deadline)
             return tokens
+
+    def cache_salt(self, body, *, unsteered=False):
+        """The request's cache_salt as the engine keys its cache
+        (request_fields.cache_salt). A process with a control vector keeps its
+        cache apart by steering state too: the vector's identity and whether
+        this request steers enter the hash, so a steered prefix is never read
+        for an unsteered request, or another vector's."""
+        base = request_fields.cache_salt(body)
+        if self.control_vector_identity is None:
+            return base
+        digest = hashlib.blake2b(
+            base.to_bytes(16, "little")
+            + self.control_vector_identity.encode("utf-8")
+            + (b"\x00" if unsteered else b"\x01"),
+            digest_size=16,
+            person=b"splash-salt",
+        ).digest()
+        return int.from_bytes(digest, "little")
 
     def score_job(self, prompt_tokens, slot_ids, deadline, priority, cache_salt):
         """A job that reads the logits of `slot_ids` where the prompt ends and
@@ -1151,14 +1178,25 @@ class Frontend:
             )
         elif budget == -1:
             budget = None
+        control_vector = body.get("control_vector")
+        if control_vector is not None and not isinstance(control_vector, bool):
+            raise APIError(400, "control_vector must be a boolean")
+        if control_vector and self.control_vector_identity is None:
+            raise APIError(
+                400, "control_vector: true, but this process loaded no control vector"
+            )
+        control_vector_off = (
+            self.control_vector_identity is not None and control_vector is False
+        )
         return GenerationOptions(
             wire.SamplingParameters(top_k=top_k, **numbers),
             stop_sequences,
             ignore_eos,
             seed,
             request_fields.priority(body),
-            request_fields.cache_salt(body),
+            self.cache_salt(body, unsteered=control_vector_off),
             budget,
+            control_vector_off,
         )
 
     def _output_budget(self, requested, prompt_tokens, field):
@@ -1181,6 +1219,8 @@ class Frontend:
         generation options set."""
         if options.ignore_eos:
             flags |= wire.RequestFlag.IGNORE_END_OF_SEQUENCE
+        if options.control_vector_off:
+            flags |= wire.RequestFlag.NO_STEER
         return Job(
             request_id=next(self.ids),
             prompt_tokens=prompt_tokens,

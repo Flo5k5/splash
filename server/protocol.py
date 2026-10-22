@@ -200,13 +200,19 @@ class RequestFlag(IntFlag):
     # Never select the model's stop tokens, so generation runs to its output
     # limit. Only unconstrained generation can carry it.
     IGNORE_END_OF_SEQUENCE = 1 << 0
+    # Leave the request's rows alone where the process's control vector
+    # (--control-vector) would steer them; a request without the bit steers,
+    # as every request of a steered process did before the bit existed.
+    NO_STEER = 1 << 2
     # Report the prompt's progress while it prefills (PromptProgressEvent).
     RETURN_PROGRESS = 1 << 1
 
 
 # A request with any other bit set is a request error.
 _REQUEST_FLAG_BITS = int(
-    RequestFlag.IGNORE_END_OF_SEQUENCE | RequestFlag.RETURN_PROGRESS
+    RequestFlag.IGNORE_END_OF_SEQUENCE
+    | RequestFlag.RETURN_PROGRESS
+    | RequestFlag.NO_STEER
 )
 
 

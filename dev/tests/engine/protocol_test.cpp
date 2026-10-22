@@ -28,6 +28,7 @@ using namespace splash::protocol;
 using splash::ConstraintMode;
 using splash::ImageSpan;
 using splash::RequestIgnoreEndOfSequence;
+using splash::RequestNoSteer;
 using splash::SamplingParameters;
 using splash::ThinkingBudget;
 using splash::engine::EngineFinishReason;
@@ -919,9 +920,9 @@ void testSamplingBlock() {
 }
 
 // The flags word follows the generation prompt count. Any request can ask
-// for its prompt's progress, unconstrained generation can ignore
-// end-of-sequence; an undefined bit, or that flag on a constrained or score
-// request, is the request's own error.
+// for its prompt's progress or opt out of the control vector, unconstrained
+// generation can ignore end-of-sequence; an undefined bit, or that flag on a
+// constrained or score request, is the request's own error.
 void testRequestFlags() {
   constexpr std::string_view test = "request flags";
   RequestFrame request = exampleIgnoreEosRequest();
@@ -929,7 +930,10 @@ void testRequestFlags() {
   RequestFrame progress = request;
   progress.flags |= kReturnProgressFlag;
   CHECK(test, roundTrip(progress) == progress);
-  for (const uint32_t flags : {1U << 2, 1U << 31, 0xffffffffU}) {
+  RequestFrame unsteered = request;
+  unsteered.flags |= RequestNoSteer;
+  CHECK(test, roundTrip(unsteered) == unsteered);
+  for (const uint32_t flags : {1U << 3, 1U << 31, 0xffffffffU}) {
     RequestFrame undefined = request;
     undefined.flags = flags;
     expectRequestIssue(test, undefined, IssueCode::InvalidEnumValue);

@@ -26,7 +26,7 @@ kernel void residual_steer(device bfloat *residual [[buffer(0)]],
                            uint sg [[simdgroup_index_in_threadgroup]]) {
   if (row >= p.rows) return;
   threadgroup float partial[kSimdgroups];
-  device bfloat *x = residual + ulong(row) * p.hidden;
+  device bfloat *x = residual + ulong(p.firstRow + row) * p.hidden;
   device const float *v = directions + ulong(p.layer) * p.hidden;
   if (p.mode == RESIDUAL_STEER_ADD) {
     for (uint d = tid; d < p.hidden; d += kThreads) x[d] = bfloat(fma(p.scale, v[d], float(x[d])));
