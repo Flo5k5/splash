@@ -333,15 +333,19 @@ def mlx_target(repo, language_only):
         for path in ("config.json", "target/config.json", "tokenizer/config.json")
     }
     files |= {"tokenizer/" + n: n for n in TOKENIZER_FILES if n in repo.files}
+    # The target's shards: those holding a tensor other than the tower's. A
+    # tower in a shard of its own is not the target's (an OptiQ checkpoint
+    # keeps it in a subdirectory).
+    files |= {"target/" + n: n for n in _weight_files(repo, exclude=VISION_TOWER)}
     vision_format = "none"
     if not language_only:
-        # A refusal of the tower's processor or configuration refuses the
-        # vision alone; its shards are the checkpoint's, read as the text's.
+        # The text passed, so a refusal of the tower's processor, shards or
+        # configuration refuses the vision alone.
         try:
             _validate_processor(_image_processor(repo))
+            shards = _weight_files(repo, VISION_TOWER)
         except models.ModelError as error:
             raise models.VisionError(str(error)) from None
-        shards = _weight_files(repo, VISION_TOWER)
         if not shards:
             raise models.VisionError(f"{repo.name} has no vision tower")
         vision_format = "safetensors"
@@ -351,10 +355,6 @@ def mlx_target(repo, language_only):
             raise models.VisionError(str(error)) from None
         files["vision/config.json"] = "config.json"
         files |= {"vision/" + n: n for n in shards}
-    # The target's shards: those holding a tensor other than the tower's. A
-    # tower in a shard of its own is not the target's (an OptiQ checkpoint
-    # keeps it in a subdirectory).
-    files |= {"target/" + n: n for n in _weight_files(repo, exclude=VISION_TOWER)}
     return Target("mlx-affine", vision_format, config, None, family, files)
 
 
