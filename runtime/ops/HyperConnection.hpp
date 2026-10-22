@@ -18,7 +18,8 @@ namespace splash::ops {
 
 // A control vector's change after a steered layer (addSteer): row `layer`
 // of its table of directions, added `scale` times, or, with project, the
-// streams' component along that unit direction taken off `scale` times.
+// streams' component along that unit direction taken off `scale` times, on
+// the rows of [firstRow, firstRow + rows).
 struct HyperSteer final {
   uint32_t layer = 0;
   bool project = false;
@@ -64,7 +65,7 @@ struct HyperConnection final {
   // steered layer, from `directions`, fp32 rows of `hidden` values
   // (model/ControlVector.hpp).
   static void addSteer(metal::CommandGraph &graph, metal::MetalBuffer streams, metal::MetalBuffer directions,
-                       HyperSteer steer, HyperShape shape, uint32_t rows);
+                       HyperSteer steer, HyperShape shape, uint32_t rows, uint32_t firstRow = 0);
   static void addStreamMean(metal::CommandGraph &graph, metal::MetalBuffer streams, metal::MetalBuffer destination,
                             RowRegion to, HyperShape shape, uint32_t rows);
 };
