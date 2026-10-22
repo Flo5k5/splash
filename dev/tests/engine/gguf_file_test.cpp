@@ -97,9 +97,9 @@ void checkSplit(const std::filesystem::path &directory) {
                         "the GGUF's split files hold another number of tensors than split.tensors.count",
                         "accepted a split.tensors.count the parts do not hold");
 }
-// A GGUF split as llama.cpp's gguf-split writes it: the first part holds the
-// metadata alone and ends at its header, unpadded (its data section is
-// empty), and the tensors are in the parts after it.
+// A split GGUF whose first part holds the metadata alone and ends at its
+// header, unpadded (its data section is empty), and whose tensors are in the
+// parts after it.
 void checkMetadataPart(const std::filesystem::path &directory) {
   const std::vector<gguf::Tensor> tensors{filled("a", 8, 0xa1), filled("b", 16, 0xb2)};
   const std::vector<std::filesystem::path> paths{directory / "metadata-00001-of-00002.gguf",
