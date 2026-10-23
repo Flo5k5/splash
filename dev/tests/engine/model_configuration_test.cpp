@@ -199,6 +199,14 @@ void testFamilies(const std::filesystem::path &fixtures) {
           "Qwen3.5-122B-A10B 48)" +
               std::string(supported),
           "a config of no family's sizes was accepted");
+  // One that differs from every family in the first size, the hidden size,
+  // matches none further than the first family of its model type, and is
+  // refused as it differs from that one.
+  refuses(moe.with(&SourceModel::config, R"("hidden_size": 2048)", R"("hidden_size": 4096)"),
+          "no supported model has this architecture (text config hidden_size: safetensors 4096, "
+          "Qwen3.6-35B-A3B 2048)" +
+              std::string(supported),
+          "a config of no family's hidden size was accepted");
 }
 
 // A descriptor states where its weights come from: one that leaves either
