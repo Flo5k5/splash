@@ -416,6 +416,13 @@ struct Runtime::Impl {
   // The request the history's staging was last reserved for
   // (reserveHistoryStaging), whose next prefill command streams into it.
   uint64_t stagingRequest = 0;
+#ifdef SPLASH_RUNTIME_INSTRUMENTATION
+  // Whether commands copy the target's logits before their policy
+  // (RuntimeInstrumentation::captureTargetLogits), and the copies, one per
+  // batch lane of the last command that made them.
+  bool capturingTargetLogits = false;
+  std::vector<std::vector<float>> capturedTargetLogits;
+#endif
   explicit Impl(RuntimeContext value)
       : backend(value.backend),
         model(value.model),
@@ -1206,6 +1213,28 @@ struct Runtime::Impl {
     uploadSamplingUniforms(entry, lane);
   }
 
+#ifdef SPLASH_RUNTIME_INSTRUMENTATION
+  // While capturing, a host step before the policy that copies the logits
+  // the target's forward left in each of the command's `lanes` batch lanes:
+  // row 0 for a selection (`rows` 1), the lane's verified rows for a verify.
+  void encodeTargetLogitsCapture(CommandGraph &graph, uint32_t lanes, uint32_t rows) {
+    if (!capturingTargetLogits)
+      return;
+    graph.host([this, lanes, rows] {
+      const uint64_t vocabulary = geometry.target.vocabularySize;
+      capturedTargetLogits.resize(lanes);
+      for (uint32_t lane = 0; lane < lanes; ++lane) {
+        const uint32_t copied =
+            rows == 1 ? 1 : *contents<uint32_t>(decodeArena->get(lane, DecodeTensor::VerifyRows), "verify rows");
+        if (!copied || copied > rows)
+          throw std::logic_error("captured verify rows are out of range");
+        const float *logits = contents<float>(decodeArena->get(lane, DecodeTensor::Logits), "logits");
+        capturedTargetLogits[lane].assign(logits, logits + copied * vocabulary);
+      }
+    });
+  }
+#endif
+
   // One LM head over the batch's `width` lanes, then one selection of the
   // first token of every selecting lane from its logits row 0, which
   // initialToken() reads. The head computes, and nothing reads, the other
@@ -1233,6 +1262,9 @@ struct Runtime::Impl {
       policies[lane.lane] = samplingPolicy(*lane.entry);
       stateLanes[lane.lane] = lane.entry->stateLane;
     }
+#ifdef SPLASH_RUNTIME_INSTRUMENTATION
+    encodeTargetLogitsCapture(graph, width, 1);
+#endif
     sampling.addInitial(graph, std::span(policies).first(width),
                         samplingBuffers(width), 0,
                         geometry.target.stopTokens[0],
@@ -2027,6 +2059,9 @@ struct Runtime::Impl {
       policies[lane] = samplingPolicy(*entries[lane]);
       stateLanes[lane] = entries[lane]->stateLane;
     }
+#ifdef SPLASH_RUNTIME_INSTRUMENTATION
+    encodeTargetLogitsCapture(graph, lanes, kDecodeRows);
+#endif
     sampling.addVerify(graph, std::span(policies).first(lanes),
                        samplingBuffers(lanes), geometry.target.stopTokens[0],
                        geometry.target.stopTokens[1],
@@ -3475,6 +3510,18 @@ std::span<const float> RuntimeInstrumentation::lastLogits(const Runtime &runtime
 
 uint32_t RuntimeInstrumentation::lastVerifyRows(const Runtime &runtime, uint32_t lane) {
   return *contents<uint32_t>(runtime.impl_->decodeArena->get(lane, DecodeTensor::VerifyRows), "verify rows");
+}
+
+void RuntimeInstrumentation::captureTargetLogits(Runtime &runtime, bool enabled) {
+  runtime.impl_->capturingTargetLogits = enabled;
+}
+
+std::vector<std::vector<float>> RuntimeInstrumentation::takeTargetLogits(Runtime &runtime) {
+  return std::exchange(runtime.impl_->capturedTargetLogits, {});
+}
+
+std::optional<uint32_t> RuntimeInstrumentation::pendingToken(const Runtime &runtime, uint64_t requestId) {
+  return runtime.impl_->requests.at(requestId).pendingToken;
 }
 
 RuntimeInstrumentation::LaneTables RuntimeInstrumentation::laneTables(const Runtime &runtime, uint64_t requestId) {

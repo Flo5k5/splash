@@ -21,6 +21,7 @@
 // of non-finite logits select the sentinel 0xFFFFFFFF. The host
 // word helpers and the lifecycle that rebuilds a resumed request's words are
 // checked bitwise.
+#include "PenaltyReference.hpp"
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
 #include "metal/MetalBackend.hpp"
@@ -64,6 +65,8 @@ constexpr float kFloatMax = std::numeric_limits<float>::max();
 // Both stop tokens sit below every spike of fillRow.
 constexpr std::array<uint32_t, 2> kStopTokens{1, 2};
 
+using splash::test::penaltyMatches;
+using splash::test::referencePenalty;
 using splash::test::rejects;
 using splash::test::require;
 
@@ -421,38 +424,6 @@ void requireInitialDraw(const Batch &batch, uint32_t lane,
   requireDraw(batch.outputTokens()[lane], target.probabilities,
               batch.uniforms()[lane * kUniforms + SPLASH_UNIFORM_INITIAL],
               target.ambiguousMass, label);
-}
-
-// The penalty kernel's arithmetic on the host: the logit of a token the
-// output holds count times, or the prompt holds.
-float referencePenalty(float value, uint32_t count, bool prompt,
-                       const SamplingPenalties &penalties) {
-  if (!count && !prompt)
-    return value;
-  value *= value > 0.0F
-               ? std::min(1.0F / penalties.repetition, kFloatMax)
-               : penalties.repetition;
-  if (count)
-    value -= penalties.frequency * float(count) + penalties.presence;
-  return std::clamp(value, -kFloatMax, kFloatMax);
-}
-
-// A penalized logit as the kernel must write it. The scaling is one IEEE
-// product on both sides, so a prompt-only token matches bitwise; the GPU may
-// fuse frequency * count + presence, which leaves the difference within an
-// ulp of the larger operand of the final subtraction.
-bool penaltyMatches(float actual, float value, uint32_t count, bool prompt,
-                    const SamplingPenalties &penalties) {
-  const float expected = referencePenalty(value, count, prompt, penalties);
-  if (!count || std::fabs(expected) == kFloatMax)
-    return std::memcmp(&actual, &expected, sizeof(float)) == 0;
-  const float subtrahend =
-      penalties.frequency * float(count) + penalties.presence;
-  const float magnitude = std::max(
-      {std::fabs(expected + subtrahend), std::fabs(subtrahend),
-       std::fabs(expected)});
-  const float ulp = std::nextafter(magnitude, INFINITY) - magnitude;
-  return std::fabs(actual - expected) <= 2.0F * ulp;
 }
 
 std::span<uint32_t> tableRow(const MetalBuffer &table, uint32_t vocabulary,
@@ -2416,8 +2387,9 @@ void extremeSearches(MetalBackend &backend) {
 // row leaves) or -inf, has no token to select: greedy and sampled policies
 // select 0xFFFFFFFF for a first token and at every verify row, and
 // acceptance retains it as the next anchor. A penalty on one of its tokens
-// leaves it so. The model runtime reports that sentinel as the request's own
-// failure, which keeps the rest of the batch serving.
+// leaves that logit, and so the row, as it is (referencePenalty). The model
+// runtime reports that sentinel as the request's own failure, which keeps
+// the rest of the batch serving.
 void nonFiniteRowsSelectTheSentinel(MetalBackend &backend) {
   constexpr uint32_t vocabulary = 1003;
   constexpr uint32_t kSentinel = 0xFFFFFFFFU;
@@ -2472,11 +2444,16 @@ void nonFiniteRowsSelectTheSentinel(MetalBackend &backend) {
         sampling.addVerify(verify, {&policy, 1}, batch.buffers, kStopTokens[0],
                            kStopTokens[1], penalties);
         static_cast<void>(backend.submitCommandAsync(verify.dispatches()).wait());
-        for (uint32_t row = 0; row < kRows; ++row)
+        for (uint32_t row = 0; row < kRows; ++row) {
           require(batch.outputTokens()[row] == kSentinel,
                   label + ": verify row " + std::to_string(row) +
                       " with no selectable logit selected " +
                       std::to_string(batch.outputTokens()[row]));
+          require(penaltyMatches(batch.row(row)[29], logit, 0, true,
+                                 policy.penalties),
+                  label + ": a penalty rewrote row " + std::to_string(row) +
+                      "'s unselectable logit");
+        }
         CommandGraph accept;
         const std::array<uint32_t, 1> maximumRetained{kRows};
         sampling.addAcceptance(accept, acceptance, maximumRetained, {&policy, 1},
