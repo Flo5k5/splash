@@ -3777,8 +3777,12 @@ void warmupEos(model::RuntimeContext context, model::LoadedModel &model) {
                 decoded.lanes[0].pendingToken.has_value(),
             "warmup EOS fixture has no deterministic token");
     prefillStop = *prefill.lanes[0].pendingToken;
-    decodeStop = *decoded.lanes[0].pendingToken;
-    require(decodeStop != 0 && !decoded.lanes[0].step.finished,
+    // The target's selection at the cycle's first verify row: its second
+    // token, or else its next anchor. A selection after accepted drafts can
+    // be the anchor again, which the decode warmup skips as a stop.
+    const std::vector<uint32_t> &output = decoded.lanes[0].step.outputTokens;
+    decodeStop = output.size() > 1 ? output[1] : *decoded.lanes[0].pendingToken;
+    require(decodeStop != output.front() && !decoded.lanes[0].step.finished,
             "warmup EOS fixture needs a non-terminal baseline continuation");
   }
   const auto originalTarget = model.descriptor.target;
