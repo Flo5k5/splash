@@ -1,4 +1,5 @@
 #include "LinearNumerics.hpp"
+#include "PenaltyReference.hpp"
 #include "TestChecks.hpp"
 #include "TestKvTier.hpp"
 #include "ane/ProgramInstrumentation.hpp"
@@ -64,6 +65,129 @@ namespace {
 
 using splash::test::rejects;
 using splash::test::require;
+
+// Checks each greedy decision of a penalized request against the logits of
+// the forward that made it (RuntimeInstrumentation::captureTargetLogits):
+// every logit of each row the request selected from, as the penalty kernel
+// must rewrite it (PenaltyReference.hpp) from the prompt and the counts of
+// the tokens selected before that row, a verify row's draft prefix included,
+// and the selected token the best of them.
+class PenaltyProbe final {
+public:
+  PenaltyProbe(model::Runtime &runtime, uint32_t vocabulary,
+               std::span<const uint32_t> prompt, ops::SamplingPenalties penalties,
+               bool enabled)
+      : runtime_(runtime), vocabulary_(vocabulary), penalties_(penalties), enabled_(enabled) {
+    if (!enabled_) return;
+    prompt_.resize(vocabulary_);
+    counts_.resize(vocabulary_);
+    // Only repetition reads the prompt's tokens.
+    if (penalties_.repetition != 1.0F)
+      for (const uint32_t token : prompt) prompt_.at(token) = 1;
+    model::RuntimeInstrumentation::captureTargetLogits(runtime_, true);
+  }
+  ~PenaltyProbe() {
+    if (enabled_) model::RuntimeInstrumentation::captureTargetLogits(runtime_, false);
+  }
+  PenaltyProbe(const PenaltyProbe &) = delete;
+  PenaltyProbe &operator=(const PenaltyProbe &) = delete;
+
+  // After a prefill: checks the first token it selected, if it selected one.
+  void initial(const ModelStepResult &result) {
+    if (!enabled_ || !result.firstToken) return;
+    require(take(), "penalty probe missed the first token's forward");
+    std::fill(counts_.begin(), counts_.end(), 0);
+    row(0, *result.firstToken);
+    ++initials_;
+  }
+
+  // Before a decode command of request `requestId`: drops what earlier
+  // commands copied, and notes the anchor the command emits first, which the
+  // request's last selection left pending.
+  void beforeDecode(uint64_t requestId) {
+    if (!enabled_) return;
+    static_cast<void>(model::RuntimeInstrumentation::takeTargetLogits(runtime_));
+    const auto anchor = model::RuntimeInstrumentation::pendingToken(runtime_, requestId);
+    require(anchor.has_value(), "penalized decode has no pending anchor to check");
+    anchor_ = *anchor;
+  }
+
+  // After it: checks the tokens it selected, given those `emitted` before.
+  void decoded(std::span<const uint32_t> emitted, const ModelStepResult &result) {
+    if (!enabled_) return;
+    require(!result.outputTokens.empty() && result.outputTokens.front() == anchor_,
+            "penalty probe lost the already-selected anchor");
+    if (!take()) {
+      require(result.outputTokens.size() == 1 && result.outputTokensWithoutKv == 1,
+              "penalty probe missed a target forward");
+      return; // A previously selected terminal anchor needs no new forward.
+    }
+    std::fill(counts_.begin(), counts_.end(), 0);
+    for (const uint32_t token : emitted) ++counts_.at(token);
+    ++counts_.at(anchor_); // Selected before this command, not yet emitted.
+    const auto next = model::RuntimeInstrumentation::pendingToken(runtime_, result.requestId);
+    require(next.has_value(), "penalty probe has no selected continuation");
+    const size_t retained = result.outputTokens.size() - result.outputTokensWithoutKv;
+    require(retained > 0 && retained <= model::ExecutionLimits::targetVerifyRows,
+            "penalty probe retention is outside the verified rows");
+    for (size_t index = 0; index < retained; ++index) {
+      const uint32_t selected = index + 1 < retained ? result.outputTokens[index + 1] : *next;
+      row(index, selected);
+      ++counts_.at(selected); // Accepted proposal prefix for the next row.
+    }
+    if (result.outputTokensWithoutKv)
+      require(result.outputTokens.back() == *next, "terminal penalty anchor changed");
+  }
+
+  void report() const {
+    if (!enabled_) return;
+    require(initials_ == 1 && rows_ > 1, "penalty probe did not cover initial and verify policies");
+    std::cout << "penalty_same_forward=PASS rows=" << rows_ << '\n';
+  }
+
+private:
+  // The rows the last capturing command since the last take copied, if one
+  // ran.
+  bool take() {
+    std::vector<std::vector<float>> lanes = model::RuntimeInstrumentation::takeTargetLogits(runtime_);
+    if (lanes.empty()) return false;
+    require(lanes.size() == 1, "penalty probe expects a B1 command");
+    raw_ = std::move(lanes.front());
+    return true;
+  }
+
+  // Every logit of row `index` as the penalty kernel must rewrite it under
+  // counts_, and `selected`, the token selected from it, the best of them.
+  void row(size_t index, uint32_t selected) {
+    const size_t offset = index * vocabulary_;
+    require(offset + vocabulary_ <= raw_.size(), "penalty probe has no raw logit row");
+    const auto raw = std::span(raw_).subspan(offset, vocabulary_);
+    const auto actual =
+        model::RuntimeInstrumentation::lastLogits(runtime_, 0).subspan(offset, vocabulary_);
+    float best = -std::numeric_limits<float>::infinity();
+    for (uint32_t token = 0; token < vocabulary_; ++token) {
+      if (!test::penaltyMatches(actual[token], raw[token], counts_[token], prompt_[token] != 0,
+                                penalties_))
+        fail("penalized logits differ from the penalty reference at token " +
+             std::to_string(token));
+      if (!test::unselectableLogit(actual[token]))
+        best = std::max(best, actual[token]);
+    }
+    require(selected < vocabulary_ && !test::unselectableLogit(actual[selected]) &&
+                actual[selected] == best,
+            "a greedy token is not the best of its penalized logits");
+    ++rows_;
+  }
+  model::Runtime &runtime_;
+  uint32_t vocabulary_;
+  ops::SamplingPenalties penalties_;
+  bool enabled_;
+  std::vector<float> raw_;
+  std::vector<uint8_t> prompt_;
+  std::vector<uint32_t> counts_;
+  uint32_t anchor_ = 0;
+  uint64_t rows_ = 0, initials_ = 0;
+};
 
 std::string mebibytes(uint64_t bytes) {
   return std::to_string(bytes >> 20) + " MiB";
@@ -5596,6 +5720,9 @@ int main(int argc, char **argv) {
       sequence.sampling.presencePenalty = penalties.presence;
       sequence.sampling.frequencyPenalty = penalties.frequency;
       sequence.sampling.repetitionPenalty = penalties.repetition;
+      PenaltyProbe penaltyProbe(executor, model.descriptor.capabilities.vocabularySize,
+                                 prompt129, penalties,
+                                 kind == RequestKind::Greedy && penalties.active());
       beginCold(executor, sequence, 0);
       uint32_t stateLane = 0;
       // A penalized request resumes in a state lane other than 0 and decodes
@@ -5639,6 +5766,7 @@ int main(int argc, char **argv) {
         }
         ModelStepResult replay = prefillChunk(
             executor, sequence.id, 0, sequence.prompt, pageTable);
+        penaltyProbe.initial(replay);
         requireOpen(replay, "regeneration replay emitted historical tokens");
         if (repeatDuringReplay) {
           const StateSamples rebuilt = sampleCommittedState(backend, states, stateLane);
@@ -5670,6 +5798,7 @@ int main(int argc, char **argv) {
       } else {
         const ModelStepResult promptEnd = prefillChunk(
             executor, sequence.id, 0, sequence.prompt, pageTable);
+        penaltyProbe.initial(promptEnd);
         requireOpen(promptEnd, "preemption prompt");
         stage = promptEnd.nextDecodeStage;
       }
@@ -5697,6 +5826,7 @@ int main(int argc, char **argv) {
       auto &transcript = run.transcript;
       bool generationPreempted = false;
       for (uint32_t cycle = 0; cycle < 24 && transcript.size() < 24; ++cycle) {
+        penaltyProbe.beforeDecode(sequence.id);
         ModelStepResult result;
         if (constrained) {
           auto pending = beginMaskedDecodeOne(
@@ -5714,6 +5844,7 @@ int main(int argc, char **argv) {
                              pageTable, stage);
         }
         require(!result.outputTokens.empty(), "preempted decode made no progress");
+        penaltyProbe.decoded(transcript, result);
         require(result.outputTokens.size() <= sequence.maxNewTokens - transcript.size() &&
                     result.acceptedDraftTokens <= result.draftedTokens &&
                     result.outputTokensWithoutKv <= result.outputTokens.size(),
@@ -5741,6 +5872,7 @@ int main(int argc, char **argv) {
       require(preemptionMode != 2 || generationPreempted,
               "preemption fixture stopped before its generation replay");
       executor.end(sequence.id);
+      penaltyProbe.report();
       return run;
     };
     for (RequestKind kind : {RequestKind::Greedy, RequestKind::Sampling,
@@ -5773,87 +5905,21 @@ int main(int argc, char **argv) {
                 << " preserved_prefix_rows=" << resumed.pendingAnchorIndex + 1 << '\n';
     }
 
-    // Score probe of a greedy transcript: for every emitted token, a score
-    // request on the context before it returns the raw logits of every
-    // prompt and earlier output token and of the emitted one, the host
-    // applies the penalties with the counts of the tokens emitted before it,
-    // and the emitted token must be the best of them. The penalties only
-    // move tokens the context holds, so a count the runtime got wrong (in
-    // the prefill's first token, a verify row's draft prefix, or the words a
-    // resume rebuilds) shows up as an option that beats the emitted token by
-    // about the penalty. The score logits come from the prefill graph and
-    // most decisions from the verify graph, whose logits differ by a share of
-    // their size: on the 35B UD-Q4_K_M on Apple9, a prompt token's logit
-    // divided by the repetition ties a new token's at a repetition 1-2% lower
-    // in verify than in prefill (1.29-1.30 against 1.31-1.32). So the emitted
-    // token may trail by graphDrift of the values compared, well inside what
-    // a wrong count moves (presence here at least 1.5, repetition 1.3 at
-    // least 23% of the logit). Returns the largest amount it trails by beyond
-    // that.
-    constexpr float graphDrift = 0.03F;
-    const auto probeLoss = [&](const std::vector<uint32_t> &transcript,
-                               const ops::SamplingPenalties &penalties) {
-      float worst = 0.0F;
-      for (size_t position = 0; position < transcript.size(); ++position) {
-        std::vector<uint32_t> context = prompt129;
-        context.insert(context.end(), transcript.begin(),
-                       transcript.begin() + position);
-        std::vector<uint32_t> options = context;
-        options.push_back(transcript[position]);
-        std::sort(options.begin(), options.end());
-        options.erase(std::unique(options.begin(), options.end()), options.end());
-        require(options.size() >= model::ExecutionLimits::minimumScoreOptions &&
-                    options.size() <= model::ExecutionLimits::maximumScoreOptions,
-                "score probe options do not fit one score request");
-        EngineRequest score = makeRequest(90, context, 0);
-        score.scoreTokens = options;
-        beginCold(executor, score, 0);
-        const ModelStepResult scored =
-            prefillChunk(executor, score.id, 0, context, pageTable);
-        executor.end(score.id);
-        require(scored.scoreLogits.size() == options.size(),
-                "score probe returned the wrong logit count");
-        float best = -std::numeric_limits<float>::infinity();
-        float emitted = best;
-        for (size_t index = 0; index < options.size(); ++index) {
-          const uint32_t token = options[index];
-          const auto count = static_cast<uint32_t>(
-              std::count(transcript.begin(), transcript.begin() + position, token));
-          float value = scored.scoreLogits[index];
-          if (count || std::find(prompt129.begin(), prompt129.end(), token) !=
-                           prompt129.end())
-            value = value > 0.0F ? value / penalties.repetition
-                                 : value * penalties.repetition;
-          if (count)
-            value -= penalties.frequency * float(count) + penalties.presence;
-          best = std::max(best, value);
-          if (token == transcript[position])
-            emitted = value;
-        }
-        const float allowance =
-            graphDrift * std::max(std::abs(best), std::abs(emitted));
-        worst = std::max(worst, best - emitted - allowance);
-      }
-      return worst;
-    };
-
-    // Penalized requests keep every preemption guarantee above, and the
-    // score probe checks their decisions within the drift between score
-    // (prefill) and verify logits, and any further drift the unpenalized
-    // transcript shows.
+    // Penalized requests keep every preemption guarantee above, and
+    // PenaltyProbe checks each greedy decision against the logits of the
+    // forward that made it, not a cold prefill's: the prefill and verify
+    // graphs can rank tokens the penalties leave near a tie differently, and
+    // which tokens those are changes with how the kernels compile (#437, #526).
     // Negative presence and frequency favour the output's tokens by their
     // counts, so the decisions they change follow the counts, a verify row's
     // draft prefix included; presence 1.5 is Qwen's recommendation, and
     // repetition also reads the prompt's tokens. The prompt repeats a chat
     // template, which a model's greedy transcript may copy by margins the
     // milder settings leave alone (the 35B mxfp4's survive them all);
-    // repetition 3 divides the copied tokens' logits, so that one setting
-    // changes a decision to probe on every model.
+    // repetition 3 divides the copied tokens' logits, so that on every model
+    // one setting changes the greedy transcript, and the preemption checks
+    // run on a history the penalties chose.
     const PreemptionRun control = runPreemption(RequestKind::Greedy, 0);
-    const float drift = probeLoss(control.transcript, {});
-    const float tolerance = std::max(2.0F * drift, 0.1F);
-    std::cout << "penalty_probe control_drift=" << drift
-              << " tolerance=" << tolerance << '\n';
     bool penaltiesDecided = false;
     for (const ops::SamplingPenalties penalties :
          {ops::SamplingPenalties{1.0F, -2.0F, -2.0F},
@@ -5873,19 +5939,13 @@ int main(int argc, char **argv) {
                                  resumed.pendingAnchorIndex + 1,
                              reference.transcript.begin()),
               "preemption changed penalized history or its pending anchor");
-      const float referenceLoss = probeLoss(reference.transcript, penalties);
-      const float resumedLoss = probeLoss(resumed.transcript, penalties);
       penaltiesDecided |= reference.transcript != control.transcript;
       std::cout << "penalty_probe presence=" << penalties.presence
                 << " frequency=" << penalties.frequency
                 << " repetition=" << penalties.repetition
-                << " changed=" << (reference.transcript != control.transcript)
-                << " reference_loss=" << referenceLoss
-                << " resumed_loss=" << resumedLoss << '\n';
-      require(referenceLoss <= tolerance && resumedLoss <= tolerance,
-              "a penalized token is not the best of its penalized logits");
+                << " changed=" << (reference.transcript != control.transcript) << '\n';
     }
-    require(penaltiesDecided, "no penalty changed a decision to probe");
+    require(penaltiesDecided, "no penalty setting changed the greedy transcript");
     // Sampled lanes with presence and frequency repeat under a fixed seed;
     // a constrained lane with repetition keeps its masked continuation.
     {
