@@ -194,13 +194,6 @@ void requireLayerTypes(NSArray *types, const QwenTargetDimensions &target,
   }
 }
 
-// Calls `use` with each family's layout, in TargetLayout's order.
-template <class Use> constexpr void forEachFamily(Use use) {
-  [&]<size_t... Family>(std::index_sequence<Family...>) {
-    (use(std::variant_alternative_t<Family, TargetLayout>{}), ...);
-  }(std::make_index_sequence<std::variant_size_v<TargetLayout>>{});
-}
-
 // Each family's native window, which its config's max_position_embeddings
 // states, and the window YaRN stretches it to fit the runtime's KV ceiling.
 template <class Layout> constexpr bool fitsKvCeiling(const Layout &layout) {
@@ -230,29 +223,44 @@ std::invalid_argument unsupportedModel(const std::string &difference) {
                                supported);
 }
 
-// The target's text configuration, of the family its model type names. Every
-// one holds the sizes the descriptor shares with it, which tell the family's
-// target from other models of its architecture. A safetensors target's
-// config.json also holds the rest of what the kernels compute; a GGUF's is
-// what the installer derived from the GGUF's metadata, which the GGUF planner
-// checks (gguf::requireMetadata).
-void validateTextConfig(NSDictionary *text, const QwenTargetDimensions &target, std::string_view family,
-                        TargetSource source) {
-  const std::string_view name = sourceName(source);
-  for (const ExpectedNumber &size : std::initializer_list<ExpectedNumber>{
-           {"hidden_size", target.hiddenSize},
-           {"num_hidden_layers", target.layers},
-           {"vocab_size", target.vocabularySize},
-           {"max_position_embeddings", target.nativeContextTokens},
-           {"num_attention_heads", target.attentionQueryHeads},
-           {"num_key_value_heads", target.attentionKvHeads},
-           {"head_dim", target.attentionHeadDimension}}) {
+// How a text configuration differs from a family in the sizes every one
+// holds, which tell the family's target from other models of its
+// architecture: the first that differs, after `matched` that agree.
+struct SizeDifference final {
+  size_t matched;
+  std::string difference;
+};
+std::optional<SizeDifference> sizeDifference(NSDictionary *text, const QwenHybridLayout &target,
+                                             TargetSource source) {
+  const std::initializer_list<ExpectedNumber> sizes{
+      {"hidden_size", target.hiddenSize},
+      {"num_hidden_layers", target.layers},
+      {"vocab_size", target.vocabularySize},
+      {"max_position_embeddings", target.nativeContextTokens},
+      {"num_attention_heads", target.attentionQueryHeads},
+      {"num_key_value_heads", target.attentionKvHeads},
+      {"head_dim", target.attentionHeadDimension}};
+  size_t matched = 0;
+  for (const ExpectedNumber &size : sizes) {
     const std::string label = std::string("text config ") + size.key;
     NSNumber *value = requireNumber(text[@(size.key)], label);
     if (value.doubleValue != size.value)
-      throw unsupportedModel(label + ": " + std::string(name) + " " + value.description.UTF8String + ", " +
-                             std::string(family) + " " + @(size.value).description.UTF8String);
+      return SizeDifference{matched, label + ": " + std::string(sourceName(source)) + " " +
+                                         value.description.UTF8String + ", " + std::string(target.family) +
+                                         " " + @(size.value).description.UTF8String};
+    ++matched;
   }
+  return std::nullopt;
+}
+
+// The target's text configuration, of its family (describeSourceModel), whose
+// sizes it holds (sizeDifference). A safetensors target's config.json also
+// holds the rest of what the kernels compute; a GGUF's is what the installer
+// derived from the GGUF's metadata, which the GGUF planner checks
+// (gguf::requireMetadata).
+void validateTextConfig(NSDictionary *text, const QwenHybridLayout &target, TargetSource source) {
+  const std::string_view name = sourceName(source);
+  if (const auto difference = sizeDifference(text, target, source)) throw unsupportedModel(difference->difference);
   if (source != TargetSource::Safetensors) return;
   requireNumbers(text, name, "text config",
                  {{"linear_num_key_heads", target.gdnKeyHeads},
@@ -535,8 +543,9 @@ void requireQuantization(NSDictionary *config, const QwenTargetDimensions &geome
 }
 
 // A DFlash2 checkpoint's config: the draft's layout. Its attention widths,
-// block, window, convolutions and selector must be those the draft kernels
-// are built for; its hidden size, vocabulary and mask token the target's;
+// window, convolutions and selector must be those the draft kernels are built
+// for, and its block at least their rows; its hidden size, vocabulary and
+// mask token the target's;
 // and the target layers it reads (target_layer_ids) some of the target's,
 // ascending. Its layers, intermediate size and rotary base are its own.
 DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimensions &target) {
@@ -567,12 +576,18 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
   NSDictionary *flash =
       requireObject(draft, @"dflash_config", "draft config dflash_config");
   requireNumbers(flash, "checkpoint", "draft config dflash_config",
-                 {{"block_size", ExecutionLimits::draftQueryRows},
-                  {"conv_group_size", SPLASH_DRAFT_CONVOLUTION_GROUP},
+                 {{"conv_group_size", SPLASH_DRAFT_CONVOLUTION_GROUP},
                   {"conv_kernel_size", SPLASH_DRAFT_CONVOLUTION_TAPS},
                   {"selector_rank", SPLASH_DRAFT_SELECTOR_RANK},
                   {"selector_top_k", SPLASH_DRAFT_CANDIDATES},
                   {"mask_token_id", target.maskToken}});
+  // The block it was trained to fill: the kernels' rows or more, of which a
+  // cycle drafts the first (Ornith-1.5-122B's fills 16). Its weights have no
+  // part of the block's length.
+  if (requireWhole(flash[@"block_size"], "draft config dflash_config block_size") <
+      ExecutionLimits::draftQueryRows)
+    throw std::invalid_argument("draft config dflash_config block_size is less than the " +
+                                std::to_string(ExecutionLimits::draftQueryRows) + " rows a cycle drafts");
   // How a target layer's output row becomes the hidden values the draft reads
   // of it, as the draft was trained (target_hidden_reduction): a
   // hyper-connected target's streams by their mean (Qwen4ExpTarget's
@@ -632,16 +647,23 @@ ModelDescriptor describeSourceModel(std::string name, std::string_view targetFor
   NSDictionary *text = config[@"text_config"];
   if (![text isKindOfClass:[NSDictionary class]]) throw unsupportedModel("its config has no text_config");
   const auto type = requireString(text, @"model_type", "text model type");
-  std::optional<TargetLayout> target;
-  forEachFamily([&](const auto &layout) {
-    if (layout.modelType == type) target = layout;
-  });
-  if (!target) throw unsupportedModel("text model type " + type);
   TargetSource targetSource;
   // "mlx-affine" names every safetensors target, as installations record it.
   if (targetFormat == "mlx-affine") targetSource = TargetSource::Safetensors;
   else if (targetFormat == "gguf") targetSource = TargetSource::Gguf;
   else throw std::invalid_argument("unsupported target source format: " + std::string(targetFormat));
+  // The family of the model type whose sizes the config holds, as
+  // Qwen3.6-35B-A3B's and Qwen3.5-122B-A10B's tell those two apart; of none,
+  // the refusal names how it differs from the one it matches furthest.
+  std::optional<TargetLayout> target;
+  std::optional<SizeDifference> nearest;
+  forEachFamily([&](const auto &layout) {
+    if (layout.modelType != type || target) return;
+    auto difference = sizeDifference(text, layout, targetSource);
+    if (!difference) target = layout;
+    else if (!nearest || difference->matched > nearest->matched) nearest = std::move(difference);
+  });
+  if (!target) throw unsupportedModel(nearest ? nearest->difference : "text model type " + type);
   VisionSource visionSource;
   if (visionFormat == "none") visionSource = VisionSource::None;
   else if (visionFormat == "safetensors") visionSource = VisionSource::Safetensors;
@@ -654,7 +676,7 @@ ModelDescriptor describeSourceModel(std::string name, std::string_view targetFor
   std::visit([&](const auto &layout) {
     if (targetSource == TargetSource::Safetensors && !layout.loadsSafetensors)
       throw std::invalid_argument(std::string(layout.family) + " loads from a GGUF only");
-    validateTextConfig(text, layout, layout.family, targetSource);
+    validateTextConfig(text, layout, targetSource);
     if (targetSource == TargetSource::Safetensors) requireQuantization(config, layout);
     if (draft) dflashLayout = readDraftLayout(draft, layout);
   }, *target);

@@ -71,6 +71,12 @@ constexpr std::string_view kMoeGgufConfig =
     R"({"model_type":"qwen3_5_moe","text_config":{"model_type":"qwen3_5_moe_text","hidden_size":2048,)"
     R"("max_position_embeddings":262144,"num_attention_heads":16,"num_key_value_heads":2,)"
     R"("head_dim":256,"num_hidden_layers":40,"vocab_size":248320}})";
+// Qwen3.5-122B-A10B's, of the same model type, from unsloth's
+// Ornith-1.5-122B GGUF (its MTP layer left out of the layers).
+constexpr std::string_view kLargeMoeGgufConfig =
+    R"({"model_type":"qwen3_5_moe","text_config":{"model_type":"qwen3_5_moe_text","hidden_size":3072,)"
+    R"("max_position_embeddings":262144,"num_attention_heads":32,"num_key_value_heads":2,)"
+    R"("head_dim":256,"num_hidden_layers":48,"vocab_size":248320}})";
 
 // The descriptor inspection makes of model's assembly.
 model::ModelDescriptor inspect(const SourceModel &model) {
@@ -111,6 +117,15 @@ void testFamilies(const std::filesystem::path &fixtures) {
               moeDescriptor.visionSource == model::VisionSource::Safetensors &&
               moeDescriptor.draft == test::qwen3_6MoeDraft(),
           "an MLX Qwen3.6-35B-A3B made another descriptor");
+  // Qwen3.5-122B-A10B's model type is the Qwen3.6-35B-A3B's: its hidden size
+  // names its family.
+  const model::ModelDescriptor largeMoeDescriptor =
+      inspect(mlxModel(fixtures, "qwen3.5-122b-a10b").with(&SourceModel::record, R"("none")", R"("safetensors")"));
+  require(largeMoeDescriptor.target == model::TargetLayout{model::kQwen3_5_122BLayout} &&
+              largeMoeDescriptor.visionSource == model::VisionSource::Safetensors &&
+              largeMoeDescriptor.vision.outputHiddenSize == 3072 &&
+              largeMoeDescriptor.draft == test::qwen3_5_122BDraft(),
+          "an MLX Qwen3.5-122B-A10B made another descriptor");
   // Qwen3.8-Flash-Next's GGUF config, with its draft's.
   const model::ModelDescriptor flashDescriptor =
       inspect(mlxModel(fixtures, "qwen3.8-flash-next").with(&SourceModel::record, R"("mlx-affine")", R"("gguf")"));
@@ -161,7 +176,7 @@ void testFamilies(const std::filesystem::path &fixtures) {
   // tell its target from other models of the architecture, which Splash does
   // not serve, such as Qwen3.5-4B.
   constexpr std::string_view supported =
-      "; supported: Qwen3.8-27B, Qwen3.6-35B-A3B, Qwen3.8-Flash-Next";
+      "; supported: Qwen3.8-27B, Qwen3.6-35B-A3B, Qwen3.5-122B-A10B, Qwen3.8-Flash-Next";
   struct Refused final {
     std::string_view from, to, difference;
   };
@@ -176,6 +191,14 @@ void testFamilies(const std::filesystem::path &fixtures) {
             "no supported model has this architecture (" + std::string(refused.difference) + ")" +
                 std::string(supported),
             "a config of another model was accepted with " + std::string(refused.to));
+  // A config of a model type of several families and the sizes of none is
+  // refused as it differs from the one it matches furthest.
+  refuses(mlxModel(fixtures, "qwen3.5-122b-a10b")
+              .with(&SourceModel::config, R"("num_hidden_layers": 48)", R"("num_hidden_layers": 40)"),
+          "no supported model has this architecture (text config num_hidden_layers: safetensors 40, "
+          "Qwen3.5-122B-A10B 48)" +
+              std::string(supported),
+          "a config of no family's sizes was accepted");
 }
 
 // A descriptor states where its weights come from: one that leaves either
@@ -580,6 +603,24 @@ void testConfigurationCheck(const std::filesystem::path &fixtures) {
   require(check("gguf", "none", kDenseGgufConfig, denseMetadata, dense.draft) == "Qwen3.8-27B" &&
               check("gguf", "none", kMoeGgufConfig, moeMetadata, std::nullopt) == "Qwen3.6-35B-A3B",
           "a GGUF's derived config and metadata were not found to be its family");
+  // Qwen3.5-122B-A10B, of the same model type and GGUF architecture as the
+  // Qwen3.6-35B-A3B, as its sizes tell; its draft, trained to fill a block
+  // of 16, drafts the kernels' eight rows, and a block of fewer is refused.
+  // Each family refuses the other's draft.
+  const SourceModel largeMoe = mlxModel(fixtures, "qwen3.5-122b-a10b");
+  const std::string largeMoeMetadata = text(fixtures / "qwen3.5-122b-a10b" / "gguf-metadata.json");
+  require(check("mlx-affine", "safetensors", largeMoe.config, std::nullopt, largeMoe.draft) == "Qwen3.5-122B-A10B" &&
+              check("gguf", "none", kLargeMoeGgufConfig, largeMoeMetadata, largeMoe.draft) == "Qwen3.5-122B-A10B",
+          "a Qwen3.5-122B-A10B's configuration was not found to be its family");
+  rejects([&] { static_cast<void>(check("mlx-affine", "none", moe.config, std::nullopt, largeMoe.draft)); },
+          "draft config hidden_size mismatch: checkpoint 3072, runtime 2048", "a larger family's draft was accepted");
+  rejects([&] { static_cast<void>(check("mlx-affine", "none", largeMoe.config, std::nullopt, moe.draft)); },
+          "draft config hidden_size mismatch: checkpoint 2048, runtime 3072", "a smaller family's draft was accepted");
+  rejects([&] {
+    static_cast<void>(check("mlx-affine", "none", largeMoe.config, std::nullopt,
+                            largeMoe.with(&SourceModel::draft, R"("block_size": 16)", R"("block_size": 4)").draft));
+  }, "draft config dflash_config block_size is less than the 8 rows a cycle drafts",
+          "a draft of a block shorter than the kernels' rows was accepted");
   rejects([&] { static_cast<void>(check("gguf", "none", kDenseGgufConfig, std::nullopt, std::nullopt)); },
           "a GGUF target is checked with its metadata", "a GGUF was checked without its metadata");
   const auto replaced = [](std::string metadata, std::string_view from, std::string_view to) {

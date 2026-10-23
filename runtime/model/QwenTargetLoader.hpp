@@ -169,7 +169,7 @@ loadQwenTarget(metal::MetalBackend &backend, const Layout &layout, const QwenTar
       SafetensorsTargetLoader &safetensors = std::get<std::reference_wrapper<SafetensorsTargetLoader>>(files).get();
       return read(safetensors, BlockTargetFormat{safetensors.float32Norms(), ops::GdnHeadOrder::Grouped}, experts);
     } else {
-      throw WeightStoreError(std::string(Layout::family) + " loads from a GGUF only");
+      throw WeightStoreError(std::string(layout.family) + " loads from a GGUF only");
     }
   }();
   weights.experts = experts.store;

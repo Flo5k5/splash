@@ -45,6 +45,11 @@ VISION_TOWER = ("vision_tower.", "model.visual.")
 # its own, or the image_processor object of processor_config.json, where newer
 # Transformers releases save it.
 PROCESSOR_FILES = ("preprocessor_config.json", "processor_config.json")
+# A DFlash2 release's BF16 embedding of its mask token, beside its weights,
+# which its draft reads in place of the target's token table row
+# (DraftCheckpoint.hpp kDraftMaskEmbedding): a quantized table can lose a
+# row as small as Qwen3.5-122B-A10B's.
+DRAFT_MASK_EMBEDDING = "mask_embedding.safetensors"
 
 
 @dataclass(frozen=True)
@@ -771,10 +776,11 @@ def _at(repo):
 def draft_files(repo, target):
     """The DFlash2 draft in repo for target's family, downloaded, by assembly
     path: its config.json and safetensors weights, model.safetensors or the
-    shards its index names, at the root of the repository or --draft-model
-    directory, as a DFlash2 release holds them. The weights download only
-    once the engine accepts its configuration with the target's
-    (check_model)."""
+    shards its index names, and the mask token's embedding when the release
+    ships one (DRAFT_MASK_EMBEDDING), at the root of the repository or
+    --draft-model directory, as a DFlash2 release holds them. The weights
+    download only once the engine accepts its configuration with the
+    target's (check_model)."""
     family = target.family
     try:
         if "config.json" not in repo.files:
@@ -799,5 +805,6 @@ def draft_files(repo, target):
             f"{repo.name}'s draft configuration is incompatible with {family.name}: "
             f"{error}"
         ) from error
-    downloaded = repo.download({"config.json", *weights})
+    mask = {DRAFT_MASK_EMBEDDING} & set(repo.files)
+    downloaded = repo.download({"config.json", *weights, *mask})
     return {"draft/" + name: path for name, path in downloaded.items()}

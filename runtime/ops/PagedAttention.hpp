@@ -11,8 +11,10 @@
 #include <array>
 #include <cstdint>
 #include <span>
+#include <string>
 #include <string_view>
 #include <type_traits>
+#include <utility>
 
 namespace splash::kv {
 
@@ -113,8 +115,8 @@ struct PrefillAttentionPlan final {
   const uint32_t tiles;
   const uint32_t splits;
   const AttentionWorkspace workspace;
-  const std::string_view splitPipeline;
-  const std::string_view reducePipeline;
+  const std::string splitPipeline;
+  const std::string reducePipeline;
   const metal::DispatchSize splitGroups;
   const metal::DispatchSize reduceGroups;
   // Whether the kernels attend through block lists (AttentionBlocks).
@@ -123,12 +125,12 @@ struct PrefillAttentionPlan final {
 private:
   friend class PagedAttention;
   PrefillAttentionPlan(uint32_t rows, uint32_t splits, AttentionWorkspace workspace,
-                       std::string_view splitPipeline, std::string_view reducePipeline,
+                       std::string splitPipeline, std::string reducePipeline,
                        metal::DispatchSize splitGroups, metal::DispatchSize reduceGroups,
                        bool sparse, kv::Layout layout, uint32_t queryHeads)
       : layout(layout), queryHeads(queryHeads), rows(rows), tiles(kv::prefillAttentionTiles(rows)),
         splits(splits), workspace(workspace),
-        splitPipeline(splitPipeline), reducePipeline(reducePipeline),
+        splitPipeline(std::move(splitPipeline)), reducePipeline(std::move(reducePipeline)),
         splitGroups(splitGroups), reduceGroups(reduceGroups), sparse(sparse) {}
 };
 
@@ -143,8 +145,8 @@ struct VerifyAttentionPlan final {
   const std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> laneSplits;
   const uint32_t splits;
   const AttentionWorkspace workspace;
-  const std::string_view splitPipeline;
-  const std::string_view reducePipeline;
+  const std::string splitPipeline;
+  const std::string reducePipeline;
   const metal::DispatchSize splitGroups;
   const metal::DispatchSize reduceGroups;
   // Whether the kernels attend through block lists (AttentionBlocks).
@@ -153,23 +155,23 @@ struct VerifyAttentionPlan final {
 private:
   friend class PagedAttention;
   // A sparse plan's split for lists with locations (AttentionBlocks).
-  const std::string_view locatedSplitPipeline_;
-  const std::string_view storePipeline_;
+  const std::string locatedSplitPipeline_;
+  const std::string storePipeline_;
   const metal::DispatchSize storeGroups_;
   const metal::DispatchSize storeThreads_;
   VerifyAttentionPlan(uint32_t lanes,
                       std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> laneSplits,
                       uint32_t splits, AttentionWorkspace workspace,
-                      std::string_view splitPipeline, std::string_view reducePipeline,
+                      std::string splitPipeline, std::string reducePipeline,
                       metal::DispatchSize splitGroups, metal::DispatchSize reduceGroups,
-                      bool sparse, std::string_view locatedSplitPipeline, std::string_view storePipeline,
+                      bool sparse, std::string locatedSplitPipeline, std::string storePipeline,
                       metal::DispatchSize storeGroups, metal::DispatchSize storeThreads, kv::Layout layout,
                       uint32_t queryHeads)
       : layout(layout), queryHeads(queryHeads), lanes(lanes), laneSplits(laneSplits),
         splits(splits), workspace(workspace),
-        splitPipeline(splitPipeline), reducePipeline(reducePipeline),
+        splitPipeline(std::move(splitPipeline)), reducePipeline(std::move(reducePipeline)),
         splitGroups(splitGroups), reduceGroups(reduceGroups), sparse(sparse),
-        locatedSplitPipeline_(locatedSplitPipeline), storePipeline_(storePipeline),
+        locatedSplitPipeline_(std::move(locatedSplitPipeline)), storePipeline_(std::move(storePipeline)),
         storeGroups_(storeGroups), storeThreads_(storeThreads) {}
 };
 

@@ -27,7 +27,9 @@ The paths an assembly links, and what reads each:
                          from the GGUF (server.py main)
   draft/config.json, draft/<name>.safetensors
                          the DFlash2 checkpoint (ModelDescriptor.mm,
-                         DraftCheckpoint.cpp)
+                         DraftCheckpoint.cpp), with the mask token's
+                         embedding, draft/mask_embedding.safetensors, when
+                         the release ships one
   vision/<shard>         the MLX shards holding vision_tower.*
                          (VisionLoader.cpp, through SafetensorsCheckpoint.mm)
   vision/mmproj.gguf     the GGUF vision projector (VisionLoader.cpp)
