@@ -34,11 +34,14 @@ model::DFlashDraftLayout draftOf() {
     return test::qwen3_8Draft();
 }
 
+// A target of Weights' architecture at the sizes of `family`, its first
+// family's by default, paired with `draft`.
 template <class Weights>
-model::LoadedModel loadedModel() {
+model::LoadedModel loadedModel(const decltype(Weights::layout) &family = {},
+                               const model::DFlashDraftLayout &draft = draftOf<Weights>()) {
   model::LoadedModel result;
   Weights target;
-  const model::DFlashDraftLayout draft = draftOf<Weights>();
+  target.layout = family;
   const auto projection = [](uint32_t n, uint32_t k) {
     return ops::Projection(n, k, ops::BlockWeights{{ops::QuantizedSegment::planes(GGUF_FMT_Q4K, n, k, {}, {}, {})}});
   };
@@ -311,6 +314,8 @@ void checkGdnWidths() {
   withoutGates.packedGdnWidth = shipped.convolutionDimension + shipped.attentionWidth;
   rejects([&] { sizeArenas(withoutGates); }, "invalid model runtime geometry",
           "packed GDN rows without the gates reached arena sizing");
+  // Every family's layout, the 122B's among them, passes the layout check.
+  model::forEachFamily([](const auto &family) { model::requireQwenLayout(family); });
   // The dense layout is checked like the sparse one: its convolution width
   // against its GDN heads.
   const model::Qwen3_8Layout dense;
@@ -332,11 +337,10 @@ int main() {
     checkYarnGeometry();
     checkIndexTables();
     checkSpilledKvGeometry();
-    const auto dense = loadedModel<model::Qwen3_8Weights>();
-    const auto sparse = loadedModel<model::Qwen3_6MoeWeights>();
-    checkLaneScratch(dense);
-    checkLaneScratch(sparse);
-    std::cout << "model execution plans: PASS (two paired geometries)\n";
+    checkLaneScratch(loadedModel<model::Qwen3_8Weights>());
+    checkLaneScratch(loadedModel<model::Qwen3_6MoeWeights>());
+    checkLaneScratch(loadedModel<model::Qwen3_6MoeWeights>(model::kQwen3_5_122BLayout, test::qwen3_5_122BDraft()));
+    std::cout << "model execution plans: PASS (three paired geometries)\n";
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
     return 1;

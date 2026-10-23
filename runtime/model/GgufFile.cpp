@@ -279,9 +279,9 @@ void GgufFile::parse(WeightSource &source, uint32_t file) {
     tensors_.push_back(std::move(tensor));
   }
   const uint64_t headerEnd = reader.position();
-  // A part of no tensors may end at its header, as llama.cpp's gguf-split
-  // writes the first part, of the metadata alone: its data section is empty,
-  // and the padding before it is not written.
+  // A part of no tensors may end at its header, as the first part of a split
+  // GGUF that holds the metadata alone does: its data section is empty, and
+  // the padding before it is not written.
   const uint64_t padding = tensors_.size() == firstTensor && headerEnd == source.bytes()
                                ? 0
                                : (alignment - headerEnd % alignment) % alignment;

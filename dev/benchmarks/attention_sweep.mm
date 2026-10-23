@@ -92,7 +92,7 @@ constexpr uint32_t kPrefillRows = SPLASH_PREFILL_TOKEN_BUDGET;
 
 // The swept attention layer is the second of the extents' two.
 constexpr uint32_t kLayer = 1;
-// The memory plan's extents of the full models: 16, 10 and 12 attention
+// The memory plan's extents of the full models: 16, 10, 12 and 12 attention
 // layers.
 constexpr uint32_t kModelLayers27b = 16, kModelLayers35b = 10, kModelLayers122b = 12, kModelLayersFn = 12;
 // Qwen3.8-Flash-Next's QSA: the indexer's top_k of 2048 tokens in blocks of 4.

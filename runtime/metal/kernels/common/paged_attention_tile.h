@@ -350,7 +350,8 @@ inline void splash_paged_attention_tile(
 
 // Partials are [slot][fused row][dimension]; statistics are
 // [slot][fused row]{max, sum}. The callers lay slots out as
-// [tile][KV head][split] (prefill) and [lane][KV head][split] (verify).
+// [tile][KV head][part][split] (prefill) and [lane][KV head][part][split]
+// (verify), a sparse tile being one part.
 // Combines the first `written` splits of one fused row in split order. The
 // statistics are shared by all 256 output dimensions: their weights are
 // computed once per row, then each lane streams one dimension of the
@@ -392,18 +393,32 @@ inline void splash_attention_combine_splits(
       bfloat(denominator > 0.0f ? numerator / denominator : 0.0f);
 }
 
-// The splits of a page loop that own at least one page wrote their
-// partials; the partition is recomputed here.
-template <uint QueryHeadsPerKVHead, uint RowsPerTile>
+// Fused row `fused_row` of a tile run as Parts parts
+// (splash_attention_tile_part) combines the splits of its part's page loop:
+// those that own at least one page wrote their partials, and the partition
+// is recomputed here. A part past the tile's active rows ran no split; its
+// rows are written as zeros.
+template <uint QueryHeadsPerKVHead, uint RowsPerTile, uint Parts>
 inline void splash_attention_reduce_row(
     device const float *partials, device const float *statistics,
-    device bfloat *tile_output, uint committed_tokens, uint active_rows,
-    uint splits, ulong head_slot, uint fused_row, uint thread_index,
-    threadgroup float *weights, threadgroup float *group_values) {
-  const uint pages = splash_attention_pages(committed_tokens + active_rows);
-  const uint per_split = splash_attention_pages_per_split(pages, splits);
+    device bfloat *output, SplashAttentionTile whole, uint slot_stride,
+    uint fused_row, uint thread_index, threadgroup float *weights,
+    threadgroup float *group_values) {
+  constexpr uint PartRows = RowsPerTile / Parts;
+  constexpr uint PartM = PartRows * QueryHeadsPerKVHead;
+  const SplashAttentionTile tile =
+      splash_attention_tile_part<QueryHeadsPerKVHead, RowsPerTile, Parts>(
+          whole, fused_row / PartM, slot_stride);
+  if (!tile.active) {
+    output[whole.offset + ulong(fused_row) * SplashKvHeadDimension +
+           thread_index] = bfloat(0.0f);
+    return;
+  }
+  const uint pages =
+      splash_attention_pages(tile.first_position + tile.active_rows);
+  const uint per_split = splash_attention_pages_per_split(pages, tile.splits);
   const uint written = (pages + per_split - 1) / per_split;
-  splash_attention_combine_splits<QueryHeadsPerKVHead, RowsPerTile>(
-      partials, statistics, tile_output, active_rows, written, head_slot,
-      fused_row, thread_index, weights, group_values);
+  splash_attention_combine_splits<QueryHeadsPerKVHead, PartRows>(
+      partials, statistics, output + tile.offset, tile.active_rows, written,
+      tile.first_slot, fused_row % PartM, thread_index, weights, group_values);
 }

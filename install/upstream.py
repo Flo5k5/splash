@@ -47,8 +47,7 @@ VISION_TOWER = ("vision_tower.", "model.visual.")
 PROCESSOR_FILES = ("preprocessor_config.json", "processor_config.json")
 # A DFlash2 release's BF16 embedding of its mask token, beside its weights,
 # which its draft reads in place of the target's token table row
-# (DraftCheckpoint.hpp kDraftMaskEmbedding): a quantized table can lose a
-# row as small as Qwen3.5-122B-A10B's.
+# (DraftCheckpoint.hpp kDraftMaskEmbedding; DEVELOPMENT.md, Drafts).
 DRAFT_MASK_EMBEDDING = "mask_embedding.safetensors"
 
 

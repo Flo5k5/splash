@@ -80,32 +80,33 @@ std::string locatedSplitName(kv::Layout layout) {
 void checkPrefillSlotOrientation(uint32_t queryHeads, kv::Layout layout) {
   bool unequalAxes = false, partialTile = false, multipleSplits = false;
   // The split grid's x: each KV head's tile parts.
-  const uint32_t heads = layout.kvHeads * tileParts(queryHeads, layout);
+  const uint32_t headParts = layout.kvHeads * tileParts(queryHeads, layout);
   // Enumerate nonsquare grids and partial final tiles. Each logical partial
-  // belongs to exactly one query tile, KV head and balanced history split.
+  // belongs to exactly one query tile, KV head part and balanced history
+  // split.
   for (const uint32_t rows : {17U, 257U, 2048U}) {
     const auto plan = ops::PagedAttention::prefillPlan(rows, queryHeads, layout);
     const uint32_t tiles = (rows + 7) / 8;
-    require(plan.splitGroups.x == heads &&
+    require(plan.splitGroups.x == headParts &&
                 plan.splitGroups.y == tiles && plan.splitGroups.z == plan.splits,
-            "prefill split axes must be KV head, query tile, split");
+            "prefill split axes must be KV head part, query tile, split");
     unequalAxes |= tiles != plan.splits;
     partialTile |= rows % 8 != 0;
     multipleSplits |= plan.splits > 1;
-    const uint64_t slots = uint64_t{tiles} * heads * plan.splits;
+    const uint64_t slots = uint64_t{tiles} * headParts * plan.splits;
     std::vector<uint8_t> visits(slots, 0);
     for (uint32_t z = 0; z < plan.splitGroups.z; ++z)
       for (uint32_t y = 0; y < plan.splitGroups.y; ++y)
         for (uint32_t x = 0; x < plan.splitGroups.x; ++x) {
           // group.y selects the query tile and group.z its balanced split;
-          // scratch is [tile][KV head][split].
-          const uint64_t slot = (uint64_t{y} * heads + x) * plan.splits + z;
+          // scratch is [tile][KV head][part][split].
+          const uint64_t slot = (uint64_t{y} * headParts + x) * plan.splits + z;
           require(slot < visits.size() && visits[slot] == 0,
                   "prefill grid aliases or exceeds a logical partial slot");
           ++visits[slot];
           require(slot % plan.splits == z &&
-                      (slot / plan.splits) % heads == x &&
-                      slot / (uint64_t{plan.splits} * heads) == y,
+                      (slot / plan.splits) % headParts == x &&
+                      slot / (uint64_t{plan.splits} * headParts) == y,
                   "prefill dispatch orientation changed logical scratch ownership");
         }
     require(std::all_of(visits.begin(), visits.end(),

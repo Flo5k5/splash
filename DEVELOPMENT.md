@@ -1840,12 +1840,13 @@ the parameters, `GgufFile` and the planner check the rest).
 Every model decodes with a DFlash2 draft. Each family names the repository
 of the DFlash2 checkpoint trained for it (`families.FAMILIES`), which holds
 it as the release publishes it: `config.json` and BF16 `model.safetensors`
-(or the shards its index names); a family whose draft is not released yet
-names none, and its installation names one with `--draft-model`. Installation
-downloads only those files and follows the repository's default branch as it
-follows the target's ([Revisions](#revisions)); `--draft-model` accepts
-another repository, followed the same way, or a local directory that holds
-them. A checkpoint is installed only when the engine accepts its
+(or the shards its index names), and `mask_embedding.safetensors` when the
+release ships its mask token's embedding; a family whose draft is not released
+yet names none, and its installation names one with `--draft-model`.
+Installation downloads only those files and follows the repository's default
+branch as it follows the target's ([Revisions](#revisions)); `--draft-model`
+accepts another repository, followed the same way, or a local directory that
+holds them. A checkpoint is installed only when the engine accepts its
 configuration with the target's (its `model-check`), so a draft of another
 architecture never replaces one that loads.
 
@@ -1859,13 +1860,14 @@ Qwen3.5-122B-A10B draft was trained to fill 16; `readDraftLayout` in
 `ModelDescriptor.mm`); the kernels take any hidden width of whole 16-channel
 convolution groups. A draft's rows after its anchor read the target's token
 table row of the mask token, unless its release ships that token's BF16
-embedding beside its weights: `mask_embedding.safetensors`, one tensor
-`mask_embedding` of the hidden size, which installation fetches with the weights
-(`DFlashDraft::addMaskRows`). A quantized table can lose the row:
-Qwen3.5-122B-A10B's is of order 1e-6, below what the fp16 block scales of Q8_0
-and the K-quants hold, so its GGUFs read zeros there, and its draft accepted 2.3
-tokens a cycle on code without the embedding, 4.7 with it. Every family loads
-and runs its draft alike: a decode cycle drafts eight rows, the anchor and its
+embedding, which they read instead (`DFlashDraft::addMaskRows`):
+`mask_embedding.safetensors`, one tensor `mask_embedding` of the hidden size.
+A quantized table can lose the row: Qwen3.5-122B-A10B's is of order 1e-6,
+below what the fp16 block scales of Q8_0 and the K-quants hold, so its GGUFs
+read zeros there: on an M5 Max serving unsloth/Ornith-1.5-122B-GGUF:UD-Q4_K_XL
+with every row verified, its draft accepted 2.3 tokens a cycle on code
+without the embedding, 4.7 with it. Every family loads and runs its draft
+alike: a decode cycle drafts eight rows, the anchor and its
 seven proposals, and the target verifies their first rows, as many as the cycle
 chose for the lane (its verify rows, `ops::DraftSelector::addVerifyRows`), never
 more than the lane may still retain: the tokens its output budget leaves, at
