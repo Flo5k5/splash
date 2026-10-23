@@ -40,12 +40,6 @@
 namespace splash {
 namespace {
 
-// Temporary host/driver allocation failures can recover during startup.
-// Preserve the desktop reserve and bound retries; configuration and compute
-// failures remain immediate and fail-closed.
-constexpr auto kStartupMemoryRecoveryTimeout = std::chrono::seconds(30);
-constexpr auto kStartupMemoryRecoveryPoll = std::chrono::seconds(1);
-
 // One observer spans bootstrap and serving. The dispatch queue only records
 // pressure and wakes control; all allocation/reclaim decisions stay on the
 // native thread. RAII also covers failed or interrupted startup.
@@ -322,7 +316,7 @@ int runNative(const engine::NativeArguments &arguments) {
         engine::NativeLoopTiming{transport.maxTickMilliseconds()});
   };
 
-  engine::StartupRetryWindow recovery(kStartupMemoryRecoveryTimeout);
+  engine::StartupRetryWindow recovery(engine::kStartupMemoryRecoveryTimeout);
   bool reportedRecoveryWait = false;
   std::unique_ptr<engine::RuntimeBootstrap> bootstrap;
   while (!bootstrap) {
@@ -351,7 +345,8 @@ int runNative(const engine::NativeArguments &arguments) {
                 "the macOS reserve remains protected...");
         reportedRecoveryWait = true;
       }
-      const auto resumeAt = std::min(now + kStartupMemoryRecoveryPoll, *recoveryDeadline);
+      const auto resumeAt =
+          std::min(now + engine::kStartupMemoryRecoveryPoll, *recoveryDeadline);
       while (AwakeClock::now() < resumeAt &&
              !transport.shutdownRequested()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));

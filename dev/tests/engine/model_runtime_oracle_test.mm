@@ -1,8 +1,10 @@
+#include "AwakeClock.hpp"
 #include "LinearNumerics.hpp"
 #include "PenaltyReference.hpp"
 #include "TestChecks.hpp"
 #include "TestKvTier.hpp"
 #include "ane/ProgramInstrumentation.hpp"
+#include "engine/Bootstrap.hpp"
 #include "engine/KvPool.hpp"
 #include "engine/RuntimeResources.hpp"
 #include "engine/MemoryGovernor.hpp"
@@ -13,7 +15,6 @@
 #include "model/KvBlockCache.hpp"
 #include "model/KvCopyRead.hpp"
 #include "model/KvHistoryStream.hpp"
-#include "model/ModelSizing.hpp"
 #include "model/Runtime.hpp"
 #include "model/Qwen4Exp.hpp"
 #include "model/Qwen4Steps.hpp"
@@ -3913,28 +3914,36 @@ int main(int argc, char **argv) {
       fail(*error);
     const uint64_t hostReserveBytes =
         EngineMemoryPolicy::hostAvailableReserveBytes(device.physicalMemoryBytes);
-    const std::optional<HostMemory> host = queryHostMemory();
-    const std::optional<uint64_t> hostAvailableBytes =
-        host ? std::optional<uint64_t>(host->available) : std::nullopt;
-    require(hostAvailableBytes.has_value(),
-            "cannot measure available host memory before loading the oracle model");
     const std::filesystem::path modelRoot(argv[2]);
     const auto descriptor = model::servedFor(model::inspectModelRoot(modelRoot), maxContext);
     // Production's weight byte count with a different bound. Production checks
     // it only against the Metal hard budget, then guards host headroom at every
     // Metal operation while loading. This oracle has no such guard, so the
     // weights must fit in reclaimable memory above the macOS reserve before
-    // any is loaded; it can refuse a model production starts.
-    const model::StreamableWeights streamable = model::streamableWeights(
-        modelRoot, descriptor,
-        {.streamExperts = loadOptions.expertMemoryBytes != 0, .streamTable = loadOptions.streamedTableBytes != 0});
-    const uint64_t weightBytes = streamable.loadedBytes + (streamable.expertBytes ? loadOptions.expertMemoryBytes : 0) +
-                                 (streamable.tableBytes ? loadOptions.streamedTableBytes : 0);
-    if (*hostAvailableBytes <= hostReserveBytes ||
-        weightBytes > *hostAvailableBytes - hostReserveBytes)
-      stopForHostMemory("the weights need " + mebibytes(weightBytes) + ", and macOS has " +
-                        mebibytes(*hostAvailableBytes) + " available and keeps " + mebibytes(hostReserveBytes) +
-                        "; close other programs and retry");
+    // any is loaded; it can refuse a model production starts. As a start
+    // retries a refusal of host memory, the oracle waits for that memory,
+    // measuring every kStartupMemoryRecoveryPoll for up to
+    // kStartupMemoryRecoveryTimeout: macOS can return the memory of a process
+    // that has just exited a moment later, so a run that starts as a server
+    // stops can find it still held.
+    const uint64_t weightBytes = tools::weightBytes(modelRoot, descriptor, loadOptions);
+    const auto memoryDeadline = AwakeClock::now() + kStartupMemoryRecoveryTimeout;
+    bool reportedMemoryWait = false;
+    while (true) {
+      const std::optional<HostMemory> host = queryHostMemory();
+      require(host.has_value(), "cannot measure available host memory before loading the oracle model");
+      if (host->available > hostReserveBytes && weightBytes <= host->available - hostReserveBytes)
+        break;
+      if (AwakeClock::now() >= memoryDeadline)
+        stopForHostMemory("the weights need " + mebibytes(weightBytes) + ", and macOS has " +
+                          mebibytes(host->available) + " available and keeps " + mebibytes(hostReserveBytes) +
+                          "; close other programs and retry");
+      if (!reportedMemoryWait) {
+        std::cerr << "model_runtime_oracle_test: waiting for the memory the weights need\n";
+        reportedMemoryWait = true;
+      }
+      std::this_thread::sleep_for(kStartupMemoryRecoveryPoll);
+    }
     // Streamed weights read on a pool of SSD readers, as the engine's do.
     loadOptions.readers = std::make_shared<model::SsdReaders>(model::kSsdReaders);
     model::LoadedModel model =
