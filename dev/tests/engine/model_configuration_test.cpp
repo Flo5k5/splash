@@ -70,13 +70,13 @@ constexpr std::string_view kDenseGgufConfig =
 constexpr std::string_view kMoeGgufConfig =
     R"({"model_type":"qwen3_5_moe","text_config":{"model_type":"qwen3_5_moe_text","hidden_size":2048,)"
     R"("max_position_embeddings":262144,"num_attention_heads":16,"num_key_value_heads":2,)"
-    R"("head_dim":256,"num_hidden_layers":40,"vocab_size":248320}})";
+    R"("head_dim":256,"num_experts":256,"num_hidden_layers":40,"vocab_size":248320}})";
 // Qwen3.5-122B-A10B's, of the same model type, from unsloth's
 // Ornith-1.5-122B GGUF (its MTP layer left out of the layers).
 constexpr std::string_view kLargeMoeGgufConfig =
     R"({"model_type":"qwen3_5_moe","text_config":{"model_type":"qwen3_5_moe_text","hidden_size":3072,)"
     R"("max_position_embeddings":262144,"num_attention_heads":32,"num_key_value_heads":2,)"
-    R"("head_dim":256,"num_hidden_layers":48,"vocab_size":248320}})";
+    R"("head_dim":256,"num_experts":256,"num_hidden_layers":48,"vocab_size":248320}})";
 
 // The descriptor inspection makes of model's assembly.
 model::ModelDescriptor inspect(const SourceModel &model) {
@@ -575,6 +575,58 @@ void testVisionConfig(const std::filesystem::path &fixtures) {
             "a vision config was accepted with " + std::string(refused.to));
 }
 
+// A GGUF MoE target is served by the routed experts its config states, which
+// the installer derives from the header, fewer than its family's in a pruned
+// release: a multiple of 8 from the experts each token takes to the family's
+// (ggufRoutedExperts). Every other dimension stays the family's, and a config
+// without the count, which an earlier release derived, states the family's.
+// An MLX target's count is the family's.
+void testPrunedExperts(const std::filesystem::path &fixtures) {
+  // The family's layout with `experts` routed experts.
+  const auto withExperts = [](auto layout, uint32_t experts) -> model::TargetLayout {
+    layout.experts = experts;
+    return layout;
+  };
+  const SourceModel flash =
+      mlxModel(fixtures, "qwen3.8-flash-next").with(&SourceModel::record, R"("mlx-affine")", R"("gguf")");
+  const auto flashWith = [&](uint32_t experts) {
+    return flash.with(&SourceModel::config, R"("num_experts": 512)",
+                      R"("num_experts": )" + std::to_string(experts));
+  };
+  const model::ModelDescriptor pruned = inspect(flashWith(256));
+  require(pruned.valid() && pruned.target == withExperts(model::Qwen4ExpLayout{}, 256) &&
+              pruned.draft == test::flashNextDraft(),
+          "a pruned Qwen3.8-Flash-Next GGUF was not described as its family with its experts");
+  for (const uint32_t experts : {16U, 512U})
+    require(inspect(flashWith(experts)).target == withExperts(model::Qwen4ExpLayout{}, experts),
+            "a Qwen3.8-Flash-Next GGUF of " + std::to_string(experts) + " experts was not served by them");
+  require(inspect(flash.with(&SourceModel::config, R"("num_experts": 512,)", "")).target ==
+              model::TargetLayout{model::Qwen4ExpLayout{}},
+          "a GGUF config without its experts did not state the family's");
+  for (const uint32_t experts : {8U, 12U, 520U})
+    refuses(flashWith(experts),
+            "(text config num_experts: GGUF " + std::to_string(experts) +
+                ", Qwen3.8-Flash-Next a multiple of 8 from 16 to 512)",
+            "a Qwen3.8-Flash-Next GGUF of " + std::to_string(experts) + " experts was accepted");
+  refuses(flash.with(&SourceModel::config, R"("num_experts": 512)", R"("num_experts": true)"),
+          "text config num_experts must be a number", "a GGUF config's experts were read from a boolean");
+  // Qwen3.6-35B-A3B's, by its own experts and the experts each token takes.
+  SourceModel moe = mlxModel(fixtures, "qwen3.6-35b-a3b").with(&SourceModel::record, R"("mlx-affine")", R"("gguf")");
+  moe.config = kMoeGgufConfig;
+  const auto moeWith = [&](uint32_t experts) {
+    return moe.with(&SourceModel::config, R"("num_experts":256)", R"("num_experts":)" + std::to_string(experts));
+  };
+  for (const uint32_t experts : {8U, 128U})
+    require(inspect(moeWith(experts)).target == withExperts(model::Qwen3_6MoeLayout{}, experts),
+            "a Qwen3.6-35B-A3B GGUF of " + std::to_string(experts) + " experts was not served by them");
+  refuses(moeWith(264), "(text config num_experts: GGUF 264, Qwen3.6-35B-A3B a multiple of 8 from 8 to 256)",
+          "a Qwen3.6-35B-A3B GGUF of more experts than its family's was accepted");
+  refuses(mlxModel(fixtures, "qwen3.6-35b-a3b")
+              .with(&SourceModel::config, R"("num_experts": 256)", R"("num_experts": 128)"),
+          "text config num_experts mismatch: safetensors 128, runtime 256",
+          "an MLX target of other experts than its family's was accepted");
+}
+
 // The installer's check before any weight download (the engine's
 // model-check): the family of a target's configuration, alone while its
 // draft is not chosen and then with the draft's, by the rules a start
@@ -631,10 +683,10 @@ void testConfigurationCheck(const std::filesystem::path &fixtures) {
           "a draft of a block shorter than the kernels' rows was accepted");
   rejects([&] { static_cast<void>(check("gguf", "none", kDenseGgufConfig, std::nullopt, std::nullopt)); },
           "a GGUF target is checked with its metadata", "a GGUF was checked without its metadata");
-  const auto replaced = [](std::string metadata, std::string_view from, std::string_view to) {
-    const size_t at = metadata.find(from);
-    require(at != std::string::npos, "the GGUF metadata has no " + std::string(from));
-    return metadata.replace(at, from.size(), to);
+  const auto replaced = [](std::string json, std::string_view from, std::string_view to) {
+    const size_t at = json.find(from);
+    require(at != std::string::npos, "the config or metadata has no " + std::string(from));
+    return json.replace(at, from.size(), to);
   };
   // Qwen3.8-Flash-Next loads from a GGUF only; its metadata also states the
   // hyper-connections, the QSA indexer and the PLE n-gram embedding.
@@ -673,6 +725,18 @@ void testConfigurationCheck(const std::filesystem::path &fixtures) {
     rejects([&] { static_cast<void>(check("gguf", "none", flashConfig, metadata, std::nullopt)); }, error,
             "Qwen3.8-Flash-Next accepted metadata the kernels do not compute");
   }
+  // A pruned release, such as its Coder GGUF of 256 of the 512 routed
+  // experts: the config derived from the header states the header's count,
+  // which the header holds it to, and every other value stays the family's.
+  const std::string coderConfig = replaced(flashConfig, R"("num_experts": 512)", R"("num_experts": 256)");
+  const std::string coderMetadata =
+      replaced(flashMetadata, R"("qwen4exp.expert_count": 512)", R"("qwen4exp.expert_count": 256)");
+  require(check("gguf", "none", coderConfig, coderMetadata, std::nullopt) == "Qwen3.8-Flash-Next" &&
+              check("gguf", "none", coderConfig, coderMetadata, flashDraft) == "Qwen3.8-Flash-Next",
+          "a pruned Qwen3.8-Flash-Next GGUF's config and metadata were not found to be its family");
+  rejects([&] { static_cast<void>(check("gguf", "none", coderConfig, flashMetadata, std::nullopt)); },
+          "GGUF metadata does not match the target: expert_count 512 (expected 256)",
+          "a config of other experts than its header's was accepted");
   struct RefusedMetadata final {
     std::string_view config;
     const std::string &metadata;
@@ -810,10 +874,11 @@ int main(int argc, char **argv) {
     testOneRulePerValue(argv[1]);
     testQuantization(argv[1]);
     testVisionConfig(argv[1]);
+    testPrunedExperts(argv[1]);
     testConfigurationCheck(argv[1]);
     testYarn(argv[1]);
-    std::cout << "model configuration: every family, sources, one rule per value, quantization, vision, the "
-                 "installer's check, YaRN PASS\n";
+    std::cout << "model configuration: every family, sources, one rule per value, quantization, vision, pruned "
+                 "experts, the installer's check, YaRN PASS\n";
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
     return 1;

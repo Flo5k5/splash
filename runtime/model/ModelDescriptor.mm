@@ -5,6 +5,7 @@
 #include "metal/abi/DraftAttention.h"
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/PagedAttention.h"
+#include "ops/MoE.hpp"
 
 #import <Foundation/Foundation.h>
 
@@ -300,6 +301,32 @@ void validateTextConfig(NSDictionary *text, const QwenHybridLayout &target, Targ
   const std::string typeLabel =
       std::string("text config rope_parameters ") + typeKey.UTF8String;
   requireEqual(requireString(rope, typeKey, typeLabel), "default", name, typeLabel);
+}
+
+// The routed experts of a GGUF target of `target`'s family: its header's
+// expert_count, which the installer derives into the config's num_experts
+// (gguf.model_config), fewer than the family's in a pruned release. A count
+// is served when it is at most the family's, a shape the MoE kernels route
+// (ops::MoeShape: from the experts each token takes to the wide slots), and
+// whole 8-column tiles of the router's float projection (GgufFloatParams);
+// every start's planner holds the header and each expert tensor to it
+// (gguf::requireMetadata). A config without it, which an earlier release
+// derived, states the family's.
+uint32_t ggufRoutedExperts(NSDictionary *text, const QwenHybridLayout &target) {
+  if (!text[@"num_experts"]) return target.experts;
+  constexpr uint32_t routerTile = 8;
+  const auto served = [&](uint32_t experts) {
+    return experts <= target.experts && experts % routerTile == 0 &&
+           ops::MoeShape{target.hiddenSize, experts, target.expertsPerToken, target.expertIntermediateSize}.valid();
+  };
+  const uint32_t experts = requireWhole(text[@"num_experts"], "text config num_experts");
+  if (served(experts)) return experts;
+  // The refusal names the counts served, from the fewest to the family's.
+  uint32_t fewest = routerTile;
+  while (fewest < target.experts && !served(fewest)) fewest += routerTile;
+  throw unsupportedModel("text config num_experts: GGUF " + std::to_string(experts) + ", " +
+                         std::string(target.family) + " a multiple of " + std::to_string(routerTile) + " from " +
+                         std::to_string(fewest) + " to " + std::to_string(target.experts));
 }
 
 // An MLX target's quantization, the "quantization" object of its config.json:
@@ -640,7 +667,8 @@ void validateVisionConfig(NSDictionary *vision, const ops::VisionLayout &layout,
 // config's model type names, from the source formats its record names, with
 // each config checked: the target's, as those formats require, its vision
 // tower's, and its DFlash2 draft's, whose layout it reads (readDraftLayout),
-// unless draft is nil.
+// unless draft is nil. A GGUF MoE target has the routed experts its config
+// states (ggufRoutedExperts).
 ModelDescriptor describeSourceModel(std::string name, std::string_view targetFormat,
                                     std::string_view visionFormat, NSDictionary *config,
                                     NSDictionary *draft) {
@@ -673,11 +701,13 @@ ModelDescriptor describeSourceModel(std::string name, std::string_view targetFor
   // (inspectSourceConfiguration), and is not valid; a model root always
   // holds its draft's.
   DFlashDraftLayout dflashLayout;
-  std::visit([&](const auto &layout) {
+  std::visit([&](auto &layout) {
     if (targetSource == TargetSource::Safetensors && !layout.loadsSafetensors)
       throw std::invalid_argument(std::string(layout.family) + " loads from a GGUF only");
     validateTextConfig(text, layout, targetSource);
     if (targetSource == TargetSource::Safetensors) requireQuantization(config, layout);
+    if (targetSource == TargetSource::Gguf && layout.ffnKind == QwenFfnKind::SparseMoe)
+      layout.experts = ggufRoutedExperts(text, layout);
     if (draft) dflashLayout = readDraftLayout(draft, layout);
   }, *target);
   ModelDescriptor result = makeModelDescriptor(std::move(name), *target, dflashLayout,
