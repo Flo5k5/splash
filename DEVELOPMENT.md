@@ -3371,6 +3371,14 @@ but no sampling policy or DFlash decode. Successful scoring emits no Tokens
 event, finishes with Stop, and reports zero decode time. Cancelled requests
 carry no logits.
 
+An engine sends its Ready event first. One whose bootstrap fails, as when
+`--max-context` exceeds what its budget holds, writes its report to stderr,
+sends the report's reason as an engine failure in its place and exits; the
+server ends the start with that reason (`Error · …`, or
+`Engine restart failed · …` for a relaunch). An engine that ends before either,
+as a crashed one or one refusing its arguments does, ends it with
+`native protocol reached EOF`.
+
 ### Failures and crash traces
 
 A row that is not finite is a per-request failure, not an engine fault. Every
