@@ -1804,6 +1804,19 @@ do), each expert's gate rows then its up rows. The planner reads each expert's
 rows of it into the gate and up tensors, so the images are those of the two
 tensors.
 
+A MoE GGUF may keep fewer routed experts than its family, as
+`ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF` keeps 256 of
+Qwen3.8-Flash-Next's 512. Its derived configuration states the header's
+`expert_count` as `num_experts` (`gguf.model_config`), and the engine serves
+any count of at most the family's that the MoE kernels route (`ops::MoeShape`,
+at least the experts each token takes) and whose router's float projection
+fills whole 8-column tiles (`ggufRoutedExperts`): the model check takes that
+count, and every start plans, sizes and loads the model by it. Every other
+dimension is the family's, and every start's planner holds the header's
+`expert_count` and each router and expert tensor to the count. A configuration
+without it, which an earlier release derived, states the family's; an MLX
+target's count must be the family's.
+
 llama.cpp's NVFP4 (type 40, as in `cdiamond/Qwen3.8-27B-iMatrix-NVFP4-MTP-GGUF`)
 is `block_nvfp4`: 64 elements, a UE4M3 scale per 16 (an E4M3 byte whose bit 7
 llama.cpp ignores, reading 0x7F as 0) and E2M1 codes, beside an optional F32

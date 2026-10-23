@@ -303,6 +303,10 @@ def model_config(metadata, vision=None):
         "num_key_value_heads": "attention.head_count_kv",
         "head_dim": "attention.key_length",
     }
+    if ARCHITECTURES[arch].moe:
+        # The routed experts, which a pruned release keeps fewer of than its
+        # family; the engine plans, sizes and loads them by this count.
+        fields["num_experts"] = "expert_count"
     text = {name: metadata.positive(arch + "." + key) for name, key in fields.items()}
     text.update(
         num_hidden_layers=loaded_layers(metadata, arch),
