@@ -870,8 +870,34 @@ class UpstreamTest(unittest.TestCase):
             ],
         )
         self.assertNotIn(f"{MODEL}/optiq/optiq_vision.safetensors", fake.downloads)
-        with self.assertRaisesRegex(models.ModelError, "missing or unsupported shards"):
-            self.prepare(selection(self.root, language_only=False))
+
+        # A tower's shard the engine cannot read, or one the index names but
+        # the release never published, refuses the vision alone.
+        def unpublished(root):
+            target(root)
+            tower = {
+                "vision_tower.blocks.0.attn.qkv.weight": "model-vision.safetensors"
+            }
+            (root / "model.safetensors.index.json").write_text(
+                json.dumps({"weight_map": shards | tower})
+            )
+
+        fake.publish("someone/no-tower-shard", "b" * 40, unpublished)
+        for model, shard in (
+            (MODEL, "optiq/optiq_vision.safetensors"),
+            ("someone/no-tower-shard", "model-vision.safetensors"),
+        ):
+            with (
+                self.subTest(model=model),
+                self.assertRaisesRegex(
+                    models.VisionError,
+                    f"missing or unsupported shards: {shard}; use --language-only",
+                ),
+            ):
+                self.prepare(selection(self.root, model, language_only=False))
+        self.assertNotIn(
+            "someone/no-tower-shard/model-00001-of-00002.safetensors", fake.downloads
+        )
 
     def test_a_shard_name_read_as_a_glob_is_never_downloaded(self):
         def target(root):
