@@ -2557,15 +2557,18 @@ the staged split law below takes it. Its output is bitwise the two passes' at th
 where its split differs from the two passes', its sums are reassociated. A step of three request
 lanes runs the 32-row tile over four lanes of storage. On Apple10 one lane runs the 16-row tile
 over two lanes of storage (`LinearConfig::sixteenRows`), its padding lane computed and
-discarded, at any K split, where the projection's quantized segments store fewer than four and a
-half bits per weight together (`ProjectionShape::underFourAndHalfBits`), and a gate/up pair
-where both its tensors' own plans do: the lane's rows are bitwise the 8-row tile's, in less time
-(the 27B UD-IQ3_XXS decodes one lane 3.3-3.6% faster on a 12-core M6; split in two or four,
-IQ3_XXS and IQ2_XS take 2-8% less on the M6 and up to 6% less on a 32-core M5 Max, though the
-padding lane's partials double the split's traffic, which the split law weighs). Q4_K's 4.5 bits
-take more time on it on the M6, and split on the M5 Max. Prefill runs the staged kernels on both
-families: the 128-row prefill tile (`LinearTile::GgufPrefill`), and the staged tile for chunks
-of up to 32 rows.
+discarded, where its staged plan is unsplit and the projection's quantized segments store fewer
+than four and a half bits per weight together (`ProjectionShape::underFourAndHalfBits()`), an
+unsplit gate/up pair where both its tensors' own plans do: the lane's rows are bitwise the 8-row
+tile's, in less time (the 27B UD-IQ3_XXS decodes one lane 3.3-3.6% faster on a 12-core M6).
+Split, the padding lane's partials double the split's traffic: on the narrow grids where the law
+splits K most (the 35B's, the 122B's and Flash-Next's output projections, 1 to 1.5 threadgroups
+per core unsplit, in four or eight partitions) the 16-row tile takes 4-36% more time than the
+8-row tile at the same split on a 32-core M5 Max (IQ3_XXS, IQ2_XS and Q2_K, and IQ4_XS where it
+stages), against 2-8% less at 4 to 20 threadgroups per core on the M6 and 7% less to 2% more on
+the 27B's 5120-column projections in four on the M5 Max. Q4_K's 4.5 bits take more time on it on
+the M6. Prefill runs the staged kernels on both families: the 128-row prefill tile
+(`LinearTile::GgufPrefill`), and the staged tile for chunks of up to 32 rows.
 
 Apple10's staged tile splits K across threadgroups, and runs a gate/up pair in one pass or two,
 by one wave law (`apple10Staged` in `runtime/ops/LinearGguf.cpp`), for decode steps and short
