@@ -2527,8 +2527,13 @@ rule.
 Decode runs one of two kernel families, chosen by GPU family in `runtime/ops/LinearGguf.cpp`. On
 Apple9 (M3, M4) the register tile (`LinearTile::GgufRegister`) runs the kernels of
 `runtime/metal/kernels/decode/linear_gguf_sgmatrix.metal`, which feed the codes themselves to
-bf16 matrix operations with one fp32 epilogue per coefficient group, so every output is the bf16
-rounding of its fp32-accumulated sum. They read their activations as the Table16 table
+bf16 matrix operations, each chain of 32 inputs (16 for zero-point codes and 16-input scales)
+closed by an fp32 epilogue, so every output is the bf16 rounding of its fp32-accumulated sum. A
+simdgroup decodes a column's coefficients into threadgroup memory once per coefficient group, the
+inputs one scale covers (a format's `Group`: 16, 32, or the groups of a meta unit that share one,
+as MLX affine's groups of 64 and 128, PQ2_0, Q2_0, FP8 and BF16 do); on a 10-core M4, MLX 4-bit
+g64 at the 27B's and 35B's projection shapes takes 1.5% less time at one lane than with a decode
+per 32 inputs, and 0.4-1.6% at two to four. They read their activations as the Table16 table
 (`kernels/common/gguf_sgmatrix.h`) that the input's producer writes, or
 `decode_linear_gguf_prepare` when none did. The formats whose operands those kernels build from
 grid lookups, IQ3_XXS, the IQ2 formats and IQ1 (`apple9StagesFormat`), and Q2_K from two lanes
