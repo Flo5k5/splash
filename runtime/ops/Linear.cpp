@@ -139,7 +139,7 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destin
 }
 
 Linear::Linear(const DeviceCapabilities &device) noexcept
-    : family_(gpuFamilyClass(device.appleGpuFamily)), apple11_(device.appleGpuFamily == 11),
+    : family_(gpuFamilyClass(device.appleGpuFamily)),
       gpuCores_(plannedGpuCores(device)) {}
 
 uint32_t Linear::decodeStorageRows(uint32_t rows, ProjectionShape shape) const {
@@ -188,8 +188,7 @@ LinearScratchSize Linear::prefillScratchSize(ProjectionShape shape) const {
   // which run the staged tile (LinearGguf.cpp).
   for (uint32_t rows = 1; rows <= kMaximumDecodeTileRows; ++rows)
     for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate})
-      bound.include(
-          ggufPrefillScratchSize({{shape.outputSize, shape.inputSize}, rows, LinearPhase::Prefill, epilogue}));
+      bound.include(plan({{shape.outputSize, shape.inputSize}, rows, LinearPhase::Prefill, epilogue}).scratchSize());
   // Every prefill plan stores at most the token budget.
   static_assert(SPLASH_PREFILL_TOKEN_BUDGET % GGUF_PREFILL_ROWS == 0, "the prefill tiles cover the budget exactly");
   if (shape.rotated) bound.rotated = rotatedBytes(shape.inputSize, SPLASH_PREFILL_TOKEN_BUDGET);
