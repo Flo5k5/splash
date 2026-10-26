@@ -300,11 +300,11 @@ private:
   [[nodiscard]] LinearConfig ggufBaseline(LinearWorkload workload,
                                           std::span<const Projection *const> projections = {},
                                           ProjectionShape shape = {}) const;
-  // Whether one decode lane runs its staged plan of `splits` K partitions on
-  // the 16-row tile (LinearConfig::sixteenRows), by the projections' formats
-  // or without them `shape`'s.
-  [[nodiscard]] bool sixteenRowLane(LinearWorkload workload, uint32_t splits,
-                                    std::span<const Projection *const> projections, ProjectionShape shape) const;
+  // Whether one decode lane runs its staged plan on the 16-row tile
+  // (LinearConfig::sixteenRows), by the projections' formats or without them
+  // `shape`'s.
+  [[nodiscard]] bool sixteenRowLane(LinearWorkload workload, std::span<const Projection *const> projections,
+                                    ProjectionShape shape) const;
   // The partials and counters a dispatch of `splits` K partitions binds: the
   // scratch's, or for one partition, which reads neither, the output.
   [[nodiscard]] static std::array<metal::MetalBuffer, 2> splitScratch(const LinearBuffers &buffers,

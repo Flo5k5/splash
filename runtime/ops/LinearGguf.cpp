@@ -475,36 +475,39 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
   // more: fewer cores run two passes.
   //
   // One lane of a projection whose quantized segments store fewer than four
-  // and a half bits per weight together runs unsplit on Apple10's 16-row
-  // tile, the second lane of its storage padding: the lane's rows are the
-  // bits of the 8-row tile's (gguf-projection checks it), in less time. On
-  // the 27B UD-IQ3_XXS's shapes, DRAM-cold and unsplit, a 12-core M6 takes
-  // 2-10% less (its fused inputs 8-10%, an IQ3_S down projection 1% more)
-  // and a 32-core M5 Max 5-7% less (a one-pass gate/up pair 10%), and the
-  // 27B decodes one lane 3.3-3.6% faster on the M6; Flash-Next's fused
-  // inputs take 7-9% less on a 20-core M5 Pro, its one-lane cycle about 1%.
-  // At 4.5 bits the M6 takes up to 1.6% more (Q4_K, the vocabulary head's),
-  // and split plans up to 18% more. An unsplit gate/up pair runs it where
+  // and a half bits per weight together runs on Apple10's 16-row tile, the
+  // second lane of its storage padding: the lane's rows are the bits of the
+  // 8-row tile's (gguf-projection checks it), in less time. On the 27B
+  // UD-IQ3_XXS's shapes, DRAM-cold and unsplit, a 12-core M6 takes 2-10% less
+  // (its fused inputs 8-10%, an IQ3_S down projection 1% more) and a 32-core
+  // M5 Max 5-7% less (a one-pass gate/up pair 10%), and the 27B decodes one
+  // lane 3.3-3.6% faster on the M6; Flash-Next's fused inputs take 7-9% less
+  // on a 20-core M5 Pro, its one-lane cycle about 1%. Split in two or four,
+  // IQ3_XXS and IQ2_XS at 5120 inputs over 4 to 20 threadgroups per core take
+  // 2-8% less on the M6 and up to 6% less on the M5 Max (3.5% more at four
+  // threadgroups per core split in four), though the padding lane's partials
+  // double the split's traffic, which the split law weighs; in eight -7% to
+  // +7%. At 4.5 bits the M6 takes up to 1.6% more (Q4_K, the vocabulary
+  // head's), the M5 Max up to 5% more split. A gate/up pair runs it where
   // both its tensors' own plans do (sixteenRowLane).
-  LinearConfig config = stagedDecode(n, k, w.rows, weightBits16(projections, shape), gpuCores_, family_, gateUp,
-                                     onePass ? Passes::Either : Passes::Two);
+  const bool sixteenRows = sixteenRowLane(w, projections, shape);
+  LinearConfig config = stagedDecode(n, k, sixteenRows ? 2 * w.rows : w.rows, weightBits16(projections, shape),
+                                     gpuCores_, family_, gateUp, onePass ? Passes::Either : Passes::Two);
   config.spread = spreads;
-  config.sixteenRows = sixteenRowLane(w, config.splits, projections, shape);
+  config.sixteenRows = sixteenRows;
   return config;
 }
 
-bool Linear::sixteenRowLane(LinearWorkload w, uint32_t splits, std::span<const Projection *const> projections,
+bool Linear::sixteenRowLane(LinearWorkload w, std::span<const Projection *const> projections,
                             ProjectionShape shape) const {
-  // An unsplit gate/up pair where both its tensors' own plans run it: the
-  // decode storage of their shapes then holds its rows (decodeStorageRows).
+  // A gate/up pair where both its tensors' own plans run it: the decode
+  // storage of their shapes then holds its rows (decodeStorageRows).
   if (w.epilogue == LinearEpilogue::GateUp)
-    return splits == 1 && !projections.empty() &&
-           std::all_of(projections.begin(), projections.end(), [&](const Projection *p) {
+    return !projections.empty() && std::all_of(projections.begin(), projections.end(), [&](const Projection *p) {
              return p && ggufBaseline({w.matrix, w.rows}, std::span(&p, 1)).sixteenRows;
            });
   if (!projections.empty()) shape = projections.front()->shape();
-  return family_ == GpuFamilyClass::Apple10 && w.rows == SPLASH_TARGET_VERIFY_ROWS && splits == 1 &&
-         shape.underFourAndHalfBits;
+  return family_ == GpuFamilyClass::Apple10 && w.rows == SPLASH_TARGET_VERIFY_ROWS && shape.underFourAndHalfBits;
 }
 
 LinearScratchSize Linear::ggufDecodeScratchSize(LinearWorkload w, bool registerFormats) const {

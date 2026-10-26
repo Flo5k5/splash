@@ -442,11 +442,10 @@ void ggufPlans() {
   }
   // Apple10 decodes one lane of a projection whose quantized segments store
   // fewer than four and a half bits per weight together, float segments
-  // aside, on the 16-row tile where its staged plan runs unsplit, and a
-  // gate/up pair where both its tensors' own plans do. The plan's other
-  // fields are the two-lane plan's, so the lane's sums stay those of every
-  // width, and the decode storage of its shapes holds its rows. Apple9 never
-  // does.
+  // aside, on the 16-row tile at any K split, and a gate/up pair where both
+  // its tensors' own plans do. The plan's other fields are the two-lane
+  // plan's, so the lane's sums stay those of the next width, and the decode
+  // storage of its shapes holds its rows. Apple9 never does.
   {
     // A projection of `k` inputs in segments of (format, columns), F32 for
     // QuantizedSegment::kFloat32.
@@ -484,9 +483,8 @@ void ggufPlans() {
                              Weighed{"F32 alone", {{kF32, 1024}}, false}})
       require(segments(5120, w.parts).shape().underFourAndHalfBits == w.under,
               std::string("the bits per weight of ") + w.projection);
-    // The 27B's 17408 x 5120 IQ3_XXS runs it on a 12-core M6 and a 32-core M5
-    // Max, its 5120 x 17408 IQ3_S on the M6 but not the M5 Max, which splits
-    // its K in four, and Q4_K on neither.
+    // The 27B's 17408 x 5120 IQ3_XXS and 5120 x 17408 IQ3_S run it on a
+    // 12-core M6 and a 32-core M5 Max, Q4_K on neither.
     struct Pick {
       const char *projection;
       uint32_t family, cores, n, k, format;
@@ -496,7 +494,7 @@ void ggufPlans() {
         {"IQ3_XXS 17408 x 5120, 12 cores", 11, 12, 17408, 5120, GGUF_FMT_IQ3XXS, true},
         {"IQ3_XXS 17408 x 5120, 32 cores", 10, 32, 17408, 5120, GGUF_FMT_IQ3XXS, true},
         {"IQ3_S 5120 x 17408, 12 cores", 11, 12, 5120, 17408, GGUF_FMT_IQ3S, true},
-        {"IQ3_S 5120 x 17408, 32 cores", 10, 32, 5120, 17408, GGUF_FMT_IQ3S, false},
+        {"IQ3_S 5120 x 17408, 32 cores", 10, 32, 5120, 17408, GGUF_FMT_IQ3S, true},
         {"Q4_K 17408 x 5120, 12 cores", 11, 12, 17408, 5120, GGUF_FMT_Q4K, false},
         {"Q4_K 17408 x 5120, 32 cores", 10, 32, 17408, 5120, GGUF_FMT_Q4K, false},
     };
@@ -508,8 +506,7 @@ void ggufPlans() {
               std::string("one lane on the 16-row tile: ") + p.projection);
     // The 27B's gate/up pair runs one lane on the 16-row tile in two passes on
     // 12 and 32 cores (17 one-pass threadgroups per core on 32), but beside a
-    // Q4_K gate; a pair of 8192 columns, split in one pass on 32 cores where
-    // each tensor's own plan is unsplit, does not.
+    // Q4_K gate; a pair of 8192 columns, split in one pass on 32 cores, too.
     for (const uint32_t cores : {12U, 32U}) {
       const Linear device = gpu(11, cores);
       const auto pair = [&](uint32_t n, uint32_t gateFormat) {
@@ -519,7 +516,7 @@ void ggufPlans() {
       };
       const LinearConfig iq = pair(17408, GGUF_FMT_IQ3XXS), wide = pair(8192, GGUF_FMT_IQ3XXS);
       require(iq.sixteenRows && !iq.oneGateUpPass && !pair(17408, GGUF_FMT_Q4K).sixteenRows &&
-                  (cores == 12 || (wide.oneGateUpPass && wide.splits == 2 && !wide.sixteenRows)),
+                  wide.sixteenRows && (cores == 12 || (wide.oneGateUpPass && wide.splits > 1)),
               "the 16-row tile of a gate/up pair at " + std::to_string(cores) + " cores");
     }
     // The projection of `formats`, with a float segment of 64 columns last.
@@ -554,7 +551,7 @@ void ggufPlans() {
               LinearConfig config = one.configuration();
               const bool sixteen = gate ? alone(*p) && alone(*gate)
                                         : family >= 10 && config.tile == LinearTile::GgufStaged &&
-                                              config.splits == 1 && p->shape().underFourAndHalfBits;
+                                              p->shape().underFourAndHalfBits;
               uint32_t storage = device.decodeStorageRows(8, p->shape());
               if (gate) storage = std::max(storage, device.decodeStorageRows(8, gate->shape()));
               require(config.sixteenRows == sixteen && one.storageRows() == (sixteen ? 16U : 8U) &&
