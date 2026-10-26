@@ -1,6 +1,7 @@
 // GPU time of one GGUF projection through ops::Linear on both decode tiles (the Apple9 register tile and the staged
-// tile, on the device policy's walk, one lane on its 8- and 16-row tiles) at one to four lanes and every K split, the
-// measurements behind the tile rule and split tiers of runtime/ops/LinearGguf.cpp:
+// tile, on the device policy's walk, one lane on its 8- and 16-row tiles, a gate/up pair in two passes and, where the
+// walks spread, in one: pair) at one to four lanes and every K split, the measurements behind the tile rule and split
+// law of runtime/ops/LinearGguf.cpp:
 //   gguf-projection-benchmark <metallib> <fmt[+fmt+fmt]> <N[+N+N]> <K> [none|residual|gateup] [rounds]
 //                             [prefill=R[,R...]]
 // The projection has one segment per format and width (up to three, fused, no epilogue), each a multiple of 64
@@ -10,7 +11,7 @@
 // next copy (decode gate/up: the gate and up weights of two copies). The register tile reads the activation table its
 // producers write alongside their output (LinearBuffers::prepared), prepared once and not timed. The cases run in
 // ABBA order after a warm-up; printed are the medians of `rounds` (20) commands in ms per projection, the device
-// policy's choice marked with *. Widths emulate core counts: the policy's tiers count threadgroups per core.
+// policy's choice marked with *. Widths emulate core counts: the policy's split law counts threadgroups per core.
 // The float formats float-bf16 and float-f32 time the float projection (ops::addGgufFloat: the router's, the QSA
 // indexer's, F32 alpha/beta) instead, one tensor per width of any multiple of 8 columns, two in one dispatch as the
 // indexer's query and key run, on both float tiles at one to four lanes or each prefill chunk of R rows (the
@@ -275,16 +276,19 @@ int main(int argc, char **argv) {
                 }))
               continue;
             if (!registerTile && (K / 32) % splits) continue;
-            // One lane stages on the 8-row tile and on the 16-row tile (staged16).
-            for (const bool sixteenRows : {false, true}) {
-              if (sixteenRows && (registerTile || lanes > 1)) continue;
-              const LinearConfig config{.tile = tile, .splits = splits, .spread = !registerTile && wide.spread,
-                                        .oneGateUpPass = !registerTile && wide.oneGateUpPass,
-                                        .sixteenRows = sixteenRows};
-              cases.push_back({"L" + std::to_string(lanes),
-                               std::string(registerTile ? "register" : sixteenRows ? "staged16" : "staged") + " S" +
-                                   std::to_string(splits),
-                               Linear::plan(w, config, FloatOutput::BFloat16), config == policy, {}});
+            // One lane stages on the 8-row tile and on the 16-row tile (staged16); a gate/up pair on the staged tile
+            // runs as two passes and, where the walks spread, also in one pass (pair).
+            for (const bool onePass : {false, true}) {
+              if (onePass && (registerTile || epilogue != LinearEpilogue::GateUp || !wide.spread)) continue;
+              for (const bool sixteenRows : {false, true}) {
+                if (sixteenRows && (registerTile || lanes > 1)) continue;
+                const LinearConfig config{.tile = tile, .splits = splits, .spread = !registerTile && wide.spread,
+                                          .oneGateUpPass = onePass, .sixteenRows = sixteenRows};
+                cases.push_back({"L" + std::to_string(lanes),
+                                 std::string(registerTile ? "register" : onePass ? "pair" : "staged") +
+                                     (sixteenRows ? "16" : "") + " S" + std::to_string(splits),
+                                 Linear::plan(w, config, FloatOutput::BFloat16), config == policy, {}});
+              }
             }
           }
       }
