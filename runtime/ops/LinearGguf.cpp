@@ -520,7 +520,11 @@ LinearScratchSize Linear::ggufDecodeScratchSize(LinearWorkload w, bool registerF
   // bits, stages where the device registers; a gate/up pair of one format may
   // run in one pass where the walks spread. Without the formats both take the
   // most bits per weight, whose partials weigh least against the weights: the
-  // most K partitions of each pass mode.
+  // most K partitions of each pass mode, since the law's split never falls
+  // with the bits per weight and never rises with the rows (a split's
+  // partials grow with its rows alone, the same in either pass mode). One
+  // lane on the 16-row tile runs the two-lane plan of its bits, which the
+  // two-lane bound at the most bits covers.
   const bool gateUp = w.epilogue == LinearEpilogue::GateUp;
   if (family_ == GpuFamilyClass::Apple9 || apple10Registers(w.rows, n, gpuCores_, true))
     size.include(LinearPlan(w, stagedDecode(n, k, w.rows, 0, gpuCores_, family_, gateUp)).scratchSize());
