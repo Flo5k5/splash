@@ -2531,11 +2531,12 @@ router and alpha/beta on the neural accelerator as three bf16 parts per weight
 that sum to it exactly, so only fp32 accumulation rounds). Its scores pick the
 experts, so it stays off the block tiles, whose staged and prefill tiles round
 the weights to half; in decode they are slower on its narrow grid as well: on a
-32-core M5 Max the 35B's router as 8-bit planes takes 6.1, 8.6, 11.0 and 15.2
-us at one to four lanes on the register tile, its native rows 4.8, 5.9, 7.1 and
-8.1 us on the float projection (prefill chunks: 56-73 us on the prefill tile at
-64 to 2048 rows, 11-183 us exact, faster below about 500 rows). The GDN
-convolution and time-step bias become bf16 under the exact rule.
+32-core M5 Max the 35B's router as 8-bit planes takes 6.3, 8.7, 11.1 and 15.6
+us at one to four lanes on the register tile, its native rows 5.2, 6.3, 7.4 and
+8.5 us on the float projection (prefill chunks: 58-74 us on the prefill tile at
+64 to 2048 rows, 10-184 us on the float tiles, faster up to about 550 rows;
+weights DRAM-cold). The GDN convolution and time-step bias become bf16 under
+the exact rule.
 
 Decode runs one of two kernel families, chosen by GPU family in `runtime/ops/LinearGguf.cpp`. On
 Apple9 (M3, M4) the register tile (`LinearTile::GgufRegister`) runs the kernels of
@@ -2621,12 +2622,17 @@ rows (`QuantizedSegment::rows`) through the gather's decode
 (`kernels/common/gguf_embedding_formats.h`), the MLX affine formats as runs of 8 codes with their
 block's scale and bias, read a step ahead and decoded once for the step's products, and writes
 their products in fp32, the router's scores. The 35B's 8-bit affine router (256 x 2048, 0.56 MB
-a layer against its F32 values' 2.1 MB) takes 4.8, 5.9, 7.1 and 8.1 us at one to four lanes on a
-32-core M5 Max, where its F32 values take 6.9, 7.2, 7.6 and 8.3, and 11.1, 14.0, 17.2 and 20.5 us
-on a 10-core M4 against 22.0, 24.4, 26.6 and 28.5 (DRAM-cold, `gguf-projection-benchmark
-float-af8g64 256 2048`); prefill chunks of 512 to 2048 rows take 5-13% longer on the M5 Max's
-accelerator tile, where the decode lies on each step's critical path, and the M4's simdgroup tile
-is within -0.5% to +3% at 64 to 2048 rows.
+a layer against its F32 values' 2.1 MB) trades the bytes it saves for its decode: at one to four
+lanes it takes 5.2, 6.3, 7.4 and 8.5 us on a 32-core M5 Max against 6.7, 7.1, 7.5 and 8.2 for its
+F32 values (4% slower at four lanes), 6.3, 8.3, 10.4 and 12.6 against 14.7, 16.1, 16.5 and 17.9
+on a 12-core M6, and 10.9, 14.7, 17.9 and 21.1 against 22.2, 23.9, 26.2 and 28.0 on a 10-core M4;
+the 122B's (256 x 3072) 6.7, 8.4, 10.0 and 11.5 against 9.0, 9.5, 10.0 and 10.9 on the M5 Max
+(`gguf-projection-benchmark float-af8g64 256 2048`, weights DRAM-cold). In the 35B's one-lane
+decode on the M5 Max its dispatch takes 8.4 us a layer against 9.45 (`decode-profile`, ABBA, 4
+runs of 96 cycles a build): 0.04 ms of a 14.7 ms cycle, within the cycle's noise. Prefill chunks
+of 1024 to 2048 rows on the M5 Max's accelerator tile, where the decode lies on each step's
+critical path, take -10% to +7% of the F32 values' time, and the M4's simdgroup tile -3% to +6%
+at 64 to 2048 rows.
 A float projection takes the neural accelerator tile on Apple10 from 16 rows and a grid of its
 64 x 32 tiles of 1.5 per core for BF16 values, 2 for F32 values and 3 for a quantized format's rows,
 by the bf16 parts the tile stages a weight as (one, three, three decoded; `Linear::ggufFloatTile`).
@@ -2697,9 +2703,10 @@ in `dev/tests/fixtures/weight-goldens/`; with `SPLASH_GGML_ORACLE=<libggml-base.
 `gguf-reference` also compares the reference with GGML directly and prints GGML's hashes.
 
 Two benchmark tools repeat the measurements behind the GGUF split tiers and MoE plans, with the
-weights DRAM-cold. `make benchmark-gguf-projection GGUF_PROJECTION_ARGS='q4k 5120 8192'` times one
-projection (up to three fused formats and widths, then `K` and an optional epilogue) on both
-decode tiles at one to four lanes (one lane also on the staged 16-row tile, `staged16`) and
+weights DRAM-cold (each command of the projection benchmark reads a ring of weight copies of at
+least 384 MiB, however small the tensor). `make benchmark-gguf-projection
+GGUF_PROJECTION_ARGS='q4k 5120 8192'` times one projection (up to three fused formats and widths,
+then `K` and an optional epilogue) on both decode tiles at one to four lanes (one lane also on the staged 16-row tile, `staged16`) and
 every K split, and marks the device policy's pick, or, with a trailing `prefill=R[,R...]`
 after the epilogue and the round count, one format's 128-row prefill tile at each chunk of `R`
 rows (more than 32); the formats `float-bf16` and `float-f32`, and `float-<format>` for a

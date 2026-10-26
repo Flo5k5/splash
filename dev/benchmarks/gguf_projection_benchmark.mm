@@ -42,8 +42,14 @@ using splash::metal::MetalBuffer;
 namespace {
 
 constexpr uint64_t kRingBytes = 384ull << 20;
-constexpr uint32_t kMinimumCopies = 3, kMaximumCopies = 64, kMaximumLanes = 4, kLaneRows = 8;
+constexpr uint32_t kMinimumCopies = 3, kMaximumLanes = 4, kLaneRows = 8;
 constexpr double kWarmupSeconds = 0.1;
+
+// The copies of `bytes` of weights in a ring of at least kRingBytes, so that every copy a command reads comes from
+// DRAM whatever the tensor's size.
+uint32_t ringCopies(uint64_t bytes) {
+  return uint32_t(std::max<uint64_t>((kRingBytes + bytes - 1) / bytes, kMinimumCopies));
+}
 
 std::vector<std::string> split(const std::string &text, char separator) {
   std::vector<std::string> parts;
@@ -146,8 +152,7 @@ void floatProjections(MetalBackend &backend, const char *formatList, const char 
                   valueBytes);
     }
   }
-  const uint32_t copies = uint32_t(std::clamp<uint64_t>((kRingBytes + bytes - 1) / bytes, kMinimumCopies,
-                                                        kMaximumCopies));
+  const uint32_t copies = ringCopies(bytes);
   std::vector<std::vector<QuantizedSegment>> ring(copies);
   for (std::vector<QuantizedSegment> &segments : ring)
     for (uint32_t i = 0, offset = 0; i < sizes.size(); offset += sizes[i++]) {
@@ -244,8 +249,7 @@ int main(int argc, char **argv) {
                                                   &images.back().planes.meta})
           bytes += plane->size();
       }
-      const uint32_t copies = uint32_t(std::clamp<uint64_t>((kRingBytes + bytes - 1) / bytes, kMinimumCopies,
-                                                            kMaximumCopies));
+      const uint32_t copies = ringCopies(bytes);
       std::vector<Projection> ring;
       for (uint32_t c = 0; c < copies; ++c) {
         BlockWeights weights;
