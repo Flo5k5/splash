@@ -61,6 +61,9 @@ struct MoeShape final {
   MoeRouter router = MoeRouter::Softmax;
   uint32_t sharedSlices = 1;
   bool sharedGate = true;
+  // The format of the router's rows (QuantizedSegment::rows), which picks its
+  // float tile (Linear::ggufFloatTile).
+  uint32_t routerFormat = QuantizedSegment::kFloat32;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
     // Experts the routing kernels' slots hold, of an intermediate width
@@ -283,8 +286,8 @@ struct MoeConfig final {
   // The execution plans derive it from the GPU family, its planned core count
   // and the expert formats (moeGgufTile).
   MoeGgufTile ggufTile = MoeGgufTile::Staged;
-  // The tile of the F32 router; the execution plans derive it from the
-  // device and the plan's rows (Linear::ggufFloatTile).
+  // The router's float tile; the execution plans derive it from the device,
+  // the plan's rows and the router's format (Linear::ggufFloatTile).
   FloatTile ggufRouterTile = FloatTile::Simdgroup;
   bool operator==(const MoeConfig &) const = default;
 };

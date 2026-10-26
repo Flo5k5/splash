@@ -2626,8 +2626,20 @@ a layer against its F32 values' 2.1 MB) takes 4.8, 5.9, 7.1 and 8.1 us at one to
 on a 10-core M4 against 22.0, 24.4, 26.6 and 28.5 (DRAM-cold, `gguf-projection-benchmark
 float-af8g64 256 2048`); prefill chunks of 512 to 2048 rows take 5-13% longer on the M5 Max's
 accelerator tile, where the decode lies on each step's critical path, and the M4's simdgroup tile
-is within -0.5% to +3% at 64 to 2048 rows. These plans are fixed rules of GPU family, core count,
-shape and format.
+is within -0.5% to +3% at 64 to 2048 rows.
+A float projection takes the neural accelerator tile on Apple10 from 16 rows and a grid of its
+64 x 32 tiles of 1.5 per core for BF16 values, 2 for F32 values and 3 for a quantized format's rows,
+by the bf16 parts the tile stages a weight as (one, three, three decoded; `Linear::ggufFloatTile`).
+Where the two tiles take the same time on a 32-core M5 Max and a 12-core M6
+(`gguf-projection-benchmark float-<format>`, rows in steps of 64): F32 at 2.0-2.67 tiles per core
+for 256 columns of 2048 or 3072 inputs, and 1.75-2.0 (M6) or 2.0 and above (M5 Max) for the 64 and
+96 of GDN alpha/beta; quantized rows at 2.67-4.0 (8-bit and 4-bit affine, Q8_0, Q4_K). Over those
+points the rule's tile takes at most 13% (F32) and 6% (quantized rows) longer than the faster one,
+where 1.5 for every weight took up to 42% and 61% longer; on the M5 Max the 35B's native router rows
+take 52.6 us at 512 rows on the simdgroup tile against 71.8 on the accelerator's. BF16 crosses at
+0.67-1.33, under its rule, which keeps a decode step's 16 to 32 rows of a 512-column router off the
+accelerator tile on 12 cores (1.6-1.8x the simdgroup tile's time there). These plans are fixed
+rules of GPU family, core count, shape and format.
 
 A rotated projection rotates its input once into `LinearScratch::rotated`
 (`gguf_rotate`, in fp32 and rounded once to bf16) before its quantized segments,

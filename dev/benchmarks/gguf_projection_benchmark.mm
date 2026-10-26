@@ -164,7 +164,7 @@ void floatProjections(MetalBackend &backend, const char *formatList, const char 
       const bool accelerator = tile == FloatTile::NeuralAccelerator;
       if (accelerator && (rows < 16 || K % 32)) continue;
       const bool chosen = std::all_of(sizes.begin(), sizes.end(),
-                                      [&](uint32_t n) { return linear.ggufFloatTile(rows, n) == tile; });
+                                      [&](uint32_t n) { return linear.ggufFloatTile(rows, n, type) == tile; });
       cases.push_back({(prefillRows.empty() ? "L" + std::to_string(rows / kLaneRows) : "R" + std::to_string(rows)),
                        accelerator ? "accelerator" : "simdgroup", tile, rows, chosen, {}});
     }

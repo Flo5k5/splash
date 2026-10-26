@@ -465,7 +465,8 @@ int floatSegments(MetalBackend &backend, uint32_t floatColumns) {
             const Dot d = dot(x.data() + uint64_t{r} * K, gates.row(c - kFloatColumn), K);
             __bf16 value;
             std::memcpy(&value, got + i, 2);
-            outside += !inside(float(value), d.value, floatBound(d, K, linear.ggufFloatTile(rows, floatColumns)));
+            const FloatTile tile = linear.ggufFloatTile(rows, floatColumns, QuantizedSegment::kFloat32);
+            outside += !inside(float(value), d.value, floatBound(d, K, tile));
           }
         }
       if (differ || outside || written) {
