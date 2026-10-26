@@ -2599,7 +2599,11 @@ Max, the M5 Pro and the M6) are in-sample, the fit's own records; the ABBA decod
 pairs in other formats and low-bit pairs take the law unmeasured. On the 12-core M6 the 35B draft's
 fc projection (2048 columns over 16384 inputs) runs two partitions instead of four at three and
 four lanes, 1.0-1.2% (2 us a cycle) more, within the 1.2-1.4% the benchmark varies between
-repeats; the law keeps it.
+repeats; the law keeps it. The benchmark times the 27B's IQ4_XS gate/up pair 6.5% slower in two
+passes than in one at three and four lanes on the M5 Max (318.0 against 298.5 us), yet in the 27B
+UD-Q4_K_M's decode cycles at a 1024-token prompt the law's two passes took 0.8-1.2% less time there
+than a build running IQ4_XS pairs in one pass (1.2-1.8% at one and two lanes, six runs each), so the
+law keeps them.
 
 The law tells a gate/up pair's pass modes apart only where a last wave falls below its floor. On
 the M5 Max the 27B gate/up pair runs two passes (one pass would put 17 threadgroups on each
@@ -2618,11 +2622,15 @@ fits the sweeps worse; no 16-core Mac has measured the case. Fewer than 16 cores
 passes whatever the law (`spreadsStagedDecode`): a 12-core M6 took 2-11% more in one. The law's
 plans depend on the batch width, since partials grow with the rows, so a request's greedy output
 may change with the requests batched with it (the 27B MLX's decode cycles of three and four
-lanes and the 35B MLX's of two to four yield other tokens per cycle than before); the register
-tile and Apple9's staged tile, whose matrix operations share the FP32 pipe or run exact in
-registers without a residency step in their time, split by tiers (`decodeSplits`: threadgroups
-per core, inputs per partition and partitions, measured on a 40-core M3 Max, Apple9's staged
-tile taking the register tile's of eight partitions) that do not depend on the batch width.
+lanes and the 35B MLX's of two to four, and of one at other prompt lengths, yield other tokens per
+cycle than before), and with it a step's time: on the 32-core M5 Max's 35B MLX at two lanes, where
+only the draft's gate/up pair changes (one partition to two), cycles took 0.5-1.1% more at a
+1024-token prompt but 0.9% less to 0.7% more at 640, 896, 1280 and 1536 tokens, tokens per cycle
+moving both ways, so that step follows the text rather than the kernel. The
+register tile and Apple9's staged tile, whose matrix operations share the FP32 pipe or run exact in
+registers without a residency step in their time, split by tiers (`decodeSplits`: threadgroups per
+core, inputs per partition and partitions, measured on a 40-core M3 Max, Apple9's staged tile taking
+the register tile's of eight partitions) that do not depend on the batch width.
 Partitions stop at eight, but the register tile splits a grid that eight leave below three
 threadgroups per core into sixteen while partitions keep 512 inputs (Qwen3.8-Flash-Next's
 hyper-connection down projection, 320 columns over 10240 inputs; measured on Apple10). The MoE
