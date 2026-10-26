@@ -1516,7 +1516,7 @@ Proxy consumers can use these fields; additional fields may be added:
 | `ane_ffn.state`, `share`, `minimum_rows`, `reason` | The prefill FFN's [Neural Engine split](#neural-engine-prefill): `split` while it serves, at `share` of the FFN's channels over chunks of `minimum_rows` rows or more; `off` when the start left the GPU alone (`share` and `minimum_rows` 0); `stopped` once it stopped while serving, until the engine restarts. `reason` is the start's outcome, or why the split stopped |
 | `ane_ffn.split_commands`, `evaluations`, `ane_ms`, `reruns` | Prefill commands the split ran since engine start, the Neural Engine's evaluations in them and its milliseconds over them (each evaluation's from the GPU's signal to start it to its report); and the chunks the GPU ran again alone after the split's work for them failed |
 | `verify_rows` | The rows of a draft block decode cycles verify ([drafts](#drafts), `--verify-rows`): `auto` where the verify budget chooses them (a MoE target under the default), `all` where they verify every row the output limit leaves (a dense target, or `--verify-rows all`) |
-| `model_timing.prefill.last_gpu_ms`, `total_gpu_ms` | GPU time of the last prefill command, and of all since engine start, warmup included: each from its first Metal command buffer's start to its last one's end, so with the Neural Engine split it spans the GPU's waits on the Neural Engine; a chunk run again adds the rerun's |
+| `model_timing.prefill.last_gpu_ms`, `total_gpu_ms` | GPU time of the last prefill command, and of all since engine start, warmup included: each from its first Metal command buffer's start to its last one's end, so with the Neural Engine split it spans the GPU's waits on the Neural Engine; a chunk's image encodes, a command of their own ahead of it, add theirs, as a chunk run again adds the rerun's |
 | `metrics.decode_tokens_per_second` | Aggregate native decode throughput, not a request's end-to-end rate |
 | `metrics.decode_wall_ms` | Total wall time of the decode commands on the GPU, from submission to completion |
 | `metrics.decode_cycle_ms` | Total engine time of the decode commands, each from the previous command's completion (or its plan after idleness) to its own: the GPU command plus the host work between commands |
@@ -2022,6 +2022,15 @@ Unsloth's mmproj stores its 1-D tensors, patch embedding and position table as
 F32, all of them BF16-exact, and loads byte-identical to the MLX tower.
 Quantized MLX towers, deepstack projectors and mmproj tensors the tower does not
 use are rejected.
+
+A prefill command encodes the images whose rows begin in it, from no cached
+rows, in a command of its own, and is submitted once that command has
+completed: an encode takes about 0.3 s for a 1000 x 1400 page on an M5 Max
+and seconds for a 4-megapixel image on a small GPU, which Metal would count
+against the 5 s it gives the prefill command's first host step or Neural
+Engine wait ([Host steps](#host-steps)). The scheduler counts the encodes'
+time in what the prefill owes decoding requests, and leaves it out of its
+prefill estimate.
 
 `--language-only` links and loads no vision weights and removes them from
 memory accounting. It skips a GGUF's mmproj download and an MLX shard that
@@ -2989,6 +2998,19 @@ threw, and must not throw: the command may have completed by then, so a
 submitCommandAsync or wait() threw (its encoding failed after its first
 buffers were committed, or the watchdog or a shutdown gave the command up),
 so the work owns what it touches.
+
+Metal fails a command buffer whose event wait is still unmet 5 s after its
+queue reached the wait ("Caused GPU Timeout Error"), and with it the command
+and the engine. The backend commits a command's buffers as it encodes them, so
+the queue reaches a command's first host step, or Neural Engine wait, as the
+command is submitted, whatever GPU work runs ahead of it, and each later one
+once the one before it was met (macOS 27, M5 Max and M5 Pro; a wait committed
+behind 4.5 s of work and met 1 s after it fails at 5.0 s). The work between
+two steps, with the step, must therefore end within 5 s, which the
+scheduler's prefill slices keep with room to spare. Work outside them runs as
+a command of its own: a prefill command's image encodes, seconds of GPU work
+on a small GPU, run first, and the prefill command is submitted once they
+have completed ([Vision](#vision)).
 
 A step about as short as the GPU's wake-up can keep the GPU awake: one GPU
 thread spins through it until the CPU ends it, so the work after it starts at
