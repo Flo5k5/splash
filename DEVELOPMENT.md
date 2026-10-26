@@ -2596,7 +2596,10 @@ measured trailing waves take as much time in total on the sweeps but leave more 
 The law's totals on the sweeps (1.1%, 1.6% and 0.05% less time than the earlier rules on the M5
 Max, the M5 Pro and the M6) are in-sample, the fit's own records; the ABBA decode runs and a
 16-core emulation are the only out-of-sample checks, and the down projections' 17408 inputs,
-pairs in other formats and low-bit pairs take the law unmeasured.
+pairs in other formats and low-bit pairs take the law unmeasured. On the 12-core M6 the 35B draft's
+fc projection (2048 columns over 16384 inputs) runs two partitions instead of four at three and
+four lanes, 1.0-1.2% (2 us a cycle) more, within the 1.2-1.4% the benchmark varies between
+repeats; the law keeps it.
 
 The law tells a gate/up pair's pass modes apart only where a last wave falls below its floor. On
 the M5 Max the 27B gate/up pair runs two passes (one pass would put 17 threadgroups on each
@@ -2608,7 +2611,10 @@ core) and a 40-core M5 Max (13.6) run one. A 16-core M5 Pro puts 34 one-pass thr
 each core (16, 16 and 2), where the law takes two passes at every lane count; emulated by width
 on the M5 Max, two passes take 9-12% less time than one unsplit pass, the earlier rule's plan,
 at one and two lanes but 7% more at three and four (the 32-row tile's lower residency), so there
-the 27B gate/up pair's three- and four-lane steps lose about 7%. Fewer than 16 cores run two
+the 27B gate/up pair's three- and four-lane steps lose about 7%. The law keeps that loss: a 32-row
+residency of 8, which gives those steps back, sends the 32-core M5 Max's 27B pair to one pass at
+three and four lanes, 19-26% slower than its two passes, and a pair efficiency factor (0.92-0.97)
+fits the sweeps worse; no 16-core Mac has measured the case. Fewer than 16 cores run two
 passes whatever the law (`spreadsStagedDecode`): a 12-core M6 took 2-11% more in one. The law's
 plans depend on the batch width, since partials grow with the rows, so a request's greedy output
 may change with the requests batched with it (the 27B MLX's decode cycles of three and four
