@@ -107,11 +107,12 @@ class MoeExpertStream;
 enum class MoePhase : uint8_t { Prefill, Decode };
 
 // The weights of one sparse MoE block, which the loaded model owns. The
-// router and the shared expert's scalar gate are float tensors (llama.cpp
-// keeps a GGUF's unquantized; an MLX target's load as their F32 values), and
-// they run in fp32; a block without the gate (!MoeShape::sharedGate) leaves
-// it empty. The routed segments hold `slots` experts, routed expert e
-// in slot slotTable[e] (one uint32 per expert): every expert and the identity
+// router is a float segment in the format its checkpoint holds it (a GGUF's
+// F32 or BF16, which llama.cpp keeps unquantized, or a quantized tensor's
+// native rows) and the shared expert's scalar gate F32 values, and both run
+// in fp32; a block without the gate (!MoeShape::sharedGate) leaves it empty.
+// The routed segments hold `slots` experts, routed expert e in slot
+// slotTable[e] (one uint32 per expert): every expert and the identity
 // table when they are all resident, or an expert store's slots and the
 // block's table there when they stream (`stream`, the block's index in it
 // `streamBlock`).

@@ -131,6 +131,16 @@ ops::QuantizedSegment readQuantizedSegment(WeightFile &file, std::string_view la
     if (format == GGUF_FMT_COUNT)
         throw WeightStoreError("unsupported GGUF tensor type " + std::to_string(d.type));
     const QuantFormat &layout = kQuantFormats[format];
+    // A quantized tensor's native rows, which no meta unit describes either
+    // (an MLX checkpoint's quantized MoE router): a float segment.
+    if (!d.metaGroups) {
+        if (format == GGUF_FMT_BF16 || format == GGUF_FMT_F16 || d.p0 || d.p1 || d.metaBytes || d.plane1Bytes ||
+            d.metaTotalBytes || d.inputSize % layout.block_elements ||
+            d.plane0Bytes != uint64_t{d.outputSize} * ggufRowBytes(layout, d.inputSize))
+            throw WeightStoreError("GGUF native rows are inconsistent: " + std::string(label));
+        return ops::QuantizedSegment::nativeRows(format, d.outputSize, d.inputSize,
+                                                 file.section(d.plane0Bytes, std::string(label) + "-native"));
+    }
     // Quantized planes fill whole tiles; float tensors are rows as stored.
     if (d.outputSize % QUANT_TILE_ROWS || d.inputSize % ggufColumnUnit(layout))
         throw WeightStoreError("GGUF tensor shape is not tile aligned: " + std::string(label));
