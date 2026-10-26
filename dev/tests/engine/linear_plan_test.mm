@@ -129,10 +129,10 @@ void requireAnchorSplits(const LinearPlan &plan, const SplitAnchor &anchor, cons
 
 constexpr auto kNone = LinearEpilogue::None, kResidual = LinearEpilogue::Residual, kGateUp = LinearEpilogue::GateUp;
 
-// Six threadgroups per core, at least 512 inputs per partition, for every
-// projection kind; the narrow grids at 32 rows, where Apple10 stages them
-// (its register tile takes the steps whose grid of column tiles and lanes
-// holds fewer than 1.5 threadgroups per core).
+// Apple10's staged wave law (apple10Staged) on Q4_K, for every projection
+// kind; the narrow grids at 32 rows, where Apple10 stages them (its register
+// tile takes the steps whose grid of column tiles and lanes holds fewer than
+// 1.5 threadgroups per core).
 constexpr std::array kStagedSplitAnchors{
     SplitAnchor{"27B down", 16, 5120, 17408, 8, kResidual, 1, 2},
     SplitAnchor{"27B down", 20, 5120, 17408, 8, kResidual, 1, 2},
@@ -238,7 +238,7 @@ void ggufPlans() {
                                      {33U, 128U}, {100U, 128U}, {129U, 256U}, {2048U, 2048U}}) {
     const LinearPlan prefill = linear.plan({{5120, 17408}, rows, LinearPhase::Prefill, LinearEpilogue::UpWithGate},
                                            blockProjection(5120, 17408, 1));
-    // Chunks of up to 32 rows take the staged tile and its split rule (two
+    // Chunks of up to 32 rows take the staged tile and its split law (two
     // partitions of the 80-tile grid on 16 cores); the 128-row prefill tile
     // takes none.
     const uint32_t splits = rows <= 32 ? 2 : 1;
@@ -255,8 +255,9 @@ void ggufPlans() {
           "the staged tile took a prefill chunk past a decode batch");
   rejects([&] { (void)Linear::plan(down, {.tile = LinearTile::GgufStaged, .splits = 3}, FloatOutput::BFloat16); },
           "staged block splits take whole 32-input groups", "the staged tile split K three ways");
-  // The arena bound is the single-tensor plan of the 32-row tile, which fused
-  // and gate/up plans share.
+  // The arena bound, of the shape without its formats, covers every lane's
+  // plan; here the 32-row tile's is the largest, which fused and gate/up
+  // plans share.
   const ProjectionShape downShape{5120, 17408};
   require(linear.decodeScratchSize(downShape).partials == three.scratchSize().partials,
           "GGUF decode scratch bound");

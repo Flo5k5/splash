@@ -87,27 +87,41 @@ constexpr SplitTier kRegisterTiers[] = {{4, 256}, {32, 1024}, {3, 512, 16}};
 // 12288 x 5120 and 50% on 2048 x 512.
 constexpr std::span<const SplitTier> kApple9StagedTiers = std::span(kRegisterTiers).first(2);
 
-// The Apple10 staged decode tiles' wave law. A tile kernel's threadgroups
-// each walk K / 32 / splits steps over a 64-column tile's weights (a one-pass
-// gate/up pair's 32 columns of both tensors). A core runs `resident` of them
-// at once, so a grid runs in waves of that many per core; it streams its
-// share of DRAM from `saturating` of them on, so a grid's first wave of fewer
-// takes as long as one of that many, waiting on its chains' latency; a later
-// wave starts as the one before drains, which hides part of that latency, and
-// takes as long as at least `following`. Measured on the 32-core M5 Max, the
-// 20-core M5 Pro and the 12-core M6 (gguf-projection-benchmark over 2 to 40
-// threadgroups per core, MLX 4-bit, Q4_K to Q8_0, IQ3_XXS and IQ2_XS, 2048
-// and 5120 inputs, one to four lanes): time per byte steps up past 10 of the
-// two-simdgroup tile's threadgroups per core at every lane count (M5 Max, one
-// lane: 140 us at 10, 190 at 11 for 1.1 times the bytes) and past 16 of the
-// pair's (229 us at 16, 334 at 17); a lone chain of 160 steps takes as long
-// as 5.4 and 9 threadgroups' bytes at DRAM's rate, one that trails a full
-// wave as 3.5 of the tile's. `saturating` and `following` are those floors
-// fitted to the fastest split of every measured case (the 16-row tile where
-// one lane takes it), where the law's choices take 1.1%, 1.7% and 0.05% less
-// time than the earlier rules' in total on the M5 Max, the M5 Pro and the M6,
-// 29, 30 and 3 cases 3-33% less, and 2, 2 and 1 cases 4-12% more (a 34-us
-// pair of four threadgroups per core over 2048 inputs, two lanes).
+// The Apple10 staged decode tiles' wave law. A tile kernel's threadgroups each
+// walk K / 32 / splits steps over a 64-column tile's weights (a one-pass
+// gate/up pair's 32 columns of both tensors). A core runs `resident` of them at
+// once, so a grid runs in waves of that many per core; it streams its share of
+// DRAM from `saturating` of them on, so a grid's first wave of fewer takes as
+// long as one of that many, waiting on its chains' latency; a later wave starts
+// as the one before drains, which hides part of that latency, and takes as long
+// as at least `following`. Measured on the 32-core M5 Max, the 20-core M5 Pro
+// and the 12-core M6 (gguf-projection-benchmark over 2 to 40 threadgroups per
+// core, MLX 4-bit, Q4_K to Q8_0, IQ3_XXS and IQ2_XS, 2048 and 5120 inputs, one
+// to four lanes): time per byte steps up past 10 of the two-simdgroup tile's
+// threadgroups per core at one and two lanes on the M5 Max and the M6 (M5 Max,
+// one lane: 140 us at 10, 190 at 11 for 1.1 times the bytes), past 8 or 9 on
+// the M5 Pro, and past 16 of the pair's at every lane count (229 us at 16, 334
+// at 17). The 32-row tile of three and four lanes steps past 9 on the M5 Max, 8
+// on the M5 Pro and 11 on the M6, which the law leaves out: it takes 10 at
+// every row count. A lone chain of 160 steps takes as long as 5.4 and 9
+// threadgroups' bytes at DRAM's rate, and one threadgroup per core past a full
+// wave adds 2.7-3.5 of the tile's threadgroups' time (M5 Max and M6, one and
+// two lanes) and 6-8.5 of the pair's (M5 Max and M5 Pro). `saturating` and
+// `following` are not those measurements but a grid search's fit, with the
+// residencies, to the fastest split of every measured case (the 16-row tile
+// where one lane takes it): 6 and 10 for the measured 5.4 and 9, 2 and 3 for
+// the measured 2.7-3.5 and 6-8.5; they stand in for what the law leaves out,
+// such as the 32-row residency and the pair's per-byte advantage
+// (apple10Staged). Floors at the measured trailing waves (3 and 7) take as much
+// time in total on the same cases but leave 18 of them more than 3% slower than
+// the earlier rules, against 5 (Q8_0 and Q6_K split at 12 threadgroups per
+// core, three- and four-lane pairs at 10 per pass). On those cases, which
+// fitted it (in-sample), the law's choices take 1.1%, 1.6% and 0.05% less time
+// than the earlier rules' in total on the M5 Max, the M5 Pro and the M6, 29, 30
+// and 3 cases 3-33% less, and 2, 2 and 1 cases 4-12% more (a 34-us pair of four
+// threadgroups per core over 2048 inputs, two lanes). The sweeps cover 2048 and
+// 5120 inputs and pairs in MLX 4-bit: the down projections' 17408 inputs, pairs
+// in other formats and low-bit pairs take the law unmeasured.
 struct StagedOccupancy final {
   uint32_t resident, saturating, following;
 };
@@ -155,11 +169,21 @@ enum class Passes : uint8_t { Two, One, Either };
 // projection of `bits16` sixteenths of a bit per weight on `cores` cores, a
 // gate/up pair's two tensors when `gateUp` in `passes`: the K split, and
 // passes, of least time by the wave law; ties keep fewer partitions, then one
-// pass. On the 32-core M5 Max the 27B gate/up pair puts 17 one-pass
+// pass. The law tells the pass modes apart only where a last wave falls below
+// its floor: on the 32-core M5 Max the 27B gate/up pair puts 17 one-pass
 // threadgroups on each core, the 17th of which runs a second wave alone (333
-// us against 245 in two passes of 8.5 per core, one lane); a 20-core M5 Pro
-// puts 27 (two waves either way), where one pass takes 8% less time (395
-// against 430), as on a 40-core M5 Max at 13.6.
+// us against 245 in two passes of 8.5 per core, one lane). Where both modes'
+// last waves clear their floors it predicts the same time for both, and the
+// tie takes one pass: in 133 of the 152 tied cases of the M5 Max's and the
+// M5 Pro's sweeps (one to four lanes) one pass takes up to 22% less time, a
+// 20-core M5 Pro's 27B pair (27.2 per core) 8% (395 us against 430), a
+// 40-core M5 Max's (13.6) 8-9%; at 20 and 36 one-pass threadgroups per core
+// it takes up to 20% more, most at one lane. A 16-core M5 Pro puts 34 (16,
+// 16 and 2), where the law takes two passes at every lane count: emulated by
+// width on the M5 Max they take 9-12% less time than one unsplit pass at one
+// and two lanes but 7% more at three and four, where the 32-row tile's lower
+// residency slows them. Below 16 cores a pair runs two passes whatever the
+// law (spreadsStagedDecode): a 12-core M6 took 2-11% more in one.
 LinearConfig apple10Staged(uint32_t n, uint32_t k, uint32_t rows, uint32_t bits16, uint32_t cores, bool gateUp,
                            Passes passes) {
   const uint32_t tileRows = stagedTileRows(rows);
