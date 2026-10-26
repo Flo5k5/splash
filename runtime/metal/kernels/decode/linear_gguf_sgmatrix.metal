@@ -5,15 +5,16 @@
 //   min, 160 + code - zero for seeded linear codes (one add), the code itself
 //   (converted) for 8-bit linear codes, or the codebook, int8 or grid value;
 // - one MMA chain per 32 inputs (per 16 for zero-point codes and 16-input
-//   scales), closed by the fp32 epilogue
-//   s * chain + b * sum (b = m - 128 s, formats with a min, or b = m for
-//   8-bit codes; sum the chain's inputs, from the table) or
-//   s * chain with the chain seeded by -160 * sum from the table (formats
-//   with a zero point, and Q2_K, whose min per 16 inputs adds b * seed with
-//   b = m / -160);
-// - coefficients decoded once per simdgroup and coefficient group, the
-//   F::Group inputs one scale covers (16, 32, or 64 to 256 where the groups
-//   of a meta unit share it, as MLX affine's groups of 64 and 128 do), into
+//   scales), closed by the fp32 epilogue s * chain; a format with a min adds
+//   b * sum once per coefficient group, the F::Group inputs one scale and min
+//   cover (16, 32, or 64 to 256 where the groups of a meta unit share them,
+//   as MLX affine's groups of 64 and 128 do), but at least once per 64-input
+//   span of the table, with the last chain of either (b = m - 128 s, or b = m
+//   for 8-bit codes; sum those inputs, from the span's sums of 32), so that
+//   it reads the current span alone; formats with a zero point seed each
+//   chain with -160 * sum from the table, and Q2_K's min per 16 inputs adds
+//   b * seed with b = m / -160;
+// - coefficients decoded once per simdgroup and coefficient group into
 //   threadgroup memory;
 // - L request lanes per threadgroup share the weight operands and coefficients;
 //   each lane's chains and epilogue run as with L = 1, so its result does not
@@ -45,6 +46,7 @@ template <class F> struct Shape {
     Operand = 0x4300 + (Seeded ? kZeroPointOffset - 128 - F::Zero : 0),
     CG = Seeded || F::Group == 16 ? 2 : 1,                    // MMA chains per 32 inputs
     CPG = CG * F::Group / 32,                                 // chains per coefficient group
+    MinChains = CPG < 2 * CG ? CPG : 2 * CG,                  // chains per min term: the group's, at most a span's
     // Spans decoded per coefficient unit: every span of eight groups (one meta unit of eight, or two of four), or
     // half of them where a span's coefficients take twice Q4_K's storage (Q2_K's (s, b) per 16 inputs)
     UnitSpans = F::MetaGroups == 1 ? 1 : CG * (HasMin ? 2 : 1) <= 2 ? 4 : 2,
@@ -61,6 +63,10 @@ template <class F> struct Shape {
   static_assert(F::Group == 16 || (F::Group % 32 == 0 && F::Group <= 32 * F::MetaGroups),
                 "a coefficient covers 16 inputs, or whole groups of one meta unit");
   static_assert(CPG >= 1 && 2 * UnitSpans * CG % CPG == 0, "a coefficient unit holds whole coefficient groups");
+  // decode adds a min term with its last chain, from the span's 32-input sums of the term's chains: a chain covers
+  // one 32-input group, and a term's chains lie in one span, so it reads no sum before the span.
+  static_assert(!(HasMin && !Seeded) || CG == 1, "a min term's chains are 32-input groups");
+  static_assert(2 * CG % MinChains == 0, "a min term's chains lie in one span");
 };
 template <class F> using Coef = metal::conditional_t<Shape<F>::HasMin != 0, float2, float>;
 // The coefficients of a threadgroup's simdgroups for one unit; the run-time-format kernels hold every format's in
@@ -231,11 +237,21 @@ inline void decode(device const bfloat *table, device const float *sums, device 
 #pragma unroll
           for (uint h = 0; h < S::CG; ++h) cs[h][nf] = cu[((us * 2 + q) * S::CG + h) / S::CPG * NC + nf * 8 + fm];
         }
+        // Whether this 32-input group of the table closes a min term's inputs, a coefficient group or its span.
+        const bool closes = ((us * 2 + q) * S::CG + S::CG) % S::MinChains == 0;
 #pragma unroll
         for (uint r = 0; r < L; ++r) {
           const vec<bfloat, 8> bq = xt[ulong(r) * K + (8 * q + fm) * 4 + c];
           float2 sum = float2(0), seed[S::CG];
-          if (S::HasMin && !S::Seeded) sum = *(device const float2 *)(s32 + ulong(r) * tileSums + q * 8 + fn);
+          if (S::HasMin && !S::Seeded && closes) {
+            // The sum of those inputs: this 32-input sum and, closing a term of 64 inputs, the span's other.
+            sum = *(device const float2 *)(s32 + ulong(r) * tileSums + q * 8 + fn);
+#pragma unroll
+            for (uint t = 1; t < S::MinChains; ++t) {
+              const int earlier = int(q) - int(t);   // an earlier 32-input group of the span
+              sum += *(device const float2 *)(s32 + ulong(r) * tileSums + fn + earlier * 8);
+            }
+          }
 #pragma unroll
           for (uint h = 0; h < S::CG; ++h)
             seed[h] = S::Seeded ? *(device const float2 *)(seeds + ulong(r) * tileSums + (2 * q + h) * 8 + fn)
@@ -250,7 +266,7 @@ inline void decode(device const bfloat *table, device const float *sums, device 
                 sgmatrix::mma_acc<bfloat>(dot, a[nf][f], reinterpret_cast<thread const bfloat2 *>(&bq)[f]);
               if constexpr (S::HasMin) {
                 acc[r][nf] = fma(dot, cs[h][nf].x, acc[r][nf]);
-                acc[r][nf] = fma(S::Seeded ? seed[h] : sum, cs[h][nf].y, acc[r][nf]);
+                if (S::Seeded || closes) acc[r][nf] = fma(S::Seeded ? seed[h] : sum, cs[h][nf].y, acc[r][nf]);
               } else {
                 acc[r][nf] = fma(dot, float(cs[h][nf]), acc[r][nf]);
               }
