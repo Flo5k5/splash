@@ -40,8 +40,8 @@ FAMILIES = (
     # released for it the family's.
     ModelFamily("Qwen3.5-122B-A10B", "incoai/Ornith-1.5-122B-DFlash2", QWEN),
     ModelFamily("Qwen3.8-Flash-Next", "incoai/Qwen3.8-Flash-Next-DFlash2", QWEN),
-    # No DFlash2 draft is released for it yet, and it has no vision tower.
-    ModelFamily("Flint", None, FLINT, vision=False),
+    # It has no vision tower.
+    ModelFamily("Flint", "incoai/Flint-DFlash2", FLINT, vision=False),
 )
 
 
