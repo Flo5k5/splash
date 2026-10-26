@@ -7,7 +7,10 @@
 //   alpha/beta widths at K of whole and partial 64-input steps, bf16 and fp32
 //   destinations at a column offset of a wider row; neighbours stay
 //   untouched. BF16 weights (a router a GGUF stores so) give the outputs of
-//   the F32 tensor of their values bit for bit. Two projections of one input
+//   the F32 tensor of their values bit for bit, and so do the native rows of
+//   every quantized format (an MLX checkpoint's quantized router) those of
+//   the F32 values the gather decodes from them, as load-time widening wrote
+//   them; their bf16 destination is refused. Two projections of one input
 //   (the QSA indexer's query and key) share a dispatch when they share a tile
 //   and each gives the outputs of its own dispatch bit for bit.
 // - Float segments of a fused GGUF projection (Linear), the 35B's and the
@@ -279,6 +282,80 @@ int bfloat16Weights(MetalBackend &backend) {
         failures += tileFailures;
       }
     }
+  return failures;
+}
+
+// The native rows of every quantized format, as an MLX checkpoint's quantized
+// router loads: on both tiles, at the row counts and fp32 destination
+// bfloat16Weights takes, the outputs of the F32 values the token gather
+// decodes from the rows (gguf_embed_f32_<format>, which load-time widening
+// runs) bit for bit, the bytes outside the tile untouched; a bf16
+// destination is refused.
+int nativeRowWeights(MetalBackend &backend) {
+  int failures = 0;
+  for (uint32_t f = 0; f < GGUF_FMT_COUNT; ++f) {
+    if (float16(Fmt(f))) continue;
+    int formatFailures = 0;
+    for (const uint32_t K : {512u, 2048u})
+      for (const uint32_t N : {16u, 256u}) {
+        const std::vector<uint8_t> native = makeNative(Fmt(f), N, K, rng);
+        const MetalBuffer rows = upload(backend, native.data(), native.size(), "gguf-native-rows");
+        // The F32 values, gathered as writeDecoded gathers them.
+        std::vector<uint32_t> ids(N);
+        std::iota(ids.begin(), ids.end(), 0u);
+        const MetalBuffer idBuffer = upload(backend, ids.data(), ids.size() * 4, "gguf-native-ids");
+        const MetalBuffer values = backend.allocateBuffer(uint64_t{N} * K * 4, BufferStorage::Shared, "gguf-floats");
+        {
+          CommandGraph graph;
+          graph.add(std::string("gguf_embed_f32_") + kQuantFormats[f].name, {idBuffer, rows, values},
+                    GgufEmbedParams{N, N, K}, {(N * K + 255) / 256, 1, 1}, {256, 1, 1});
+          static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+        }
+        const QuantizedSegment f32 = QuantizedSegment::floats(N, K, values);
+        const QuantizedSegment quantized = QuantizedSegment::nativeRows(f, N, K, rows);
+        for (const FloatTile tile : {FloatTile::Simdgroup, FloatTile::NeuralAccelerator}) {
+          const bool accelerator = tile == FloatTile::NeuralAccelerator;
+          for (const uint32_t count : {1u, 7u, 16u, 33u, 263u, 2048u}) {
+            if (count == 2048 && (K != 2048 || N != 256)) continue;
+            if (accelerator && count < 16) continue;
+            const MetalBuffer input = bfloatBuffer(backend, activations(uint64_t{count} * K), "float-input");
+            const uint32_t stride = N + 96, offset = 32;
+            const uint64_t bytes = uint64_t{count + 1} * stride * 4;
+            const auto run = [&](const QuantizedSegment &weights) {
+              MetalBuffer output = backend.allocateBuffer(bytes, BufferStorage::Shared, "float-output");
+              std::memset(output.contents(), 0x7F, bytes);
+              CommandGraph graph;
+              splash::ops::addGgufFloat(graph, input, weights, output, count, stride, offset, FloatOutput::Float32,
+                                        tile);
+              static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+              return output;
+            };
+            const MetalBuffer want = run(f32), got = run(quantized);
+            if (std::memcmp(want.contents(), got.contents(), bytes)) {
+              printf("  float %s %s K=%u N=%u rows=%u: native rows' outputs differ from the F32 values' FAIL\n",
+                     accelerator ? "accelerator" : "simdgroup", kQuantFormats[f].name, K, N, count);
+              ++formatFailures;
+            }
+          }
+          bool refused = false;
+          try {
+            CommandGraph graph;
+            splash::ops::addGgufFloat(graph, bfloatBuffer(backend, activations(uint64_t{16} * K), "float-input"),
+                                      quantized, values, 16, N, 0, FloatOutput::BFloat16, tile);
+          } catch (const std::invalid_argument &) {
+            refused = true;
+          }
+          if (!refused) {
+            printf("  float %s %s: a bf16 destination of native rows was accepted FAIL\n",
+                   accelerator ? "accelerator" : "simdgroup", kQuantFormats[f].name);
+            ++formatFailures;
+          }
+        }
+      }
+    printf("float native %-7s K=512,2048 N=16,256: the F32 values' outputs bit for bit, both tiles %s\n",
+           kQuantFormats[f].name, formatFailures ? "FAIL" : "ok");
+    failures += formatFailures;
+  }
   return failures;
 }
 
@@ -1271,7 +1348,8 @@ int main(int argc, const char *argv[]) {
     try {
       MetalBackend backend(argv[1]);
       bufferExtents(backend);
-      const int failures = floatProjection(backend) + bfloat16Weights(backend) + floatPairs(backend) +
+      const int failures = floatProjection(backend) + bfloat16Weights(backend) + nativeRowWeights(backend) +
+                           floatPairs(backend) +
                            floatSegments(backend, 64) + floatSegments(backend, 96) + floatOnlyChain(backend) +
                            moe(backend) + routingLoads(backend) + permutedSlots(backend) + verifiedRows(backend);
       if (failures) {

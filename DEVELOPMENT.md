@@ -2603,8 +2603,18 @@ of one request.
 The float router, QSA indexer and alpha/beta projections run in `kernels/shared/gguf_float.metal`,
 which runs two projections of one input in one dispatch where they take the same tile (the
 indexer's query and key, each on the tile of its own width), and the token rows are gathered by
-one template in `kernels/shared/embedding.metal`. These plans are fixed rules of GPU family, core
-count, shape and format.
+one template in `kernels/shared/embedding.metal`. The float projection reads a quantized format's
+rows (`QuantizedSegment::nativeRows`) through the gather's decode
+(`kernels/common/gguf_embedding_formats.h`), the MLX affine formats as runs of 8 codes with their
+block's scale and bias, read a step ahead and decoded once for the step's products, and writes
+their products in fp32, the router's scores. The 35B's 8-bit affine router (256 x 2048, 0.56 MB
+a layer against its F32 values' 2.1 MB) takes 4.8, 5.9, 7.1 and 8.1 us at one to four lanes on a
+32-core M5 Max, where its F32 values take 6.9, 7.2, 7.6 and 8.3, and 11.1, 14.0, 17.2 and 20.5 us
+on a 10-core M4 against 22.0, 24.4, 26.6 and 28.5 (DRAM-cold, `gguf-projection-benchmark
+float-af8g64 256 2048`); prefill chunks of 512 to 2048 rows take 5-13% longer on the M5 Max's
+accelerator tile, where the decode lies on each step's critical path, and the M4's simdgroup tile
+is within -0.5% to +3% at 64 to 2048 rows. These plans are fixed rules of GPU family, core count,
+shape and format.
 
 A rotated projection rotates its input once into `LinearScratch::rotated`
 (`gguf_rotate`, in fp32 and rounded once to bf16) before its quantized segments,
@@ -2667,7 +2677,8 @@ projection (up to three fused formats and widths, then `K` and an optional epilo
 decode tiles at one to four lanes (one lane also on the staged 16-row tile, `staged16`) and
 every K split, and marks the device policy's pick, or, with a trailing `prefill=R[,R...]`
 after the epilogue and the round count, one format's 128-row prefill tile at each chunk of `R`
-rows (more than 32); the formats `float-bf16` and `float-f32` time the float projection
+rows (more than 32); the formats `float-bf16` and `float-f32`, and `float-<format>` for a
+quantized format's native rows (such as `float-af8g64`), time the float projection
 (`ops::addGgufFloat`, widths of any multiple of 8) on both float tiles instead, marking
 `Linear::ggufFloatTile`'s pick; `make benchmark-gguf-moe` times one MoE layer at the 35B shape,
 or at Qwen3.8-Flash-Next's or Flint's (`GGUF_MOE_ARGS='flash-next'` or `'flint'`), on the

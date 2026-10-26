@@ -49,13 +49,16 @@ enum class FloatOutput : uint8_t { BFloat16, Float32 };
   return type == FloatOutput::Float32 ? sizeof(float) : sizeof(uint16_t);
 }
 
-// A prepared GGUF tensor occupying a projection's output columns
+// A prepared tensor occupying a projection's output columns
 // [columnOffset, columnOffset + outputSize): repacked planes in the GGUF_FMT_*
-// format formatId (metal/abi/QuantFormat.h), or a float tensor the GGUF keeps
-// unquantized (as quantized GGUFs keep the MoE router: F32, or BF16 as some
-// store it), whose plane0 holds [outputSize][inputSize] values multiplied
-// unrounded in fp32 (kernels/shared/gguf_float.metal). The source container
-// is not part of it.
+// format formatId (metal/abi/QuantFormat.h), or a float segment, whose plane0
+// holds a row of inputSize values per output column, which the float
+// projection multiplies unrounded in fp32 (kernels/shared/gguf_float.metal):
+// F32 or BF16 values (formatId kFloat32, kBFloat16), as a GGUF keeps a tensor
+// unquantized, or the native rows of a quantized format (nativeRows), each
+// value the fp32 its decode gives, as the token gather decodes it. The MoE
+// router is a float segment in the format its checkpoint holds it. The source
+// container is not part of it.
 struct QuantizedSegment final {
   // The formatIds of a float segment of F32 and of BF16 values.
   static constexpr uint32_t kFloat32 = 0xffffffff, kBFloat16 = 0xfffffffe;
@@ -68,6 +71,10 @@ struct QuantizedSegment final {
                                                uint32_t type = kFloat32) {
     return {std::move(values), {}, {}, outputSize, inputSize, 0, type};
   }
+  // The native rows of a quantized GGUF_FMT_* format, every one but the
+  // 16-bit floats', each of whole native blocks; throws for any other.
+  [[nodiscard]] static QuantizedSegment nativeRows(uint32_t formatId, uint32_t outputSize, uint32_t inputSize,
+                                                   metal::MetalBuffer rows);
 
   metal::MetalBuffer plane0;
   metal::MetalBuffer plane1;
@@ -76,14 +83,16 @@ struct QuantizedSegment final {
   uint32_t inputSize = 0;
   uint32_t columnOffset = 0;
   uint32_t formatId = kFloat32;
+  // A float segment of formatId's native rows.
+  bool native = false;
 
-  [[nodiscard]] bool isFloat() const noexcept { return formatId == kFloat32 || formatId == kBFloat16; }
-  // The bytes of a float segment's value.
-  [[nodiscard]] uint32_t floatBytes() const noexcept { return formatId == kBFloat16 ? 2 : 4; }
-  // The plane geometry of a quantized segment.
+  [[nodiscard]] bool isFloat() const noexcept { return formatId == kFloat32 || formatId == kBFloat16 || native; }
+  // The bytes of a float segment's row.
+  [[nodiscard]] uint64_t floatRowBytes() const noexcept;
+  // The plane geometry or native block of a quantized format.
   [[nodiscard]] const QuantFormat &format() const noexcept;
-  // The kernel name suffix of its format ("f32" or "bf16" for a float
-  // segment).
+  // The kernel name suffix of its format: its kQuantFormats name, "f32" or
+  // "bf16" for F32 and BF16 values.
   [[nodiscard]] const char *name() const noexcept;
   // The buffer bound in plane1's slot: a format without a second plane binds
   // its meta plane there, which its kernels never read as plane1.
