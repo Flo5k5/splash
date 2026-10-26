@@ -201,7 +201,7 @@ uint32_t weightBits16(std::span<const Projection *const> projections, Projection
   uint32_t sum = 0, count = 0;
   for (const Projection *p : projections)
     if (p) sum += p->shape().weightBits16, ++count;
-  return count ? (sum + count - 1) / count : shape.weightBits16;
+  return count ? sum / count : shape.weightBits16;
 }
 
 // Whether every quantized segment of the projections satisfies `holds`.
@@ -507,7 +507,7 @@ bool Linear::sixteenRowLane(LinearWorkload w, std::span<const Projection *const>
              return p && ggufBaseline({w.matrix, w.rows}, std::span(&p, 1)).sixteenRows;
            });
   if (!projections.empty()) shape = projections.front()->shape();
-  return family_ == GpuFamilyClass::Apple10 && w.rows == SPLASH_TARGET_VERIFY_ROWS && shape.underFourAndHalfBits;
+  return family_ == GpuFamilyClass::Apple10 && w.rows == SPLASH_TARGET_VERIFY_ROWS && shape.underFourAndHalfBits();
 }
 
 LinearScratchSize Linear::ggufDecodeScratchSize(LinearWorkload w, bool registerFormats) const {

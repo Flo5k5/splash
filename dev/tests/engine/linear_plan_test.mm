@@ -463,26 +463,31 @@ void ggufPlans() {
       return Projection(n, k, std::move(weights));
     };
     constexpr uint32_t kF32 = QuantizedSegment::kFloat32;
+    // Its bits per weight in sixteenths, rounded down, and whether they fall
+    // below four and a half.
     struct Weighed {
       const char *projection;
       Parts parts;
+      uint32_t bits16;
       bool under;
     };
-    for (const Weighed &w : {Weighed{"IQ4_XS", {{GGUF_FMT_IQ4XS, 1024}}, true},
-                             Weighed{"MXFP4", {{GGUF_FMT_MXFP4, 1024}}, true},
-                             Weighed{"MLX 4-bit in groups of 128", {{GGUF_FMT_AF4G128, 1024}}, true},
-                             Weighed{"Q4_K", {{GGUF_FMT_Q4K, 1024}}, false},
-                             Weighed{"Q4_0", {{GGUF_FMT_Q40, 1024}}, false},
-                             Weighed{"IQ4_NL", {{GGUF_FMT_IQ4NL, 1024}}, false},
-                             Weighed{"MLX 4-bit in groups of 64", {{GGUF_FMT_AF4G64, 1024}}, false},
+    for (const Weighed &w : {Weighed{"IQ4_XS", {{GGUF_FMT_IQ4XS, 1024}}, 68, true},
+                             Weighed{"MXFP4", {{GGUF_FMT_MXFP4, 1024}}, 68, true},
+                             Weighed{"MLX 4-bit in groups of 128", {{GGUF_FMT_AF4G128, 1024}}, 68, true},
+                             Weighed{"Q4_K", {{GGUF_FMT_Q4K, 1024}}, 72, false},
+                             Weighed{"Q4_0", {{GGUF_FMT_Q40, 1024}}, 72, false},
+                             Weighed{"IQ4_NL", {{GGUF_FMT_IQ4NL, 1024}}, 72, false},
+                             Weighed{"MLX 4-bit in groups of 64", {{GGUF_FMT_AF4G64, 1024}}, 72, false},
                              Weighed{"the 27B UD-IQ3_XXS attention input, Q2_K q beside Q4_K k and v",
-                                     {{GGUF_FMT_Q2K, 12288}, {GGUF_FMT_Q4K, 1024}, {GGUF_FMT_Q4K, 1024}}, true},
+                                     {{GGUF_FMT_Q2K, 12288}, {GGUF_FMT_Q4K, 1024}, {GGUF_FMT_Q4K, 1024}}, 46, true},
                              Weighed{"IQ2_XXS beside as much Q8_0",
-                                     {{GGUF_FMT_IQ2XXS, 512}, {GGUF_FMT_Q80, 512}}, false},
-                             Weighed{"IQ3_XXS beside F32", {{GGUF_FMT_IQ3XXS, 1024}, {kF32, 96}}, true},
-                             Weighed{"F32 alone", {{kF32, 1024}}, false}})
-      require(segments(5120, w.parts).shape().underFourAndHalfBits == w.under,
+                                     {{GGUF_FMT_IQ2XXS, 512}, {GGUF_FMT_Q80, 512}}, 84, false},
+                             Weighed{"IQ3_XXS beside F32", {{GGUF_FMT_IQ3XXS, 1024}, {kF32, 96}}, 49, true},
+                             Weighed{"F32 alone", {{kF32, 1024}}, 0, false}}) {
+      const ProjectionShape shape = segments(5120, w.parts).shape();
+      require(shape.weightBits16 == w.bits16 && shape.underFourAndHalfBits() == w.under,
               std::string("the bits per weight of ") + w.projection);
+    }
     // The 27B's 17408 x 5120 IQ3_XXS and 5120 x 17408 IQ3_S run it on a
     // 12-core M6 and a 32-core M5 Max, Q4_K on neither.
     struct Pick {
@@ -551,7 +556,7 @@ void ggufPlans() {
               LinearConfig config = one.configuration();
               const bool sixteen = gate ? alone(*p) && alone(*gate)
                                         : family >= 10 && config.tile == LinearTile::GgufStaged &&
-                                              p->shape().underFourAndHalfBits;
+                                              p->shape().underFourAndHalfBits();
               uint32_t storage = device.decodeStorageRows(8, p->shape());
               if (gate) storage = std::max(storage, device.decodeStorageRows(8, gate->shape()));
               require(config.sixteenRows == sixteen && one.storageRows() == (sixteen ? 16U : 8U) &&
