@@ -321,6 +321,7 @@ template <uint Bits, uint Group> struct GgufEmbedAffine {
       // Blocks are whole 4-byte words, so a row of them holds s | z in one word and the codes of 2, 4 and 8 bits in
       // aligned halfwords, words and pairs of words.
       static_assert(Bytes % 4 == 0, "affine blocks are whole words");
+      static_assert(S == 0 && Z == 2 && Codes == 4, "a block's first word is s | z, its codes follow");
       device const uchar *at = block + Codes + (k % Weights) / 8 * Bits;
       ulong codes = 0;
       if constexpr (Bits == 8) {
