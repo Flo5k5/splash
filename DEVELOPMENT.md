@@ -1492,6 +1492,8 @@ Proxy consumers can use these fields; additional fields may be added:
 | `streamed_table` | While the PLE table streams, the [streamed PLE table](#ple-table-streaming)'s cache, stages, reads and prefetches; `null` otherwise |
 | `streamed_experts` | While routed experts stream, the [streamed experts](#streamed-experts)' store: its slots and resident experts, per use its loads, reads, read-ahead and host-step round trips, and its failure; `null` otherwise |
 | `kv_spill` | While a block-sparse target's KV can go to the SSD, its [KV on the SSD](#kv-on-the-ssd): the requests that started in each mode, converted to `spill`, had their output bounded or ended at that bound, and were refused for the quota, the write budget or a closed tier, and the starts waiting for the quota (`requests`); the pages that hold only their index and those whose KV is on the SSD; the write-through of spilling requests' pages; page moves, rewrites and restores; the quota of KV in service; the hot block cache's memory, hits, reads and host steps (`block_cache`; `read` over `resolves` is the blocks a layer's step missed on average) and the history streams' reads, how long each layer's took (`read_ms`, whose total gives with `bytes` the streams' bandwidth) and staging, the streamed commands that ran beside decoders, and the decoders' gaps across them (`history_stream`); absent for a target whose KV stays in memory, whose plan's `memory_plan.budget.kv_spill` is `null` |
+| `kv.window` | For a target with sliding-window layers, its [windows](#sliding-windows): the `window_pages` a row's window and a state's tail keep Full, whether pages past every window give up their windowed layers' K/V (`trim`, off with the native `--kv-window-trim off`), the pool's `full_pages` and `slim_pages` in use and the Slim extents' `slim_bytes`, the `pinned_blocks` states' tails hold, the `trimmed_pages` since engine start, the `upgrades` of blocks that took the page of a writer that computed them again, and the `refused_states` whose tail was not Full; absent for other targets |
+| `memory_plan.budget.kv_window` | For a target whose pages give up a window's layers, a Slim page's `slim_page_bytes` and the `floor_pages` a lane keeps Full, by which one request's KV capacity is counted; absent for other targets |
 | `memory_plan.budget.context_bounds` | What bounds `maximum_context_tokens` ([memory and context](#memory-and-context)): the model's `window`, one request's KV in memory (`resident`), the longest context a block-sparse target's floors hold (`spilled`) and its SSD cache's room holds (`disk`), and the `bound` that sets the limit: `model`, `memory` or `disk` |
 | `ane_ffn.state`, `share`, `minimum_rows`, `reason` | The prefill FFN's [Neural Engine split](#neural-engine-prefill): `split` while it serves, at `share` of the FFN's channels over chunks of `minimum_rows` rows or more; `off` when the start left the GPU alone (`share` and `minimum_rows` 0); `stopped` once it stopped while serving, until the engine restarts. `reason` is the start's outcome, or why the split stopped |
 | `ane_ffn.split_commands`, `evaluations`, `ane_ms`, `reruns` | Prefill commands the split ran since engine start, the Neural Engine's evaluations in them and its milliseconds over them (each evaluation's from the GPU's signal to start it to its report); and the chunks the GPU ran again alone after the split's work for them failed |
@@ -2901,27 +2903,39 @@ pressure and swap.
 KV pages live in extents: ordinary shared Metal buffers of one size per pool,
 between half and one and a half times 128 MiB, in which every tensor region of
 each attention layer starts 64 KiB-aligned, sized to leave the fewest of the
-budget's pages unused (`Layout::extentPagesFor`). Each extent has a form
-(`kv::PageForm`): a Full extent holds its pages' K/V and then, for a layout
-with a block index, their index plane; an Index extent only the plane, for
-pages whose K/V is on the SSD, and only a pool that spills allocates one. A
-page moves to the other form, its references with it, when its K/V leaves
-memory or comes back (`KvPool::movePages`). The pool allocates an extent
-when it needs one of its pages. When it is built it allocates the runway, the
-extents of the first 64 pages, which startup warmup runs on; nothing but the
-pool allocates or releases an extent. An extent whose last page is free stays
-allocated until a reclaim releases it, at once and only between commands: memory
-pressure, an admission the budget denies, the publication of a replay point in
-use or a junction, or startup cleanup. Kernels reach a page through the GPU
-address in its request's page table, so no command binds KV; the command
-queue's residency set makes extents resident for every command buffer. The host reaches the same memory
-(`PageStorage::spans`), which is how the disk tier moves pages. A reclaim
-returns free pages before it evicts anything: an empty extent as it is, and the
-free pages scattered over the others of its form as soon as they cover the
-extent of that form that holds the fewest pages, whose pages the pool copies to
-them (`KvPool::compactExtent`): a Full extent before an Index one, unless the
-reclaim needs the memory of one form, as a shortfall of Index pages needs Full
-memory.
+budget's pages unused (`Layout::extentPagesFor`). The regions follow the
+layers, except that a layout with a sliding window (`Layout::windowTokens`,
+over the layers `windowedLayers` names) places the regions of the layers no
+window bounds first and then the windowed layers', each in layer order
+(`Layout::region`): what a row reads of a page every window has passed lies in
+its first regions, and a page's SSD slot holds them first too. Each extent has
+a form (`kv::PageForm`), which holds the first of a Full extent's regions
+(`Layout::regions`) and then, for a layout with a block index, their index
+plane: a Full extent every layer's; an Index extent none, only the plane, for
+pages whose K/V is on the SSD, and only a pool that spills allocates one; and a
+Slim extent, only of a layout with a sliding window whose slots hold a page's
+spans in order (`Layout::slimmable`), those of the layers no window bounds, for
+a page every row's window has passed. A layer's region sits at one offset in
+every extent that holds it, so the kernels reach a Slim page as they reach a
+Full one, through a real page table entry; only an Index page's is absent. A
+page moves to another form, its references with it, when its K/V leaves memory
+or comes back, or when it gives up its windowed layers' K/V
+(`KvPool::movePages`), and the copy takes what both forms hold. The pool
+allocates an extent when it needs one of its pages. When it is built it
+allocates the runway, the extents of the first 64 pages, which startup warmup
+runs on; nothing but the pool allocates or releases an extent. An extent whose
+last page is free stays allocated until a reclaim releases it, at once and only
+between commands: memory pressure, an admission the budget denies, the
+publication of a replay point in use or a junction, or startup cleanup. Kernels
+reach a page through the GPU address in its request's page table, so no command
+binds KV; the command queue's residency set makes extents resident for every
+command buffer. The host reaches the same memory (`PageStorage::spans`), which
+is how the disk tier moves pages. A reclaim returns free pages before it evicts
+anything: an empty extent as it is, and the free pages scattered over the others
+of its form as soon as they cover the extent of that form that holds the fewest
+pages, whose pages the pool copies to them (`KvPool::compactExtent`): a Full
+extent before a Slim one and a Slim one before an Index one, unless the reclaim
+needs the memory of one form, as a shortfall of Index pages needs Full memory.
 The blocks and requests on those pages follow them, a page a disk transfer reads
 or writes stays where it is, and a pass that evicts everything copies only what
 is left afterwards. Every extent a pass empties is released, except that a
@@ -3164,7 +3178,82 @@ GDN layer's dispatches stop there to store the state and go on from it, and
 the state's window is a copy of the lane's as the chunk finds it plus the
 chunk's rows before the boundary, since the chunk's later rows take the slots
 of the state's oldest rows in the lane's window. A state at the chunk's end is
-copied from the lane after it.
+copied from the lane after it. A target without GDN layers keeps no GDN state:
+its cells have no bytes, every lane and state shares one empty cell that holds
+no memory, so a lane holds the draft's rings and window and a cached state the
+window alone, and `state.idle_gdn_cells` stays 0.
+
+### Sliding windows
+
+A target whose layers include sliding-window ones (`kv::Layout::windowTokens`,
+over the layers `windowedLayers` names) pages every layer, and a row of a
+windowed layer reads only the `windowTokens` keys before its own. Once every
+row that will run has passed a page by a window, its windowed layers' K/V is
+read no more, and the page gives it up for the Slim form, which keeps the
+layers no window bounds (`kv::PageForm::Slim`): for Flint 14 of 49 layers, 462
+KiB of a page's 1.58 MiB in int8. A cached state needs its tail, the
+`windowPages` blocks that end at its block (`Layout::windowPages`, 16 for a
+512-token window), Full, since a request resuming there reads them whole: so a
+cached prefix restores at a state as ever (`Cache::restoreRequest`), and states
+closer than a window share the pages of their tails. The cache keeps it so
+(`CacheWindowPolicy`):
+
+- Between commands, before any lane grows, `Cache::trimWindows` moves to the
+  Slim form every Full page that every request holding it has published
+  `windowPages` blocks past (its next command's rows, at or past its published
+  blocks, read no key on it), that no state's tail holds and that no transfer
+  moves, the cached pages no request holds and the pages requests keep beside
+  their blocks among them. The Slim runway's free pages take them first,
+  then extents memory allows: while a request is in service, memory it
+  needs, as its KV is, so the host's pause does not hold them back and a long
+  prompt's passed pages trim as it prefills. A refusal leaves pages Full for
+  the next pass: memory, never correctness. A multi-pass prefill publishes
+  only once its last pass ends, so its rows' windows stay Full between
+  passes.
+- Every state, in RAM or on the SSD, pins its tail (`KvCache::countState`, a
+  bounded walk beside the counts of the states below); only its removal
+  unpins the tail, which the next pass trims: a state written to the SSD
+  keeps its entry and its tail Full, on a request's own chain too, where the
+  plan's floor (`kvWindowFloorPages`) does not count it.
+- A writer that computes a block again keeps its own page, which the block
+  takes once no transfer moves the block's (`KvCache::insert`,
+  `kv.window.upgrades`), rather than moving onto the block's page as a
+  writer of another layout does: its window reads the page whole, which a
+  Slim page no longer is, and were it to move onto a Full one, what it reads
+  would depend on whether trimming had taken the block's windowed layers.
+  Requests that hold the old page keep it, as a page of their own the next
+  passes trim once their windows have passed it. A copy of a Slim page goes,
+  there and where a disk-only block takes a writer's page: a block's copy
+  holds at least what its page holds, should the page leave.
+- A state is published only on a Full tail (`Cache::stateTailFull`), which a
+  command leaves where it computed or held the tail in its window; the engine
+  counts one it refuses as a failed publication. A start takes back a
+  persistent restore point only with Full copies of its tail.
+- Each cut of a request's page table checks that every page from the window
+  before its published blocks on is Full, always (`Cache::cutPageTable`).
+- A KV slot holds what its page holds when it is written, and its record
+  names the form (`KvSlotLabel`); a restore allocates that form. A restore
+  point persists its tail Full, as RAM holds it.
+
+So no byte a kernel reads changes: a run with trimming off
+(`--kv-window-trim off`, the native argument validation passes) emits the
+same tokens and logits wherever memory lets it cache what a run with
+trimming on caches, only taking the memory of Full pages. The memory plan
+counts on trimming, with it off too, so a validation run keeps within what
+Full pages hold: one request's KV capacity is the Full pages its lane keeps,
+its window's, the pages a command writes (a chunk, or a group of four where
+the routed experts stream) and one more (`kvWindowFloorPages`), in whole Full
+extents, and the pages of as many whole Slim extents as the rest holds, since an
+extent holds pages of one form; the pool's page ids cover the Slim pages the
+hard budget could hold. A Full shortfall takes trims first, then, while the Slim
+pool has room for their tails, states, a checkpoint first, each followed by a
+trim of the tail it unpinned, while those trims free pages, before any KV leaf
+goes (`Cache::reclaimForPages`). At the memory wall, where the Slim runway
+cannot refill, no state goes for its tail, and the victims go as without a
+window, dead leaves before ordinary states. A state the SSD cache keeps unpins
+nothing: each step that keeps extents (`CacheReclaimMode::KeepExtents`) writes
+one more state there before any leaf goes. Empty Slim extents beyond the runway
+go for the retry to grow by.
 
 ### Disk tier
 
@@ -3269,12 +3358,15 @@ chain whose newest blocks have no copy, as a finished request's prompt past the
 chain it restored, so leaves RAM one write at a time, and an allocation refused
 meanwhile waits for each write. Unneeded
 tails are dropped without writing, before any state, together with any disk
-copies below them. Writes run on their file's IO worker. A KV page is restored
-by the engine's SSD readers (`SsdReaders`), which
-read what the page's form holds, its index alone or the whole page, with one
-aligned read into memory of their own, and scatter it into the page; the
-restores asked for between two submissions (`KvTier::submitRestores`) go out
-together, index restores on every reader and whole ones on at most
+copies below them. Writes run on their file's IO worker. A KV page's slot
+holds what the page holds as it is written: a Slim page's is the first part of a
+Full page's payload, its regions in their order, and the block keeps the form of
+its copy (`KvCache::copyForm`), which a restore of the block allocates its page
+in. A KV page is restored by the engine's SSD readers (`SsdReaders`), which read
+what the page's form holds, its index alone, a Slim page's payload or the whole
+page, with one aligned read into memory of their own, and scatter it into the
+page; the restores asked for between two submissions (`KvTier::submitRestores`)
+go out together, index restores on every reader and whole ones on at most
 `KvPageTier::kWholeRestoreReaders`. A state is restored on its file's worker.
 Either way the transfer runs beside whatever command the model runs: a cached
 page is never written by a command, and no command uses a page before its read
@@ -3353,7 +3445,9 @@ one of each segment: the page's index, then each block's record. A state that
 fails it on its first read is a miss. Every read of a KV copy a restart took
 back checks the segments it covers: a whole or index restore that fails is a
 miss, and a block or history read that fails is `kv_unreadable` for the
-requests that read it.
+requests that read it. A KV record of a layout with a sliding window also names
+the form of the page its slot holds (`KvSlotLabel`), and a start takes back
+only the forms it restores.
 
 `/status` reports the shared quota, its limit, the write budget and KV
 transfers under `disk`. Its cumulative `read_bytes` and `written_bytes` count
