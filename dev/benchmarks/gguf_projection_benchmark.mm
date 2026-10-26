@@ -120,8 +120,8 @@ void floatProjections(MetalBackend &backend, const char *formatList, const char 
   const Fmt format = native ? fmtNamed(name) : Fmt(0);
   if (native && (format >= FMT_COUNT || float16(format)))
     throw std::invalid_argument("float-" + name + ": native rows take a quantized format");
-  const uint32_t type = name == "bf16" ? QuantizedSegment::kBFloat16 : QuantizedSegment::kFloat32;
-  const uint32_t valueBytes = type == QuantizedSegment::kBFloat16 ? 2 : 4;
+  const uint32_t type = native ? uint32_t(format) : name == "bf16" ? GGUF_FMT_BF16 : QuantizedSegment::kFloat32;
+  const uint32_t valueBytes = type == GGUF_FMT_BF16 ? 2 : 4;
   std::mt19937 rng(9);
   std::normal_distribution<float> normal(0.0f, 0.05f);
   std::vector<uint32_t> sizes;
@@ -151,8 +151,7 @@ void floatProjections(MetalBackend &backend, const char *formatList, const char 
   std::vector<std::vector<QuantizedSegment>> ring(copies);
   for (std::vector<QuantizedSegment> &segments : ring)
     for (uint32_t i = 0, offset = 0; i < sizes.size(); offset += sizes[i++]) {
-      segments.push_back(native ? QuantizedSegment::nativeRows(format, sizes[i], K, upload(backend, tensors[i]))
-                                : QuantizedSegment::floats(sizes[i], K, upload(backend, tensors[i]), type));
+      segments.push_back(QuantizedSegment::rows(type, sizes[i], K, upload(backend, tensors[i])));
       segments.back().columnOffset = offset;
     }
   const Linear linear(backend.capabilities());

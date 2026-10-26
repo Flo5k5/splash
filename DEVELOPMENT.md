@@ -2615,7 +2615,7 @@ The float router, QSA indexer and alpha/beta projections run in `kernels/shared/
 which runs two projections of one input in one dispatch where they take the same tile (the
 indexer's query and key, each on the tile of its own width), and the token rows are gathered by
 one template in `kernels/shared/embedding.metal`. The float projection reads a quantized format's
-rows (`QuantizedSegment::nativeRows`) through the gather's decode
+rows (`QuantizedSegment::rows`) through the gather's decode
 (`kernels/common/gguf_embedding_formats.h`), the MLX affine formats as runs of 8 codes with their
 block's scale and bias, read a step ahead and decoded once for the step's products, and writes
 their products in fp32, the router's scores. The 35B's 8-bit affine router (256 x 2048, 0.56 MB

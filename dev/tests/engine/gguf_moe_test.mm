@@ -248,8 +248,8 @@ int bfloat16Weights(MetalBackend &backend) {
       for (float &v : values) v = bf16(normal(rng));
       const std::vector<__bf16> bits(values.begin(), values.end());
       const QuantizedSegment f32 = floatSegment(backend, values, N, K);
-      const QuantizedSegment b16 = QuantizedSegment::floats(
-          N, K, upload(backend, bits.data(), bits.size() * 2, "gguf-bf16"), QuantizedSegment::kBFloat16);
+      const QuantizedSegment b16 = QuantizedSegment::rows(
+          GGUF_FMT_BF16, N, K, upload(backend, bits.data(), bits.size() * 2, "gguf-bf16"));
       for (const FloatTile tile : {FloatTile::Simdgroup, FloatTile::NeuralAccelerator}) {
         const bool accelerator = tile == FloatTile::NeuralAccelerator;
         int tileFailures = 0;
@@ -312,7 +312,7 @@ int nativeRowWeights(MetalBackend &backend) {
           static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
         }
         const QuantizedSegment f32 = QuantizedSegment::floats(N, K, values);
-        const QuantizedSegment quantized = QuantizedSegment::nativeRows(f, N, K, rows);
+        const QuantizedSegment quantized = QuantizedSegment::rows(f, N, K, rows);
         for (const FloatTile tile : {FloatTile::Simdgroup, FloatTile::NeuralAccelerator}) {
           const bool accelerator = tile == FloatTile::NeuralAccelerator;
           for (const uint32_t count : {1u, 7u, 16u, 33u, 263u, 2048u}) {
@@ -371,8 +371,8 @@ int floatPairs(MetalBackend &backend) {
   const auto name = [](FloatTile tile) { return tile == FloatTile::NeuralAccelerator ? "accelerator" : "simdgroup"; };
   const Tensor query = floating(backend, 64, K, 0.05f), key = floating(backend, 24, K, 0.05f);
   const std::vector<__bf16> bits(key.values.begin(), key.values.end());
-  const QuantizedSegment bfloatKey = QuantizedSegment::floats(
-      24, K, upload(backend, bits.data(), bits.size() * 2, "gguf-bf16"), QuantizedSegment::kBFloat16);
+  const QuantizedSegment bfloatKey = QuantizedSegment::rows(
+      GGUF_FMT_BF16, 24, K, upload(backend, bits.data(), bits.size() * 2, "gguf-bf16"));
   int failures = 0;
   for (const uint32_t rows : {1u, 16u, 33u, 263u}) {
     const MetalBuffer input = bfloatBuffer(backend, activations(uint64_t{rows} * K), "pair-input");

@@ -688,9 +688,9 @@ void addGgufFloat(metal::CommandGraph &graph, metal::MetalBuffer input, std::spa
         (p.tile == FloatTile::NeuralAccelerator && (rows < 16 || k % 32)))
       throw std::invalid_argument("invalid float projection");
     // The rows of a quantized format write fp32, the MoE router's scores.
-    if (w.native && type != FloatOutput::Float32)
+    if (w.quantizedRows() && type != FloatOutput::Float32)
       throw std::invalid_argument("a float projection of quantized rows writes fp32");
-    requireBytes(w.plane0, uint64_t{n} * w.floatRowBytes(), "float projection weight");
+    requireBytes(w.plane0, uint64_t{n} * QuantizedSegment::rowBytes(w.formatId, k), "float projection weight");
     requireBytes(p.output, rowBytes(rows, p.outStride, uint64_t{p.outOffset} + n, elementBytes(type)),
                  "float projection output");
   }
@@ -728,6 +728,8 @@ void requireSegmentPlanes(const QuantizedSegment &segment, std::string_view what
   // Each plane ends at its unit of the last row's last group the segment
   // reads, or meta unit: tile row (rows - 1) % T of that group of its tile,
   // whose rows hold the groups of planeInputs inputs.
+  if (segment.layout != QuantizedSegment::Layout::Planes)
+    throw std::invalid_argument(std::string(what) + " takes planes");
   const QuantFormat &format = segment.format();
   const uint32_t groups = segment.inputSize / 32, units = groups / format.meta_groups;
   const uint32_t rowGroups = (planeInputs ? planeInputs : segment.inputSize) / 32,
@@ -754,23 +756,24 @@ QuantizedSegment QuantizedSegment::planes(uint32_t formatId, uint32_t outputSize
                                           metal::MetalBuffer plane0, metal::MetalBuffer plane1,
                                           metal::MetalBuffer meta) {
   if (formatId >= GGUF_FMT_COUNT) throw std::invalid_argument("unknown GGUF segment format");
-  return {std::move(plane0), std::move(plane1), std::move(meta), outputSize, inputSize, 0, formatId};
+  return {std::move(plane0), std::move(plane1), std::move(meta), outputSize, inputSize, 0, formatId, Layout::Planes};
 }
-QuantizedSegment QuantizedSegment::nativeRows(uint32_t formatId, uint32_t outputSize, uint32_t inputSize,
-                                              metal::MetalBuffer rows) {
-  if (formatId >= GGUF_FMT_COUNT || formatId == GGUF_FMT_BF16 || formatId == GGUF_FMT_F16)
-    throw std::invalid_argument("native rows take a quantized GGUF format");
-  if (inputSize % kQuantFormats[formatId].block_elements)
-    throw std::invalid_argument(std::string("native rows hold whole ") + kQuantFormats[formatId].name + " blocks");
-  return {std::move(rows), {}, {}, outputSize, inputSize, 0, formatId, true};
+QuantizedSegment QuantizedSegment::rows(uint32_t formatId, uint32_t outputSize, uint32_t inputSize,
+                                        metal::MetalBuffer rows) {
+  if (!rowBytes(formatId, inputSize))
+    throw std::invalid_argument("rows take F32 or BF16 values or whole native blocks of a quantized GGUF format");
+  return {std::move(rows), {}, {}, outputSize, inputSize, 0, formatId, Layout::Rows};
 }
-uint64_t QuantizedSegment::floatRowBytes() const noexcept {
-  return native ? uint64_t{inputSize} / format().block_elements * format().block_bytes
-                : uint64_t{inputSize} * (formatId == kBFloat16 ? 2 : 4);
+// F32 and BF16 values each their own; a quantized format's native blocks
+// (kernels/common/gguf_embedding_formats.h).
+uint64_t QuantizedSegment::rowBytes(uint32_t formatId, uint32_t inputSize) noexcept {
+  if (formatId == kFloat32) return uint64_t{inputSize} * sizeof(float);
+  if (formatId == GGUF_FMT_BF16) return uint64_t{inputSize} * sizeof(uint16_t);
+  if (formatId >= GGUF_FMT_COUNT || formatId == GGUF_FMT_F16) return 0;
+  const QuantFormat &f = kQuantFormats[formatId];
+  return inputSize % f.block_elements ? 0 : uint64_t{inputSize} / f.block_elements * f.block_bytes;
 }
 const QuantFormat &QuantizedSegment::format() const noexcept { return kQuantFormats[formatId]; }
-const char *QuantizedSegment::name() const noexcept {
-  return formatId == kFloat32 ? "f32" : formatId == kBFloat16 ? "bf16" : format().name;
-}
+const char *QuantizedSegment::name() const noexcept { return formatId == kFloat32 ? "f32" : format().name; }
 
 } // namespace splash::ops
