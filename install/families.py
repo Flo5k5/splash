@@ -10,13 +10,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from server.chat_format import QWEN, ChatFormat
+from server.chat_format import FLINT, QWEN, ChatFormat
 
 
 @dataclass(frozen=True)
 class ModelFamily:
     # The family's name, as the engine names it (each target layout's family,
-    # runtime/model/Qwen3_8.hpp, Qwen3_6Moe.hpp and Qwen4Exp.hpp).
+    # runtime/model/Qwen3_8.hpp, Qwen3_6Moe.hpp, Qwen4Exp.hpp and Flint.hpp).
     name: str
     # The repository of the DFlash2 draft released for the family, as its
     # release publishes it (config.json and BF16 safetensors). Installations
@@ -27,6 +27,10 @@ class ModelFamily:
     # How the family's model reasons and calls tools, and the tokens it
     # shares with the engine (server/chat_format.py).
     chat_format: ChatFormat
+    # Whether the family's models have a vision tower, which an installation
+    # loads from the target repository unless --language-only. The models of
+    # a family without one serve text only, whatever their repository holds.
+    vision: bool = True
 
 
 FAMILIES = (
@@ -36,6 +40,8 @@ FAMILIES = (
     # released for it the family's.
     ModelFamily("Qwen3.5-122B-A10B", "incoai/Ornith-1.5-122B-DFlash2", QWEN),
     ModelFamily("Qwen3.8-Flash-Next", "incoai/Qwen3.8-Flash-Next-DFlash2", QWEN),
+    # It has no vision tower.
+    ModelFamily("Flint", "incoai/Flint-DFlash2", FLINT, vision=False),
 )
 
 

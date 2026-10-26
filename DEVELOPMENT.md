@@ -1524,6 +1524,7 @@ Proxy consumers can use these fields; additional fields may be added:
 | `maximum_context_tokens` | Declared context limit; available memory may limit admission |
 | `thermal_state` | The Mac's thermal state as macOS reports it: `nominal`, `fair`, `serious` or `critical`. As the Mac heats, its CPU and GPU clocks drop and prefill and decode slow down, on some Macs already at `fair`; readiness ignores it. The engine samples it twice a second and logs each change (`Thermal state: fair → serious`) |
 | `vision`, `input_modalities` | Whether image and PDF input is accepted; `false` and `["text"]` after `--language-only` |
+| `reasoning_switch` | Whether a request's reasoning effort or `enable_thinking` turns the model's reasoning on and off ([default reasoning effort](#default-reasoning-effort)): `true` for the Qwen families, `false` for Flint, whose model decides each turn |
 | `chat_template.later_system` | `native`, `patched` or `unsupported`: how system messages after the first render (per name for named templates) |
 | `transport.recovering`, `transport.stopped`, `transport.error` | The engine is restarting, or Splash stopped restarting it after repeated failures; `error` names its failure, the last failed restart, or why restarts stopped |
 
@@ -1655,13 +1656,20 @@ and model-card `base_model` fields play no part. Families of one model type,
 Qwen3.6-35B-A3B and Qwen3.5-122B-A10B (`qwen3_5_moe_text`, GGUF `qwen35moe`),
 are told apart by their sizes, and a fine-tune of either, such as
 Ornith-1.5-35B-A3B or Ornith-1.5-122B, is its family. A layout type
-(`Qwen3_8.hpp`, `Qwen3_6Moe.hpp`, `Qwen4Exp.hpp` in `runtime/model/`) is an
-architecture, whose code its families share, and each family is a value of it in
-one list, `model::kFamilies` (`ModelDescriptor.hpp`): another size of an
-architecture is one more value there, its draft in `families.FAMILIES`, and, for
-a GDN or attention shape no family had, its kernel instances and a row of the
-compiled shapes in `ops/GDN.cpp` or `ops/PagedAttention.cpp`. The kernel tests
-take every family's shapes from that list (`dev/tests/engine/TestFamilies.hpp`).
+(`Qwen3_8.hpp`, `Qwen3_6Moe.hpp`, `Qwen4Exp.hpp`, `Flint.hpp` in
+`runtime/model/`) is an architecture, whose code its families share, and each
+family is a value of it in one list, `model::kFamilies` (`ModelDescriptor.hpp`):
+another size of an architecture is one more value there, its draft in
+`families.FAMILIES`, and, for a GDN or attention shape no family had, its kernel
+instances and a row of the compiled shapes in `ops/GDN.cpp` or
+`ops/PagedAttention.cpp`. The kernel tests take every family's shapes from that
+list (`dev/tests/engine/TestFamilies.hpp`). A Qwen config holds its text model
+under `text_config`; Flint's is flat, its keys at the top level, which the check
+reads only for a model type whose configs are flat (a layout type's
+`flatConfig`). Flint loads from a GGUF only, and its configuration is held to
+Flint's values key by key (its widths, router, window, `layer_types`,
+`no_rope_layer_indices`, `mlp_only_layers` and `eos_token_id`; `softmax_type`,
+`rope_theta` and the rest where it states them).
 An MLX target must declare `quantization` in `config.json` in formats it loads
 ([MLX targets](#mlx-targets)). Every start checks the configuration again.
 Remote Python code is not loaded.
@@ -1903,14 +1911,17 @@ architecture never replaces one that loads.
 A draft's `config.json` states its layers, intermediate size, rotary base and
 the target layers whose outputs it reads (`dflash_config.target_layer_ids`,
 ascending, at most eight); its hidden size, vocabulary and mask token are its
-target's, and its attention (32 query and 8 KV heads of 128), selector (rank
-256, 16 candidates) and 2048-token window are those the kernels are built for,
-and its block at least their 8 rows, of which a cycle drafts the first (the
-Qwen3.5-122B-A10B draft was trained to fill 16; `readDraftLayout` in
-`ModelDescriptor.mm`); the kernels take any hidden width of whole 16-channel
-convolution groups. A draft's rows after its anchor read the target's token
-table row of the mask token, unless its release ships that token's BF16
-embedding, which they read instead (`DFlashDraft::addMaskRows`):
+target's (Flint's vocabulary keeps no mask token: a Flint draft chooses one of
+its reserved special tokens, 150019 to 150143, as its
+`dflash_config.mask_token_id`, which the target's layout then holds,
+`QwenTargetDimensions::firstDraftMaskToken`), and its attention (32 query and
+8 KV heads of 128), selector (rank 256, 16 candidates) and 2048-token window are
+those the kernels are built for, and its block at least their 8 rows, of which a
+cycle drafts the first (the Qwen3.5-122B-A10B draft was trained to fill 16;
+`readDraftLayout` in `ModelDescriptor.mm`); the kernels take any hidden width of
+whole 16-channel convolution groups. A draft's rows after its anchor read the
+target's token table row of the mask token, unless its release ships that
+token's BF16 embedding, which they read instead (`DFlashDraft::addMaskRows`):
 `mask_embedding.safetensors`, one tensor `mask_embedding` of the hidden size.
 A quantized table can lose the row: Qwen3.5-122B-A10B's is of order 1e-6,
 below what the fp16 block scales of Q8_0 and the K-quants hold, so its GGUFs
@@ -1999,7 +2010,9 @@ BF16. The processor configuration (MLX `preprocessor_config.json`, or the
 `image_processor` object of `processor_config.json`, where newer Transformers
 releases save it; the GGUF's `clip.vision` metadata) must describe the one
 preprocessing Splash implements (`server/images.py`); it is checked before any
-weight download and not installed.
+weight download and not installed. The models of a family without a vision
+tower (Flint; `vision` in `install/families.py`) serve text only: their
+installation reads no projector, with or without `--language-only`.
 
 Both sources are written into one image, which the one BF16 vision operator
 reads: BF16 tensors are
@@ -2156,8 +2169,9 @@ model's source options (`--revision`, `--draft-model`, `--language-only`,
   `hf download incoai/Qwen3.8-27B-DFlash2` does; `splash serve` downloads by
   commit, which records none.
 - `mmproj`: a GGUF target's vision projector ([Vision](#vision)); without
-  one, a GGUF target serves text only. An MLX target serves images with the
-  tower in its checkpoint unless `language_only=True`.
+  one, a GGUF target serves text only, and a target of a family without a
+  vision tower refuses one. An MLX target serves images with the tower in
+  its checkpoint unless `language_only=True`.
 - `models_dir`: where prepared models are kept, Splash's own models
   directory by default ([files Splash writes](#files-splash-writes)).
 
@@ -2378,8 +2392,14 @@ reads the sources at about the speed of the disk that holds them
 
 At load time the engine validates the GGUF metadata, including the rotary
 embedding and norm epsilon the kernels assume (`rope.freq_base`,
-`rope.dimension_count`, `attention.layer_norm_rms_epsilon`, and no
-`rope.scaling.type` but `none`), and plans the `MDGG0001` layout.
+`rope.dimension_count`, which a Flint GGUF, whose RoPE rotates whole heads,
+need not state, `attention.layer_norm_rms_epsilon`, and no
+`rope.scaling.type` but `none`), and plans the `MDGG0001` layout. A Flint
+GGUF's family keys hold its window, leading dense layers, shared expert's
+slices, sigmoid router and normalized, unscaled routing weights
+(`expert_weights_scale` 1) and its two layer patterns to the family's, and
+a router bias (`ffn_exp_probs_b`), which its blocks would not add, is
+refused.
 `GgufPreparation` stages rows in image order on the CPU within the
 staging bound, splitting rows wider than it into column chunks, and runs the
 `gguf_repack` kernel, which writes their planes into the image. Embeddings and
@@ -2457,8 +2477,36 @@ through `BlockTargetFormat`, which reads each tensor as one block-quantized
 `QuantizedSegment` (a fused projection's tensors in output column order), the
 norms as F32 (bf16 for an MLX checkpoint), and keeps the GDN output projection's
 input in the source's value-head order, llama.cpp's tiled or MLX's grouped.
-Both Qwen families share one layout
-(`QwenHybridLayout`) and its validator.
+Every family's layout derives `QwenHybridLayout`, whose validator
+(`requireQwenLayout`) it shares.
+
+A family's target is a `QwenTarget` (`QwenTarget.hpp`) composed of the blocks
+every Qwen target shares: a step's checks and plans, the GDN and attention
+mixers, the FFNs of a residual of one row (a dense SwiGLU and a MoE block's
+routing and experts), the draft's captures and the normed head. The Qwen3.5
+architecture's target (`Qwen3_5Target`, `QwenTarget.cpp`), Flash-Next's
+(`Qwen4ExpTarget`) and Flint's (`FlintTarget`) each compose them into their own
+layer loop. What a family changes in a block is a value of its layout
+(`QwenTargetDimensions`), read by the shared block rather than branched on: an
+attention layer's variant (`QwenTargetGeometry::attentionVariant`: rotated by
+the target's RoPE unless `unrotatedLayers` names it, over a sliding window of
+`slidingWindow` keys where `slidingLayers` does), for which a step plans the
+windowed layers apart; the learned sinks, which a layer's
+`QwenAttentionWeights` carry where its geometry adds them; the MoE router and
+the shared expert's slices and gate (`QwenTargetDimensions::moeBlockShape`);
+and the leading layers of a MoE target whose FFN is dense
+(`leadingDenseLayers`), whose blocks, and streamed experts, are the MoE layers'
+alone. The output gate (`attentionGate`) and the RoPE pairs (`rotaryPairs`) are
+values the attention kernels compile with their geometry (`kCompiledAttention`),
+to which a target holds its layout's (`PagedAttention::compiles`). Flint
+(`Flint.hpp`) has no GDN layers (`fullAttentionPeriod` 1): its 49 layers
+attend, 35 over a window of the 512 keys before a row's with RoPE over whole
+heads and 14 over every key without RoPE, each with its sinks; its first two
+layers' FFN is dense and the others' a MoE of a sigmoid router and an ungated
+shared expert of two slices; its norms are plain, as its GGUFs store them. Its
+layer images (`GgufImage.cpp`, `FlintGguf`) hold its input norm, attention,
+sinks, the norm before its FFN and its FFN, which `loadFlintWeights` reads with
+the Qwen readers.
 
 Every source loads into block planes: `Projection`, `BlockMoeWeights` and
 `EmbeddingWeights` (`runtime/ops/Weights.hpp`, `MoE.hpp`) hold them whatever
@@ -3655,7 +3703,7 @@ does, and `REVISION`, `DRAFT_MODEL` and `LANGUAGE_ONLY=1` as its `--revision`,
 | --- | --- |
 | `verify-models` | the installer's restarts without the Hub, `verify --full`, and the record of the weight images (`dev/tools/installer_restarts.py`, `weight-digests` with `WEIGHT_DIGESTS_ARGS` added, such as `WEIGHT_DIGESTS_ARGS="--expert-memory 7G --ple-memory 2G"` to stream the routed experts and the PLE table, [Release check](#release-check)) |
 | `test-real` | vision parity with the family's fixture in `dev/tests/fixtures/vision-parity/` when the installation serves vision, and the native model runtime oracle, each of its three runs with `ORACLE_ARGS` added (`ORACLE_ARGS="--kv-format bf16"`, `"--expert-memory 16G"` or `"--max-context 1010000"`); for a block-sparse target their spill checks take the default prompts, two staging buffers, and 32K tokens with the default window |
-| `test-http-real` | the HTTP frontend on an isolated server (`dev/tests/smoke_real.py`), whose greedy comparisons (a penalized greedy request repeats once its prompt is cached, `min_p` 1 answers as greedy) run where `/status` reports `verify_rows` `all`, which on any MoE target takes `HTTP_SMOKE_ARGS="--verify-rows all"`; with `HTTP_SMOKE_ARGS="--persistent-cache --max-cache-disk 8G"`, instead of that smoke, the [persistent cache](#persistent-cache) across a restart in a fresh cache directory: a clean stop, a restart that takes the restore point back, and a next turn that restores the prompt from disk; `release-check` runs both |
+| `test-http-real` | the HTTP frontend on an isolated server (`dev/tests/smoke_real.py`), whose greedy comparisons (a penalized greedy request repeats once its prompt is cached, `min_p` 1 answers as greedy) run where `/status` reports `verify_rows` `all`, which on any MoE target takes `HTTP_SMOKE_ARGS="--verify-rows all"`; where `/status` reports `reasoning_switch` `false` (Flint), it gives each request whose answer it checks room for the model's reasoning and leaves out the thinking budget's check; with `HTTP_SMOKE_ARGS="--persistent-cache --max-cache-disk 8G"`, instead of that smoke, the [persistent cache](#persistent-cache) across a restart in a fresh cache directory: a clean stop, a restart that takes the restore point back, and a next turn that restores the prompt from disk; `release-check` runs both |
 | `test-agent-real` | the five official clients through `splash serve` (`dev/tests/agent_real.py`), in `AGENT_SCENARIO` `complete` (the default) or `smoke` |
 | `test-release-real` | the HTTP smoke and all five clients on one `splash serve` |
 | `test-performance-real` | the native decode, partial-prefix and short-prompt benchmark, or with `BASELINE` its ABBA comparison with that build, in which both builds' `weight-digests` take `WEIGHT_DIGESTS_ARGS` (`dev/benchmarks/backend_regression.py`) |
@@ -3885,7 +3933,14 @@ window, the fp32 logits of the prefill's final position and of ROWS decode
 positions after it, each computed by a verify row forced to the true next
 token, in `OUTPUT-END.f32`, and prints how well they predict the true ids. It
 also takes `--kv-format`, `--state-format`, `--expert-memory` and
-`--ple-memory`.
+`--ple-memory`, and, with `--captures yes`, writes the output rows of the
+target layers the model's draft reads (its `target_layer_ids`) at the
+positions a window's prefill computed, in one command, to
+`OUTPUT-END.captures.f32` (fp32, a row per position of each layer's hidden
+values in the draft's layer order), which a reference's residuals after those
+layers compare with (`dev/tools/flint_reference.py` writes Flint's,
+`residuals.npy`): a draft of the layers to compare, such as a test draft whose
+`fc` reads them, makes them its captures.
 
 `benchmark-backend` lists the contexts the memory plan cannot hold in its
 report. Its cache checks reuse each context's cached prefix, so they need that
