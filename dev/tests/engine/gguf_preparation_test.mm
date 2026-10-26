@@ -356,6 +356,28 @@ void checkSixteenBitFloats(MetalBackend &backend, const std::filesystem::path &d
   }
 }
 
+// The MoE layer with a router of a quantized type (Q8_0, Q4_K): its native
+// rows as stored, which the float projection decodes, as an MLX checkpoint's
+// quantized router loads.
+void checkQuantizedRouter(MetalBackend &backend, const std::filesystem::path &directory) {
+  for (const Fmt f : {Q80, Q4K}) {
+    SmallTarget target = smallTarget(true);
+    const model::QwenTargetDimensions &g = target.geometry;
+    const auto path = directory / (std::string("moe-router-") + fmtName(f) + ".gguf");
+    const std::string name = "blk.0.ffn_gate_inp.weight";
+    Tensor &tensor = tensorNamed(target.tensors, name);
+    tensor.type = *ggufType(f);
+    tensor.data = fixture(f, g.experts, g.hiddenSize, 990 + f);
+    writeGguf(path, target.tensors, g);
+    const std::vector<model::gguf::Image> images = planned(path, g);
+    const std::vector<uint8_t> image = preparedImages(backend, path, g).front();
+    const auto *copy = copyOf(images[0], name);
+    check(copy && copy->conversion == model::gguf::Conversion::None &&
+              slice(image, copy->destination, tensor.data.size()) == tensor.data,
+          std::string("prepared ") + fmtName(f) + " router: its native rows as stored");
+  }
+}
+
 // The MoE layer with BF16 or F16 alpha/beta: a BF16 pair stays one BF16
 // tensor of their rows as stored, which the float projection reads as it
 // reads their F32 values; preparation decodes an F16 pair on the GPU into
@@ -923,6 +945,7 @@ int main(int argc, char **argv) {
             [&] {
               for (const Fmt gate : {BF16, Q80}) checkSixteenBitFloats(backend, directory.path(), gate);
             });
+    guarded("preparation of quantized routers", [&] { checkQuantizedRouter(backend, directory.path()); });
     guarded("preparation of quantized alpha/beta", [&] { checkQuantizedAlphaBeta(backend, directory.path()); });
     guarded("llama.cpp NVFP4", [&] { checkGgufNvfp4(backend, directory.path()); });
     guarded("the target loader", [&] { checkDenseTarget(backend, directory.path()); });

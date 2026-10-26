@@ -1778,7 +1778,9 @@ and lists every unsupported tensor in one error:
   IQ4_NL, MXFP4, NVFP4, PQ2_0, Q2_0, BF16 or F16;
 - token embeddings: any of the linears' formats;
 - norms: F32, BF16 or F16, loaded as the F32 values they hold;
-- the MoE router: F32 or BF16, which the float projection runs as stored;
+- the MoE router: F32, BF16 or any of the linears' quantized formats (not
+  F16), which the float projection runs as stored, a quantized one as its
+  native rows (as an MLX target's quantized router loads);
 - the shared-expert scalar gate: F32, BF16 or Q8_0, loaded as the F32 values
   it holds;
 - the GDN convolution, decay and time-step bias: F32;
