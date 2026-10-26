@@ -809,9 +809,11 @@ struct Runtime::Impl {
 
   // Encodes every image whose rows first appear in this chunk and overwrites
   // the chunk's placeholder embedding rows, the item's from row `rowBegin` of
-  // `hidden` on, with the image rows. Text-only requests add no dispatches.
-  void addImageRows(CommandGraph &graph, Request &entry, const ModelBatchItem &item, const MetalBuffer &hidden,
+  // `hidden` on, with the image rows; true when it encoded one. Text-only
+  // requests add no dispatches.
+  bool addImageRows(CommandGraph &graph, Request &entry, const ModelBatchItem &item, const MetalBuffer &hidden,
                     uint32_t rowBegin) {
+    bool encodes = false;
     const uint64_t chunkBegin = item.logicalPosition;
     const uint64_t chunkEnd = chunkBegin + item.tokenCount;
     for (ImageState &image : entry.images) {
@@ -827,6 +829,7 @@ struct Runtime::Impl {
           throw std::logic_error("image request has no vision encoder");
         vision->encode(graph, image.span.grid(), rows.pixels, rows.embeddings);
         rows.encoding = true;
+        encodes = true;
         ++counters.imageEncodes;
       }
       const uint32_t width = model.vision.tensors.layout.outputHiddenSize;
@@ -836,6 +839,7 @@ struct Runtime::Impl {
           {rowBegin + static_cast<uint32_t>(begin - chunkBegin), width, 0},
           static_cast<uint32_t>(end - begin), width);
     }
+    return encodes;
   }
 
   static float nextUniform(Request &entry) noexcept {
@@ -1740,6 +1744,7 @@ struct Runtime::Impl {
     inside.reserve(uint64_t{chunks.size()} * kLaneCount);
     std::vector<QwenTargetPrefillChunk> modelChunks;
     modelChunks.reserve(chunks.size());
+    bool encodesImages = false;
     for (uint32_t c = 0; c < chunks.size(); ++c) {
       const PrefillChunk &chunk = chunks[c];
       const auto p = [&](PrefillTensor tensor) { return prefillArena->get(tensor, c); };
@@ -1755,7 +1760,7 @@ struct Runtime::Impl {
       for (uint32_t s = 0; s < chunk.sequences.size(); ++s) {
         const PrefillSequence &sequence = chunk.sequences[s];
         const ModelBatchItem &part = sequence.part;
-        if (begins) addImageRows(graph, *sequence.entry, part, model.buffers.hidden[0], sequence.rowBegin);
+        if (begins) encodesImages |= addImageRows(graph, *sequence.entry, part, model.buffers.hidden[0], sequence.rowBegin);
         const GdnParityBuffers &in = *from[sequence.lane], &out = *written[c][s];
         from[sequence.lane] = &out;
         QwenTargetPrefillSequence &destination = sequences[c].emplace_back();
@@ -1789,8 +1794,13 @@ struct Runtime::Impl {
       }
       model.sequences = sequences[c];
     }
+    // A command that encodes an image runs on the GPU alone: the encode, ahead
+    // of the command's waits for the Neural Engine, takes seconds for a large
+    // image on a small GPU (about 8 s for 2048 x 1792 on an M6), and Metal
+    // fails a command buffer whose event wait stays unmet for 5 s
+    // (ops/AneFfn.cpp), which fails the engine.
     const std::vector<MetalBuffer> finalHidden =
-        targetModel->addPrefill(graph, modelChunks, kvPages, reads, layers, aneFfn);
+        targetModel->addPrefill(graph, modelChunks, kvPages, reads, layers, encodesImages ? nullptr : aneFfn);
     for (uint32_t c = 0; ends && c < chunks.size(); ++c) addDraftContext(graph, chunks, c);
 
     PrefillOutputs outputs;
