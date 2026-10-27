@@ -76,21 +76,9 @@ private struct ChatList: View {
             if !shown.isEmpty {
                 Section(query.isEmpty ? "Recents" : "Results") {
                     ForEach(shown) { conversation in
-                        let open = chats.selection == conversation.id
-                        Button { chats.selection = conversation.id } label: {
-                            Text(conversation.title.isEmpty ? "New Chat" : conversation.title)
-                                .lineLimit(1)
-                                .foregroundStyle(.primary)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .contentShape(.rect)
+                        ChatRow(conversation: conversation, open: chats.selection == conversation.id) {
+                            chats.selection = conversation.id
                         }
-                        .buttonStyle(.plain)
-                        .listRowBackground(
-                            RoundedRectangle(cornerRadius: 8)
-                                .fill(open ? AnyShapeStyle(.quaternary) : AnyShapeStyle(.clear))
-                                .padding(.horizontal, 10)
-                        )
-                        .accessibilityAddTraits(open ? .isSelected : [])
                         .contextMenu {
                             Button("Rename…") {
                                 title = conversation.title
@@ -104,6 +92,33 @@ private struct ChatList: View {
         }
         .listStyle(.sidebar)
         .scrollContentBackground(.hidden)
+    }
+}
+
+/// A conversation in the list: its title, on a soft highlight when open, a lighter one under the
+/// pointer.
+private struct ChatRow: View {
+    let conversation: Conversation
+    let open: Bool
+    let select: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: select) {
+            Text(conversation.title.isEmpty ? "New Chat" : conversation.title)
+                .lineLimit(1)
+                .foregroundStyle(.primary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .listRowBackground(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(.quaternary.opacity(open ? 1 : hovering ? 0.6 : 0))
+                .padding(.horizontal, 10)
+        )
+        .accessibilityAddTraits(open ? .isSelected : [])
     }
 }
 
@@ -215,16 +230,18 @@ private struct StatusLine: View {
                 Image(systemName: "exclamationmark.triangle.fill").symbolRenderingMode(.multicolor)
                 Text("\(state.status).").foregroundStyle(.secondary)
                 Button("Open Server") { state.section = .server }
+                    .foregroundStyle(.tint)
             case .stopped:
                 Text(state.installed.isEmpty ? "Download a model to start chatting." : "No model is running.")
                     .foregroundStyle(.secondary)
                 Button("Open Server") { state.section = .server }
+                    .foregroundStyle(.tint)
             case .ready:
                 EmptyView()
             }
         }
         .font(.callout)
-        .buttonStyle(.link)
+        .buttonStyle(.hover)
         .padding(.horizontal, 4)
     }
 }
@@ -303,7 +320,7 @@ private struct MessageView: View {
     }
 
     private var actions: some View {
-        HStack(spacing: 4) {
+        HStack(spacing: 0) {
             Button {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(message.text, forType: .string)
@@ -326,10 +343,11 @@ private struct MessageView: View {
             Text(details)
                 .font(.caption)
                 .foregroundStyle(.tertiary)
-                .padding(.leading, 4)
+                .padding(.leading, 6)
                 .help(message.tokensPerSecond.map { "\($0.formatted(.number.precision(.fractionLength(0)))) tokens per second" } ?? "")
         }
-        .buttonStyle(.borderless)
+        .buttonStyle(.hover)
+        .padding(.leading, -6)
         .font(.callout)
         .foregroundStyle(.secondary)
         .opacity(hovering || last ? 1 : 0)
@@ -360,9 +378,9 @@ private struct Thinking: View {
                 }
                 .font(.callout)
                 .foregroundStyle(.secondary)
-                .contentShape(.rect)
             }
-            .buttonStyle(.plain)
+            .buttonStyle(.hover)
+            .padding(.leading, -6)
             if open {
                 Text(text)
                     .font(.body)

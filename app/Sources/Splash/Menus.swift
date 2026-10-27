@@ -130,7 +130,6 @@ private struct PanelRow: View {
     var open: Bool?
     var indent = false
     let action: () -> Void
-    @State private var hovering = false
     @Environment(\.isEnabled) private var enabled
 
     var body: some View {
@@ -149,10 +148,7 @@ private struct PanelRow: View {
             .padding(.leading, indent ? 22 : 10)
             .padding(.trailing, 10)
             .padding(.vertical, 5)
-            .background(.quaternary.opacity(hovering && enabled ? 1 : 0), in: .rect(cornerRadius: 7))
-            .contentShape(.rect)
         }
-        .buttonStyle(.plain)
-        .onHover { hovering = $0 }
+        .buttonStyle(.hoverFlush)
     }
 }

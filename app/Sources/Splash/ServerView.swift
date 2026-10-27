@@ -86,13 +86,15 @@ struct ServerView: View {
 
     /// Ways to models the list doesn't offer: one from Hugging Face by its ID, or files on this Mac.
     private var otherModels: some View {
-        HStack(spacing: 16) {
+        HStack(spacing: 4) {
             Button("Download Another Model…") { customModel = true }
                 .disabled(state.installer.running || !state.ready)
             Button("Add Model from This Mac…", action: addLocal)
                 .disabled(!state.ready)
         }
-        .buttonStyle(.link)
+        .buttonStyle(.hover)
+        .foregroundStyle(.tint)
+        .padding(.leading, -6)
     }
 
     /// Asks for model files on this Mac: a GGUF file, or the folder of an MLX or GGUF model.
@@ -187,8 +189,7 @@ private struct ControlBar: View {
                     .help(server.asleep ? "It freed its memory while idle and loads again with the next message." : "")
                 Text(verbatim: "· Port \(server.settings.port)")
                 Button { state.copyAPIAddress() } label: { Image(systemName: "doc.on.doc") }
-                    .buttonStyle(.borderless)
-                    .controlSize(.small)
+                    .buttonStyle(.hover)
                     .help("Copy API Address: \(server.settings.url.appending(path: "v1").absoluteString)")
                     .accessibilityLabel("Copy API Address")
             }
@@ -299,9 +300,9 @@ private struct RequestLog: View {
                 Text("Request Log")
                 Spacer()
             }
-            .contentShape(.rect)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.hoverRow)
+        .hoverRowAligned()
         .accessibilityValue(open ? "Expanded" : "Collapsed")
         if open {
             ScrollView {
@@ -331,7 +332,6 @@ private struct RequestLog: View {
 /// The coding agents to open in Terminal on the model that runs, and its API address to copy.
 private struct AgentsPopup: View {
     @Environment(AppState.self) private var state
-    @State private var hovering = false
     private static let copy = "copy"
 
     var body: some View {
@@ -352,11 +352,8 @@ private struct AgentsPopup: View {
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 5)
-            .background(.quaternary.opacity(hovering ? 1 : 0), in: .rect(cornerRadius: 7))
-            .contentShape(.rect)
         }
         .fixedSize()
-        .onHover { hovering = $0 }
         .help("Open a coding agent in Terminal, connected to this model")
     }
 }
@@ -395,7 +392,7 @@ private struct ProblemRow: View {
             Button("Show Log") { NSWorkspace.shared.open(log) }
             if let retry { Button(retry.title, action: retry.action) }
             Button(action: dismiss) { Image(systemName: "xmark") }
-                .buttonStyle(.borderless)
+                .buttonStyle(.hover)
                 .foregroundStyle(.secondary)
                 .help("Dismiss")
                 .accessibilityLabel("Dismiss")
@@ -472,9 +469,9 @@ private struct ModelRow: View {
                     .foregroundStyle(.secondary)
                 }
             }
-            .contentShape(.rect)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.hoverRow)
+        .hoverRowAligned()
         .accessibilityLabel(state.displayName(of: model.id))
         .accessibilityValue(phase ?? "")
         .accessibilityAddTraits(selected ? .isSelected : [])

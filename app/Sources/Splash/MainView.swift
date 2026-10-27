@@ -82,7 +82,7 @@ struct SectionSwitch: View {
                 }
                 .contentShape(.capsule)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(HoverStyle(padding: EdgeInsets(), shape: AnyShape(.capsule)))
         .help(help)
         .accessibilityAddTraits(selected ? .isSelected : [])
     }

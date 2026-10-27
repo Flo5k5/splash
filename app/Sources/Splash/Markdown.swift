@@ -475,7 +475,7 @@ private struct CodeBlock: View {
                 .font(.callout)
                 .contentTransition(.symbolEffect(.replace))
         }
-        .buttonStyle(.borderless)
+        .buttonStyle(.hover)
         .foregroundStyle(.secondary)
         .help("Copy")
         .accessibilityLabel("Copy Code")

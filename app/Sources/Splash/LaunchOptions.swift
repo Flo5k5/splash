@@ -31,9 +31,9 @@ struct LaunchOptions: View {
                     Text("Advanced")
                     Spacer()
                 }
-                .contentShape(.rect)
             }
-            .buttonStyle(.plain)
+            .buttonStyle(.hoverRow)
+            .hoverRowAligned()
             .accessibilityValue(advanced ? "Expanded" : "Collapsed")
             .background(ViewAnchor { row.view = $0 })
         } header: {
@@ -44,7 +44,9 @@ struct LaunchOptions: View {
                 Spacer()
                 if state.options != ServeSettings() {
                     Button("Restore Defaults") { state.options = ServeSettings() }
-                        .buttonStyle(.link)
+                        .buttonStyle(.hover)
+                        .foregroundStyle(.tint)
+                        .padding(.trailing, -6)
                 }
             }
         }
@@ -100,7 +102,6 @@ private struct ChoicePicker: View {
     let custom: LaunchOption.Value?
     @Binding var value: String?
     @State private var typing = false
-    @State private var hovering = false
 
     /// The items' IDs of the default and of Custom…, which are no values.
     private static let none = "\u{0}default", other = "\u{0}custom"
@@ -122,10 +123,8 @@ private struct ChoicePicker: View {
                     Text(items.first { $0.id == (value ?? Self.none) }?.title ?? standard)
                     Image(systemName: "chevron.up.chevron.down").font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
                 }
-                .optionField(hovering: hovering)
-                .contentShape(.rect)
+                .optionField()
             }
-            .onHover { hovering = $0 }
         }
         .sheet(isPresented: $typing) {
             if let custom {
@@ -180,7 +179,7 @@ private struct FolderRow: View {
                 Text(value.map { URL(filePath: $0).lastPathComponent } ?? "Default")
                     .foregroundStyle(.secondary)
                     .help(value ?? "")
-                if value != nil { Button { value = nil } label: { Text("Default").optionField() }.buttonStyle(.plain) }
+                if value != nil { Button { value = nil } label: { Text("Default").optionField() }.buttonStyle(.hoverFlush) }
                 Button {
                     let panel = NSOpenPanel()
                     panel.canChooseDirectories = true
@@ -190,7 +189,7 @@ private struct FolderRow: View {
                 } label: {
                     Text("Choose…").optionField()
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(.hoverFlush)
             }
         }
     }
@@ -268,12 +267,13 @@ private struct CustomValueSheet: View {
 }
 
 extension View {
-    /// The look the launch options' fields and menus share: a light rounded fill, a little deeper
-    /// under the pointer, and a ring in the accent color while a field is typed in.
-    func optionField(focused: Bool = false, hovering: Bool = false) -> some View {
+    /// The look the launch options' fields and menus share: a light rounded fill, deeper under the
+    /// pointer as `HoverStyle` adds its highlight, and a ring in the accent color while a field is
+    /// typed in.
+    func optionField(focused: Bool = false) -> some View {
         padding(.horizontal, 8)
             .padding(.vertical, 4)
-            .background(.quaternary.opacity(hovering ? 1 : 0.6), in: .rect(cornerRadius: 6))
+            .background(.quaternary.opacity(0.6), in: .rect(cornerRadius: 6))
             .overlay { RoundedRectangle(cornerRadius: 6).strokeBorder(.tint.opacity(focused ? 0.8 : 0), lineWidth: 1.5) }
     }
 }

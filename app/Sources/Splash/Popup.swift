@@ -34,7 +34,7 @@ struct PopupMenu<Label: View>: View {
         } label: {
             label()
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.hoverFlush)
         .background(PopupAnchor(popup: popup))
     }
 }
@@ -66,7 +66,7 @@ struct PopupList: View {
         .padding(5)
         .frame(minWidth: 200, alignment: .leading)
         .fixedSize()
-        .background(Color(nsColor: .windowBackgroundColor), in: .rect(cornerRadius: 12))
+        .background { PopoverMaterial().clipShape(.rect(cornerRadius: 12)) }
         .overlay { RoundedRectangle(cornerRadius: 12).strokeBorder(.separator) }
     }
 }
@@ -75,7 +75,6 @@ private struct PopupRow: View {
     let item: PopupItem
     let chosen: Bool
     let choose: () -> Void
-    @State private var hovering = false
 
     var body: some View {
         Button(action: choose) {
@@ -99,13 +98,23 @@ private struct PopupRow: View {
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 6)
-            .background(.quaternary.opacity(hovering ? 1 : 0), in: .rect(cornerRadius: 8))
-            .contentShape(.rect)
         }
-        .buttonStyle(.plain)
-        .onHover { hovering = $0 }
+        .buttonStyle(HoverStyle(padding: EdgeInsets(), shape: AnyShape(.rect(cornerRadius: 8))))
         .accessibilityAddTraits(chosen ? .isSelected : [])
     }
+}
+
+/// The material of the system's popovers and menus, behind a popup's items.
+private struct PopoverMaterial: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        view.material = .popover
+        view.blendingMode = .behindWindow
+        view.state = .active
+        return view
+    }
+
+    func updateNSView(_ view: NSVisualEffectView, context: Context) {}
 }
 
 /// The open panel of a `PopupMenu`: a borderless child window of the control's, at its trailing
