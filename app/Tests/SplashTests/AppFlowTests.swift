@@ -104,10 +104,9 @@ struct AppFlowTests {
         await Snapshot.save("menu-bar", size: CGSize(width: 300, height: 400), MenuBarPanel().environment(state))
         await Snapshot.save("popup-thinking", size: CGSize(width: 300, height: 260), PopupList(
             header: "Thinking",
-            items: [PopupItem(id: "xhigh", title: "Extra High", detail: "Thinks thoroughly", badge: "Default"),
-                    PopupItem(id: "medium", title: "Medium", detail: "Thinks a while"),
-                    PopupItem(id: "low", title: "Low", detail: "Thinks briefly"),
-                    PopupItem(id: "none", title: "No Thinking", detail: "Answers at once")],
+            items: [PopupItem(id: "xhigh", title: "Extra High", badge: "Default"),
+                    PopupItem(id: "medium", title: "Medium"), PopupItem(id: "low", title: "Low"),
+                    PopupItem(id: "none", title: "No Thinking")],
             chosen: "xhigh") { _ in })
         await Snapshot.save("popup-context", size: CGSize(width: 260, height: 320), PopupList(
             header: "Context length",

@@ -136,7 +136,9 @@ private struct ConversationView: View {
                 // bottom; a short conversation still reads from the top.
                 .defaultScrollAnchor(.bottom, for: .initialOffset)
                 .defaultScrollAnchor(atBottom ? .bottom : nil, for: .sizeChanges)
-                .onScrollPhaseChange { _, phase in scrolling = phase != .idle }
+                // The reader's own scrolling: a drag, the wheel, and the glide after them; not the
+                // conversation's own following.
+                .onScrollPhaseChange { _, phase in scrolling = [.tracking, .interacting, .decelerating].contains(phase) }
                 .onScrollGeometryChange(for: Bool.self) { geometry in
                     geometry.contentOffset.y + geometry.containerSize.height >= geometry.contentSize.height - 40
                 } action: { _, bottom in

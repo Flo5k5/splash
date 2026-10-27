@@ -5,8 +5,6 @@ import SwiftUI
 struct PopupItem: Identifiable, Hashable {
     let id: String
     let title: String
-    /// A line under the title.
-    var detail: String?
     /// A word beside the title, such as Default.
     var badge: String?
     /// Set apart from the items before it by a line.
@@ -14,8 +12,8 @@ struct PopupItem: Identifiable, Hashable {
 }
 
 /// A menu in Splash's own style: a rounded panel under the control that opens it, or over it,
-/// with a header and its items, each a title, any detail under it and a badge, the chosen one
-/// checked. It closes on a choice, a click elsewhere or Escape.
+/// with a header and its items, each a title and any badge, the chosen one checked. It closes on
+/// a choice, a click elsewhere or Escape.
 struct PopupMenu<Label: View>: View {
     var header: String?
     let items: [PopupItem]
@@ -82,20 +80,15 @@ private struct PopupRow: View {
     var body: some View {
         Button(action: choose) {
             HStack(alignment: .firstTextBaseline, spacing: 12) {
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: 8) {
-                        Text(item.title)
-                        if let badge = item.badge {
-                            Text(badge)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 1)
-                                .background(.quaternary, in: .rect(cornerRadius: 5))
-                        }
-                    }
-                    if let detail = item.detail {
-                        Text(detail).font(.callout).foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    Text(item.title)
+                    if let badge = item.badge {
+                        Text(badge)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1)
+                            .background(.quaternary, in: .rect(cornerRadius: 5))
                     }
                 }
                 Spacer(minLength: 16)
@@ -186,16 +179,47 @@ extension Popup {
 }
 
 /// The control's view, where its panel opens.
-private struct PopupAnchor: NSViewRepresentable {
+private struct PopupAnchor: View {
     let popup: Popup
+
+    var body: some View {
+        ViewAnchor { popup.anchor = $0 }
+    }
+}
+
+/// The AppKit view behind a SwiftUI view, handed to `found` as it is made and updated.
+struct ViewAnchor: NSViewRepresentable {
+    let found: (NSView) -> Void
 
     func makeNSView(context: Context) -> NSView {
         let view = NSView()
-        popup.anchor = view
+        found(view)
         return view
     }
 
     func updateNSView(_ view: NSView, context: Context) {
-        popup.anchor = view
+        found(view)
+    }
+}
+
+/// A view to scroll the scroll view it lies in to, as AppKit scrolls: a short animation that the
+/// reader's own scrolling takes over, and that works again the next time.
+@MainActor
+final class ScrollTarget {
+    weak var view: NSView?
+
+    /// Puts the view at the top of its scroll view, as far as the content goes.
+    func scrollToTop(margin: CGFloat = 12) {
+        guard let view, let scrollView = view.enclosingScrollView, let document = scrollView.documentView else { return }
+        let clip = scrollView.contentView
+        let frame = view.convert(view.bounds, to: document)
+        let top = document.isFlipped ? frame.minY - margin : frame.maxY + margin - clip.bounds.height
+        let y = min(max(top, 0), max(document.frame.height - clip.bounds.height, 0))
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.25
+            context.allowsImplicitAnimation = true
+            clip.animator().setBoundsOrigin(NSPoint(x: clip.bounds.minX, y: y))
+        }
+        scrollView.reflectScrolledClipView(clip)
     }
 }

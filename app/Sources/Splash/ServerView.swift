@@ -19,58 +19,56 @@ struct ServerView: View {
         let available = suggestions.filter { !installedNames.contains($0.name) && $0.id != state.installer.model }
         let first = state.installed.isEmpty
         let failed = if case .failed = state.server.phase { true } else { false }
-        ScrollViewReader { scroll in
-            Form {
-                if state.server.phase == .ready {
-                    Section {
-                        ActivityFigures(activity: state.server.activity)
-                        RequestLog(lines: state.server.requestLog, open: advanced)
-                    } header: {
-                        SectionTitle(text: "Activity")
-                    }
-                }
-                if first || failed || state.installer.failure != nil || state.installer.running {
-                    Section {
-                        if case .failed(let message) = state.server.phase, let model = state.server.model {
-                            ProblemRow(title: "\(state.displayName(of: model)) ran into a problem", message: message,
-                                       log: Server.log, dismiss: state.server.dismissFailure)
-                        }
-                        if let failure = state.installer.failure {
-                            ProblemRow(title: "\(state.displayName(of: failure.model)) couldn’t download",
-                                       message: failure.message, log: Installer.log, dismiss: state.installer.dismissFailure,
-                                       retry: ("Download Again", { state.download(failure.model) }))
-                        }
-                        if state.installer.running { DownloadRow() }
-                    } header: {
-                        if first { welcome }
-                    }
-                }
-                if !first {
-                    Section {
-                        ForEach(state.installed) { ModelRow(model: $0) }
-                    } header: {
-                        SectionTitle(text: "Models on This Mac")
-                    } footer: {
-                        otherModels
-                    }
-                    LaunchOptions(advanced: advanced) { withAnimation(.smooth) { scroll.scrollTo(LaunchOptions.advancedID, anchor: .top) } }
-                }
+        Form {
+            if state.server.phase == .ready {
                 Section {
-                    ForEach(available, id: \.id) { variant in
-                        SuggestedRow(variant: variant, recommended: variant == suggestions.first,
-                                     lead: first && !state.installer.running && variant == suggestions.first)
-                    }
+                    ActivityFigures(activity: state.server.activity)
+                    RequestLog(lines: state.server.requestLog, open: advanced)
                 } header: {
-                    if !available.isEmpty { SectionTitle(text: "Available to Download") }
-                } footer: {
-                    if suggestions.isEmpty, let minimum = state.catalog.minimumMemory {
-                        Text("The suggested models need a Mac with at least \(minimum) GB of memory; this one has \(Catalog.memory) GB.")
-                    }
-                    if first { otherModels }
+                    SectionTitle(text: "Activity")
                 }
             }
-            .formStyle(.grouped)
+            if first || failed || state.installer.failure != nil || state.installer.running {
+                Section {
+                    if case .failed(let message) = state.server.phase, let model = state.server.model {
+                        ProblemRow(title: "\(state.displayName(of: model)) ran into a problem", message: message,
+                                   log: Server.log, dismiss: state.server.dismissFailure)
+                    }
+                    if let failure = state.installer.failure {
+                        ProblemRow(title: "\(state.displayName(of: failure.model)) couldn’t download",
+                                   message: failure.message, log: Installer.log, dismiss: state.installer.dismissFailure,
+                                   retry: ("Download Again", { state.download(failure.model) }))
+                    }
+                    if state.installer.running { DownloadRow() }
+                } header: {
+                    if first { welcome }
+                }
+            }
+            if !first {
+                Section {
+                    ForEach(state.installed) { ModelRow(model: $0) }
+                } header: {
+                    SectionTitle(text: "Models on This Mac")
+                } footer: {
+                    otherModels
+                }
+                LaunchOptions(advanced: advanced)
+            }
+            Section {
+                ForEach(available, id: \.id) { variant in
+                    SuggestedRow(variant: variant, recommended: variant == suggestions.first,
+                                 lead: first && !state.installer.running && variant == suggestions.first)
+                }
+            } header: {
+                if !available.isEmpty { SectionTitle(text: "Available to Download") }
+            } footer: {
+                if suggestions.isEmpty, let minimum = state.catalog.minimumMemory {
+                    Text("The suggested models need a Mac with at least \(minimum) GB of memory; this one has \(Catalog.memory) GB.")
+                }
+                if first { otherModels }
+            }
         }
+        .formStyle(.grouped)
         .contentMargins(.horizontal, max(0, (width - column) / 2), for: .scrollContent)
         .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width = $0 }
         .safeAreaInset(edge: .bottom, spacing: 0) {

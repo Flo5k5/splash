@@ -164,8 +164,7 @@ private struct ModelMenu: View {
                     + (levels && reasoning.default == nil && thinks ? [""] : []) + ["none"]
                 let chosen = state.effort.isEmpty ? initial : !levels && state.effort != "none" ? "on" : state.effort
                 PopupMenu(header: "Thinking", items: choices.map { choice in
-                    PopupItem(id: choice, title: Self.title(choice), detail: Self.detail(choice),
-                              badge: choice == initial ? "Default" : nil)
+                    PopupItem(id: choice, title: Self.title(choice), badge: choice == initial ? "Default" : nil)
                 }, chosen: chosen, above: true) { choice in
                     // On, for a model whose thinking is only on or off, is any effort but none.
                     state.effort = choice == initial ? "" : choice == "on" ? "medium" : choice
@@ -190,19 +189,6 @@ private struct ModelMenu: View {
             } else {
                 name.font(.callout).lineLimit(1)
             }
-        }
-    }
-
-    /// What an effort does, in a few words.
-    private static func detail(_ effort: String) -> String {
-        switch effort {
-        case "none": "Answers at once"
-        case "on": "Thinks before it answers"
-        case "minimal", "low": "Thinks briefly"
-        case "medium": "Thinks a while"
-        case "high", "xhigh": "Thinks thoroughly"
-        case "max": "Thinks as long as it needs"
-        default: "As the model chooses"
         }
     }
 

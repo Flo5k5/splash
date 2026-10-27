@@ -6,11 +6,8 @@ import SwiftUI
 struct LaunchOptions: View {
     @Environment(AppState.self) private var state
     @State var advanced = false
-    /// Brings the Advanced options into view once they open.
-    var reveal: () -> Void = {}
-
-    /// The Advanced row's ID, to scroll to.
-    static let advancedID = "advanced"
+    /// The Advanced row, which opening it scrolls to the top, the options under it in view.
+    @State private var row = ScrollTarget()
 
     var body: some View {
         Section {
@@ -18,7 +15,12 @@ struct LaunchOptions: View {
             Button {
                 withAnimation(.smooth(duration: 0.2)) { advanced.toggle() }
                 // Once the options are laid out under the row.
-                if advanced { Task { reveal() } }
+                if advanced {
+                    Task {
+                        try? await Task.sleep(for: .milliseconds(60))
+                        row.scrollToTop()
+                    }
+                }
             } label: {
                 HStack(spacing: 6) {
                     Image(systemName: "chevron.right")
@@ -33,7 +35,7 @@ struct LaunchOptions: View {
             }
             .buttonStyle(.plain)
             .accessibilityValue(advanced ? "Expanded" : "Collapsed")
-            .id(Self.advancedID)
+            .background(ViewAnchor { row.view = $0 })
         } header: {
             SectionTitle(text: LaunchOption.Section.main.rawValue)
         } footer: {
@@ -120,9 +122,7 @@ private struct ChoicePicker: View {
                     Text(items.first { $0.id == (value ?? Self.none) }?.title ?? standard)
                     Image(systemName: "chevron.up.chevron.down").font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
                 }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 3)
-                .background(.quaternary.opacity(hovering ? 1 : 0.6), in: .rect(cornerRadius: 6))
+                .optionField(hovering: hovering)
                 .contentShape(.rect)
             }
             .onHover { hovering = $0 }
@@ -147,11 +147,12 @@ private struct TextRow: View {
         LabeledContent(title) {
             TextField(title, text: $text, prompt: Text(custom.prompt))
                 .labelsHidden()
-                .textFieldStyle(.roundedBorder)
+                .textFieldStyle(.plain)
                 .multilineTextAlignment(.trailing)
-                .frame(maxWidth: 240)
                 .focused($focused)
                 .onSubmit(commit)
+                .optionField(focused: focused)
+                .frame(maxWidth: 220)
         }
         .onAppear { text = value.map(custom.text) ?? "" }
         .onChange(of: value) { text = value.map(custom.text) ?? "" }
@@ -179,14 +180,17 @@ private struct FolderRow: View {
                 Text(value.map { URL(filePath: $0).lastPathComponent } ?? "Default")
                     .foregroundStyle(.secondary)
                     .help(value ?? "")
-                if value != nil { Button("Default") { value = nil } }
-                Button("Choose…") {
+                if value != nil { Button { value = nil } label: { Text("Default").optionField() }.buttonStyle(.plain) }
+                Button {
                     let panel = NSOpenPanel()
                     panel.canChooseDirectories = true
                     panel.canChooseFiles = false
                     panel.canCreateDirectories = true
                     if panel.runModal() == .OK, let url = panel.url { value = url.path }
+                } label: {
+                    Text("Choose…").optionField()
                 }
+                .buttonStyle(.plain)
             }
         }
     }
@@ -203,10 +207,12 @@ private struct SecretRow: View {
         LabeledContent(title) {
             SecureField(title, text: $text, prompt: Text("None"))
                 .labelsHidden()
-                .textFieldStyle(.roundedBorder)
-                .frame(maxWidth: 240)
+                .textFieldStyle(.plain)
+                .multilineTextAlignment(.trailing)
                 .focused($focused)
                 .onSubmit(commit)
+                .optionField(focused: focused)
+                .frame(maxWidth: 220)
         }
         .onAppear { text = value ?? "" }
         .onChange(of: focused) { if !focused { commit() } }
@@ -258,5 +264,16 @@ private struct CustomValueSheet: View {
         guard let value = custom.parse(text) else { return }
         set(value)
         dismiss()
+    }
+}
+
+extension View {
+    /// The look the launch options' fields and menus share: a light rounded fill, a little deeper
+    /// under the pointer, and a ring in the accent color while a field is typed in.
+    func optionField(focused: Bool = false, hovering: Bool = false) -> some View {
+        padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(.quaternary.opacity(hovering ? 1 : 0.6), in: .rect(cornerRadius: 6))
+            .overlay { RoundedRectangle(cornerRadius: 6).strokeBorder(.tint.opacity(focused ? 0.8 : 0), lineWidth: 1.5) }
     }
 }
