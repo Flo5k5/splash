@@ -260,18 +260,25 @@ void ggufPlans() {
   const ProjectionShape downShape{5120, 17408};
   require(linear.decodeScratchSize(downShape).partials == three.scratchSize().partials,
           "GGUF decode scratch bound");
-  // Float projections take the neural accelerator tile from three of its
-  // 64 x 32 tiles per two cores: on 16 cores the 35B router (N 256) from 129
-  // rows, alpha/beta (N 64) from 705; never on Apple9 or below 16 rows.
+  // Float projections take the neural accelerator tile from 1.5 of its
+  // 64 x 32 tiles per core for BF16 values, 2 for F32 values and 3 for a
+  // quantized format's rows: on 16 cores a router of 256 experts from 129,
+  // 193 and 321 rows, F32 alpha/beta (N 64) from 961; never on Apple9 or
+  // below 16 rows.
   const Linear oneCore = gpu(10, 1);
-  require(linear.ggufFloatTile(32, 256) == FloatTile::Simdgroup && linear.ggufFloatTile(128, 256) == FloatTile::Simdgroup &&
-              linear.ggufFloatTile(129, 256) == FloatTile::NeuralAccelerator &&
-              linear.ggufFloatTile(2048, 256) == FloatTile::NeuralAccelerator &&
-              linear.ggufFloatTile(704, 64) == FloatTile::Simdgroup &&
-              linear.ggufFloatTile(705, 64) == FloatTile::NeuralAccelerator &&
-              oneCore.ggufFloatTile(15, 256) == FloatTile::Simdgroup &&
-              oneCore.ggufFloatTile(16, 256) == FloatTile::NeuralAccelerator,
-          "GGUF float tile rule");
+  constexpr uint32_t kF32 = QuantizedSegment::kFloat32;
+  for (const auto [format, first] : {std::pair{uint32_t{GGUF_FMT_BF16}, 129U}, std::pair{kF32, 193U},
+                                     std::pair{uint32_t{GGUF_FMT_AF8G64}, 321U}, std::pair{uint32_t{GGUF_FMT_Q4K}, 321U}})
+    require(linear.ggufFloatTile(32, 256, format) == FloatTile::Simdgroup &&
+                linear.ggufFloatTile(first - 1, 256, format) == FloatTile::Simdgroup &&
+                linear.ggufFloatTile(first, 256, format) == FloatTile::NeuralAccelerator &&
+                linear.ggufFloatTile(2048, 256, format) == FloatTile::NeuralAccelerator &&
+                oneCore.ggufFloatTile(15, 256, format) == FloatTile::Simdgroup &&
+                oneCore.ggufFloatTile(16, 256, format) == FloatTile::NeuralAccelerator,
+            std::string("GGUF float tile rule of ") + (format == kF32 ? "f32" : kQuantFormats[format].name) + " rows");
+  require(linear.ggufFloatTile(960, 64, kF32) == FloatTile::Simdgroup &&
+              linear.ggufFloatTile(961, 64, kF32) == FloatTile::NeuralAccelerator,
+          "GGUF float tile rule of F32 alpha/beta");
 
   // Apple9 decodes every GGUF width with the exact register tile, all lanes
   // in one threadgroup, and K splits from the core count; prefill stages.
@@ -303,7 +310,8 @@ void ggufPlans() {
   require(m3.plan({{5120, 17408}, 100, LinearPhase::Prefill, LinearEpilogue::Residual},
                   blockProjection(5120, 17408, 1)).configuration().tile == LinearTile::GgufPrefill,
           "Apple9 GGUF prefill stages");
-  require(m3.ggufFloatTile(2048, 256) == FloatTile::Simdgroup, "Apple9 float projections take the simdgroup tile");
+  require(m3.ggufFloatTile(2048, 256, QuantizedSegment::kFloat32) == FloatTile::Simdgroup,
+          "Apple9 float projections take the simdgroup tile");
   const LinearScratchSize bound = m3.decodeScratchSize(downShape);
   require(bound.partials ==
               m3.plan({down.matrix, 32, LinearPhase::Decode, LinearEpilogue::Residual}, blockProjection(5120, 17408, 1))
@@ -766,24 +774,29 @@ void ggufCoreLaws() {
               }
             }
     }
-  // The float tile follows the grid per core: once a chunk takes the neural
-  // accelerator, longer chunks and fewer cores keep it; never below 16 rows or
-  // on Apple9.
+  // The float tile follows the grid per core and a step's work: once a chunk
+  // takes the neural accelerator, longer chunks, fewer cores and rows of less
+  // work a step (BF16 below F32 below a quantized format's) keep it; never
+  // below 16 rows or on Apple9.
+  constexpr std::array<uint32_t, 3> kByWork{GGUF_FMT_BF16, QuantizedSegment::kFloat32, GGUF_FMT_AF8G64};
   for (uint32_t cores = 1; cores <= 128; ++cores)
-    for (const uint32_t n : {16U, 64U, 256U, 1024U}) {
-      for (const uint32_t family : {10U, 11U}) {
-        const Linear linear = gpu(family, cores), more = gpu(family, cores + 1);
-        bool accelerator = false;
-        for (uint32_t rows = 1; rows <= 2048; ++rows) {
-          const bool now = linear.ggufFloatTile(rows, n) == FloatTile::NeuralAccelerator;
-          require((!accelerator || now) && (!now || rows >= 16) &&
-                      (more.ggufFloatTile(rows, n) == FloatTile::Simdgroup || now),
-                  "GGUF float tile is not monotone in rows and cores");
-          accelerator = now;
+    for (const uint32_t n : {16U, 64U, 256U, 1024U})
+      for (size_t w = 0; w < kByWork.size(); ++w) {
+        const uint32_t format = kByWork[w];
+        for (const uint32_t family : {10U, 11U}) {
+          const Linear linear = gpu(family, cores), more = gpu(family, cores + 1);
+          bool accelerator = false;
+          for (uint32_t rows = 1; rows <= 2048; ++rows) {
+            const bool now = linear.ggufFloatTile(rows, n, format) == FloatTile::NeuralAccelerator;
+            require((!accelerator || now) && (!now || rows >= 16) &&
+                        (more.ggufFloatTile(rows, n, format) == FloatTile::Simdgroup || now) &&
+                        (!now || !w || linear.ggufFloatTile(rows, n, kByWork[w - 1]) == FloatTile::NeuralAccelerator),
+                    "GGUF float tile is not monotone in rows, cores and work");
+            accelerator = now;
+          }
         }
+        require(gpu(9, cores).ggufFloatTile(2048, n, format) == FloatTile::Simdgroup, "Apple9 GGUF float tile");
       }
-      require(gpu(9, cores).ggufFloatTile(2048, n) == FloatTile::Simdgroup, "Apple9 GGUF float tile");
-    }
 }
 
 metal::MetalBuffer allocate(metal::MetalBackend &backend, uint64_t bytes) {

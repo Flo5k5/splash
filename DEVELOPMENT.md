@@ -1709,8 +1709,10 @@ each quantized tensor in the format mlx-lm infers from its tensors, an affine
 NVFP4, at the checkpoint's bits per weight (NVFP4's at 4.625, its tensor scale
 stored once per 256 weights); projections and experts as block planes, a
 quantized token table as native rows and an unquantized one as its bf16 rows.
-The block MoE kernels read the router and the shared-expert gate in F32, so
-these load as the F32 values of their quantization, and so do GDN alpha and
+The MoE router keeps its format too, a quantized one as native rows, an
+unquantized one as its bf16 or F32 rows, which the float projection runs
+([Kernels](#kernels)). The MoE selection reads the shared-expert gate in F32,
+so it loads as the F32 values of its quantization, and so do GDN alpha and
 beta unless both are in one format. Norms stay bf16 and the GDN value heads in
 MLX's grouped order.
 
@@ -1776,7 +1778,9 @@ and lists every unsupported tensor in one error:
   IQ4_NL, MXFP4, NVFP4, PQ2_0, Q2_0, BF16 or F16;
 - token embeddings: any of the linears' formats;
 - norms: F32, BF16 or F16, loaded as the F32 values they hold;
-- the MoE router: F32 or BF16, which the float projection runs as stored;
+- the MoE router: F32, BF16 or any of the linears' quantized formats (not
+  F16), which the float projection runs as stored, a quantized one as its
+  native rows (as an MLX target's quantized router loads);
 - the shared-expert scalar gate: F32, BF16 or Q8_0, loaded as the F32 values
   it holds;
 - the GDN convolution, decay and time-step bias: F32;
@@ -2354,7 +2358,7 @@ Loading never rounds a target or vision weight but in the F32 values of
 quantized tensors the kernels read unquantized, in the Q8_0 of Flash-Next's
 BF16 or F16 hyper-connection projections ([GGUF targets](#gguf-targets)), and
 in two conversions: the GDN decay above and the RMSNorm weights below. The first are a safetensors
-target's quantized router and shared-expert gate, and its quantized GDN alpha
+target's quantized shared-expert gate, and its quantized GDN alpha
 or beta beside one of another format or an unquantized one, an MLX target's
 ([MLX targets](#mlx-targets)) or a Model Optimizer or compressed-tensors
 target's in NVFP4 or FP8, and a GGUF's quantized alpha or beta beside one of
@@ -2516,13 +2520,23 @@ for decode.
 
 ### Kernels
 
-Every tensor keeps its stored format: the F32 norm multipliers, GDN decay, the
-MoE router and shared-expert scalar gate, and GDN alpha/beta when a file
-stores them as F32 stay F32 and run in fp32, as llama.cpp keeps them (Apple10
-prefill chunks multiply the router and alpha/beta on the neural accelerator as
-three bf16 parts per weight that sum to it exactly, so only fp32 accumulation
-rounds). The GDN convolution and time-step bias become bf16 under the exact
-rule.
+Every tensor keeps its stored format: the F32 norm multipliers, GDN decay,
+shared-expert scalar gate, and GDN alpha/beta when a file stores them as F32
+stay F32 and run in fp32, as llama.cpp keeps them. The MoE router runs in fp32
+in the format its checkpoint holds it: a GGUF's F32 or BF16 values, or the
+native rows of a quantized router (an MLX checkpoint's 8-bit affine one), each
+weight the fp32 value the token gather decodes, so its scores are those of the
+F32 tensor of its values bit for bit (Apple10 prefill chunks multiply the
+router and alpha/beta on the neural accelerator as three bf16 parts per weight
+that sum to it exactly, so only fp32 accumulation rounds). Its scores pick the
+experts, so it stays off the block tiles, whose staged and prefill tiles round
+the weights to half; in decode they are slower on its narrow grid as well: on a
+32-core M5 Max the 35B's router as 8-bit planes takes 6.3, 8.7, 11.1 and 15.6
+us at one to four lanes on the register tile, its native rows 5.2, 6.3, 7.4 and
+8.5 us on the float projection (prefill chunks: 58-74 us on the prefill tile at
+64 to 2048 rows, 10-184 us on the float tiles, faster up to about 550 rows;
+weights DRAM-cold). The GDN convolution and time-step bias become bf16 under
+the exact rule.
 
 Decode runs one of two kernel families, chosen by GPU family in `runtime/ops/LinearGguf.cpp`. On
 Apple9 (M3, M4) the register tile (`LinearTile::GgufRegister`) runs the kernels of
@@ -2603,8 +2617,35 @@ of one request.
 The float router, QSA indexer and alpha/beta projections run in `kernels/shared/gguf_float.metal`,
 which runs two projections of one input in one dispatch where they take the same tile (the
 indexer's query and key, each on the tile of its own width), and the token rows are gathered by
-one template in `kernels/shared/embedding.metal`. These plans are fixed rules of GPU family, core
-count, shape and format.
+one template in `kernels/shared/embedding.metal`. The float projection reads a quantized format's
+rows (`QuantizedSegment::rows`) through the gather's decode
+(`kernels/common/gguf_embedding_formats.h`), the MLX affine formats as runs of 8 codes with their
+block's scale and bias, read a step ahead and decoded once for the step's products, and writes
+their products in fp32, the router's scores. The 35B's 8-bit affine router (256 x 2048, 0.56 MB
+a layer against its F32 values' 2.1 MB) trades the bytes it saves for its decode: at one to four
+lanes it takes 5.2, 6.3, 7.4 and 8.5 us on a 32-core M5 Max against 6.7, 7.1, 7.5 and 8.2 for its
+F32 values (4% slower at four lanes), 6.3, 8.3, 10.4 and 12.6 against 14.7, 16.1, 16.5 and 17.9
+on a 12-core M6, and 10.9, 14.7, 17.9 and 21.1 against 22.2, 23.9, 26.2 and 28.0 on a 10-core M4;
+the 122B's (256 x 3072) 6.7, 8.4, 10.0 and 11.5 against 9.0, 9.5, 10.0 and 10.9 on the M5 Max
+(`gguf-projection-benchmark float-af8g64 256 2048`, weights DRAM-cold). In the 35B's one-lane
+decode on the M5 Max its dispatch takes 8.4 us a layer against 9.45 (`decode-profile`, ABBA, 4
+runs of 96 cycles a build): 0.04 ms of a 14.7 ms cycle, within the cycle's noise. Prefill chunks
+of 1024 to 2048 rows on the M5 Max's accelerator tile, where the decode lies on each step's
+critical path, take -10% to +7% of the F32 values' time, and the M4's simdgroup tile -3% to +6%
+at 64 to 2048 rows.
+A float projection takes the neural accelerator tile on Apple10 from 16 rows and a grid of its
+64 x 32 tiles of 1.5 per core for BF16 values, 2 for F32 values and 3 for a quantized format's rows,
+by the bf16 parts the tile stages a weight as (one, three, three decoded; `Linear::ggufFloatTile`).
+Where the two tiles take the same time on a 32-core M5 Max and a 12-core M6
+(`gguf-projection-benchmark float-<format>`, rows in steps of 64): F32 at 2.0-2.67 tiles per core
+for 256 columns of 2048 or 3072 inputs, and 1.75-2.0 (M6) or 2.0 and above (M5 Max) for the 64 and
+96 of GDN alpha/beta; quantized rows at 2.67-4.0 (8-bit and 4-bit affine, Q8_0, Q4_K). Over those
+points the rule's tile takes at most 13% (F32) and 6% (quantized rows) longer than the faster one,
+where 1.5 for every weight took up to 42% and 61% longer; on the M5 Max the 35B's native router rows
+take 52.6 us at 512 rows on the simdgroup tile against 71.8 on the accelerator's. BF16 crosses at
+0.67-1.33, under its rule, which keeps a decode step's 16 to 32 rows of a 512-column router off the
+accelerator tile on 12 cores (1.6-1.8x the simdgroup tile's time there). These plans are fixed
+rules of GPU family, core count, shape and format.
 
 A rotated projection rotates its input once into `LinearScratch::rotated`
 (`gguf_rotate`, in fp32 and rounded once to bf16) before its quantized segments,
@@ -2662,12 +2703,14 @@ in `dev/tests/fixtures/weight-goldens/`; with `SPLASH_GGML_ORACLE=<libggml-base.
 `gguf-reference` also compares the reference with GGML directly and prints GGML's hashes.
 
 Two benchmark tools repeat the measurements behind the GGUF split tiers and MoE plans, with the
-weights DRAM-cold. `make benchmark-gguf-projection GGUF_PROJECTION_ARGS='q4k 5120 8192'` times one
-projection (up to three fused formats and widths, then `K` and an optional epilogue) on both
-decode tiles at one to four lanes (one lane also on the staged 16-row tile, `staged16`) and
+weights DRAM-cold (each command of the projection benchmark reads a ring of weight copies of at
+least 384 MiB, however small the tensor). `make benchmark-gguf-projection
+GGUF_PROJECTION_ARGS='q4k 5120 8192'` times one projection (up to three fused formats and widths,
+then `K` and an optional epilogue) on both decode tiles at one to four lanes (one lane also on the staged 16-row tile, `staged16`) and
 every K split, and marks the device policy's pick, or, with a trailing `prefill=R[,R...]`
 after the epilogue and the round count, one format's 128-row prefill tile at each chunk of `R`
-rows (more than 32); the formats `float-bf16` and `float-f32` time the float projection
+rows (more than 32); the formats `float-bf16` and `float-f32`, and `float-<format>` for a
+quantized format's native rows (such as `float-af8g64`), time the float projection
 (`ops::addGgufFloat`, widths of any multiple of 8) on both float tiles instead, marking
 `Linear::ggufFloatTile`'s pick; `make benchmark-gguf-moe` times one MoE layer at the 35B shape,
 or at Qwen3.8-Flash-Next's or Flint's (`GGUF_MOE_ARGS='flash-next'` or `'flint'`), on the

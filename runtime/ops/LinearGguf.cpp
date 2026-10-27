@@ -647,20 +647,35 @@ void Linear::addGgufFloatSegments(metal::CommandGraph &graph, const LinearBuffer
   for (const QuantizedSegment &s : p.blocks().segments)
     if (s.isFloat())
       addGgufFloat(graph, b.input, s, b.output, w.rows, w.matrix.outputSize, s.columnOffset, plan.destination(),
-                   ggufFloatTile(w.rows, s.outputSize));
+                   ggufFloatTile(w.rows, s.outputSize, s.formatId));
 }
 
 // The neural accelerator tile needs one (Apple9's matrix operations share the
-// FP32 pipe, where three bf16 matmuls cost three fp32 ones) and a grid of its
-// 64-row by 32-column tiles of at least three threadgroups per two cores. A
-// tile runs K / 32 dependent steps, while the fp32 kernel spreads fewer rows
-// over 8-column tiles with 8 K partitions each and finishes first below that
-// grid: on the 20-core M5 Pro the two take the same time at about 1.5 tiles
-// per core for Flash-Next's BF16 router (K = 2560), and at about 2.2 for the
-// 35B's F32 router (K = 2048), whose weights take three matmuls a step.
-FloatTile Linear::ggufFloatTile(uint32_t rows, uint32_t outputSize) const noexcept {
+// FP32 pipe, where three bf16 matmuls cost three fp32 ones) and enough of its
+// 64-row by 32-column tiles per core. A tile runs K / 32 dependent steps, each
+// staging the step's weights in threadgroup memory as bf16 parts and running
+// a matmul per part (kernels/shared/gguf_float.metal), while the fp32 kernel
+// spreads fewer rows over 8-column tiles with 8 K partitions each and
+// finishes first below that grid. The grid it needs grows with that staging:
+// 1.5 tiles per core for BF16 values, one part each, 2 for F32 values, three
+// parts, and 3 for a quantized format's rows, decoded into three parts.
+// Where the two tiles take the same time (gguf-projection-benchmark
+// float-<format>, rows in steps of 64) on a 32-core M5 Max and a 12-core M6:
+// F32 at 2.25-2.5 and 2.0-2.67 tiles per core for 256 columns of 2048 or 3072
+// inputs, but 1.75-2.0 on the M6 and 2.0 and more on the M5 Max for the 64
+// and 96 of GDN alpha/beta; quantized rows at 3.5 (8-bit affine) and
+// 2.67-4.0 (8-bit affine, Q8_0, 4-bit affine, Q4_K); on a 20-core M5 Pro F32
+// at about 2.2 for the 35B's router. Over those points the rule's tile takes
+// at most 13% (F32) and 6% (quantized) longer than the faster one, where 1.5
+// for every weight took up to 42% and 61% longer. BF16 crosses at 0.67-1.33
+// (the M5 Pro: about 1.5 for Flash-Next's router), below its rule, which
+// keeps a decode step's 16 to 32 rows on the simdgroup tile on 12 cores (a
+// 512-column router: 1.6-1.8x faster there).
+FloatTile Linear::ggufFloatTile(uint32_t rows, uint32_t outputSize, uint32_t formatId) const noexcept {
   const uint64_t tiles = uint64_t{(rows + 63) / 64} * ((outputSize + 31) / 32);
-  return family_ == GpuFamilyClass::Apple10 && rows >= 16 && 2 * tiles >= uint64_t{3} * gpuCores_
+  // The grid in half tiles per core.
+  const uint32_t halves = formatId == GGUF_FMT_BF16 ? 3 : formatId == QuantizedSegment::kFloat32 ? 4 : 6;
+  return family_ == GpuFamilyClass::Apple10 && rows >= 16 && 2 * tiles >= uint64_t{halves} * gpuCores_
              ? FloatTile::NeuralAccelerator
              : FloatTile::Simdgroup;
 }
@@ -687,7 +702,10 @@ void addGgufFloat(metal::CommandGraph &graph, metal::MetalBuffer input, std::spa
     if (!w.isFloat() || w.inputSize != k || !n || n % 8 || p.outOffset + uint64_t{n} > p.outStride ||
         (p.tile == FloatTile::NeuralAccelerator && (rows < 16 || k % 32)))
       throw std::invalid_argument("invalid float projection");
-    requireBytes(w.plane0, uint64_t{n} * k * w.floatBytes(), "float projection weight");
+    // The rows of a quantized format write fp32, the MoE router's scores.
+    if (w.quantizedRows() && type != FloatOutput::Float32)
+      throw std::invalid_argument("a float projection of quantized rows writes fp32");
+    requireBytes(w.plane0, uint64_t{n} * QuantizedSegment::rowBytes(w.formatId, k), "float projection weight");
     requireBytes(p.output, rowBytes(rows, p.outStride, uint64_t{p.outOffset} + n, elementBytes(type)),
                  "float projection output");
   }
@@ -725,6 +743,8 @@ void requireSegmentPlanes(const QuantizedSegment &segment, std::string_view what
   // Each plane ends at its unit of the last row's last group the segment
   // reads, or meta unit: tile row (rows - 1) % T of that group of its tile,
   // whose rows hold the groups of planeInputs inputs.
+  if (segment.layout != QuantizedSegment::Layout::Planes)
+    throw std::invalid_argument(std::string(what) + " takes planes");
   const QuantFormat &format = segment.format();
   const uint32_t groups = segment.inputSize / 32, units = groups / format.meta_groups;
   const uint32_t rowGroups = (planeInputs ? planeInputs : segment.inputSize) / 32,
@@ -751,11 +771,24 @@ QuantizedSegment QuantizedSegment::planes(uint32_t formatId, uint32_t outputSize
                                           metal::MetalBuffer plane0, metal::MetalBuffer plane1,
                                           metal::MetalBuffer meta) {
   if (formatId >= GGUF_FMT_COUNT) throw std::invalid_argument("unknown GGUF segment format");
-  return {std::move(plane0), std::move(plane1), std::move(meta), outputSize, inputSize, 0, formatId};
+  return {std::move(plane0), std::move(plane1), std::move(meta), outputSize, inputSize, 0, formatId, Layout::Planes};
+}
+QuantizedSegment QuantizedSegment::rows(uint32_t formatId, uint32_t outputSize, uint32_t inputSize,
+                                        metal::MetalBuffer rows) {
+  if (!rowBytes(formatId, inputSize))
+    throw std::invalid_argument("rows take F32 or BF16 values or whole native blocks of a quantized GGUF format");
+  return {std::move(rows), {}, {}, outputSize, inputSize, 0, formatId, Layout::Rows};
+}
+// F32 and BF16 values each their own; a quantized format's native blocks
+// (kernels/common/gguf_embedding_formats.h).
+uint64_t QuantizedSegment::rowBytes(uint32_t formatId, uint32_t inputSize) noexcept {
+  if (formatId == kFloat32) return uint64_t{inputSize} * sizeof(float);
+  if (formatId == GGUF_FMT_BF16) return uint64_t{inputSize} * sizeof(uint16_t);
+  if (formatId >= GGUF_FMT_COUNT || formatId == GGUF_FMT_F16) return 0;
+  const QuantFormat &f = kQuantFormats[formatId];
+  return inputSize % f.block_elements ? 0 : uint64_t{inputSize} / f.block_elements * f.block_bytes;
 }
 const QuantFormat &QuantizedSegment::format() const noexcept { return kQuantFormats[formatId]; }
-const char *QuantizedSegment::name() const noexcept {
-  return formatId == kFloat32 ? "f32" : formatId == kBFloat16 ? "bf16" : format().name;
-}
+const char *QuantizedSegment::name() const noexcept { return formatId == kFloat32 ? "f32" : format().name; }
 
 } // namespace splash::ops
