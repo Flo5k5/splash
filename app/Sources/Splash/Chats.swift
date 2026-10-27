@@ -15,6 +15,9 @@ struct ChatMessage: Codable, Identifiable, Equatable {
     /// The model that answered.
     var model: String?
     var tokensPerSecond: Double?
+    /// Seconds the model thought before it answered, and the tokens its thinking took.
+    var thinkingTime: Double?
+    var reasoningTokens: Int?
     /// Why an answer stopped short.
     var error: String?
     /// Whether the user, or a switch of models, stopped the answer.
@@ -45,11 +48,22 @@ struct ChatTarget {
 /// The conversations, one JSON file each in the app's folder, and the one reply that streams.
 @MainActor @Observable
 final class ChatStore {
+    /// The reply that streams: its conversation, when it was asked for, when the model began to
+    /// think, and how much of the prompt it has read, while it reads.
+    struct Live: Equatable {
+        let conversation: UUID
+        let asked: Date
+        var thinking: Date?
+        var read: Double?
+    }
+
     private(set) var conversations: [Conversation] = []
     /// The open conversation; nil is a new one, saved once it has a message.
     var selection: UUID?
+    private(set) var live: Live?
+
     /// The conversation whose reply streams now, the open one or another.
-    private(set) var streaming: UUID?
+    var streaming: UUID? { live?.conversation }
 
     static let folder = URL.applicationSupportDirectory.appending(path: "Splash/Chats")
 
@@ -119,18 +133,30 @@ final class ChatStore {
         conversation.updated = .now
         put(conversation)
         selection = conversation.id
-        streaming = conversation.id
+        live = Live(conversation: conversation.id, asked: .now)
         reply = Task { [weak self] in
             var shown = ContinuousClock.now
+            var thinking: Date?
+            var read: Double?
             do {
                 for try await delta in ChatClient.stream(history, with: server) {
+                    if !delta.reasoning.isEmpty, thinking == nil {
+                        thinking = .now
+                        self?.live?.thinking = thinking
+                    }
+                    if !delta.text.isEmpty, answer.text.isEmpty, let thinking {
+                        answer.thinkingTime = Date.now.timeIntervalSince(thinking)
+                    }
                     answer.reasoning += delta.reasoning
                     answer.text += delta.text
                     answer.tokensPerSecond = delta.tokensPerSecond ?? answer.tokensPerSecond
+                    answer.reasoningTokens = delta.reasoningTokens ?? answer.reasoningTokens
+                    read = delta.read ?? read
                     if delta.cut { answer.error = "The reply reached its length limit." }
                     // A redraw of the whole reply per token would be wasted work.
                     if ContinuousClock.now - shown > .milliseconds(50) {
                         shown = .now
+                        self?.live?.read = read
                         self?.update(conversation.id, answer, save: false)
                     }
                 }
@@ -139,8 +165,10 @@ final class ChatStore {
             } catch {
                 answer.error = error.localizedDescription
             }
+            // A reply that ended while the model still thought.
+            if let thinking, answer.thinkingTime == nil { answer.thinkingTime = Date.now.timeIntervalSince(thinking) }
             self?.update(conversation.id, answer, save: true)
-            self?.streaming = nil
+            self?.live = nil
         }
     }
 
@@ -194,6 +222,10 @@ enum ChatClient {
         var tokensPerSecond: Double?
         /// Whether the reply ended at its length limit.
         var cut = false
+        /// How much of the prompt the model has read, from 0 to 1, while it reads.
+        var read: Double?
+        /// The tokens the model's thinking took, once the reply ends.
+        var reasoningTokens: Int?
     }
 
     enum Event: Equatable {
@@ -238,8 +270,9 @@ enum ChatClient {
     }
 
     /// The request for `messages`: images as data URLs, or a note in their place for a model that
-    /// cannot see them; earlier answers with what the model thought, empty ones left out; and the
-    /// reasoning effort unless it is the model's default.
+    /// cannot see them; earlier answers with what the model thought, empty ones left out; the
+    /// reasoning effort unless it is the model's default; and the prompt's progress and the usage
+    /// asked for.
     static func body(_ messages: [ChatMessage], effort: String, images: Bool) throws -> Data {
         let wire: [[String: Any]] = messages.compactMap { message in
             switch message.role {
@@ -259,7 +292,8 @@ enum ChatClient {
                 return ["role": "assistant", "content": message.text, "reasoning_content": message.reasoning]
             }
         }
-        var body: [String: Any] = ["messages": wire, "stream": true, "stream_options": ["include_usage": true]]
+        var body: [String: Any] = ["messages": wire, "stream": true, "stream_options": ["include_usage": true],
+                                   "return_progress": true]
         if !effort.isEmpty { body["reasoning_effort"] = effort }
         return try JSONSerialization.data(withJSONObject: body)
     }
@@ -280,17 +314,26 @@ enum ChatClient {
                 struct Latency: Decodable { let stream_tokens_per_second: Double? }
                 let request_latency: Latency?
             }
+            struct Progress: Decodable { let total: Int; let processed: Int }
+            struct Usage: Decodable {
+                struct Details: Decodable { let reasoning_tokens: Int? }
+                let completion_tokens_details: Details?
+            }
             struct Problem: Decodable { let message: String }
             let choices: [Choice]?
             let metrics: Metrics?
+            let prompt_progress: Progress?
+            let usage: Usage?
             let error: Problem?
         }
         let chunk = try JSONDecoder().decode(Chunk.self, from: Data(payload.utf8))
         if let error = chunk.error { throw Failure(errorDescription: error.message) }
         let choice = chunk.choices?.first
+        let progress = chunk.prompt_progress.flatMap { $0.total > 0 ? min(Double($0.processed) / Double($0.total), 1) : nil }
         return .delta(Delta(text: choice?.delta?.content ?? "", reasoning: choice?.delta?.reasoning_content ?? "",
                             tokensPerSecond: chunk.metrics?.request_latency?.stream_tokens_per_second,
-                            cut: choice?.finish_reason == "length"))
+                            cut: choice?.finish_reason == "length", read: progress,
+                            reasoningTokens: chunk.usage?.completion_tokens_details?.reasoning_tokens))
     }
 
     private static func message(of data: Data) -> String? {

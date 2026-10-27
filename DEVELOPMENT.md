@@ -4296,12 +4296,14 @@ downloads are the ones a packaged `splash` uses, in
 offers `install/suggested-models.tsv`, per model the variant meant for the
 Mac's memory with its download size and a few words about the model, and
 starts coding agents with `splash AGENT --port PORT` in Terminal, in a folder
-the user picks. Its launch options are every option `splash serve` takes but
-the ones of one model (`--revision`, `--draft-model`) and the ones it sets
-itself, from one table (`LaunchOption.all`) the tests hold to `splash serve
---help`; the API key reaches the server as `SPLASH_API_KEY`, from the
-Keychain. It serves model files on this Mac the user adds with `splash serve
---model PATH`, and at launch it runs `install/cached.py`. While a model runs,
+the user picks, from a script that holds the running server's API key and
+removes itself as it starts. Its launch options are every option `splash
+serve` takes but the ones of one model (`--revision`, `--draft-model`) and the
+ones it sets itself, from one table (`LaunchOption.all`) the tests hold to
+`splash serve --help`; the API key reaches the server as `SPLASH_API_KEY`,
+from the Keychain, and nothing starts while the Keychain does not give it. It
+serves model files on this Mac the user adds with `splash serve --model PATH`,
+and at launch it runs `install/cached.py`. While a model runs,
 the Server shows its `/status`: requests, answering and prompt speed, time to
 first token, the tokens generated, read and taken from the cache, and the Metal
 memory it holds, with each request's line of the server's log, folded. Its chat
@@ -4309,10 +4311,12 @@ is its own, not the chat page: it streams
 `/v1/chat/completions` and keeps each conversation as a JSON file in
 `~/Library/Application Support/Splash/Chats`, so a conversation outlives a
 switch of models. Its icon is `app/AppIcon.icon`, an Icon Composer document
-`actool` compiles, which needs the full Xcode. `swift test --package-path app`
-runs its tests; with `SPLASH_RUNTIME` naming a packaged runtime and
-`SPLASH_APP_MODELS` installed models, they also drive the app end to end and,
-with `SPLASH_APP_SNAPSHOTS`, render its windows to that folder.
+`actool` compiles, which needs the full Xcode; its mark, a circle cut twice
+and slid apart, is the menu bar's too (`SplashMark`), and the chat page's
+(`server/favicon.svg`). `swift test --package-path app` runs its tests; with
+`SPLASH_RUNTIME` naming a packaged runtime and `SPLASH_APP_MODELS` installed
+models, they also drive the app end to end and, with `SPLASH_APP_SNAPSHOTS`,
+render its windows to that folder.
 
 ### Private test releases
 

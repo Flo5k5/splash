@@ -407,10 +407,7 @@ private struct BlockView: View, Equatable {
         case .quote(let blocks):
             Blocks(blocks: blocks, depth: depth)
                 .foregroundStyle(.secondary)
-                .padding(.leading, 14)
-                .overlay(alignment: .leading) {
-                    Capsule().fill(.tertiary).frame(width: 2)
-                }
+                .setApart()
         case .table(let header, let rows):
             TableBlock(header: header, rows: rows)
         case .rule:
@@ -425,60 +422,46 @@ private extension MarkdownBlock {
     }
 }
 
+/// Code, outlined: what a reply gives to take away, apart from what is said, which the user's
+/// messages show filled. Its language and Copy head it.
 private struct CodeBlock: View {
     let language: String?
     let code: String
-    @State private var copied = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            if let language {
-                HStack {
-                    Text(language)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    copy
-                }
-                .padding(.leading, 14)
-                .padding(.trailing, 10)
-                .padding(.top, 8)
+            HStack {
+                Text(language ?? "").font(.subheadline).foregroundStyle(.secondary)
+                Spacer()
+                CopyButton(copy: { NSPasteboard.put(code) })
+                .buttonStyle(.hover)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .help("Copy")
+                .accessibilityLabel("Copy Code")
             }
+            .padding(.leading, 14)
+            .padding(.trailing, 8)
+            .frame(height: 32)
+            Divider()
             ScrollView(.horizontal) {
                 Text(code)
                     .font(.system(size: 13, design: .monospaced))
                     .lineSpacing(3)
-                    .padding(.horizontal, 14)
-                    .padding(.top, language == nil ? 14 : 4)
-                    .padding(.bottom, 14)
+                    .padding(14)
             }
             .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .overlay(alignment: .topTrailing) {
-            if language == nil { copy.padding(.top, 8).padding(.trailing, 10) }
-        }
-        .background(.quaternary.opacity(0.6), in: .rect(cornerRadius: 10))
+        .overlay { RoundedRectangle(cornerRadius: 10).strokeBorder(.separator) }
     }
+}
 
-    private var copy: some View {
-        Button {
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(code, forType: .string)
-            copied = true
-            Task {
-                try? await Task.sleep(for: .seconds(1.5))
-                copied = false
-            }
-        } label: {
-            Image(systemName: copied ? "checkmark" : "doc.on.doc")
-                .font(.callout)
-                .contentTransition(.symbolEffect(.replace))
-        }
-        .buttonStyle(.hover)
-        .foregroundStyle(.secondary)
-        .help("Copy")
-        .accessibilityLabel("Copy Code")
+extension View {
+    /// Set apart from the text around it by a rule at its side, as quotes and the model's thinking
+    /// are.
+    func setApart() -> some View {
+        padding(.leading, 14).overlay(alignment: .leading) { Capsule().fill(.tertiary).frame(width: 2) }
     }
 }
 

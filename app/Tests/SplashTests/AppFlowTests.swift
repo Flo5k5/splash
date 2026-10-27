@@ -42,6 +42,8 @@ struct AppFlowTests {
 
     /// The launch options of every run: the server's defaults, on the test's port.
     static let defaults = ServeSettings(values: ["--port": String(port)])
+    /// Where the runs keep an API key: not where the user's Splash does.
+    static let keychain = Keychain(service: "Splash Tests")
 
     let state: AppState
     let model: String
@@ -52,7 +54,7 @@ struct AppFlowTests {
         Self.defaults.save()
         let runtime = try #require(Runtime.locate(), "SPLASH_RUNTIME names no runtime")
         #expect(runtime.packaged)
-        state = AppState(runtime: runtime, chats: ChatStore(folder: chats))
+        state = AppState(runtime: runtime, chats: ChatStore(folder: chats), keychain: Self.keychain)
         model = Self.models![0]
         await state.launch()
         // The window opens on the Server, and nothing starts until the user starts it.
@@ -73,7 +75,7 @@ struct AppFlowTests {
         let fresh = FileManager.default.temporaryDirectory.appending(path: "splash-first-run-\(getpid())")
         try FileManager.default.createDirectory(at: fresh.appending(path: "install"), withIntermediateDirectories: true)
         try? FileManager.default.copyItem(at: state.runtime.suggestedModels, to: Runtime(root: fresh).suggestedModels)
-        let first = AppState(runtime: Runtime(root: fresh))
+        let first = AppState(runtime: Runtime(root: fresh), keychain: Self.keychain)
         #expect(first.installed.isEmpty && first.selection == nil)
         await first.launch()
         await Snapshot.save("server-first-run", MainView().environment(first))
@@ -98,7 +100,7 @@ struct AppFlowTests {
         #expect(conversation.messages[1].model == model)
         #expect(ChatStore(folder: chats).conversations.first?.messages == conversation.messages, "saved")
         await Snapshot.save("chat-ready", MainView().environment(state))
-        #expect(state.server.requestLog.contains { $0.contains("Done · ") })
+        #expect(state.server.requestLog.contains { $0.outcome == .done && ($0.output ?? 0) > 0 })
         #expect(state.server.activity.generated > 0)
         await Snapshot.save("server-activity", size: CGSize(width: 1120, height: 1100), ServerView(advanced: true).environment(state))
         await Snapshot.save("menu-bar", size: CGSize(width: 300, height: 400), MenuBarPanel().environment(state))
@@ -107,13 +109,13 @@ struct AppFlowTests {
             items: [PopupItem(id: "xhigh", title: "Extra High", badge: "Default"),
                     PopupItem(id: "medium", title: "Medium"), PopupItem(id: "low", title: "Low"),
                     PopupItem(id: "none", title: "No Thinking")],
-            chosen: "xhigh") { _ in })
+            chosen: "xhigh", highlighted: .constant("medium")) { _ in })
         await Snapshot.save("popup-context", size: CGSize(width: 260, height: 320), PopupList(
-            header: "Context length",
+            header: nil,
             items: [PopupItem(id: "", title: "Auto", badge: "Default")]
                 + ContextLength.lengths.map { PopupItem(id: String($0), title: ContextLength.title($0)) }
                 + [PopupItem(id: "custom", title: "Custom…", separated: true)],
-            chosen: "") { _ in })
+            chosen: "", highlighted: .constant(nil)) { _ in })
         // Changed options ask for a restart, which starts the model with them.
         state.options["--max-context"] = "32768"
         #expect(state.optionsChanged)
@@ -215,7 +217,7 @@ struct AppFlowTests {
         state.start(model)
         #expect(!state.server.running)
         // The model stays picked for the next launch, which starts nothing by itself.
-        #expect(AppState(runtime: state.runtime).selection == model)
+        #expect(AppState(runtime: state.runtime, keychain: Self.keychain).selection == model)
     }
 
     @Test func aRelaunchStopsTheServerACrashLeftBehind() async throws {
@@ -223,7 +225,7 @@ struct AppFlowTests {
         try await ready()
         let pid = try #require(state.runtime.serveLockOwner(port: Self.port))
         // The next launch of the app, as after a crash of this one.
-        let relaunch = AppState(runtime: state.runtime)
+        let relaunch = AppState(runtime: state.runtime, keychain: Self.keychain)
         await relaunch.server.stopLeftover()
         #expect(kill(pid, 0) != 0)
         try await waitFor({ if case .failed = state.server.phase { true } else { false } }(), "noticed")
@@ -247,7 +249,7 @@ struct AppFlowTests {
         installer.install(download)
         try await waitFor((installer.progress?.done ?? 0) > 0, "progress again", seconds: 120)
         let pid = pid_t(UserDefaults.standard.integer(forKey: Preference.installerPID))
-        await AppState(runtime: state.runtime).installer.stopLeftover()
+        await AppState(runtime: state.runtime, keychain: Self.keychain).installer.stopLeftover()
         #expect(kill(pid, 0) != 0)
         try await waitFor(!installer.running, "noticed", seconds: 30)
         try await install(download)
@@ -268,17 +270,6 @@ struct AppFlowTests {
             .subtracting(["--help", "--model", "--offline", "--revision", "--draft-model"])
         #expect(!flags.isEmpty)
         #expect(flags == Set(LaunchOption.all.map(\.flag)))
-    }
-
-    @Test func agentsRunInTheFolderPicked() {
-        let folder = URL(filePath: "/tmp/it's a project")
-        let script = Agent.claude.script(runtime: state.runtime, port: 8100, folder: folder)
-        #expect(script.contains(#"cd '/tmp/it'\''s a project' || exit"#))
-        #expect(script.contains(#"'claude' '--port' '8100'"#))
-        #expect(script.contains("'-I' '-B' '-u'"))
-        #expect(!script.contains("SPLASH_API_KEY"))
-        #expect(Agent.claude.script(runtime: state.runtime, port: 8100, folder: folder, apiKey: true)
-            .contains("export SPLASH_API_KEY=\"$(security find-generic-password -s Splash -a 'API key' -w)\""))
     }
 
     // MARK: -

@@ -18,6 +18,8 @@ final class AppState {
     }
 
     let runtime: Runtime
+    /// Where the API key is kept.
+    let keychain: Keychain
     let server: Server
     let installer: Installer
     let catalog: Catalog
@@ -31,18 +33,34 @@ final class AppState {
     var section = Section.server
     /// The launch options the next start uses.
     var options = ServeSettings.current() {
-        didSet { options.save() }
+        didSet {
+            options.save()
+            if options.apiKey != keptKey { keep(options.apiKey) }
+        }
     }
+    /// The API key the Keychain holds, as last read or written.
+    @ObservationIgnored private var keptKey: String?
+    /// Why the Keychain didn't give or keep the API key; nothing starts until it does, so that a
+    /// model never serves without the key it is meant to ask for.
+    private(set) var keyProblem: String?
     /// Set once the app quits: nothing starts any more.
     private(set) var quitting = false
+    /// The installer of the models the Hugging Face cache holds, while it runs (`launch`).
+    private var cachedInstaller: Process?
+    /// The model files the user added, by path, as last measured (`refresh`), and the count of
+    /// measurements started, so that only the latest one counts.
+    @ObservationIgnored private var measured: [String: InstalledModel] = [:]
+    @ObservationIgnored private var measurements = 0
 
-    init(runtime: Runtime, chats: ChatStore = ChatStore()) {
+    init(runtime: Runtime, chats: ChatStore = ChatStore(), keychain: Keychain = .app) {
         self.runtime = runtime
+        self.keychain = keychain
         self.chats = chats
         server = Server(runtime: runtime)
         installer = Installer(runtime: runtime)
         catalog = Catalog(contentsOf: runtime.suggestedModels)
         installer.installed = { [weak self] in self?.didInstall($0) }
+        readKey()
         refresh()
     }
 
@@ -53,7 +71,14 @@ final class AppState {
     /// Whether models can start and download.
     var ready: Bool { available && !quitting }
 
-    /// What runs, in the words the menus and the Chat use.
+    /// Whether the app runs something it must stop or wait for before it quits.
+    var busy: Bool { server.running || installer.running || cachedInstaller != nil }
+
+    /// Whether the models the Hugging Face cache holds are still being looked for.
+    var findingCachedModels: Bool { cachedInstaller != nil }
+
+    /// What runs, in a sentence: VoiceOver announces it, and the Chat's composer says it while a
+    /// model stops.
     var status: String {
         let name = server.model.map(displayName(of:)) ?? ""
         switch server.phase {
@@ -64,6 +89,16 @@ final class AppState {
             return next == server.model ? "Restarting \(name)…" : "Switching to \(displayName(of: next))…"
         case .ready: return "\(name) · \(server.asleep ? "Sleeping" : "Running")"
         case .failed: return "\(name) ran into a problem"
+        }
+    }
+
+    /// What the server does, as the mark shows it.
+    var markLook: MarkLook {
+        switch server.phase {
+        case .starting: .loading
+        case .ready: server.asleep ? .asleep : .on
+        case .failed: .failed
+        case .stopped, .stopping: .off
         }
     }
 
@@ -115,20 +150,48 @@ final class AppState {
         }
         await installer.stopLeftover()
         await server.stopLeftover()
-        Task { await installCached() }
+        installCached()
     }
 
     /// Installs, without downloading, the models other tools or a source checkout of Splash left
-    /// in the Hugging Face cache that Splash serves; the installer leaves out the rest.
-    private func installCached() async {
-        let runtime = runtime
-        await Task.detached { runtime.installCached() }.value
-        refresh()
+    /// in the Hugging Face cache that Splash serves (`install/cached.py`), then lists them.
+    private func installCached() {
+        let process = runtime.cachedInstaller()
+        process.terminationHandler = { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.cachedInstaller = nil
+                self?.refresh()
+            }
+        }
+        guard (try? process.run()) != nil else { return }
+        cachedInstaller = process
+    }
+
+    /// Reads the API key kept; a Keychain that doesn't give it is a problem to solve first.
+    func readKey() {
+        do {
+            keptKey = try keychain.read()
+            keyProblem = nil
+            options.apiKey = keptKey
+        } catch {
+            keyProblem = error.localizedDescription
+        }
+    }
+
+    private func keep(_ key: String?) {
+        do {
+            try keychain.write(key)
+            // The Keychain holds the key the options have.
+            keptKey = key
+            keyProblem = nil
+        } catch {
+            keyProblem = error.localizedDescription
+        }
     }
 
     /// Starts `model` with the launch options, stopping the one that runs first.
     func start(_ model: String) {
-        guard ready else { return }
+        guard ready, keyProblem == nil else { return }
         selection = model
         chats.stop()
         server.start(model, settings: options)
@@ -144,12 +207,20 @@ final class AppState {
         installer.install(model)
     }
 
-    /// Stops the download and the model for the app to quit, and starts nothing after.
+    /// Stops the download, the model and the installer of cached models for the app to quit, and
+    /// starts nothing after. The last gets SIGINT, as Ctrl+C sends, and SIGTERM 5 s later.
     func quit() {
         quitting = true
         chats.stop()
         installer.cancel()
         server.stop()
+        if let cachedInstaller {
+            cachedInstaller.interrupt()
+            Task {
+                try? await Task.sleep(for: .seconds(5))
+                if cachedInstaller.isRunning { cachedInstaller.terminate() }
+            }
+        }
     }
 
     /// Sends a message to the running model.
@@ -188,16 +259,27 @@ final class AppState {
 
     func copyAPIAddress() {
         let settings = server.running ? server.settings : options
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(settings.url.appending(path: "v1").absoluteString, forType: .string)
+        NSPasteboard.put(settings.url.appending(path: "v1").absoluteString)
     }
 
     /// The models installed here, the suggested ones first in the list's order, then the model files
-    /// on this Mac the user added.
+    /// on this Mac the user added, with their sizes as last measured; they are measured again off the
+    /// main thread, as a folder picked may be large.
     func refresh() {
         let rank = { (id: String) in self.catalog.variants.firstIndex { $0.id == id } ?? Int.max }
+        let paths = localModels
         installed = runtime.installedModels().sorted { (rank($0.id), $0.id) < (rank($1.id), $1.id) }
-            + localModels.map(InstalledModel.local)
+            + paths.map { measured[$0] ?? InstalledModel(id: $0) }
+        guard !paths.isEmpty else { return }
+        measurements += 1
+        let measurement = measurements
+        Task {
+            let models = await Task.detached { paths.map(InstalledModel.local) }.value
+            guard measurement == measurements else { return }
+            measured = Dictionary(models.map { ($0.id, $0) }) { first, _ in first }
+            let current = installed.map { $0.local ? measured[$0.id] ?? $0 : $0 }
+            if current != installed { installed = current }
+        }
     }
 
     private var localModels: [String] {

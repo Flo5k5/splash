@@ -21,7 +21,8 @@ enum Preference {
 
 /// How a model starts: `splash serve --model MODEL --port PORT --offline` and the launch options
 /// set, each an option of `LaunchOption.all`; one not set is the server's default. The API key is
-/// kept in the Keychain and reaches the server in its environment, never its command line.
+/// kept in the Keychain (`AppState` reads and writes it) and reaches the server in its environment,
+/// never its command line.
 struct ServeSettings: Equatable {
     static let defaultPort = 8000
 
@@ -40,16 +41,15 @@ struct ServeSettings: Equatable {
     /// The memory limit set, in GB.
     var memoryLimit: Int? { values["--max-memory"].flatMap { Int($0.dropLast()) } }
 
-    /// The options UserDefaults keeps, of the flags the app offers and values they take.
+    /// The options UserDefaults keeps, of the flags the app offers and values they take; no key.
     static func current(_ defaults: UserDefaults = .standard) -> ServeSettings {
         let kept = defaults.dictionary(forKey: Preference.launchOptions) as? [String: String] ?? [:]
-        let values = kept.filter { flag, value in LaunchOption.all.contains { $0.flag == flag && $0.accepts(value) } }
-        return ServeSettings(values: values, apiKey: Keychain.apiKey)
+        return ServeSettings(values: kept.filter { flag, value in LaunchOption.all.contains { $0.flag == flag && $0.accepts(value) } })
     }
 
+    /// Keeps the options in UserDefaults; the key is kept apart.
     func save(_ defaults: UserDefaults = .standard) {
         defaults.set(values, forKey: Preference.launchOptions)
-        if Keychain.apiKey != apiKey { Keychain.apiKey = apiKey }
     }
 
     func serveArguments(model: String) -> [String] {
@@ -70,8 +70,8 @@ struct ServeSettings: Equatable {
         serveArguments(model: model) != other.serveArguments(model: model) || apiKey != other.apiKey
     }
 
-    /// The server's address: it listens on the loopback address, where the app's chat, health and
-    /// status requests go.
+    /// The server's address: it listens on the loopback address, alone or with every other one, and
+    /// the app's chat, health and status requests and the coding agents go there.
     var url: URL { URL(string: "http://127.0.0.1:\(port)")! }
 
     /// A request to `path` on the server, with the API key it asks for.
@@ -108,7 +108,7 @@ struct LaunchOption: Identifiable, Sendable {
         case text(Value, list: Bool)
         /// A folder picked.
         case folder
-        /// The API key, kept apart (`ServeSettings.apiKey`).
+        /// The API key, typed in a field that hides it and kept apart (`ServeSettings.apiKey`).
         case secret
     }
 
@@ -131,6 +131,8 @@ struct LaunchOption: Identifiable, Sendable {
     let kind: Kind
     /// Whether the option has effect with the others set as they are.
     var applies: @Sendable (ServeSettings) -> Bool = { _ in true }
+    /// What to beware of with the options set as they are, if anything.
+    var warning: @Sendable (ServeSettings) -> String? = { _ in nil }
 
     var id: String { flag }
 
@@ -175,7 +177,7 @@ extension LaunchOption {
                           custom: Value(prompt: "100K",
                                         message: "Tokens, with K for 1024 or M for a million, such as 100K or 1M. Past the model’s own window it stretches it with YaRN, which changes answers at every length.",
                                         parse: { ContextLength.parse($0).map(String.init) },
-                                        text: { Int($0).map { ContextLength.title($0).replacing(" tokens", with: "") } ?? $0 },
+                                        text: { Int($0).map(ContextLength.text) ?? $0 },
                                         title: { Int($0).map(ContextLength.title) ?? $0 }))),
         LaunchOption(
             flag: "--max-memory", title: "Memory limit",
@@ -257,28 +259,30 @@ extension LaunchOption {
             flag: "--host", title: "Listen on",
             help: "This Mac only, or every network it is on, for other devices to reach the model.",
             section: .network,
-            kind: .choice(standard: "This Mac Only", choices: [("0.0.0.0", "All Networks")],
-                          custom: Value(prompt: "192.168.1.10", message: "An IP address of this Mac.",
-                                        parse: { $0.wholeMatch(of: /[0-9a-fA-F:.]+/) != nil ? $0 : nil }))),
+            kind: .choice(standard: "This Mac Only", choices: [("0.0.0.0", "All Networks")], custom: nil),
+            warning: { $0["--host"] != nil && $0.apiKey == nil
+                ? "Any device on these networks can use the model. Set an API key to require one." : nil }),
         LaunchOption(
             flag: "--allowed-host", title: "Host names",
             help: "Other names clients reach this Mac by, such as mymac.local.",
             section: .network,
-            kind: .text(Value(prompt: "mymac.local", message: "", parse: { items($0).isEmpty ? nil : items($0).joined(separator: ", ") }),
+            kind: .text(Value(prompt: "None", message: "", parse: { items($0).isEmpty ? nil : items($0).joined(separator: ", ") }),
                         list: true)),
         LaunchOption(
             flag: "--allowed-origin", title: "Web origins",
             help: "Origins whose pages may call the API from a browser, such as tauri://localhost; * for any.",
             section: .network,
-            kind: .text(Value(prompt: "https://example.com", message: "", parse: { items($0).isEmpty ? nil : items($0).joined(separator: ", ") }),
-                        list: true)),
+            kind: .text(Value(prompt: "None", message: "", parse: { items($0).isEmpty ? nil : items($0).joined(separator: ", ") }),
+                        list: true),
+            warning: { $0["--allowed-origin"].map(items)?.contains("*") == true && $0.apiKey == nil
+                ? "Any website open in a browser can use the model. Set an API key to require one." : nil }),
         LaunchOption(
             flag: "--api-key", title: "API key",
             help: "A key every request but the chat page’s must carry. Splash’s own chat and coding agents send it.",
             section: .network, kind: .secret),
         LaunchOption(
             flag: "--no-webui", title: "Browser chat page",
-            help: "The chat page at the model’s address, for a browser on this Mac.",
+            help: "The chat page at the model’s address, for a browser.",
             section: .network, kind: .toggle(on: false)),
     ]
 
@@ -288,7 +292,7 @@ extension LaunchOption {
             help: "How much the model thinks for apps whose requests don’t say. The Chat asks for its own.",
             section: .api,
             kind: .choice(standard: "Model’s Default",
-                          choices: [("none", "Off"), ("minimal", "Minimal"), ("low", "Low"), ("medium", "Medium"),
+                          choices: [("none", "No Thinking"), ("minimal", "Minimal"), ("low", "Low"), ("medium", "Medium"),
                                     ("high", "High"), ("xhigh", "Extra High"), ("max", "Max")], custom: nil)),
         LaunchOption(
             flag: "--thinking-token-budget", title: "Thinking tokens",
@@ -305,7 +309,7 @@ extension LaunchOption {
             flag: "--served-model-name", title: "Other model names",
             help: "More names requests may give the model, such as gpt-4o for an app that asks for it.",
             section: .api,
-            kind: .text(Value(prompt: "gpt-4o", message: "", parse: { items($0).isEmpty ? nil : items($0).joined(separator: ", ") }),
+            kind: .text(Value(prompt: "None", message: "", parse: { items($0).isEmpty ? nil : items($0).joined(separator: ", ") }),
                         list: true)),
         LaunchOption(
             flag: "--announce-served-name", title: "Answer as the first other name",
@@ -336,15 +340,15 @@ extension LaunchOption {
             kind: .choice(standard: "4,194,304", choices: [], custom: Value(prompt: "1048576", message: "Pixels, 65,536 to 4,194,304.",
                                                                            parse: whole))),
         LaunchOption(
-            flag: "--decode-share", title: "Decode share",
-            help: "Answer time owed per unit of prompt reading while other requests answer; 0 alternates one step each.",
+            flag: "--decode-share", title: "Answering while reading",
+            help: "How long answers go on, for each second spent reading a new prompt meanwhile: more keeps answers flowing, less starts the new one sooner; 0 takes turns step by step.",
             section: .requests,
             kind: .choice(standard: "0.5", choices: [], custom: Value(prompt: "1", message: "A number, 0 or more.",
                                                                      parse: { Double($0).flatMap { $0 >= 0 ? String($0) : nil } }))),
         LaunchOption(
-            flag: "--verify-rows", title: "Draft rows",
-            help: "All makes a MoE model’s seeded answers repeat exactly, at some cost in speed.",
-            section: .requests, kind: .choice(standard: "Auto", choices: [("all", "All")], custom: nil)),
+            flag: "--verify-rows", title: "Repeatable answers",
+            help: "A MoE model’s greedy and seeded answers repeat exactly from run to run, at some cost in speed.",
+            section: .requests, kind: .choice(standard: "Off", choices: [("all", "On")], custom: nil)),
         LaunchOption(
             flag: "--disable-ane", title: "Neural Engine for long prompts",
             help: "Reads long prompts faster on models that can use it.",
@@ -385,9 +389,14 @@ enum ContextLength {
 
     /// A length as the menu names it: 32K tokens, 1M tokens, 100,000 tokens.
     static func title(_ tokens: Int) -> String {
-        if tokens % 1_000_000 == 0 { return "\(tokens / 1_000_000)M tokens" }
-        if tokens % 1024 == 0 { return "\(tokens / 1024)K tokens" }
-        return "\(tokens.formatted()) tokens"
+        tokens % 1024 == 0 || tokens % 1_000_000 == 0 ? "\(text(tokens)) tokens" : "\(tokens.formatted()) tokens"
+    }
+
+    /// A length as it is typed, which `parse` reads back: 32K, 1M, 100000.
+    static func text(_ tokens: Int) -> String {
+        if tokens % 1_000_000 == 0 { return "\(tokens / 1_000_000)M" }
+        if tokens % 1024 == 0 { return "\(tokens / 1024)K" }
+        return String(tokens)
     }
 
     /// A length typed as `--max-context` takes it: a token count, with K for 1024 tokens or M for
@@ -400,23 +409,45 @@ enum ContextLength {
     }
 }
 
-/// The API key, kept in the login Keychain.
-enum Keychain {
-    private static var query: [CFString: Any] {
-        [kSecClass: kSecClassGenericPassword, kSecAttrService: "Splash", kSecAttrAccount: "API key"]
+/// Where the API key is kept: an item of the login Keychain.
+struct Keychain: Sendable {
+    /// The app's own.
+    static let app = Keychain(service: "Splash")
+
+    let service: String
+    var account = "API key"
+
+    /// Why the Keychain didn't read or keep the key.
+    struct Failure: LocalizedError {
+        let status: OSStatus
+        var errorDescription: String? { SecCopyErrorMessageString(status, nil) as String? ?? "Keychain error \(status)." }
     }
 
-    static var apiKey: String? {
-        get {
-            var item: CFTypeRef?
-            let search = query.merging([kSecReturnData: true, kSecMatchLimit: kSecMatchLimitOne]) { $1 }
-            guard SecItemCopyMatching(search as CFDictionary, &item) == errSecSuccess, let data = item as? Data else { return nil }
-            return String(data: data, encoding: .utf8)
+    private var query: [CFString: Any] {
+        [kSecClass: kSecClassGenericPassword, kSecAttrService: service, kSecAttrAccount: account]
+    }
+
+    /// The key kept, or nil for none; throws when the Keychain doesn't give it, as when access to it
+    /// is denied.
+    func read() throws -> String? {
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query.merging([kSecReturnData: true, kSecMatchLimit: kSecMatchLimitOne]) { $1 } as CFDictionary, &item)
+        if status == errSecItemNotFound { return nil }
+        guard status == errSecSuccess, let data = item as? Data else { throw Failure(status: status) }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    /// Keeps `key` in place of the one kept; nil or empty removes it.
+    func write(_ key: String?) throws {
+        var status: OSStatus
+        if let key, !key.isEmpty {
+            let data: [CFString: Any] = [kSecValueData: Data(key.utf8)]
+            status = SecItemUpdate(query as CFDictionary, data as CFDictionary)
+            if status == errSecItemNotFound { status = SecItemAdd(query.merging(data) { $1 } as CFDictionary, nil) }
+        } else {
+            status = SecItemDelete(query as CFDictionary)
+            if status == errSecItemNotFound { status = errSecSuccess }
         }
-        set {
-            SecItemDelete(query as CFDictionary)
-            guard let newValue, !newValue.isEmpty else { return }
-            SecItemAdd(query.merging([kSecValueData: Data(newValue.utf8)]) { $1 } as CFDictionary, nil)
-        }
+        guard status == errSecSuccess else { throw Failure(status: status) }
     }
 }

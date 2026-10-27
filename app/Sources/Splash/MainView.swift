@@ -55,6 +55,7 @@ struct MainView: View {
 struct SectionSwitch: View {
     @Environment(AppState.self) private var state
     @Environment(\.colorScheme) private var colorScheme
+    @Namespace private var pill
 
     var body: some View {
         HStack(spacing: 2) {
@@ -63,6 +64,8 @@ struct SectionSwitch: View {
         }
         .padding(2)
         .background(.primary.opacity(colorScheme == .dark ? 0.08 : 0.06), in: .capsule)
+        // The pill slides; the window's content swaps at once.
+        .animation(Motion.settle, value: state.section)
     }
 
     private func segment(_ title: String, _ section: AppState.Section, help: String) -> some View {
@@ -78,6 +81,7 @@ struct SectionSwitch: View {
                         Capsule()
                             .fill(colorScheme == .dark ? AnyShapeStyle(.white.opacity(0.16)) : AnyShapeStyle(.white))
                             .shadow(color: .black.opacity(0.12), radius: 1.5, y: 0.5)
+                            .matchedGeometryEffect(id: "pill", in: pill)
                     }
                 }
                 .contentShape(.capsule)
@@ -104,6 +108,36 @@ struct DownloadButton: View {
     }
 }
 
+/// A figure of the engine's: its value large, its unit beside it, what it is under it; a dash
+/// before there is one. The value rolls as it changes (`Motion.number`).
+struct Figure: View {
+    let value: String?
+    var unit: String?
+    let caption: String
+    var compact = false
+    var help = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(alignment: .firstTextBaseline, spacing: 3) {
+                Text(value ?? "–")
+                    .font(.system(size: compact ? 15 : 22, weight: .medium))
+                    .foregroundStyle(value == nil ? .tertiary : .primary)
+                    .monospacedDigit()
+                    .contentTransition(Motion.number)
+                if let unit, value != nil {
+                    Text(unit).font(compact ? .subheadline : .callout).foregroundStyle(.secondary)
+                }
+            }
+            Text(caption).font(.subheadline).foregroundStyle(.secondary)
+        }
+        .lineLimit(1)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine)
+        .help(help)
+    }
+}
+
 enum Format {
     /// Decimal units, as Finder counts: 120 MB, 6.7 GB, 21 GB. Whole GB from 10 GB up, so a
     /// model's size reads the same everywhere.
@@ -114,4 +148,37 @@ enum Format {
     }
 
     static func gigabytes(_ count: Int) -> Int64 { Int64(count) * 1_000_000_000 }
+
+    /// A count in a few figures: 950, 12K, 3.4M.
+    static func count(_ value: Int) -> String {
+        value.formatted(.number.notation(.compactName))
+    }
+
+    /// A figure with no fraction: 37, 1,204.
+    static func whole(_ value: Double) -> String {
+        value.formatted(.number.precision(.fractionLength(0)))
+    }
+
+    /// A time to first token, and its unit: 136 ms, or 1.4 s.
+    static func latency(_ duration: Duration) -> (String, String) {
+        // Rounded first, so that 999.7 ms reads 1.0 s.
+        let milliseconds = (Double(duration.components.seconds) * 1000 + Double(duration.components.attoseconds) / 1e15).rounded()
+        return milliseconds < 1000 ? (whole(milliseconds), "ms")
+            : ((milliseconds / 1000).formatted(.number.precision(.fractionLength(1))), "s")
+    }
+
+    /// A figure and its unit, as `size` says it: 4.3 and GB.
+    static func parts(_ text: String) -> (String, String?) {
+        guard let space = text.lastIndex(of: " ") else { return (text, nil) }
+        return (String(text[..<space]), String(text[text.index(after: space)...]))
+    }
+
+    /// A while, as the chat says it: 9.8s, 24s, 1m 24s.
+    static func seconds(_ seconds: Double) -> String {
+        // Rounded first, so that 9.96 s reads 10s.
+        let tenths = (seconds * 10).rounded() / 10
+        if tenths < 10 { return "\(tenths.formatted(.number.precision(.fractionLength(1))))s" }
+        let whole = Int(seconds.rounded())
+        return whole < 60 ? "\(whole)s" : "\(whole / 60)m \(whole % 60)s"
+    }
 }

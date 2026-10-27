@@ -42,17 +42,16 @@ struct Runtime: Sendable {
          "--model", model, "prepare", "--json-progress"]
     }
 
-    /// Installs, without the Hub, the models the Hugging Face cache holds whole that Splash serves
-    /// (`install/cached.py`); returns once it has tried them all.
-    func installCached() {
+    /// The installer of the models the Hugging Face cache holds whole that Splash serves, without
+    /// the Hub (`install/cached.py`), to run.
+    func cachedInstaller() -> Process {
         let process = Process()
         process.executableURL = python
         process.arguments = ["-I", "-B", "-u", root.appending(path: "install/cached.py").path, "--models", models.path]
         process.environment = environment
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
-        guard (try? process.run()) != nil else { return }
-        process.waitUntilExit()
+        return process
     }
 
     /// The environment of the programs the app runs: the app's own (an app does not get the shell's),
@@ -124,19 +123,25 @@ struct Runtime: Sendable {
     }
 }
 
-struct InstalledModel: Identifiable, Hashable {
+struct InstalledModel: Identifiable, Hashable, Sendable {
     /// Its Hugging Face ID, or the path of model files on this Mac.
     let id: String
-    /// What its files take on disk, shared with any other installation of the same files.
-    let bytes: Int64
+    /// What its files take on disk, shared with any other installation of the same files; nil for
+    /// model files on this Mac not measured yet.
+    var bytes: Int64?
+    /// Whether model files on this Mac are no longer where they were added from.
+    var missing = false
 
     /// Whether it is model files on this Mac rather than a model Splash installed.
     var local: Bool { id.hasPrefix("/") }
 
-    /// The model files at `path`, a GGUF file or a folder, with what they take on disk.
+    /// The model files at `path`, a GGUF file or a folder, measured.
     static func local(_ path: String) -> InstalledModel {
-        let url = URL(filePath: path)
-        let files = (FileManager.default.enumerator(at: url, includingPropertiesForKeys: nil)?.allObjects as? [URL]) ?? [url]
+        let url = URL(filePath: path).resolvingSymlinksInPath()
+        guard let kind = try? url.resourceValues(forKeys: [.isDirectoryKey]) else { return InstalledModel(id: path, missing: true) }
+        let files = kind.isDirectory == true
+            ? (FileManager.default.enumerator(at: url, includingPropertiesForKeys: nil)?.allObjects as? [URL]) ?? []
+            : [url]
         let bytes = files.reduce(Int64(0)) { total, file in
             total + Int64((try? file.resolvingSymlinksInPath().resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
         }

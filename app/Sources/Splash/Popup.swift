@@ -12,8 +12,10 @@ struct PopupItem: Identifiable, Hashable {
 }
 
 /// A menu in Splash's own style: a rounded panel under the control that opens it, or over it,
-/// with a header and its items, each a title and any badge, the chosen one checked. It closes on
-/// a choice, a click elsewhere or Escape.
+/// with any header and its items, each a title and any badge, the chosen one checked. It opens at
+/// once, its control held while it is open. The arrow keys move through it, Return or Space picks;
+/// a choice, a click or a scroll elsewhere, Escape or any other key, or its control going away
+/// closes it, fading out, a choice still highlighted.
 struct PopupMenu<Label: View>: View {
     var header: String?
     let items: [PopupItem]
@@ -25,25 +27,23 @@ struct PopupMenu<Label: View>: View {
 
     var body: some View {
         Button {
-            popup.toggle(above: above) {
-                PopupList(header: header, items: items, chosen: chosen) { id in
-                    popup.close()
-                    choose(id)
-                }
-            }
+            popup.toggle(header: header, items: items, chosen: chosen, above: above, choose: choose)
         } label: {
             label()
         }
-        .buttonStyle(.hoverFlush)
-        .background(PopupAnchor(popup: popup))
+        .buttonStyle(HoverStyle(padding: EdgeInsets(), held: popup.isOpen))
+        .background(ViewAnchor { popup.anchor = $0 })
+        .onDisappear { popup.close() }
     }
 }
 
-/// The panel of a `PopupMenu`, apart from the control.
+/// The panel of a `PopupMenu`, apart from the control, the item under the pointer or the arrow
+/// keys highlighted.
 struct PopupList: View {
     let header: String?
     let items: [PopupItem]
     let chosen: String?
+    @Binding var highlighted: String?
     let choose: (String) -> Void
 
     var body: some View {
@@ -60,7 +60,7 @@ struct PopupList: View {
                 if item.separated {
                     Divider().padding(.horizontal, 8).padding(.vertical, 4)
                 }
-                PopupRow(item: item, chosen: item.id == chosen) { choose(item.id) }
+                PopupRow(item: item, chosen: item.id == chosen, highlighted: $highlighted) { choose(item.id) }
             }
         }
         .padding(5)
@@ -71,9 +71,12 @@ struct PopupList: View {
     }
 }
 
+/// An item, highlighted as `HoverStyle` highlights, but one at a time, for the pointer and the
+/// arrow keys alike.
 private struct PopupRow: View {
     let item: PopupItem
     let chosen: Bool
+    @Binding var highlighted: String?
     let choose: () -> Void
 
     var body: some View {
@@ -83,7 +86,7 @@ private struct PopupRow: View {
                     Text(item.title)
                     if let badge = item.badge {
                         Text(badge)
-                            .font(.caption)
+                            .font(.subheadline)
                             .foregroundStyle(.secondary)
                             .padding(.horizontal, 6)
                             .padding(.vertical, 1)
@@ -98,8 +101,14 @@ private struct PopupRow: View {
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 6)
+            // Concentric with the panel's corners.
+            .background(.quaternary.opacity(highlighted == item.id ? 0.75 : 0), in: .rect(cornerRadius: 7))
+            .contentShape(.rect(cornerRadius: 7))
         }
-        .buttonStyle(HoverStyle(padding: EdgeInsets(), shape: AnyShape(.rect(cornerRadius: 8))))
+        .buttonStyle(.plain)
+        .onHover { inside in
+            if inside { highlighted = item.id } else if highlighted == item.id { highlighted = nil }
+        }
         .accessibilityAddTraits(chosen ? .isSelected : [])
     }
 }
@@ -118,40 +127,39 @@ private struct PopoverMaterial: NSViewRepresentable {
 }
 
 /// The open panel of a `PopupMenu`: a borderless child window of the control's, at its trailing
-/// edge, under it or over it.
-@MainActor
+/// edge, under it or over it as asked where the screen has room, else the other way. One is open at
+/// a time.
+@MainActor @Observable
 final class Popup {
-    weak var anchor: NSView?
-    private var panel: NSPanel?
-    private var monitors: [Any] = []
-    private var resigned: NSObjectProtocol?
+    @ObservationIgnored weak var anchor: NSView?
+    /// The item the pointer or the arrow keys are on.
+    var highlighted: String?
+    private(set) var isOpen = false
+    @ObservationIgnored private var panel: NSPanel?
+    @ObservationIgnored private var items: [PopupItem] = []
+    @ObservationIgnored private var chosen: String?
+    @ObservationIgnored private var choose: (String) -> Void = { _ in }
+    @ObservationIgnored private var monitors: [Any] = []
+    @ObservationIgnored private var resigned: NSObjectProtocol?
+    /// The popup open in the app.
+    private static weak var open: Popup?
 
-    func toggle(above: Bool, @ViewBuilder content: () -> some View) {
-        if panel != nil { close() } else { show(above: above, content: content()) }
-    }
-
-    func close() {
-        monitors.forEach(NSEvent.removeMonitor)
-        monitors = []
-        resigned.map(NotificationCenter.default.removeObserver)
-        resigned = nil
-        if let panel {
-            panel.parent?.removeChildWindow(panel)
-            panel.orderOut(nil)
-        }
-        panel = nil
-    }
-
-    private func show(above: Bool, content: some View) {
+    func toggle(header: String?, items: [PopupItem], chosen: String?, above: Bool, choose: @escaping (String) -> Void) {
+        if panel != nil { return close() }
+        Self.open?.close()
         guard let anchor, let window = anchor.window else { return }
-        let control = window.convertToScreen(anchor.convert(anchor.bounds, to: nil))
-        let host = NSHostingView(rootView: content)
+        (self.items, self.chosen, self.choose, highlighted) = (items, chosen, choose, nil)
+        let list = PopupList(header: header, items: items, chosen: chosen,
+                             highlighted: Binding { self.highlighted } set: { self.highlighted = $0 }) { [weak self] in self?.pick($0) }
+        let host = NSHostingView(rootView: list)
         let size = host.fittingSize
+        let control = window.convertToScreen(anchor.convert(anchor.bounds, to: nil))
         let screen = window.screen?.visibleFrame ?? .infinite
-        let origin = NSPoint(
-            x: min(max(control.maxX - size.width, screen.minX + 8), screen.maxX - size.width - 8),
-            y: above ? control.maxY + 6 : control.minY - 6 - size.height
-        )
+        let under = control.minY - 6 - size.height, over = control.maxY + 6
+        let roomUnder = under >= screen.minY + 8, roomOver = over + size.height <= screen.maxY - 8
+        let y = above ? (roomOver || !roomUnder ? over : under) : (roomUnder || !roomOver ? under : over)
+        let origin = NSPoint(x: min(max(control.maxX - size.width, screen.minX + 8), screen.maxX - size.width - 8),
+                             y: min(max(y, screen.minY + 8), screen.maxY - size.height - 8))
         let panel = NSPanel(contentRect: NSRect(origin: origin, size: size), styleMask: [.borderless, .nonactivatingPanel],
                             backing: .buffered, defer: false)
         panel.isOpaque = false
@@ -161,15 +169,26 @@ final class Popup {
         window.addChildWindow(panel, ordered: .above)
         panel.invalidateShadow()
         self.panel = panel
+        isOpen = true
+        Self.open = self
         monitors = [
-            NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
+            NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown, .scrollWheel]) { [weak self] event in
                 // A click on the control is its own: it closes the panel itself.
-                if let self, event.window !== panel, !onAnchor(event) { close() }
+                if let self, event.window !== panel, event.type == .scrollWheel || !onAnchor(event) { close() }
                 return event
             },
             NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-                guard event.keyCode == 53 else { return event }
-                self?.close()
+                guard let self else { return event }
+                switch event.keyCode {
+                case 125: move(1)
+                case 126: move(-1)
+                case 36, 76, 49:  // Return, Enter, Space
+                    if let highlighted { pick(highlighted) } else { close() }
+                case 53: close()  // Escape
+                default:
+                    close()
+                    return event
+                }
                 return nil
             },
         ].compactMap { $0 }
@@ -178,21 +197,51 @@ final class Popup {
             MainActor.assumeIsolated { self?.close() }
         }
     }
-}
 
-extension Popup {
+    /// Closes the panel, which fades out as a menu does, taking no more clicks meanwhile.
+    func close() {
+        monitors.forEach(NSEvent.removeMonitor)
+        monitors = []
+        resigned.map(NotificationCenter.default.removeObserver)
+        resigned = nil
+        if Self.open === self { Self.open = nil }
+        guard let panel else { return }
+        self.panel = nil
+        isOpen = false
+        panel.ignoresMouseEvents = true
+        Task {
+            await NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.12
+                context.timingFunction = CAMediaTimingFunction(name: .easeIn)
+                panel.animator().alphaValue = 0
+            }
+            panel.parent?.removeChildWindow(panel)
+            panel.orderOut(nil)
+        }
+    }
+
+    /// Takes the choice at once, under the panel fading out with it highlighted.
+    private func pick(_ id: String) {
+        highlighted = id
+        let choose = choose
+        close()
+        choose(id)
+    }
+
+    /// Moves the highlight `step` items on, starting at the chosen item when none is highlighted.
+    private func move(_ step: Int) {
+        guard !items.isEmpty else { return }
+        let index = if let current = items.firstIndex(where: { $0.id == highlighted }) {
+            current + step
+        } else {
+            items.firstIndex { $0.id == chosen } ?? (step > 0 ? 0 : items.count - 1)
+        }
+        highlighted = items[min(max(index, 0), items.count - 1)].id
+    }
+
     private func onAnchor(_ event: NSEvent) -> Bool {
         guard let anchor, event.window === anchor.window else { return false }
         return anchor.bounds.contains(anchor.convert(event.locationInWindow, from: nil))
-    }
-}
-
-/// The control's view, where its panel opens.
-private struct PopupAnchor: View {
-    let popup: Popup
-
-    var body: some View {
-        ViewAnchor { popup.anchor = $0 }
     }
 }
 
@@ -225,7 +274,9 @@ final class ScrollTarget {
         let top = document.isFlipped ? frame.minY - margin : frame.maxY + margin - clip.bounds.height
         let y = min(max(top, 0), max(document.frame.height - clip.bounds.height, 0))
         NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.25
+            // Motion.glide's travel, in AppKit.
+            context.duration = Motion.reduced ? 0 : 0.4
+            context.timingFunction = CAMediaTimingFunction(controlPoints: 0.3, 0, 0, 1)
             context.allowsImplicitAnimation = true
             clip.animator().setBoundsOrigin(NSPoint(x: clip.bounds.minX, y: y))
         }

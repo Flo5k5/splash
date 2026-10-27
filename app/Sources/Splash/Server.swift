@@ -18,6 +18,8 @@ final class Server {
     private var queued: (model: String, settings: ServeSettings)?
     /// The options of the model starting, served or last failed.
     private(set) var settings = ServeSettings()
+    /// When the model starting, served or last failed began to start.
+    private(set) var since = Date.now
     /// Once ready: whether the engine has given the weights back while idle.
     private(set) var asleep = false
     /// Once ready: whether the model takes images.
@@ -27,8 +29,8 @@ final class Server {
     /// Once ready: the work the server reports, as its status gives it.
     private(set) var activity = Activity()
 
-    /// Once ready: the server's line for each request, as its log gives them, the latest last.
-    private(set) var requestLog: [String] = []
+    /// Once ready: each request the server finished, as its log line gives it, the latest last.
+    private(set) var requestLog: [RequestEntry] = []
 
     /// The server's work since it started, from `/status`: requests served and running, the average
     /// speed of answers and of reading prompts in tokens a second, the median time to an answer's
@@ -113,12 +115,13 @@ final class Server {
     }
 
     /// Stops the server this app started before it quit or crashed, if it still serves, and waits
-    /// until it has given its port and memory back.
+    /// until it has given its port and memory back; its record stays until then, for the next
+    /// launch should this one end first.
     func stopLeftover() async {
         let defaults = UserDefaults.standard
         let pid = pid_t(defaults.integer(forKey: Preference.serverPID))
         let port = defaults.integer(forKey: Preference.serverPort)
-        defaults.removeObject(forKey: Preference.serverPID)
+        defer { defaults.removeObject(forKey: Preference.serverPID) }
         guard pid > 0, runtime.serveLockOwner(port: port) == pid, runtime.runsPython(pid) else { return }
         await stopProcessGroup(pid)
     }
@@ -137,6 +140,7 @@ final class Server {
         if portInUse(settings.port) {
             return refuse("Port \(settings.port) is in use by another app. Quit that app, or choose another port in Launch Options › Advanced.")
         }
+        since = .now
         phase = .starting
         do {
             child = try ChildProcess(
@@ -165,8 +169,8 @@ final class Server {
     private func received(_ line: String) {
         // Why a start fails; once serving, error lines are about requests.
         if phase == .starting, firstError == nil { firstError = errorMessage(line) }
-        if phase == .ready, line.wholeMatch(of: /\d\d:\d\d:\d\d (Started|Done|Cancelled|Error) · .*/) != nil {
-            requestLog.append(line)
+        if phase == .ready, let entry = RequestEntry(line) {
+            requestLog.append(entry)
             if requestLog.count > 1000 { requestLog.removeFirst(requestLog.count - 1000) }
         }
     }
@@ -233,31 +237,45 @@ final class Server {
             }
             try? await Task.sleep(for: .milliseconds(500))
         }
-        // The status, unless the server was started with an API key it asks for.
+        // Then its status, every 2 s while it serves.
         while !Task.isCancelled, phase == .ready {
-            if let status = await status(), phase == .ready { apply(status) }
+            if let report = await status(), phase == .ready {
+                asleep = report.asleep
+                activity = report.activity
+                if let stopped = report.stopped { phase = .failed(stopped) }
+            }
             try? await Task.sleep(for: .seconds(2))
         }
     }
 
-    private func apply(_ status: Status) {
-        asleep = status.weights?.released ?? false
+    /// What the server's status says: the work it has done, whether it has given the weights back
+    /// while idle, and, once it serves nothing more, why.
+    struct Report: Equatable {
+        var activity: Activity
+        var asleep: Bool
+        var stopped: String?
+    }
+
+    /// The report of `/status`'s body, if it is one.
+    nonisolated static func report(_ data: Data) -> Report? {
+        guard let status = try? JSONDecoder().decode(Status.self, from: data) else { return nil }
         let metrics = status.metrics
-        activity = Activity(
-            served: status.requests?.completed ?? 0,
-            running: status.active_requests?.count ?? 0,
-            generation: metrics?.decode_tokens_per_second.flatMap { $0 > 0 ? $0 : nil },
-            reading: metrics?.prefill_tokens_per_second.flatMap { $0 > 0 ? $0 : nil },
-            firstToken: metrics?.ttft_ms?.p50.flatMap { $0 > 0 ? .milliseconds($0) : nil },
-            generated: metrics?.decode_output_tokens ?? 0,
-            read: metrics?.prefill_input_tokens ?? 0,
-            cached: status.cache?.reused_tokens ?? 0,
-            memory: status.memory_actual?.current_bytes
-        )
-        if status.transport?.stopped == true {
+        return Report(
+            activity: Activity(
+                served: status.requests?.completed ?? 0,
+                running: status.active_requests?.count ?? 0,
+                generation: metrics?.decode_tokens_per_second.flatMap { $0 > 0 ? $0 : nil },
+                reading: metrics?.prefill_tokens_per_second.flatMap { $0 > 0 ? $0 : nil },
+                firstToken: metrics?.ttft_ms?.p50.flatMap { $0 > 0 ? .milliseconds($0) : nil },
+                generated: metrics?.decode_output_tokens ?? 0,
+                read: metrics?.prefill_input_tokens ?? 0,
+                cached: status.cache?.reused_tokens ?? 0,
+                memory: status.memory_actual?.current_bytes
+            ),
+            asleep: status.weights?.released ?? false,
             // The engine failed again and again; the server stays up but serves nothing.
-            phase = .failed(status.transport?.error ?? "It stopped after failing repeatedly.")
-        }
+            stopped: status.transport?.stopped == true ? status.transport?.error ?? "It stopped after failing repeatedly." : nil
+        )
     }
 
     private struct Status: Decodable {
@@ -298,10 +316,55 @@ final class Server {
         return models.data.first
     }
 
-    private func status() async -> Status? {
+    private func status() async -> Report? {
         var request = settings.request("status")
         request.timeoutInterval = 2
         guard let (data, _) = try? await URLSession.shared.data(for: request) else { return nil }
-        return try? JSONDecoder().decode(Status.self, from: data)
+        return Self.report(data)
+    }
+}
+
+/// A request the server finished, as its log line gives it: when, how it ended, and, for one that
+/// answered, the tokens it read, took from the cache and wrote, how soon it began and how fast it
+/// went; for one that failed, why.
+struct RequestEntry: Equatable {
+    enum Outcome: Equatable { case done, cancelled, error }
+
+    let time: String
+    let outcome: Outcome
+    /// The line itself.
+    let raw: String
+    var input: Int?
+    var cached: Int?
+    var output: Int?
+    /// Seconds to the first token, and tokens a second.
+    var firstToken: Double?
+    var rate: Double?
+    var message: String?
+
+    /// The request `line` of the server's log finishes, if it finishes one.
+    init?(_ line: String) {
+        guard let match = line.wholeMatch(of: /(\d\d:\d\d:\d\d) (Done|Cancelled|Error) · (.*)/) else { return nil }
+        time = String(match.1)
+        outcome = match.2 == "Done" ? .done : match.2 == "Cancelled" ? .cancelled : .error
+        raw = line
+        guard outcome != .error else {
+            message = String(match.3)
+            return
+        }
+        for part in match.3.components(separatedBy: " · ") {
+            if let count = part.wholeMatch(of: /(input|cached|output) ([\d,]+)/) {
+                let tokens = Int(count.2.replacing(",", with: ""))
+                switch count.1 {
+                case "input": input = tokens
+                case "cached": cached = tokens
+                default: output = tokens
+                }
+            } else if let seconds = part.wholeMatch(of: /TTFT ([\d.]+)s/) {
+                firstToken = Double(seconds.1)
+            } else if let speed = part.wholeMatch(of: /([\d.]+) tok\/s/) {
+                rate = Double(speed.1)
+            }
+        }
     }
 }

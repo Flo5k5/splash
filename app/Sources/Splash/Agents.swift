@@ -17,7 +17,8 @@ enum Agent: String, CaseIterable, Identifiable {
         }
     }
 
-    /// Asks for the project folder, then opens the agent there in Terminal.
+    /// Asks for the project folder, then opens the agent there in Terminal, on the model served with
+    /// `settings`.
     @MainActor
     func open(runtime: Runtime, settings: ServeSettings) {
         let panel = NSOpenPanel()
@@ -30,11 +31,13 @@ enum Agent: String, CaseIterable, Identifiable {
         }
         guard panel.runModal() == .OK, let folder = panel.url else { return }
         UserDefaults.standard.set(folder, forKey: Preference.agentFolder)
-        let script = script(runtime: runtime, port: settings.port, folder: folder, apiKey: settings.apiKey != nil)
+        let script = script(runtime: runtime, port: settings.port, folder: folder, apiKey: settings.apiKey)
         do {
             let directory = FileManager.default.temporaryDirectory.appending(path: "Splash")
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            let url = directory.appending(path: "\(rawValue).command")
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+                                                    attributes: [.posixPermissions: 0o700])
+            // A name of its own, as a script removes itself when it starts.
+            let url = directory.appending(path: "\(rawValue)-\(UUID().uuidString.prefix(8)).command")
             try Data(script.utf8).write(to: url, options: .atomic)
             try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)
             let terminal = URL(filePath: "/System/Applications/Utilities/Terminal.app")
@@ -44,12 +47,13 @@ enum Agent: String, CaseIterable, Identifiable {
         }
     }
 
-    /// The Terminal script that runs the agent in `folder`; with `apiKey`, it reads the server's key
-    /// from the Keychain as it runs, so that the key is never written to a file.
-    func script(runtime: Runtime, port: Int, folder: URL, apiKey: Bool = false) -> String {
-        let key = apiKey ? "export SPLASH_API_KEY=\"$(security find-generic-password -s Splash -a 'API key' -w)\"\n" : ""
+    /// The Terminal script that runs the agent in `folder`, with the key the server asks for. It
+    /// removes itself as it starts, so that the key, in a file only this user reads, stays no longer.
+    func script(runtime: Runtime, port: Int, folder: URL, apiKey: String? = nil) -> String {
+        let key = apiKey.map { "export SPLASH_API_KEY=\(Self.quoted($0))\n" } ?? ""
         return """
         #!/bin/sh
+        rm -f -- "$0"
         cd \(Self.quoted(folder.path)) || exit
         \(key)clear
         exec \(runtime.command([rawValue, "--port", String(port)]).map(Self.quoted).joined(separator: " "))

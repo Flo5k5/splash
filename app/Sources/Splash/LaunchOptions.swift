@@ -12,40 +12,17 @@ struct LaunchOptions: View {
     var body: some View {
         Section {
             ForEach(Self.options(.main)) { OptionRow(option: $0) }
-            Button {
-                withAnimation(.smooth(duration: 0.2)) { advanced.toggle() }
-                // Once the options are laid out under the row.
-                if advanced {
-                    Task {
-                        try? await Task.sleep(for: .milliseconds(60))
-                        row.scrollToTop()
-                    }
-                }
-            } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: "chevron.right")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                        .rotationEffect(.degrees(advanced ? 90 : 0))
-                        .accessibilityHidden(true)
-                    Text("Advanced")
-                    Spacer()
-                }
-            }
-            .buttonStyle(.hoverRow)
-            .hoverRowAligned()
-            .accessibilityValue(advanced ? "Expanded" : "Collapsed")
-            .background(ViewAnchor { row.view = $0 })
+            DisclosureRow(title: "Advanced", open: $advanced, opened: { row.scrollToTop() })
+                .background(ViewAnchor { row.view = $0 })
         } header: {
-            SectionTitle(text: LaunchOption.Section.main.rawValue)
-        } footer: {
             HStack(alignment: .firstTextBaseline) {
-                Text("Options on Auto fit themselves to this Mac. Changes apply the next time a model starts.")
+                SectionTitle(text: LaunchOption.Section.main.rawValue)
                 Spacer()
                 if state.options != ServeSettings() {
                     Button("Restore Defaults") { state.options = ServeSettings() }
                         .buttonStyle(.hover)
                         .foregroundStyle(.tint)
+                        .font(.callout)
                         .padding(.trailing, -6)
                 }
             }
@@ -55,7 +32,7 @@ struct LaunchOptions: View {
                 Section {
                     ForEach(Self.options(section)) { OptionRow(option: $0) }
                 } header: {
-                    Text(section.rawValue).font(.subheadline.weight(.semibold)).foregroundStyle(.secondary).textCase(nil)
+                    Text(section.rawValue).font(.callout.weight(.semibold)).foregroundStyle(.secondary).textCase(nil)
                 }
             }
         }
@@ -66,7 +43,8 @@ struct LaunchOptions: View {
     }
 }
 
-/// One launch option, with the control its kind takes; dimmed where the others leave it no effect.
+/// One launch option, with the control its kind takes; dimmed where the others leave it no effect,
+/// and with what to beware of under it.
 private struct OptionRow: View {
     @Environment(AppState.self) private var state
     let option: LaunchOption
@@ -74,23 +52,33 @@ private struct OptionRow: View {
     var body: some View {
         @Bindable var state = state
         let value = Binding(get: { state.options[option.flag] }, set: { state.options[option.flag] = $0 })
-        Group {
-            switch option.kind {
-            case .toggle(let on):
-                Toggle(option.title, isOn: Binding(get: { (value.wrappedValue == "true") == on },
-                                                    set: { value.wrappedValue = $0 == on ? "true" : nil }))
-            case .choice(let standard, let choices, let custom):
-                ChoicePicker(title: option.title, standard: standard, choices: choices, custom: custom, value: value)
-            case .text(let custom, _):
-                TextRow(title: option.title, custom: custom, value: value)
-            case .folder:
-                FolderRow(title: option.title, value: value)
-            case .secret:
-                SecretRow(title: option.title, value: $state.options.apiKey)
+        VStack(alignment: .leading, spacing: 6) {
+            Group {
+                switch option.kind {
+                case .toggle(let on):
+                    Toggle(option.title, isOn: Binding(get: { (value.wrappedValue == "true") == on },
+                                                        set: { value.wrappedValue = $0 == on ? "true" : nil }))
+                case .choice(let standard, let choices, let custom):
+                    ChoicePicker(title: option.title, standard: standard, choices: choices, custom: custom, value: value)
+                case .text(let custom, _):
+                    TextRow(title: option.title, custom: custom, value: value)
+                case .folder:
+                    FolderRow(title: option.title, value: value)
+                case .secret:
+                    TextRow(title: option.title, custom: LaunchOption.Value(prompt: "None", message: "", parse: { $0.isEmpty ? nil : $0 }),
+                            secure: true, value: $state.options.apiKey)
+                        .disabled(state.keyProblem != nil)
+                }
+            }
+            .help(option.help)
+            .disabled(!option.applies(state.options))
+            if let warning = option.warning(state.options) {
+                Label(warning, systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .symbolRenderingMode(.multicolor)
             }
         }
-        .help(option.help)
-        .disabled(!option.applies(state.options))
     }
 }
 
@@ -116,15 +104,18 @@ private struct ChoicePicker: View {
             + [typed].compactMap { $0 }
             + (custom == nil ? [] : [PopupItem(id: Self.other, title: "Custom…", separated: true)])
         LabeledContent(title) {
-            PopupMenu(header: title, items: items, chosen: value ?? Self.none) { choice in
+            // Its row names it.
+            PopupMenu(items: items, chosen: value ?? Self.none) { choice in
                 if choice == Self.other { typing = true } else { value = choice == Self.none ? nil : choice }
             } label: {
                 HStack(spacing: 5) {
                     Text(items.first { $0.id == (value ?? Self.none) }?.title ?? standard)
-                    Image(systemName: "chevron.up.chevron.down").font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
+                    MenuChevron()
                 }
                 .optionField()
             }
+            .accessibilityLabel(title)
+            .accessibilityValue(items.first { $0.id == (value ?? Self.none) }?.title ?? standard)
         }
         .sheet(isPresented: $typing) {
             if let custom {
@@ -134,36 +125,49 @@ private struct ChoicePicker: View {
     }
 }
 
-/// A value typed in a field, kept once it is one the option takes; empty for the default.
+/// A value typed in a field, hidden for a secret, taken as it is typed once it is one the option
+/// takes, so that Start uses it at once; empty for the default. Text it doesn't take is ringed, and
+/// gives way to the value taken when the field is left.
 private struct TextRow: View {
     let title: String
     let custom: LaunchOption.Value
+    var secure = false
     @Binding var value: String?
     @State private var text = ""
     @FocusState private var focused: Bool
 
     var body: some View {
         LabeledContent(title) {
-            TextField(title, text: $text, prompt: Text(custom.prompt))
-                .labelsHidden()
-                .textFieldStyle(.plain)
-                .multilineTextAlignment(.trailing)
-                .focused($focused)
-                .onSubmit(commit)
-                .optionField(focused: focused)
-                .frame(maxWidth: 220)
+            Group {
+                if secure {
+                    SecureField(title, text: $text, prompt: Text(custom.prompt))
+                } else {
+                    TextField(title, text: $text, prompt: Text(custom.prompt))
+                }
+            }
+            .labelsHidden()
+            .textFieldStyle(.plain)
+            .multilineTextAlignment(.trailing)
+            .focused($focused)
+            .onSubmit(show)
+            .optionField(focused: focused, invalid: taken(text) == nil)
+            .frame(maxWidth: 220)
         }
-        .onAppear { text = value.map(custom.text) ?? "" }
-        .onChange(of: value) { text = value.map(custom.text) ?? "" }
-        .onChange(of: focused) { if !focused { commit() } }
+        .onAppear(perform: show)
+        .onChange(of: text) { if let taken = taken(text) { value = taken } }
+        // Changed elsewhere, as by Restore Defaults.
+        .onChange(of: value) { if taken(text) != .some(value) { show() } }
+        .onChange(of: focused) { if !focused { show() } }
     }
 
-    private func commit() {
-        if text.trimmingCharacters(in: .whitespaces).isEmpty {
-            value = nil
-        } else if let parsed = custom.parse(text) {
-            value = parsed
-        }
+    /// The value `text` sets: none for empty text, the value parsed, or nil for text the option
+    /// doesn't take, which sets nothing.
+    private func taken(_ text: String) -> String?? {
+        text.trimmingCharacters(in: .whitespaces).isEmpty ? .some(nil) : custom.parse(text).map(Optional.some)
+    }
+
+    /// Shows the value taken.
+    private func show() {
         text = value.map(custom.text) ?? ""
     }
 }
@@ -176,10 +180,15 @@ private struct FolderRow: View {
     var body: some View {
         LabeledContent(title) {
             HStack {
+                Spacer(minLength: 0)
                 Text(value.map { URL(filePath: $0).lastPathComponent } ?? "Default")
                     .foregroundStyle(.secondary)
+                    .truncationMode(.middle)
+                    .layoutPriority(1)
                     .help(value ?? "")
-                if value != nil { Button { value = nil } label: { Text("Default").optionField() }.buttonStyle(.hoverFlush) }
+                if value != nil {
+                    Button { value = nil } label: { Text("Use Default").optionField() }.buttonStyle(.hoverFlush)
+                }
                 Button {
                     let panel = NSOpenPanel()
                     panel.canChooseDirectories = true
@@ -192,33 +201,6 @@ private struct FolderRow: View {
                 .buttonStyle(.hoverFlush)
             }
         }
-    }
-}
-
-/// The API key, typed in a secure field; empty for none.
-private struct SecretRow: View {
-    let title: String
-    @Binding var value: String?
-    @State private var text = ""
-    @FocusState private var focused: Bool
-
-    var body: some View {
-        LabeledContent(title) {
-            SecureField(title, text: $text, prompt: Text("None"))
-                .labelsHidden()
-                .textFieldStyle(.plain)
-                .multilineTextAlignment(.trailing)
-                .focused($focused)
-                .onSubmit(commit)
-                .optionField(focused: focused)
-                .frame(maxWidth: 220)
-        }
-        .onAppear { text = value ?? "" }
-        .onChange(of: focused) { if !focused { commit() } }
-    }
-
-    private func commit() {
-        value = text.isEmpty ? nil : text
     }
 }
 
@@ -269,11 +251,16 @@ private struct CustomValueSheet: View {
 extension View {
     /// The look the launch options' fields and menus share: a light rounded fill, deeper under the
     /// pointer as `HoverStyle` adds its highlight, and a ring in the accent color while a field is
-    /// typed in.
-    func optionField(focused: Bool = false) -> some View {
+    /// typed in, in red while it holds what the option doesn't take.
+    func optionField(focused: Bool = false, invalid: Bool = false) -> some View {
         padding(.horizontal, 8)
             .padding(.vertical, 4)
-            .background(.quaternary.opacity(0.6), in: .rect(cornerRadius: 6))
-            .overlay { RoundedRectangle(cornerRadius: 6).strokeBorder(.tint.opacity(focused ? 0.8 : 0), lineWidth: 1.5) }
+            .background(.quaternary.opacity(0.6), in: .rect(cornerRadius: 7))
+            .overlay {
+                RoundedRectangle(cornerRadius: 7)
+                    .strokeBorder(invalid ? AnyShapeStyle(.red.opacity(0.8)) : AnyShapeStyle(.tint.opacity(focused ? 0.8 : 0)), lineWidth: 1.5)
+            }
+            .animation(Motion.quick, value: focused)
+            .animation(Motion.quick, value: invalid)
     }
 }

@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// The width of the Server screen's column.
 private let column: CGFloat = 640
@@ -23,21 +24,29 @@ struct ServerView: View {
             if state.server.phase == .ready {
                 Section {
                     ActivityFigures(activity: state.server.activity)
-                    RequestLog(lines: state.server.requestLog, open: advanced)
+                    RequestLog(entries: state.server.requestLog, totals: RequestLog.totals(state.server.activity), open: advanced)
                 } header: {
                     SectionTitle(text: "Activity")
                 }
             }
-            if first || failed || state.installer.failure != nil || state.installer.running {
+            if first || failed || state.installer.failure != nil || state.installer.running || state.keyProblem != nil {
                 Section {
+                    if let problem = state.keyProblem {
+                        ProblemRow(title: "Splash can’t use its API key",
+                                   message: "The Keychain says: \(problem) Allow Splash to use it, then try again.",
+                                   action: ("Try Again", state.readKey))
+                    }
                     if case .failed(let message) = state.server.phase, let model = state.server.model {
                         ProblemRow(title: "\(state.displayName(of: model)) ran into a problem", message: message,
-                                   log: Server.log, dismiss: state.server.dismissFailure)
+                                   log: Server.log, dismiss: state.server.dismissFailure,
+                                   // Files on this Mac that can't serve won't serve on a second try.
+                                   action: model.hasPrefix("/") && !state.server.running
+                                       ? ("Remove from List", { state.server.dismissFailure(); state.removeLocal(model) }) : nil)
                     }
                     if let failure = state.installer.failure {
                         ProblemRow(title: "\(state.displayName(of: failure.model)) couldn’t download",
                                    message: failure.message, log: Installer.log, dismiss: state.installer.dismissFailure,
-                                   retry: ("Download Again", { state.download(failure.model) }))
+                                   action: ("Download Again", { state.download(failure.model) }))
                     }
                     if state.installer.running { DownloadRow() }
                 } header: {
@@ -57,7 +66,7 @@ struct ServerView: View {
             Section {
                 ForEach(available, id: \.id) { variant in
                     SuggestedRow(variant: variant, recommended: variant == suggestions.first,
-                                 lead: first && !state.installer.running && variant == suggestions.first)
+                                 lead: first && !state.installer.running && !state.findingCachedModels && variant == suggestions.first)
                 }
             } header: {
                 if !available.isEmpty { SectionTitle(text: "Available to Download") }
@@ -69,6 +78,12 @@ struct ServerView: View {
             }
         }
         .formStyle(.grouped)
+        // The screen changes its shape as one: rows and sections fade in and out as the server,
+        // downloads and options change, the rows after them moving along.
+        .animation(Motion.settle, value: Layout(phase: state.server.phase, next: state.server.next, asleep: state.server.asleep,
+                                                installed: state.installed.map(\.id), downloading: state.installer.running,
+                                                failure: state.installer.failure?.message, keyProblem: state.keyProblem,
+                                                finding: state.findingCachedModels, options: state.options))
         .contentMargins(.horizontal, max(0, (width - column) / 2), for: .scrollContent)
         .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width = $0 }
         .safeAreaInset(edge: .bottom, spacing: 0) {
@@ -82,6 +97,20 @@ struct ServerView: View {
         }
         .onAppear { state.refresh() }
         .sheet(isPresented: $customModel) { CustomModelSheet() }
+    }
+
+    /// What the screen holds: what the server does, the models, a download or a problem, and the
+    /// launch options; the model picked is not in it, so that picking one is immediate.
+    private struct Layout: Equatable {
+        var phase: Server.Phase
+        var next: String?
+        var asleep: Bool
+        var installed: [String]
+        var downloading: Bool
+        var failure: String?
+        var keyProblem: String?
+        var finding: Bool
+        var options: ServeSettings
     }
 
     /// Ways to models the list doesn't offer: one from Hugging Face by its ID, or files on this Mac.
@@ -102,21 +131,32 @@ struct ServerView: View {
         let panel = NSOpenPanel()
         panel.canChooseFiles = true
         panel.canChooseDirectories = true
+        panel.allowedContentTypes = [.folder] + (UTType(filenameExtension: "gguf").map { [$0] } ?? [])
         panel.prompt = "Add"
         panel.message = "Choose a GGUF file, or the folder of an MLX or GGUF model."
         guard panel.runModal() == .OK, let url = panel.url else { return }
         state.addLocal(url)
     }
 
-    /// The screen's heading before a model is on this Mac.
+    /// The screen's heading before a model is on this Mac, while the ones other tools left are
+    /// looked for and after.
     private var welcome: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("Welcome to Splash")
                 .font(.title2.weight(.semibold))
                 .foregroundStyle(.primary)
-            Text("Splash runs AI models privately on this Mac. Download one to get started.")
+            if state.findingCachedModels {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("Looking for models already on this Mac…")
+                }
                 .font(.body)
                 .foregroundStyle(.secondary)
+            } else {
+                Text("Splash runs AI models privately on this Mac. Download one to get started.")
+                    .font(.body)
+                    .foregroundStyle(.secondary)
+            }
         }
         .textCase(nil)
         .padding(.top, 12)
@@ -130,20 +170,34 @@ struct ServerView: View {
 private struct ControlBar: View {
     @Environment(AppState.self) private var state
 
+    /// What the bar shows, which changes it with one cross-fade.
+    private struct Stage: Equatable {
+        var phase: Server.Phase
+        var next: String?
+        var model: String?
+        var asleep: Bool
+        var selection: String?
+        var changed: Bool
+    }
+
     var body: some View {
         let server = state.server
         let model = server.running ? server.model : state.selection
+        let stage = Stage(phase: server.phase, next: server.next, model: server.model, asleep: server.asleep,
+                          selection: state.selection, changed: state.optionsChanged)
         HStack(spacing: 12) {
-            indicator
+            StatusMark(look: look, since: server.since)
             VStack(alignment: .leading, spacing: 2) {
-                Text(model.map(state.displayName(of:)) ?? "").font(.headline)
+                Text(model.map(state.displayName(of:)) ?? "")
+                    .font(.headline)
+                    .truncationMode(.middle)
+                    .contentTransition(.opacity)
                 detail
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
-            .layoutPriority(1)
             Spacer()
-            actions
+            actions.fixedSize()
         }
         .lineLimit(1)
         .controlSize(.large)
@@ -151,6 +205,7 @@ private struct ControlBar: View {
         .frame(maxWidth: column - 40)
         .padding(.vertical, 12)
         .frame(maxWidth: .infinity)
+        .animation(Motion.settle, value: stage)
     }
 
     /// Whether the model picked is the one that failed, so that Start tries it again.
@@ -158,25 +213,21 @@ private struct ControlBar: View {
         if case .failed = state.server.phase { state.server.model == state.selection } else { false }
     }
 
-    @ViewBuilder private var indicator: some View {
-        let server = state.server
-        switch server.phase {
-        case .starting, .stopping:
-            ProgressView().controlSize(.small)
-        case .ready:
-            Circle().fill(.green).frame(width: 8, height: 8)
-        case .failed where server.running || failedPicked:
-            Image(systemName: "exclamationmark.triangle.fill").symbolRenderingMode(.multicolor)
-        default:
-            Circle().fill(.quaternary).frame(width: 8, height: 8)
-        }
+    /// The mark's look, for the model the bar names: a failure of another one isn't its.
+    private var look: MarkLook {
+        if case .failed = state.server.phase, !state.server.running, !failedPicked { return .off }
+        return state.markLook
     }
 
     @ViewBuilder private var detail: some View {
         let server = state.server
         switch server.phase {
         case .starting:
-            Text("Loading into memory…")
+            // Seconds, once a load takes long enough to wonder about.
+            TimelineView(.periodic(from: server.since, by: 1)) { context in
+                let seconds = Int(context.date.timeIntervalSince(server.since))
+                Text(seconds < 3 ? "Loading into memory…" : "Loading into memory · \(seconds)s").monospacedDigit()
+            }
         case .stopping:
             if let next = server.next {
                 Text(next == server.model ? "Restarting…" : "Switching to \(state.displayName(of: next))…")
@@ -185,10 +236,9 @@ private struct ControlBar: View {
             }
         case .ready:
             HStack(spacing: 4) {
-                Text(server.asleep ? "Sleeping" : "Running")
+                Text(verbatim: "\(server.asleep ? "Sleeping" : "Running") · Port \(server.settings.port)")
                     .help(server.asleep ? "It freed its memory while idle and loads again with the next message." : "")
-                Text(verbatim: "· Port \(server.settings.port)")
-                Button { state.copyAPIAddress() } label: { Image(systemName: "doc.on.doc") }
+                CopyButton(copy: state.copyAPIAddress)
                     .buttonStyle(.hover)
                     .help("Copy API Address: \(server.settings.url.appending(path: "v1").absoluteString)")
                     .accessibilityLabel("Copy API Address")
@@ -206,9 +256,13 @@ private struct ControlBar: View {
         let server = state.server
         switch server.phase {
         case .stopped, .failed:
-            Button(failedPicked ? "Try Again" : "Start") { if let model = state.selection { state.start(model) } }
-                .buttonStyle(.borderedProminent)
-                .disabled(state.selection == nil || !state.ready)
+            // A server that runs but serves nothing gives way to the model picked.
+            let switching = server.running && state.selection != server.model
+            Button(failedPicked ? "Try Again" : switching ? "Switch to \(state.selection.map(state.displayName(of:)) ?? "")" : "Start") {
+                if let model = state.selection { state.start(model) }
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(state.selection == nil || !state.ready || state.keyProblem != nil)
         case .starting:
             Button("Cancel") { state.stop() }
         case .stopping:
@@ -218,11 +272,14 @@ private struct ControlBar: View {
                 Button("Stop") { state.stop() }
                 Button("Switch to \(state.displayName(of: selection))") { state.start(selection) }
                     .buttonStyle(.borderedProminent)
+                    .disabled(state.keyProblem != nil)
             } else {
                 AgentsPopup()
                 Button("Stop") { state.stop() }
                 if state.optionsChanged, let model = server.model {
-                    Button("Restart to Apply") { state.start(model) }.buttonStyle(.borderedProminent)
+                    Button("Restart to Apply") { state.start(model) }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(state.keyProblem != nil)
                 } else {
                     Button("Open Chat") { state.section = .chat }.buttonStyle(.borderedProminent)
                 }
@@ -231,101 +288,98 @@ private struct ControlBar: View {
     }
 }
 
-/// What the model that runs has done since it started, in two rows of figures: requests, how fast
-/// it answers and reads prompts on average, how soon an answer starts; the tokens it generated,
-/// read and took from its cache, and the memory it holds.
+/// How the model that runs does since it started: how fast it answers and reads prompts on average,
+/// how soon an answer starts, and the memory it holds.
 private struct ActivityFigures: View {
     let activity: Server.Activity
 
     var body: some View {
-        Grid(alignment: .leading, horizontalSpacing: 0, verticalSpacing: 14) {
-            GridRow {
-                figure(activity.served.formatted(), activity.running > 0 ? "Requests · \(activity.running) running" : "Requests")
-                figure(rate(activity.generation), "Answering", help: "Average since the model started")
-                figure(rate(activity.reading), "Reading prompts", help: "Average since the model started")
-                figure(activity.firstToken.map { $0.formatted(.units(allowed: [.seconds, .milliseconds], width: .narrow, maximumUnitCount: 1)) } ?? "–",
-                       "To first token", help: "Median since the model started")
-            }
-            GridRow {
-                figure(count(activity.generated), "Tokens generated")
-                figure(count(activity.read), "Prompt tokens read")
-                figure(count(activity.cached), "Tokens from cache", help: "Prompt tokens taken from earlier requests rather than read again")
-                figure(activity.memory.map(Format.size) ?? "–", "Memory", help: "What the engine holds in memory now")
-            }
+        let latency = activity.firstToken.map(Format.latency)
+        let memory = activity.memory.map { Format.parts(Format.size($0)) }
+        HStack(spacing: 0) {
+            Figure(value: activity.generation.map(Format.whole), unit: "tok/s", caption: "Answering",
+                   help: "Average since the model started")
+            Figure(value: activity.reading.map(Format.whole), unit: "tok/s", caption: "Reading prompts",
+                   help: "Average since the model started")
+            Figure(value: latency?.0, unit: latency?.1, caption: "To first token", help: "Median since the model started")
+            Figure(value: memory?.0, unit: memory?.1, caption: "Memory", help: "What the engine holds in memory now")
         }
         .padding(.vertical, 6)
-    }
-
-    private func rate(_ value: Double?) -> String {
-        value.map { "\($0.formatted(.number.precision(.fractionLength(0)))) tok/s" } ?? "–"
-    }
-
-    private func count(_ value: Int) -> String {
-        value.formatted(.number.notation(.compactName))
-    }
-
-    private func figure(_ value: String, _ caption: String, help: String = "") -> some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Text(value)
-                .font(.title3.weight(.semibold))
-                .monospacedDigit()
-                .contentTransition(.numericText())
-            Text(caption)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
-        .lineLimit(1)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .help(help)
-        .accessibilityElement(children: .combine)
+        .animation(Motion.settle, value: activity)
     }
 }
 
-/// The server's line for each request since it started, folded until opened, in a box of its own
-/// that scrolls, following the latest.
+/// The requests since the model started, their totals on the row, and when opened, one line for
+/// each, the latest first; past six they scroll.
 private struct RequestLog: View {
-    let lines: [String]
+    let entries: [RequestEntry]
+    let totals: String?
     @State var open = false
 
     var body: some View {
-        Button {
-            withAnimation(.smooth(duration: 0.2)) { open.toggle() }
-        } label: {
-            HStack(spacing: 6) {
-                Image(systemName: "chevron.right")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                    .rotationEffect(.degrees(open ? 90 : 0))
-                    .accessibilityHidden(true)
-                Text("Request Log")
-                Spacer()
-            }
-        }
-        .buttonStyle(.hoverRow)
-        .hoverRowAligned()
-        .accessibilityValue(open ? "Expanded" : "Collapsed")
+        DisclosureRow(title: "Requests", open: $open, detail: totals)
         if open {
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 3) {
-                    if lines.isEmpty {
-                        Text("No requests yet.").foregroundStyle(.secondary)
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    if entries.isEmpty {
+                        Text("No requests yet.").font(.callout).foregroundStyle(.tertiary).frame(height: 22)
                     }
-                    ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
-                        Text(line)
+                    ForEach(Array(entries.reversed().enumerated()), id: \.offset) { _, entry in
+                        RequestRow(entry: entry)
                     }
                 }
-                .font(.system(.caption, design: .monospaced))
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(10)
             }
-            .frame(height: 180)
-            // From the top down, following the latest once the box is full.
-            .defaultScrollAnchor(.top, for: .alignment)
-            .defaultScrollAnchor(.bottom, for: .initialOffset)
-            .defaultScrollAnchor(.bottom, for: .sizeChanges)
-            .background(.quaternary.opacity(0.5), in: .rect(cornerRadius: 8))
+            .frame(height: CGFloat(min(max(entries.count, 1), 6)) * 22)
+            .padding(.leading, 18)
         }
+    }
+
+    /// How many requests, the tokens they wrote and read, those taken from the cache, and any
+    /// running; none before the first.
+    static func totals(_ activity: Server.Activity) -> String? {
+        guard activity.served > 0 || activity.running > 0 else { return nil }
+        var parts = [activity.served.formatted(), "\(Format.count(activity.generated)) tokens out", "\(Format.count(activity.read)) in"]
+        if activity.cached > 0 { parts.append("\(Format.count(activity.cached)) cached") }
+        if activity.running > 0 { parts.append("\(activity.running) running") }
+        return parts.joined(separator: " · ")
+    }
+}
+
+/// A request as a line: when, the tokens it wrote, and how fast, how soon and from how much prompt;
+/// or that it was cancelled, or why it failed. The server's own line is a hover away.
+private struct RequestRow: View {
+    let entry: RequestEntry
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(entry.time).font(.subheadline).foregroundStyle(.tertiary).frame(width: 56, alignment: .leading)
+            switch entry.outcome {
+            case .done:
+                Text("\((entry.output ?? 0).formatted()) tokens")
+                Text(facts).foregroundStyle(.secondary)
+            case .cancelled:
+                Text("Cancelled").foregroundStyle(.secondary)
+            case .error:
+                Image(systemName: "exclamationmark.triangle.fill").symbolRenderingMode(.multicolor).font(.system(size: 11))
+                Text(entry.message ?? "").foregroundStyle(.secondary)
+            }
+        }
+        .font(.callout)
+        .monospacedDigit()
+        .lineLimit(1)
+        .frame(height: 22)
+        .help(entry.raw)
+        .contextMenu {
+            Button("Copy Line") { NSPasteboard.put(entry.raw) }
+        }
+    }
+
+    private var facts: String {
+        [entry.rate.map { "\($0.formatted(.number.precision(.fractionLength(1)))) tok/s" },
+         entry.firstToken.map { "first \(Format.seconds($0))" },
+         entry.input.map { "\($0.formatted()) in" },
+         entry.cached.flatMap { $0 > 0 ? "\($0.formatted()) cached" : nil }]
+            .compactMap { $0 }.joined(separator: " · ")
     }
 }
 
@@ -336,7 +390,7 @@ private struct AgentsPopup: View {
 
     var body: some View {
         PopupMenu(header: "Open in Terminal",
-                  items: Agent.allCases.map { PopupItem(id: $0.rawValue, title: $0.title) }
+                  items: Agent.allCases.map { PopupItem(id: $0.rawValue, title: "\($0.title)…") }
                       + [PopupItem(id: Self.copy, title: "Copy API Address", separated: true)],
                   chosen: nil, above: true) { choice in
             if let agent = Agent(rawValue: choice) {
@@ -348,7 +402,7 @@ private struct AgentsPopup: View {
         } label: {
             HStack(spacing: 4) {
                 Text("Coding Agents")
-                Image(systemName: "chevron.up.chevron.down").font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
+                MenuChevron()
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 5)
@@ -367,14 +421,14 @@ struct SectionTitle: View {
     }
 }
 
-/// A start or a download that failed: why, in a line or three, with the log and a way out.
+/// Something that failed: why, in a line or three, with any log and a way out.
 private struct ProblemRow: View {
     let title: String
     let message: String
-    let log: URL
-    let dismiss: () -> Void
-    /// A way to try again, with its button's title.
-    var retry: (title: String, action: () -> Void)?
+    var log: URL?
+    var dismiss: (() -> Void)?
+    /// The way out, with its button's title.
+    var action: (title: String, run: () -> Void)?
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 10) {
@@ -389,13 +443,15 @@ private struct ProblemRow: View {
                     .help(message)
             }
             Spacer(minLength: 12)
-            Button("Show Log") { NSWorkspace.shared.open(log) }
-            if let retry { Button(retry.title, action: retry.action) }
-            Button(action: dismiss) { Image(systemName: "xmark") }
-                .buttonStyle(.hover)
-                .foregroundStyle(.secondary)
-                .help("Dismiss")
-                .accessibilityLabel("Dismiss")
+            if let log { Button("Show Log") { NSWorkspace.shared.open(log) } }
+            if let action { Button(action.title, action: action.run) }
+            if let dismiss {
+                Button(action: dismiss) { Image(systemName: "xmark") }
+                    .buttonStyle(.hover)
+                    .foregroundStyle(.secondary)
+                    .help("Dismiss")
+                    .accessibilityLabel("Dismiss")
+            }
         }
         .padding(.vertical, 4)
     }
@@ -435,47 +491,43 @@ private struct DownloadRow: View {
     }
 }
 
-/// A model on this Mac, to pick for Start: its name, and under it its Hugging Face ID, which tells
-/// its variants apart, and its size. The one the server runs says so.
+/// A model on this Mac, to pick for Start: its name, and under it what tells its variants apart and
+/// its size; what the server does with it and the check of the one picked at the right. Its
+/// Hugging Face ID is a hover away.
 private struct ModelRow: View {
     @Environment(AppState.self) private var state
     let model: InstalledModel
 
     var body: some View {
         let selected = state.selection == model.id
+        let detail = ([Catalog.variant(of: model.id), model.missing ? "Not found" : model.bytes.map(Format.size)] as [String?])
+            .compactMap { $0 }.joined(separator: " · ")
         Button { state.selection = model.id } label: {
-            HStack(spacing: 10) {
-                Image(systemName: "checkmark")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(.tint)
-                    .frame(width: 16)
-                    .opacity(selected ? 1 : 0)
+            HStack(spacing: 8) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(state.catalog.name(of: model.id))
-                    Text("\(model.id) · \(Format.size(model.bytes))")
+                    Text(detail)
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
                 }
                 Spacer()
-                if let phase {
-                    HStack(spacing: 6) {
-                        if state.server.phase == .ready && state.server.model == model.id {
-                            Circle().fill(.green).frame(width: 7, height: 7)
-                        }
-                        Text(phase)
-                    }
-                    .foregroundStyle(.secondary)
-                }
+                if let phase { Text(phase).foregroundStyle(.secondary) }
+                Image(systemName: "checkmark")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.tint)
+                    .frame(width: 16)
+                    .opacity(selected ? 1 : 0)
+                    .animation(Motion.quick, value: selected)
             }
         }
         .buttonStyle(.hoverRow)
         .hoverRowAligned()
-        .accessibilityLabel(state.displayName(of: model.id))
+        .accessibilityLabel("\(state.displayName(of: model.id)), \(detail)")
         .accessibilityValue(phase ?? "")
         .accessibilityAddTraits(selected ? .isSelected : [])
-        .help(state.catalog.about(of: model.id) ?? model.id)
+        .help(([state.catalog.about(of: model.id), model.id] as [String?]).compactMap { $0 }.joined(separator: "\n"))
         .contextMenu {
             if model.local {
                 Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([URL(filePath: model.id)]) }
@@ -514,9 +566,14 @@ private struct SuggestedRow: View {
                 .help(state.installer.running ? "One download at a time" : "")
                 .prominent(lead)
         } label: {
-            Text(variant.name)
-            Text(([recommended ? "Recommended" : nil, variant.about, Format.size(Format.gigabytes(variant.size))]
-                as [String?]).compactMap { $0 }.joined(separator: " · "))
+            // The anatomy of a model row.
+            VStack(alignment: .leading, spacing: 2) {
+                Text(variant.name)
+                Text(([recommended ? "Recommended" : nil, variant.about, Format.size(Format.gigabytes(variant.size))]
+                    as [String?]).compactMap { $0 }.joined(separator: " · "))
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
         }
         .help(variant.id)
         .contextMenu { CopyModelID(id: variant.id) }
@@ -527,10 +584,7 @@ private struct CopyModelID: View {
     let id: String
 
     var body: some View {
-        Button("Copy Model ID") {
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(id, forType: .string)
-        }
+        Button("Copy Model ID") { NSPasteboard.put(id) }
     }
 }
 

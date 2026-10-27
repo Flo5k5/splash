@@ -44,10 +44,14 @@ struct MenuBarPanel: View {
         let server = state.server
         VStack(alignment: .leading, spacing: 1) {
             HStack(spacing: 10) {
-                Circle()
-                    .fill(server.phase == .ready ? AnyShapeStyle(.green) : AnyShapeStyle(.quaternary))
-                    .frame(width: 8, height: 8)
-                Text(state.status).font(.headline).lineLimit(1)
+                StatusMark(look: state.markLook, since: server.since)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(server.model.map(state.displayName(of:)) ?? "No model running")
+                        .font(.headline)
+                        .truncationMode(.middle)
+                    if server.model != nil { Text(phase).font(.callout).foregroundStyle(.secondary) }
+                }
+                .lineLimit(1)
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 8)
@@ -66,15 +70,16 @@ struct MenuBarPanel: View {
                     .disabled(server.phase == .stopping && server.next == nil)
             }
             if server.phase == .ready {
-                PanelRow(title: "Coding Agents", open: agents) { withAnimation(.smooth(duration: 0.2)) { agents.toggle() } }
+                PanelRow(title: "Coding Agents", open: agents) { withAnimation(Motion.settle) { agents.toggle() } }
                 if agents {
                     ForEach(Agent.allCases) { agent in
-                        PanelRow(title: agent.title, indent: true) {
+                        PanelRow(title: "\(agent.title)…", indent: true) {
                             NSApp.activate()
                             agent.open(runtime: state.runtime, settings: server.settings)
                         }
                     }
-                    PanelRow(title: "Copy API Address", indent: true) { state.copyAPIAddress() }
+                    CopyButton(copy: state.copyAPIAddress) { PanelLabel(title: "Copy API Address", indent: true, check: $0) }
+                        .buttonStyle(.hoverFlush)
                 }
             }
             if server.running {
@@ -86,33 +91,31 @@ struct MenuBarPanel: View {
         .frame(width: 300)
     }
 
-    /// What the model did since it started: requests, answering speed and memory; the tokens it
-    /// generated, read and took from its cache.
+    /// What the model in the header does, as the Server screen says it.
+    private var phase: String {
+        let server = state.server
+        switch server.phase {
+        case .starting: return "Loading into memory…"
+        case .stopping:
+            guard let next = server.next else { return "Stopping…" }
+            return next == server.model ? "Restarting…" : "Switching to \(state.displayName(of: next))…"
+        case .ready: return server.asleep ? "Sleeping" : "Running"
+        case .failed: return server.running ? "Not responding" : "Ran into a problem"
+        case .stopped: return "Not running"
+        }
+    }
+
+    /// How the model does since it started: answering speed, requests and memory.
     private func totals(_ activity: Server.Activity) -> some View {
-        Grid(alignment: .leading, horizontalSpacing: 0, verticalSpacing: 8) {
-            GridRow {
-                figure(activity.served.formatted(), "Requests")
-                figure(activity.generation.map { "\($0.formatted(.number.precision(.fractionLength(0)))) tok/s" } ?? "–", "Answering")
-                figure(activity.memory.map(Format.size) ?? "–", "Memory")
-            }
-            GridRow {
-                figure(activity.generated.formatted(.number.notation(.compactName)), "Generated")
-                figure(activity.read.formatted(.number.notation(.compactName)), "Prompt read")
-                figure(activity.cached.formatted(.number.notation(.compactName)), "From cache")
-            }
+        let memory = activity.memory.map { Format.parts(Format.size($0)) }
+        return HStack(spacing: 0) {
+            Figure(value: activity.generation.map(Format.whole), unit: "tok/s", caption: "Answering", compact: true)
+            Figure(value: activity.served.formatted(), caption: "Requests", compact: true)
+            Figure(value: memory?.0, unit: memory?.1, caption: "Memory", compact: true)
         }
         .padding(.horizontal, 10)
         .padding(.bottom, 8)
-    }
-
-    private func figure(_ value: String, _ caption: String) -> some View {
-        VStack(alignment: .leading, spacing: 1) {
-            Text(value).font(.callout.weight(.semibold)).monospacedDigit()
-            Text(caption).font(.caption2).foregroundStyle(.secondary)
-        }
-        .lineLimit(1)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .accessibilityElement(children: .combine)
+        .animation(Motion.settle, value: activity)
     }
 
     private func show(_ section: AppState.Section) {
@@ -130,25 +133,42 @@ private struct PanelRow: View {
     var open: Bool?
     var indent = false
     let action: () -> Void
-    @Environment(\.isEnabled) private var enabled
 
     var body: some View {
         Button(action: action) {
-            HStack {
-                Text(title).foregroundStyle(enabled ? .primary : .tertiary)
-                Spacer()
-                if let shortcut { Text(shortcut).foregroundStyle(.secondary) }
-                if let open {
-                    Image(systemName: "chevron.right")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                        .rotationEffect(.degrees(open ? 90 : 0))
-                }
-            }
-            .padding(.leading, indent ? 22 : 10)
-            .padding(.trailing, 10)
-            .padding(.vertical, 5)
+            PanelLabel(title: title, shortcut: shortcut, open: open, indent: indent)
         }
         .buttonStyle(.hoverFlush)
+        .accessibilityValue(open.map { $0 ? "Expanded" : "Collapsed" } ?? "")
+    }
+}
+
+/// What a row of the menu bar's panel shows: its title, and a shortcut, a chevron or a check.
+private struct PanelLabel: View {
+    let title: String
+    var shortcut: String?
+    var open: Bool?
+    var indent = false
+    var check = false
+
+    var body: some View {
+        HStack {
+            Text(title)
+            Spacer()
+            if let shortcut { Text(shortcut).foregroundStyle(.secondary) }
+            if let open {
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .rotationEffect(.degrees(open ? 90 : 0))
+                    .accessibilityHidden(true)
+            }
+            if check {
+                Image(systemName: "checkmark").font(.system(size: 12, weight: .semibold)).foregroundStyle(.secondary)
+            }
+        }
+        .padding(.leading, indent ? 22 : 10)
+        .padding(.trailing, 10)
+        .padding(.vertical, 5)
     }
 }

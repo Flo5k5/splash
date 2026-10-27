@@ -46,8 +46,8 @@ final class Draft {
     }
 }
 
-/// Where a message is written: the text, the images attached, the reasoning effort, and Send, or
-/// Stop while a reply streams.
+/// Where a message is written: the text and the images attached; under them what the Server runs,
+/// how much the model thinks, and Send, or Stop while a reply streams.
 struct Composer: View {
     @Environment(AppState.self) private var state
     @Environment(\.colorScheme) private var colorScheme
@@ -65,31 +65,32 @@ struct Composer: View {
                           placeholder: "Message Splash", submit: send, cancel: stop, acceptsImages: images,
                           attach: draft.attach)
                 .frame(height: min(max(height, 22), 220))
-            HStack(spacing: 12) {
+            HStack(spacing: 6) {
                 // Only for a model that sees images.
                 if images {
                     Button { picking = true } label: { Image(systemName: "plus") }
-                        .buttonStyle(.hover)
                         .foregroundStyle(.secondary)
                         .help("Attach Images")
                         .accessibilityLabel("Attach Images")
                 }
-                Spacer()
-                ModelMenu()
-                if streaming {
-                    Button { state.chats.stop() } label: { Image(systemName: "stop.fill").font(.system(size: 10, weight: .bold)) }
-                        .keyboardShortcut(".", modifiers: .command)
-                        .help("Stop")
-                        .accessibilityLabel("Stop")
-                        .buttonStyle(InkCircle())
-                } else {
-                    Button(action: send) { Image(systemName: "arrow.up") }
-                        .help(help)
-                        .accessibilityLabel("Send")
-                        .disabled(!sendable)
-                        .buttonStyle(InkCircle())
+                EngineSlot()
+                Spacer(minLength: 12)
+                EffortMenu()
+                Button { if streaming { state.chats.stop() } else { send() } } label: {
+                    Image(systemName: streaming ? "stop.fill" : "arrow.up")
+                        .font(.system(size: streaming ? 10 : 13, weight: streaming ? .bold : .semibold))
+                        .contentTransition(.symbolEffect(.replace))
                 }
+                .buttonStyle(InkCircle())
+                .disabled(!streaming && !sendable)
+                .keyboardShortcut(streaming ? KeyboardShortcut(".", modifiers: .command) : nil)
+                .help(streaming ? "Stop" : help)
+                .accessibilityLabel(streaming ? "Stop" : "Send")
+                .animation(Motion.quick, value: streaming)
             }
+            .buttonStyle(.hover)
+            // The first control's glyph on the text's edge.
+            .padding(.leading, -6)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
@@ -132,58 +133,85 @@ struct Composer: View {
     }
 }
 
-/// The send and stop button: a circle in the label color, the composer's one solid element.
+/// The send and stop button: a circle in the label color, the composer's one solid element, faded
+/// as the app's controls fade while it can't be used.
 private struct InkCircle: ButtonStyle {
     @Environment(\.isEnabled) private var isEnabled
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .font(.system(size: 13, weight: .semibold))
             .foregroundStyle(.background)
             .frame(width: 28, height: 28)
-            .background(.primary.opacity(isEnabled ? (configuration.isPressed ? 0.7 : 1) : 0.2), in: .circle)
+            .background(.primary, in: .circle)
+            .opacity(isEnabled ? (configuration.isPressed ? 0.7 : 1) : 0.4)
     }
 }
 
-/// The model that answers and how much it thinks, as Claude's composer shows them: its name, then
-/// its effort, which a click changes, as its template tells efforts apart (its levels, or thinking
-/// on or off), its default marked. A model that decides itself shows its name alone. Models
-/// themselves change on the Server screen.
-private struct ModelMenu: View {
+/// What the Server runs, at the composer's start, which opens the Server: the model's name, the
+/// mark showing what it does; or why nothing answers, with Open Server. Models change on the
+/// Server only.
+private struct EngineSlot: View {
     @Environment(AppState.self) private var state
 
     var body: some View {
-        if state.server.phase == .ready, let model = state.server.model {
-            let name = Text(state.displayName(of: model)).foregroundStyle(.secondary)
-            if let reasoning = state.server.reasoning, let thinks = reasoning.thinks {
-                let levels = !reasoning.efforts.isEmpty
-                // The choice that leaves the effort to the model: its default, by name where it has one.
-                let initial = !thinks ? "none" : levels ? reasoning.default ?? "" : "on"
-                let choices = (levels ? reasoning.efforts.reversed() : ["on"])
-                    + (levels && reasoning.default == nil && thinks ? [""] : []) + ["none"]
-                let chosen = state.effort.isEmpty ? initial : !levels && state.effort != "none" ? "on" : state.effort
-                PopupMenu(header: "Thinking", items: choices.map { choice in
-                    PopupItem(id: choice, title: Self.title(choice), badge: choice == initial ? "Default" : nil)
-                }, chosen: chosen, above: true) { choice in
-                    // On, for a model whose thinking is only on or off, is any effort but none.
-                    state.effort = choice == initial ? "" : choice == "on" ? "medium" : choice
-                } label: {
-                    HStack(spacing: 6) {
-                        name
-                        Text(Self.title(chosen)).foregroundStyle(.tertiary)
-                    }
-                    .font(.callout)
-                    .lineLimit(1)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                }
-                .fixedSize()
-                .help("How much the model thinks before it answers")
-                .accessibilityLabel(state.displayName(of: model))
-                .accessibilityValue(Self.title(chosen))
-            } else {
-                name.font(.callout).lineLimit(1)
+        let server = state.server
+        let name = server.model.map(state.displayName(of:)) ?? ""
+        let words = switch server.phase {
+        case .ready: name
+        case .starting: "Loading \(name)…"
+        case .stopping: state.status
+        case .failed: "\(name) ran into a problem"
+        case .stopped: state.installed.isEmpty ? "No model on this Mac" : "No model running"
+        }
+        let blocked = if case .failed = server.phase { true } else { server.phase == .stopped }
+        Button { state.section = .server } label: {
+            HStack(spacing: 6) {
+                StatusMark(look: state.markLook, since: server.since, size: 12)
+                Text(words).foregroundStyle(.secondary)
+                if blocked { Text("Open Server").foregroundStyle(.tint) }
             }
+            .font(.callout)
+            .lineLimit(1)
+            .truncationMode(.middle)
+        }
+        .help("Open Server (⌘1)")
+    }
+}
+
+/// How much the model thinks, which a click changes, as its template tells efforts apart (its
+/// levels, or thinking on or off), its default marked. A model that decides itself shows nothing.
+private struct EffortMenu: View {
+    @Environment(AppState.self) private var state
+
+    var body: some View {
+        if state.server.phase == .ready, let reasoning = state.server.reasoning, let thinks = reasoning.thinks {
+            let levels = !reasoning.efforts.isEmpty
+            // The choice that leaves the effort to the model: its default, by name where it has one.
+            let initial = !thinks ? "none" : levels ? reasoning.default ?? "" : "on"
+            let choices = (levels ? reasoning.efforts.reversed() : ["on"])
+                + (levels && reasoning.default == nil && thinks ? [""] : []) + ["none"]
+            let chosen = state.effort.isEmpty ? initial : !levels && state.effort != "none" ? "on" : state.effort
+            PopupMenu(header: "Thinking", items: choices.map { choice in
+                // The default's own item is named Default already.
+                PopupItem(id: choice, title: Self.title(choice), badge: choice == initial && !choice.isEmpty ? "Default" : nil)
+            }, chosen: chosen, above: true) { choice in
+                // On, for a model whose thinking is only on or off, is any effort but none.
+                state.effort = choice == initial ? "" : choice == "on" ? "medium" : choice
+            } label: {
+                HStack(spacing: 4) {
+                    Text(Self.title(chosen))
+                    MenuChevron()
+                }
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+            }
+            .fixedSize()
+            .help("How much the model thinks before it answers")
+            .accessibilityLabel("Thinking")
+            .accessibilityValue(Self.title(chosen))
         }
     }
 
@@ -260,6 +288,11 @@ private struct ComposerField: NSViewRepresentable {
         view.isAutomaticTextReplacementEnabled = false
         view.isContinuousSpellCheckingEnabled = true
         view.textContainerInset = NSSize(width: 0, height: 2)
+        // As a message reads once sent.
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineSpacing = 3
+        view.defaultParagraphStyle = paragraph
+        view.typingAttributes[.paragraphStyle] = paragraph
         view.textContainer?.lineFragmentPadding = 0
         view.isVerticallyResizable = true
         view.autoresizingMask = [.width]

@@ -111,10 +111,11 @@ final class Installer {
         failure = nil
     }
 
-    /// Stops the download this app started before it quit or crashed, if it still runs.
+    /// Stops the download this app started before it quit or crashed, if it still runs; its record
+    /// stays until then, for the next launch should this one end first.
     func stopLeftover() async {
         let pid = pid_t(UserDefaults.standard.integer(forKey: Preference.installerPID))
-        UserDefaults.standard.removeObject(forKey: Preference.installerPID)
+        defer { UserDefaults.standard.removeObject(forKey: Preference.installerPID) }
         guard pid > 0, runtime.runsPython(pid) else { return }
         await stopProcessGroup(pid)
     }

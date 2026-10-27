@@ -1,4 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#171717" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-  <style>@media (prefers-color-scheme: dark) { svg { stroke: #ececec } }</style>
-  <path d="M13.5 2 5 13h6l-.5 9L19 11h-6z"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="216 197 611 611">
+  <!-- Splash's mark, as app/AppIcon.icon/Assets/mark.svg draws it, with cuts wide enough for a tab. -->
+  <linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#2EC9FF"/><stop offset="1" stop-color="#3B5BFF"/></linearGradient>
+  <path fill="url(#g)" d="M238.3 613.2L582.1 269.4A272 272 0 0 0 238.3 613.2ZM651.0 262.7L282.5 631.2A272 272 0 0 0 366.5 725.4L745.2 346.7A272 272 0 0 0 651.0 262.7ZM793.4 360.7L431.4 722.7A272 272 0 0 0 793.4 360.7Z"/>
 </svg>

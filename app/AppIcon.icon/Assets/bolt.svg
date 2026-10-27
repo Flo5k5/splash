@@ -1,6 +1,0 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
-  <!-- server/favicon.svg's bolt (a 24-unit path), filled, about 46% of the icon's height. -->
-  <g transform="translate(512 512) scale(21.3) translate(-12 -12)">
-    <path d="M13.5 2 5 13h6l-.5 9L19 11h-6z" fill="#000" stroke="#000" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round"/>
-  </g>
-</svg>

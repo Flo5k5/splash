@@ -55,9 +55,10 @@ struct Catalog {
         return repository.replacing(/(?i)-(gguf|mlx)$/, with: "")
     }
 
-    /// What tells variants of a model apart: the GGUF variant `id` names, or MLX for a model in
-    /// MLX's format, or else its repository.
+    /// What tells variants of a model apart: the folder of model files on this Mac, the GGUF variant
+    /// `id` names, or MLX for a model in MLX's format, or else its repository.
     static func variant(of id: String) -> String {
+        if id.hasPrefix("/") { return URL(filePath: id).deletingLastPathComponent().lastPathComponent }
         if let variant = id.split(separator: ":", maxSplits: 1).dropFirst().first { return String(variant) }
         return id.localizedCaseInsensitiveContains("mlx") ? "MLX" : String(id.split(separator: "/").last ?? Substring(id))
     }

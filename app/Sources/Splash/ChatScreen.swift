@@ -46,8 +46,8 @@ private struct ChatList: View {
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 6)
-            .background(.quaternary.opacity(0.6), in: .rect(cornerRadius: 8))
-            .padding(.horizontal, 12)
+            .background(.quaternary.opacity(0.6), in: .rect(cornerRadius: 7))
+            .padding(.horizontal, 10)
             .padding(.top, 10)
             .padding(.bottom, 4)
             list(shown)
@@ -69,55 +69,47 @@ private struct ChatList: View {
         }
     }
 
-    /// The conversations, the open one on a soft highlight.
+    /// The conversations, the latest first, the open one held highlighted; a conversation that
+    /// gets a message moves to the top, and one deleted closes its gap.
     private func list(_ shown: [Conversation]) -> some View {
         let chats = state.chats
         return List {
-            if !shown.isEmpty {
-                Section(query.isEmpty ? "Recents" : "Results") {
-                    ForEach(shown) { conversation in
-                        ChatRow(conversation: conversation, open: chats.selection == conversation.id) {
-                            chats.selection = conversation.id
-                        }
-                        .contextMenu {
-                            Button("Rename…") {
-                                title = conversation.title
-                                renaming = conversation
-                            }
-                            Button("Delete…", role: .destructive) { deleting = conversation }
-                        }
+            ForEach(shown) { conversation in
+                ChatRow(conversation: conversation, open: chats.selection == conversation.id) {
+                    chats.selection = conversation.id
+                }
+                .contextMenu {
+                    Button("Rename…") {
+                        title = conversation.title
+                        renaming = conversation
                     }
+                    Button("Delete…", role: .destructive) { deleting = conversation }
                 }
             }
         }
         .listStyle(.sidebar)
         .scrollContentBackground(.hidden)
+        .animation(Motion.settle, value: shown.map(\.id))
     }
 }
 
-/// A conversation in the list: its title, on a soft highlight when open, a lighter one under the
-/// pointer.
+/// A conversation in the list: its title, highlighted as the app's buttons are, held while open;
+/// its text in line with the search field's.
 private struct ChatRow: View {
     let conversation: Conversation
     let open: Bool
     let select: () -> Void
-    @State private var hovering = false
 
     var body: some View {
         Button(action: select) {
             Text(conversation.title.isEmpty ? "New Chat" : conversation.title)
                 .lineLimit(1)
-                .foregroundStyle(.primary)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .contentShape(.rect)
         }
-        .buttonStyle(.plain)
-        .onHover { hovering = $0 }
-        .listRowBackground(
-            RoundedRectangle(cornerRadius: 8)
-                .fill(.quaternary.opacity(open ? 1 : hovering ? 0.6 : 0))
-                .padding(.horizontal, 10)
-        )
+        .buttonStyle(HoverStyle(padding: EdgeInsets(top: 6, leading: 8, bottom: 6, trailing: 8), held: open))
+        .listRowInsets(EdgeInsets(top: 0, leading: 10, bottom: 0, trailing: 10))
+        .listRowBackground(Color.clear)
         .accessibilityAddTraits(open ? .isSelected : [])
     }
 }
@@ -163,7 +155,7 @@ private struct ConversationView: View {
                 }
                 .onChange(of: conversation.messages.count) {
                     atBottom = true
-                    position.scrollTo(edge: .bottom)
+                    withAnimation(Motion.glide) { position.scrollTo(edge: .bottom) }
                 }
                 .onChange(of: conversation.messages.last.map { $0.text.count + $0.reasoning.count }) {
                     if atBottom && !scrolling { position.scrollTo(edge: .bottom) }
@@ -172,29 +164,13 @@ private struct ConversationView: View {
                     atBottom = true
                     position.scrollTo(edge: .bottom)
                 }
-                .overlay(alignment: .bottom) {
-                    if !atBottom {
-                        Button {
-                            withAnimation(.smooth) { position.scrollTo(edge: .bottom) }
-                        } label: {
-                            Image(systemName: "arrow.down")
-                                .font(.system(size: 13, weight: .semibold))
-                                .frame(width: 30, height: 30)
-                        }
-                        .buttonStyle(.plain)
-                        .background(.regularMaterial, in: .circle)
-                        .overlay { Circle().strokeBorder(.separator) }
-                        .padding(.bottom, 12)
-                        .help("Scroll to Latest")
-                        .transition(.opacity)
-                    }
-                }
+                .overlay(alignment: .bottom) { latest.padding(.bottom, 12) }
                 footer
             } else {
+                // A new chat: the mark, showing what the Server does, over the composer.
                 Spacer()
-                Text("How can I help?")
-                    .font(.system(size: 28, weight: .semibold))
-                    .padding(.bottom, 24)
+                StatusMark(look: state.markLook == .failed ? .off : state.markLook, since: state.server.since, size: 44)
+                    .padding(.bottom, 28)
                 footer
                 Spacer()
                 Spacer()
@@ -205,44 +181,30 @@ private struct ConversationView: View {
     }
 
     private var footer: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            StatusLine()
-            Composer(draft: state.draft)
-        }
-        .frame(maxWidth: column)
-        .padding(.horizontal, 32)
-        .padding(.bottom, 24)
+        Composer(draft: state.draft)
+            .frame(maxWidth: column)
+            .padding(.horizontal, 32)
+            .padding(.bottom, 24)
     }
-}
 
-/// What keeps the chat from answering now, in one line above the composer: a model starting or
-/// stopping, a problem, none running. Models start on the Server screen.
-private struct StatusLine: View {
-    @Environment(AppState.self) private var state
-
-    var body: some View {
-        HStack(spacing: 8) {
-            switch state.server.phase {
-            case .starting, .stopping:
-                ProgressView().controlSize(.small)
-                Text(state.status).foregroundStyle(.secondary)
-            case .failed:
-                Image(systemName: "exclamationmark.triangle.fill").symbolRenderingMode(.multicolor)
-                Text("\(state.status).").foregroundStyle(.secondary)
-                Button("Open Server") { state.section = .server }
-                    .foregroundStyle(.tint)
-            case .stopped:
-                Text(state.installed.isEmpty ? "Download a model to start chatting." : "No model is running.")
-                    .foregroundStyle(.secondary)
-                Button("Open Server") { state.section = .server }
-                    .foregroundStyle(.tint)
-            case .ready:
-                EmptyView()
-            }
+    /// Back to the latest message, once the reader has scrolled up from it.
+    private var latest: some View {
+        Button {
+            withAnimation(Motion.glide) { position.scrollTo(edge: .bottom) }
+        } label: {
+            Image(systemName: "arrow.down")
+                .font(.system(size: 13, weight: .semibold))
+                .frame(width: 30, height: 30)
         }
-        .font(.callout)
-        .buttonStyle(.hover)
-        .padding(.horizontal, 4)
+        .buttonStyle(HoverStyle(padding: EdgeInsets(), shape: AnyShape(.circle)))
+        .background(.regularMaterial, in: .circle)
+        .overlay { Circle().strokeBorder(.separator) }
+        .help("Scroll to Latest")
+        .accessibilityLabel("Scroll to Latest")
+        .opacity(atBottom ? 0 : 1)
+        .allowsHitTesting(!atBottom)
+        .accessibilityHidden(atBottom)
+        .animation(Motion.quick, value: atBottom)
     }
 }
 
@@ -252,7 +214,6 @@ private struct MessageView: View {
     let last: Bool
     let streaming: Bool
     @State private var hovering = false
-    @State private var copied = false
 
     var body: some View {
         switch message.role {
@@ -286,21 +247,14 @@ private struct MessageView: View {
             }
         case .assistant:
             let live = streaming && last
+            // The reply's actions keep their place, so that the reply doesn't grow as it ends; they
+            // show under the pointer and on the latest reply, a little slower to come than to go.
+            let shown = !live && (hovering || last)
             VStack(alignment: .leading, spacing: 10) {
-                if !message.reasoning.isEmpty {
-                    Thinking(text: message.reasoning, live: live && message.text.isEmpty)
+                if (live && message.text.isEmpty) || !message.reasoning.isEmpty {
+                    ReplyLine(message: message, live: live ? state.chats.live : nil)
                 }
-                if message.isEmpty && live {
-                    HStack(spacing: 8) {
-                        ProgressView().controlSize(.small)
-                        // After the idle release, the model loads again before it answers.
-                        if state.server.asleep, let model = state.server.model {
-                            Text("Loading \(state.displayName(of: model)) back into memory…")
-                                .font(.callout)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                } else if !message.text.isEmpty {
+                if !message.text.isEmpty {
                     MarkdownView(text: message.text)
                 }
                 if let error = message.error {
@@ -311,9 +265,12 @@ private struct MessageView: View {
                     }
                     .font(.callout)
                 }
-                if !live {
-                    actions
-                }
+                actions
+                    .opacity(shown ? 1 : 0)
+                    .allowsHitTesting(shown)
+                    // For VoiceOver, which never hovers, they are there but while the reply streams.
+                    .accessibilityHidden(live)
+                    .animation(shown ? Motion.quick.delay(0.08) : Motion.quick, value: shown)
             }
             .onHover { hovering = $0 }
         }
@@ -321,17 +278,7 @@ private struct MessageView: View {
 
     private var actions: some View {
         HStack(spacing: 0) {
-            Button {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(message.text, forType: .string)
-                copied = true
-                Task {
-                    try? await Task.sleep(for: .seconds(1.5))
-                    copied = false
-                }
-            } label: {
-                Image(systemName: copied ? "checkmark" : "doc.on.doc").contentTransition(.symbolEffect(.replace))
-            }
+            CopyButton(copy: { NSPasteboard.put(message.text) })
             .help("Copy")
             .accessibilityLabel("Copy Reply")
             if last {
@@ -341,56 +288,121 @@ private struct MessageView: View {
                     .accessibilityLabel("Ask Again")
             }
             Text(details)
-                .font(.caption)
-                .foregroundStyle(.tertiary)
+                .font(.subheadline)
+                .monospacedDigit()
                 .padding(.leading, 6)
-                .help(message.tokensPerSecond.map { "\($0.formatted(.number.precision(.fractionLength(0)))) tokens per second" } ?? "")
         }
         .buttonStyle(.hover)
         .padding(.leading, -6)
         .font(.callout)
         .foregroundStyle(.secondary)
-        .opacity(hovering || last ? 1 : 0)
     }
 
+    /// The model that answered, how fast, and whether it was stopped.
     private var details: String {
-        [message.model.map(state.displayName(of:)), message.stopped == true ? "Stopped" : nil]
+        [message.model.map(state.displayName(of:)), message.tokensPerSecond.map { "\(Format.whole($0)) tok/s" },
+         message.stopped == true ? "Stopped" : nil]
             .compactMap { $0 }.joined(separator: " · ")
     }
 }
 
-/// What the model thought, open while it thinks and folded once it answers, set apart from the
-/// answer by a rule.
-private struct Thinking: View {
-    let text: String
-    let live: Bool
+/// The line over a reply, of what comes before its answer: Reading while the prompt is read, then
+/// Thinking while the model thinks, and once it answers, what the thinking took. Only numbers move,
+/// once a second. It shows half a second into a wait, so that a quick answer doesn't flash it, and
+/// opens to the thinking, of which it shows the latest lines while the model thinks.
+private struct ReplyLine: View {
+    @Environment(AppState.self) private var state
+    let message: ChatMessage
+    /// The reply as it streams, for this message while it is the one streaming.
+    let live: ChatStore.Live?
     @State private var expanded: Bool?
+    @State private var held = false
+    @State private var tall = false
 
     var body: some View {
-        let open = expanded ?? live
+        let reasoned = !message.reasoning.isEmpty
+        let thinking = live != nil && message.text.isEmpty && reasoned
+        let open = reasoned && (expanded ?? thinking)
         VStack(alignment: .leading, spacing: 8) {
-            Button { expanded = !open } label: {
-                HStack(spacing: 4) {
-                    Text(live ? "Thinking…" : "Thought process")
+            Button { if reasoned { expanded = !open } } label: {
+                HStack(spacing: 6) {
                     Image(systemName: "chevron.right")
-                        .font(.caption2.weight(.semibold))
+                        .font(.caption.weight(.semibold))
+                        .frame(width: 12)
                         .rotationEffect(.degrees(open ? 90 : 0))
+                        .opacity(reasoned ? 1 : 0)
+                        .accessibilityHidden(true)
+                    if let live, message.text.isEmpty {
+                        TimelineView(.periodic(from: live.asked, by: 1)) { context in
+                            words(live: live, at: context.date)
+                        }
+                    } else {
+                        words(live: nil, at: .now)
+                    }
                 }
                 .font(.callout)
                 .foregroundStyle(.secondary)
+                .monospacedDigit()
             }
             .buttonStyle(.hover)
             .padding(.leading, -6)
+            .allowsHitTesting(reasoned)
+            .accessibilityValue(reasoned ? (open ? "Expanded" : "Collapsed") : "")
             if open {
-                Text(text)
+                Text(message.reasoning)
                     .font(.body)
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.leading, 12)
-                    .overlay(alignment: .leading) { Rectangle().fill(.separator).frame(width: 1) }
+                    .fixedSize(horizontal: false, vertical: true)
+                    .onGeometryChange(for: Bool.self) { $0.size.height > 96 } action: { tall = $0 }
+                    // While it thinks, its latest lines, faded at the top; all of it after.
+                    .frame(maxWidth: .infinity, maxHeight: thinking ? 96 : nil, alignment: .bottomLeading)
+                    .clipped()
+                    .mask {
+                        if thinking && tall {
+                            VStack(spacing: 0) {
+                                LinearGradient(colors: [.clear, .black], startPoint: .top, endPoint: .bottom).frame(height: 28)
+                                Rectangle()
+                            }
+                        } else {
+                            Rectangle()
+                        }
+                    }
+                    .setApart()
             }
         }
-        .animation(.smooth(duration: 0.2), value: open)
+        .opacity(live == nil || held || reasoned ? 1 : 0)
+        .animation(Motion.settle, value: open)
+        .task {
+            try? await Task.sleep(for: .milliseconds(500))
+            withAnimation(Motion.quick) { held = true }
+        }
+    }
+
+    /// Reading or Thinking, and its figures in a fainter tone.
+    private func words(live: ChatStore.Live?, at date: Date) -> some View {
+        let (verb, facts): (String, String?) = if let live, message.reasoning.isEmpty {
+            if state.server.asleep {
+                // After the idle release, the model loads again before it reads.
+                ("Loading into memory", Self.elapsed(since: live.asked, at: date))
+            } else {
+                ("Reading", live.read.map { "\(Int($0 * 100))%" } ?? Self.elapsed(since: live.asked, at: date))
+            }
+        } else if let live, let started = live.thinking {
+            ("Thinking", Self.elapsed(since: started, at: date))
+        } else {
+            ("Thinking", [message.reasoningTokens.map { "\(Format.count($0)) tokens" }, message.thinkingTime.map(Format.seconds)]
+                .compactMap { $0 }.joined(separator: " · "))
+        }
+        return HStack(spacing: 6) {
+            Text(verb)
+            if let facts, !facts.isEmpty { Text("· \(facts)").foregroundStyle(.tertiary) }
+        }
+    }
+
+    /// Whole seconds since `start`, from the first.
+    private static func elapsed(since start: Date, at date: Date) -> String? {
+        let seconds = Int(date.timeIntervalSince(start))
+        return seconds < 1 ? nil : "\(seconds)s"
     }
 }

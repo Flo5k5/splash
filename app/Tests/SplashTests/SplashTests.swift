@@ -37,6 +37,20 @@ struct CatalogTests {
         #expect(Catalog.variant(of: "someone/Other-GGUF:Q8_0") == "Q8_0")
         #expect(Catalog.variant(of: "mlx-community/Other-4bit") == "MLX")
         #expect(Catalog.variant(of: "someone/Other-4bit") == "Other-4bit")
+        // Model files on this Mac, by their folder.
+        #expect(catalog.name(of: "/a/mlx-models/Qwen3-8B.gguf") == "Qwen3-8B")
+        #expect(Catalog.variant(of: "/a/mlx-models/Qwen3-8B.gguf") == "mlx-models")
+    }
+
+    @Test func measuresModelFilesOnThisMac() throws {
+        let folder = FileManager.default.temporaryDirectory.appending(path: "splash-local-tests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try FileManager.default.createDirectory(at: folder.appending(path: "Q4"), withIntermediateDirectories: true)
+        try Data(count: 12_345).write(to: folder.appending(path: "m.gguf"))
+        try Data(count: 1000).write(to: folder.appending(path: "Q4/m-00001-of-00002.gguf"))
+        #expect(InstalledModel.local(folder.appending(path: "m.gguf").path) == InstalledModel(id: folder.appending(path: "m.gguf").path, bytes: 12_345))
+        #expect(InstalledModel.local(folder.path).bytes == 13_345)
+        #expect(InstalledModel.local(folder.appending(path: "gone").path).missing)
     }
 }
 
@@ -84,6 +98,8 @@ struct ServeSettingsTests {
         #expect(ContextLength.title(32768) == "32K tokens")
         #expect(ContextLength.title(1_000_000) == "1M tokens")
         #expect(ContextLength.title(100_000) == "100,000 tokens")
+        // As typed, read back alike.
+        #expect([32768, 1_000_000, 100_000].map { ContextLength.parse(ContextLength.text($0)) } == [32768, 1_000_000, 100_000])
     }
 
     @Test func offersMemoryLimitsBelowTheMacs() {
@@ -109,11 +125,12 @@ struct ServeSettingsTests {
     }
 
     @Test func keepsTheOptionsAndReadsBadOnesAsDefaults() throws {
-        let defaults = try #require(UserDefaults(suiteName: "splash-tests-\(UUID().uuidString)"))
+        let name = "splash-tests-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: name))
+        defer { defaults.removePersistentDomain(forName: name) }
         #expect(ServeSettings.current(defaults).values.isEmpty)
-        let settings = ServeSettings(values: ["--port": "9000", "--max-context": "32768", "--max-memory": "20G",
-                                              "--allowed-host": "mymac.local", "--allow-idle-sleep": "true"],
-                                     apiKey: Keychain.apiKey)
+        let settings = ServeSettings(values: ["--port": "9000", "--max-context": "100000", "--max-memory": "20G",
+                                              "--allowed-host": "mymac.local", "--allow-idle-sleep": "true"])
         settings.save(defaults)
         #expect(ServeSettings.current(defaults) == settings)
         defaults.set(["--port": "70000", "--max-context": "-1", "--max-memory": "lots", "--nope": "1",
@@ -137,6 +154,115 @@ struct ServeSettingsTests {
         #expect(try custom("--idle-release").parse("45M") == "45m")
         #expect(try custom("--port").parse("0") == nil)
         #expect(try custom("--served-model-name").parse("gpt-4o,  o3 ") == "gpt-4o, o3")
+        // A value typed in is one the option takes, as kept and read back: every example, and the
+        // menu's choices.
+        for option in LaunchOption.all {
+            switch option.kind {
+            case .choice(_, let choices, let custom):
+                #expect(choices.allSatisfy { option.accepts($0.value) }, "\(option.flag)")
+                if let custom, custom.prompt != "None" {
+                    #expect(custom.parse(custom.prompt).map(option.accepts) == true, "\(option.flag)")
+                }
+            case .text(let custom, _) where custom.prompt != "None":
+                #expect(custom.parse(custom.prompt).map(option.accepts) == true, "\(option.flag)")
+            default: break
+            }
+        }
+    }
+
+    @Test func warnsOfAServerOthersCanUse() throws {
+        let host = try #require(LaunchOption.all.first { $0.flag == "--host" })
+        #expect(host.warning(ServeSettings()) == nil)
+        #expect(host.warning(ServeSettings(values: ["--host": "0.0.0.0"])) != nil)
+        #expect(host.warning(ServeSettings(values: ["--host": "0.0.0.0"], apiKey: "k")) == nil)
+        let origins = try #require(LaunchOption.all.first { $0.flag == "--allowed-origin" })
+        #expect(origins.warning(ServeSettings(values: ["--allowed-origin": "a.example, *"])) != nil)
+        #expect(origins.warning(ServeSettings(values: ["--allowed-origin": "a.example"])) == nil)
+    }
+
+    /// Whether this session can write the login Keychain, which is locked over SSH.
+    static let keychainWritable: Bool = {
+        let keychain = Keychain(service: "Splash Tests \(UUID().uuidString)")
+        guard (try? keychain.write("probe")) != nil else { return false }
+        try? keychain.write(nil)
+        return true
+    }()
+
+    @Test(.enabled(if: keychainWritable, "the login Keychain is locked, as over SSH"))
+    func keepsTheKeyInTheKeychain() throws {
+        let keychain = Keychain(service: "Splash Tests \(UUID().uuidString)")
+        defer { try? keychain.write(nil) }
+        #expect(try keychain.read() == nil)
+        try keychain.write("first")
+        try keychain.write("second")
+        #expect(try keychain.read() == "second")
+        try keychain.write("")
+        #expect(try keychain.read() == nil)
+        try keychain.write(nil)
+    }
+}
+
+@MainActor
+struct AppStateTests {
+    @Test(.enabled(if: ServeSettingsTests.keychainWritable, "the login Keychain is locked, as over SSH"))
+    func keepsTheKeyTheOptionsHave() throws {
+        let keychain = Keychain(service: "Splash Tests \(UUID().uuidString)")
+        defer { try? keychain.write(nil) }
+        let root = FileManager.default.temporaryDirectory.appending(path: "splash-state-tests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try keychain.write("first")
+        let state = AppState(runtime: Runtime(root: root), chats: ChatStore(folder: root.appending(path: "Chats")), keychain: keychain)
+        #expect(state.options.apiKey == "first" && state.keyProblem == nil)
+        state.options.apiKey = "second"
+        #expect(try keychain.read() == "second")
+        // A key changed elsewhere is read again.
+        try keychain.write("third")
+        state.readKey()
+        #expect(state.options.apiKey == "third")
+        state.options.apiKey = nil
+        #expect(try keychain.read() == nil)
+    }
+}
+
+struct ServerTests {
+    @Test func readsTheStatus() throws {
+        let golden = URL(filePath: #filePath).deletingLastPathComponent().appending(path: "../../../dev/tests/engine/status_golden.json")
+        let report = try #require(Server.report(try Data(contentsOf: golden)))
+        #expect(report == Server.Report(activity: Server.Activity(served: 2, running: 2, generated: 32, read: 4096, cached: 64,
+                                                                  memory: 4_294_967_296),
+                                        asleep: false))
+        let busy = Server.report(Data(#"{"requests": {"completed": 5}, "metrics": {"decode_tokens_per_second": 71.5, "prefill_tokens_per_second": 900, "ttft_ms": {"p50": 120}}, "weights": {"released": true}, "transport": {"stopped": true, "error": "the engine failed"}}"#.utf8))
+        #expect(busy == Server.Report(activity: Server.Activity(served: 5, generation: 71.5, reading: 900, firstToken: .milliseconds(120)),
+                                      asleep: true, stopped: "the engine failed"))
+        #expect(Server.report(Data("not json".utf8)) == nil)
+    }
+
+    @Test func readsTheRequestsTheLogFinishes() throws {
+        // As diagnostics.print_request writes them.
+        let done = try #require(RequestEntry("12:01:09 Done · input 4,096 · cached 1,024 · output 574 · TTFT 0.4s · 36.8 tok/s · 1.9 tok/cycle"))
+        #expect(done.time == "12:01:09" && done.outcome == .done)
+        #expect((done.input, done.cached, done.output, done.firstToken, done.rate) == (4096, 1024, 574, 0.4, 36.8))
+        let cancelled = try #require(RequestEntry("12:02:00 Cancelled · input 69 · cached 0 · output 12"))
+        #expect(cancelled.outcome == .cancelled && cancelled.output == 12 && cancelled.rate == nil)
+        let error = try #require(RequestEntry("12:03:00 Error · invalid_request_error · POST /v1/messages"))
+        #expect(error.outcome == .error && error.message == "invalid_request_error · POST /v1/messages")
+        #expect(RequestEntry("12:01:02 Started · input 4,096 · cached 0 · thinking on") == nil)
+        #expect(RequestEntry("12:00:58 Ready · http://127.0.0.1:8000") == nil)
+    }
+}
+
+struct AgentTests {
+    @Test func runsInTheFolderPickedWithTheServersKey() {
+        let runtime = Runtime(root: URL(filePath: "/opt/splash"))
+        let folder = URL(filePath: "/tmp/it's a project")
+        let script = Agent.claude.script(runtime: runtime, port: 8100, folder: folder)
+        #expect(script.hasPrefix("#!/bin/sh\nrm -f -- \"$0\"\n"))
+        #expect(script.contains(#"cd '/tmp/it'\''s a project' || exit"#))
+        #expect(script.contains(#"'claude' '--port' '8100'"#))
+        #expect(script.contains("'-I' '-B' '-u'"))
+        #expect(!script.contains("SPLASH_API_KEY"))
+        #expect(Agent.claude.script(runtime: runtime, port: 8100, folder: folder, apiKey: "k'ey")
+            .contains(#"export SPLASH_API_KEY='k'\''ey'"#))
     }
 }
 
@@ -163,6 +289,13 @@ struct OutputTests {
         #expect(Installer.Progress(line: "Fetching 1 file(s), 0.93 GB") == nil)
     }
 
+    @Test func formatsFiguresAndTimes() {
+        #expect(Format.seconds(9.84) == "9.8s" && Format.seconds(24.4) == "24s" && Format.seconds(84) == "1m 24s")
+        #expect(Format.latency(.milliseconds(136)) == ("136", "ms") && Format.latency(.milliseconds(1440)) == ("1.4", "s"))
+        #expect(Format.parts("4.3 GB") == ("4.3", "GB") && Format.parts("12") == ("12", nil))
+        #expect(Format.whole(36.8) == "37")
+    }
+
     @Test func formatsSizes() {
         #expect(Format.size(120_000_000) == "120 MB")
         #expect(Format.size(6_730_000_000) == "6.7 GB")
@@ -181,6 +314,11 @@ struct ChatTests {
         #expect(try ChatClient.parse(#"data: {"choices":[]}"#) == .delta(ChatClient.Delta()))
         #expect(try ChatClient.parse(#"data: {"choices":[{"delta":{},"finish_reason":"length"}]}"#)
             == .delta(ChatClient.Delta(cut: true)))
+        // The prompt as the model reads it, and the tokens its thinking took.
+        #expect(try ChatClient.parse(#"data: {"choices":[{"delta":{}}],"prompt_progress":{"total":4096,"cache":0,"processed":1024,"time_ms":80.5}}"#)
+            == .delta(ChatClient.Delta(read: 0.25)))
+        #expect(try ChatClient.parse(#"data: {"choices":[],"usage":{"completion_tokens":600,"completion_tokens_details":{"reasoning_tokens":412}}}"#)
+            == .delta(ChatClient.Delta(reasoningTokens: 412)))
         #expect(throws: ChatClient.Failure.self) {
             try ChatClient.parse(#"data: {"error":{"message":"engine is recovering; retry shortly"}}"#)
         }
@@ -196,6 +334,7 @@ struct ChatTests {
         let body = try JSONSerialization.jsonObject(with: ChatClient.body(messages, effort: "low", images: true)) as! [String: Any]
         #expect(body["reasoning_effort"] as? String == "low")
         #expect(body["stream"] as? Bool == true)
+        #expect(body["return_progress"] as? Bool == true)
         let wire = body["messages"] as! [[String: Any]]
         let parts = wire[0]["content"] as! [[String: Any]]
         #expect((parts[0]["image_url"] as! [String: String])["url"] == "data:image/png;base64,\(png.base64EncodedString())")

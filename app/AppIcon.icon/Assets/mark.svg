@@ -1,0 +1,4 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- A circle cut by two lines at 45°, its pieces slid along them, up and to the right. -->
+  <path d="M242.0 623.6 L592.5 273.1 A272 272 0 0 0 242.0 623.6 Z M641.7 257.9 L277.7 621.9 A272 272 0 0 0 375.0 731.0 L750.8 355.2 A272 272 0 0 0 641.7 257.9 Z M788.7 351.2 L422.0 718.0 A272 272 0 0 0 788.7 351.2 Z"/>
+</svg>

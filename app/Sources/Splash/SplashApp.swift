@@ -45,7 +45,8 @@ struct SplashApp: App {
             MenuBarPanel()
                 .environment(state)
         } label: {
-            Image(systemName: state.server.phase == .ready ? "bolt.fill" : "bolt")
+            Image(nsImage: SplashMark.menuBarImage(serving: state.server.phase == .ready))
+                .accessibilityLabel("Splash")
         }
         .menuBarExtraStyle(.window)
     }
@@ -106,10 +107,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        let server = state.server
-        let installer = state.installer
-        guard server.running || installer.running else { return .terminateNow }
-        if let model = installer.model, !signalled {
+        let state = state
+        guard state.busy else { return .terminateNow }
+        if let model = state.installer.model, !signalled {
             let alert = NSAlert()
             alert.messageText = "Quit Splash?"
             alert.informativeText = "\(state.displayName(of: model)) is still downloading. If you quit, the download starts over next time."
@@ -119,7 +119,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         state.quit()
         Task {
-            while server.running || installer.running {
+            while state.busy {
                 try? await Task.sleep(for: .milliseconds(200))
             }
             sender.reply(toApplicationShouldTerminate: true)
