@@ -10,7 +10,7 @@ struct ServerView: View {
     @Environment(AppState.self) private var state
     @State private var customModel = false
     @State private var width: CGFloat = 0
-    /// For pictures of the screen: the launch options' Advanced group open.
+    /// For pictures of the screen: the launch options' Advanced group and the request log open.
     var advanced = false
 
     var body: some View {
@@ -23,7 +23,8 @@ struct ServerView: View {
             Form {
                 if state.server.phase == .ready {
                     Section {
-                        ActivityRow(activity: state.server.activity)
+                        ActivityFigures(activity: state.server.activity)
+                        RequestLog(lines: state.server.requestLog, open: advanced)
                     } header: {
                         SectionTitle(text: "Activity")
                     }
@@ -235,19 +236,27 @@ private struct ControlBar: View {
     }
 }
 
-/// What the model that runs has done, in a row of figures: requests served and running, how fast
-/// it answers and reads prompts, how soon an answer starts, the memory it holds and its context.
-private struct ActivityRow: View {
+/// What the model that runs has done since it started, in two rows of figures: requests, how fast
+/// it answers and reads prompts on average, how soon an answer starts; the tokens it generated,
+/// read and took from its cache, and the memory it holds.
+private struct ActivityFigures: View {
     let activity: Server.Activity
 
     var body: some View {
-        HStack(alignment: .top, spacing: 0) {
-            figure(activity.served.formatted(), activity.running > 0 ? "Requests · \(activity.running) running" : "Requests")
-            figure(rate(activity.generation), "Answering")
-            figure(rate(activity.reading), "Reading prompts")
-            figure(activity.firstToken.map { $0.formatted(.units(allowed: [.seconds, .milliseconds], width: .narrow, maximumUnitCount: 1)) } ?? "–",
-                   "To first token")
-            figure(activity.memory.map(Format.size) ?? "–", "Memory")
+        Grid(alignment: .leading, horizontalSpacing: 0, verticalSpacing: 14) {
+            GridRow {
+                figure(activity.served.formatted(), activity.running > 0 ? "Requests · \(activity.running) running" : "Requests")
+                figure(rate(activity.generation), "Answering", help: "Average since the model started")
+                figure(rate(activity.reading), "Reading prompts", help: "Average since the model started")
+                figure(activity.firstToken.map { $0.formatted(.units(allowed: [.seconds, .milliseconds], width: .narrow, maximumUnitCount: 1)) } ?? "–",
+                       "To first token", help: "Median since the model started")
+            }
+            GridRow {
+                figure(count(activity.generated), "Tokens generated")
+                figure(count(activity.read), "Prompt tokens read")
+                figure(count(activity.cached), "Tokens from cache", help: "Prompt tokens taken from earlier requests rather than read again")
+                figure(activity.memory.map(Format.size) ?? "–", "Memory", help: "What the engine holds in memory now")
+            }
         }
         .padding(.vertical, 6)
     }
@@ -256,7 +265,11 @@ private struct ActivityRow: View {
         value.map { "\($0.formatted(.number.precision(.fractionLength(0)))) tok/s" } ?? "–"
     }
 
-    private func figure(_ value: String, _ caption: String) -> some View {
+    private func count(_ value: Int) -> String {
+        value.formatted(.number.notation(.compactName))
+    }
+
+    private func figure(_ value: String, _ caption: String, help: String = "") -> some View {
         VStack(alignment: .leading, spacing: 3) {
             Text(value)
                 .font(.title3.weight(.semibold))
@@ -268,7 +281,53 @@ private struct ActivityRow: View {
         }
         .lineLimit(1)
         .frame(maxWidth: .infinity, alignment: .leading)
+        .help(help)
         .accessibilityElement(children: .combine)
+    }
+}
+
+/// The server's line for each request since it started, folded until opened, in a box of its own
+/// that scrolls, following the latest.
+private struct RequestLog: View {
+    let lines: [String]
+    @State var open = false
+
+    var body: some View {
+        Button {
+            withAnimation(.smooth(duration: 0.2)) { open.toggle() }
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .rotationEffect(.degrees(open ? 90 : 0))
+                    .accessibilityHidden(true)
+                Text("Request Log")
+                Spacer()
+            }
+            .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+        .accessibilityValue(open ? "Expanded" : "Collapsed")
+        if open {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 3) {
+                    if lines.isEmpty {
+                        Text("No requests yet.").foregroundStyle(.secondary)
+                    }
+                    ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
+                        Text(line)
+                    }
+                }
+                .font(.system(.caption, design: .monospaced))
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(10)
+            }
+            .frame(height: 180)
+            .defaultScrollAnchor(.bottom)
+            .background(.quaternary.opacity(0.5), in: .rect(cornerRadius: 8))
+        }
     }
 }
 

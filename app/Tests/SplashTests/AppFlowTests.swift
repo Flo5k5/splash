@@ -98,6 +98,9 @@ struct AppFlowTests {
         #expect(conversation.messages[1].model == model)
         #expect(ChatStore(folder: chats).conversations.first?.messages == conversation.messages, "saved")
         await Snapshot.save("chat-ready", MainView().environment(state))
+        #expect(state.server.requestLog.contains { $0.contains("Done · ") })
+        #expect(state.server.activity.generated > 0)
+        await Snapshot.save("server-activity", size: CGSize(width: 1120, height: 1100), ServerView(advanced: true).environment(state))
         // Changed options ask for a restart, which starts the model with them.
         state.options["--max-context"] = "32768"
         #expect(state.optionsChanged)

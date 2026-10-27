@@ -27,17 +27,23 @@ final class Server {
     /// Once ready: the work the server reports, as its status gives it.
     private(set) var activity = Activity()
 
-    /// The server's work since it started, from `/status`: requests served and running, the speed
-    /// of answers and of reading prompts in tokens a second, the median time to an answer's first
-    /// token, the memory the engine holds, and the context it serves.
+    /// Once ready: the server's line for each request, as its log gives them, the latest last.
+    private(set) var requestLog: [String] = []
+
+    /// The server's work since it started, from `/status`: requests served and running, the average
+    /// speed of answers and of reading prompts in tokens a second, the median time to an answer's
+    /// first token, the tokens it generated, read and took from its cache, and the memory the
+    /// engine holds.
     struct Activity: Equatable {
         var served = 0
         var running = 0
         var generation: Double?
         var reading: Double?
         var firstToken: Duration?
+        var generated = 0
+        var read = 0
+        var cached = 0
         var memory: Int64?
-        var context: Int?
     }
 
     /// What a reasoning effort does to the served model, as `/v1/models` reports it from its
@@ -122,6 +128,7 @@ final class Server {
         self.settings = settings
         asleep = false
         activity = Activity()
+        requestLog = []
         acceptsImages = false
         reasoning = nil
         firstError = nil
@@ -158,6 +165,10 @@ final class Server {
     private func received(_ line: String) {
         // Why a start fails; once serving, error lines are about requests.
         if phase == .starting, firstError == nil { firstError = errorMessage(line) }
+        if phase == .ready, line.wholeMatch(of: /\d\d:\d\d:\d\d (Started|Done|Cancelled|Error) · .*/) != nil {
+            requestLog.append(line)
+            if requestLog.count > 1000 { requestLog.removeFirst(requestLog.count - 1000) }
+        }
     }
 
     private func exited(_ status: Int32) {
@@ -238,8 +249,10 @@ final class Server {
             generation: metrics?.decode_tokens_per_second.flatMap { $0 > 0 ? $0 : nil },
             reading: metrics?.prefill_tokens_per_second.flatMap { $0 > 0 ? $0 : nil },
             firstToken: metrics?.ttft_ms?.p50.flatMap { $0 > 0 ? .milliseconds($0) : nil },
-            memory: status.memory_actual?.current_bytes,
-            context: status.maximum_context_tokens
+            generated: metrics?.decode_output_tokens ?? 0,
+            read: metrics?.prefill_input_tokens ?? 0,
+            cached: status.cache?.reused_tokens ?? 0,
+            memory: status.memory_actual?.current_bytes
         )
         if status.transport?.stopped == true {
             // The engine failed again and again; the server stays up but serves nothing.
@@ -257,15 +270,18 @@ final class Server {
             let decode_tokens_per_second: Double?
             let prefill_tokens_per_second: Double?
             let ttft_ms: Percentiles?
+            let decode_output_tokens: Int?
+            let prefill_input_tokens: Int?
         }
+        struct Cache: Decodable { let reused_tokens: Int? }
         struct Memory: Decodable { let current_bytes: Int64? }
         let weights: Weights?
         let transport: Transport?
         let requests: Requests?
         let active_requests: [Request]?
         let metrics: Metrics?
+        let cache: Cache?
         let memory_actual: Memory?
-        let maximum_context_tokens: Int?
     }
 
     private struct ServedModel: Decodable {

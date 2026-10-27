@@ -66,12 +66,14 @@ struct Composer: View {
                           attach: draft.attach)
                 .frame(height: min(max(height, 22), 220))
             HStack(spacing: 12) {
-                Button { picking = true } label: { Image(systemName: "plus") }
-                    .buttonStyle(.borderless)
-                    .foregroundStyle(.secondary)
-                    .disabled(!images)
-                    .help(images ? "Attach Images" : "Images need a model that can see them")
-                    .accessibilityLabel("Attach Images")
+                // Only for a model that sees images.
+                if images {
+                    Button { picking = true } label: { Image(systemName: "plus") }
+                        .buttonStyle(.borderless)
+                        .foregroundStyle(.secondary)
+                        .help("Attach Images")
+                        .accessibilityLabel("Attach Images")
+                }
                 Spacer()
                 ModelMenu()
                 if streaming {
@@ -149,6 +151,7 @@ private struct InkCircle: ButtonStyle {
 /// themselves change on the Server screen.
 private struct ModelMenu: View {
     @Environment(AppState.self) private var state
+    @State private var hovering = false
 
     var body: some View {
         if state.server.phase == .ready, let model = state.server.model {
@@ -177,12 +180,17 @@ private struct ModelMenu: View {
                     }
                     .font(.callout)
                     .lineLimit(1)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(.quaternary.opacity(hovering ? 1 : 0), in: .rect(cornerRadius: 7))
                     .contentShape(.rect)
                 }
                 .menuStyle(.button)
                 .buttonStyle(.plain)
                 .menuIndicator(.hidden)
                 .fixedSize()
+                .onHover { hovering = $0 }
+                .animation(.easeOut(duration: 0.12), value: hovering)
                 .help("How much the model thinks before it answers")
                 .accessibilityLabel(state.displayName(of: model))
                 .accessibilityValue(Self.title(chosen))
