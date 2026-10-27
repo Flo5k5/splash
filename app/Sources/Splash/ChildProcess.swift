@@ -113,10 +113,55 @@ final class LogTail {
     }
 }
 
+/// Stops the process group `pid` leads, as `ChildProcess.signal` would, when this app no longer
+/// holds it: SIGINT, then SIGKILL if it still runs 20 s later; returns once it has ended.
+func stopProcessGroup(_ pid: pid_t) async {
+    killpg(pid, SIGINT)
+    for tick in 1...300 where kill(pid, 0) == 0 {
+        if tick == 200 { killpg(pid, SIGKILL) }
+        try? await Task.sleep(for: .milliseconds(100))
+    }
+}
+
+/// Whether something listens on, or holds, the loopback `port`, as the launcher checks it.
+func portInUse(_ port: Int) -> Bool {
+    var address = sockaddr_in()
+    address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+    address.sin_family = sa_family_t(AF_INET)
+    address.sin_port = in_port_t(UInt16(port).bigEndian)
+    address.sin_addr.s_addr = inet_addr("127.0.0.1")
+    func attempt(_ operation: (Int32, UnsafePointer<sockaddr>, socklen_t) -> Int32) -> Bool {
+        let socket = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+        defer { close(socket) }
+        var reuse: Int32 = 1
+        setsockopt(socket, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
+        return withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                operation(socket, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0
+            }
+        }
+    }
+    return !attempt(bind) || attempt(connect)
+}
+
 /// Creates `url` empty, with its folder, for a run's log.
 func resetLog(_ url: URL) {
     try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
     FileManager.default.createFile(atPath: url.path, contents: nil)
+}
+
+/// A failure of `model`'s in words a user can act on; the log keeps the original.
+func plainProblem(_ message: String, model: String) -> String {
+    if let option = message.firstMatch(of: /unrecognized arguments: (.+)/)?.1 {
+        return "The server options in Settings include \(option), which the server doesn’t recognize. Change them in Settings › Advanced."
+    }
+    if message.contains("Repository Not Found") || message.contains("404 Client Error") {
+        return "Hugging Face has no public model named \(model.split(separator: ":")[0]). Check the name, then try again."
+    }
+    if message.contains("ConnectionError") || message.contains("Max retries exceeded") || message.contains("nodename nor servname") {
+        return "Splash couldn’t reach Hugging Face. Check the internet connection, then try again."
+    }
+    return message
 }
 
 /// The message of an error line, without its prefix: `error: ...` from the launcher, installer

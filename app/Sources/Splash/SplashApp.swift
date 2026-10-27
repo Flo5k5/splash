@@ -6,22 +6,46 @@ struct SplashApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
 
     var body: some Scene {
+        let state = delegate.state
         Window("Splash", id: "main") {
             MainView()
-                .environment(delegate.state)
+                .environment(state)
         }
         .defaultSize(width: 1120, height: 780)
+        .commands {
+            CommandGroup(replacing: .newItem) {
+                Button("New Chat") {
+                    state.chats.newChat()
+                    state.draft.focus()
+                }
+                    .keyboardShortcut("n")
+                    .disabled(state.screen != .chat)
+            }
+            // The toolbar holds the model's controls; it is not to be hidden.
+            CommandGroup(replacing: .toolbar) {}
+            CommandMenu("Model") {
+                Group {
+                    ModelMenuItems()
+                    Divider()
+                    Menu("Coding Agents") { AgentMenuItems() }
+                }
+                .environment(state)
+            }
+            CommandGroup(replacing: .help) {
+                Button("Show Server Log") { NSWorkspace.shared.open(Server.log) }
+                Button("Show Download Log") { NSWorkspace.shared.open(Installer.log) }
+            }
+        }
 
         Settings {
             SettingsView()
-                .environment(delegate.state)
         }
 
         MenuBarExtra {
             MenuBarMenu()
-                .environment(delegate.state)
+                .environment(state)
         } label: {
-            Image(systemName: delegate.state.server.phase == .ready ? "bolt.fill" : "bolt")
+            Image(systemName: state.server.phase == .ready ? "bolt.fill" : "bolt")
         }
     }
 }
@@ -44,7 +68,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         super.init()
     }
 
+    /// Quits as the Quit command does when the system or `kill` asks the app to end, without
+    /// asking first.
+    private var termination: DispatchSourceSignal?
+    private var signalled = false
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // One Splash at a time: another would take over the first one's model. Of two opened at
+        // once, the one launched first stays, and the other shows its window; but a copy that runs
+        // nothing, from the disk image, gives way to this one.
+        if let id = Bundle.main.bundleIdentifier, let first = NSRunningApplication.runningApplications(withBundleIdentifier: id)
+            .filter({ !$0.isTerminated })
+            .min(by: { ($0.launchDate ?? .distantFuture, $0.processIdentifier) < ($1.launchDate ?? .distantFuture, $1.processIdentifier) }),
+            first != .current, let bundle = first.bundleURL {
+            if AppState.mustMoveToApplications(bundle) {
+                first.terminate()
+            } else {
+                NSWorkspace.shared.openApplication(at: bundle, configuration: NSWorkspace.OpenConfiguration())
+                NSApp.terminate(nil)
+                return
+            }
+        }
+        signal(SIGTERM, SIG_IGN)
+        termination = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+        termination?.setEventHandler { [weak self] in
+            self?.signalled = true
+            // From the run loop, not this main-queue block: terminating waits for the model to stop,
+            // which is reported on the main queue.
+            NSApp.perform(#selector(NSApplication.terminate(_:)), with: nil, afterDelay: 0)
+        }
+        termination?.resume()
         Task { await state.launch() }
     }
 
@@ -56,12 +109,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let server = state.server
         let installer = state.installer
         guard server.running || installer.running else { return .terminateNow }
-        if installer.running || server.activeRequests > 0 {
+        if let model = installer.model, !signalled {
             let alert = NSAlert()
             alert.messageText = "Quit Splash?"
-            alert.informativeText = installer.running
-                ? "The download of \(installer.model ?? "a model") stops, and starts over next time."
-                : "Splash is answering a request, which stops."
+            alert.informativeText = "\(state.displayName(of: model)) is still downloading. If you quit, the download starts over next time."
             alert.addButton(withTitle: "Quit")
             alert.addButton(withTitle: "Cancel")
             guard alert.runModal() == .alertFirstButtonReturn else { return .terminateCancel }

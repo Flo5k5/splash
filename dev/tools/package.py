@@ -101,15 +101,17 @@ def python_distribution():
     cached = ROOT / "build/release/python-runtime.tar.gz"
     cached.parent.mkdir(parents=True, exist_ok=True)
     if not cached.exists() or digest(cached) != PYTHON_SHA256:
-        with tempfile.NamedTemporaryFile(dir=cached.parent, delete=False) as download:
+        with tempfile.NamedTemporaryFile(dir=cached.parent) as download:
             with urllib.request.urlopen(PYTHON_URL, timeout=60) as response:
                 shutil.copyfileobj(response, download)
-        downloaded = Path(download.name)
-        if digest(downloaded) != PYTHON_SHA256:
-            downloaded.unlink()
-            raise ValueError("Python distribution checksum mismatch")
-        # Renamed into place whole, so a concurrent build never reads part of it.
-        downloaded.replace(cached)
+            download.flush()
+            if digest(Path(download.name)) != PYTHON_SHA256:
+                raise ValueError("Python distribution checksum mismatch")
+            # Linked into place whole, so a concurrent build never reads part of it;
+            # the download itself goes away with its temporary file.
+            temporary = cached.with_name(f".{Path(download.name).name}")
+            os.link(download.name, temporary)
+            temporary.replace(cached)
     return cached
 
 

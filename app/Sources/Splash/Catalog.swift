@@ -1,13 +1,17 @@
 import Foundation
 
 /// The models Splash suggests: `install/suggested-models.tsv`, which shell completion reads too.
-/// Each line is `MODEL<TAB>NAME<TAB>MEMORY`: the ID `splash serve --model` takes, the model's name,
-/// and the smallest Mac memory in GB the variant is meant for. Best first.
+/// Each line is `MODEL<TAB>NAME<TAB>MEMORY<TAB>SIZE<TAB>ABOUT`: the ID `splash serve --model`
+/// takes, the model's name, the smallest Mac memory in GB the variant is meant for, its download
+/// in GB, and a few words on the model. Best first.
 struct Catalog {
     struct Variant: Hashable {
         let id: String
         let name: String
         let memory: Int
+        /// The download, in GB.
+        let size: Int
+        let about: String
     }
 
     let variants: [Variant]
@@ -19,8 +23,9 @@ struct Catalog {
     init(text: String) {
         variants = text.split(separator: "\n").compactMap { line in
             let fields = line.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
-            guard !line.hasPrefix("#"), fields.count == 3, let memory = Int(fields[2]) else { return nil }
-            return Variant(id: fields[0], name: fields[1], memory: memory)
+            guard !line.hasPrefix("#"), fields.count == 5, let memory = Int(fields[2]), let size = Int(fields[3])
+            else { return nil }
+            return Variant(id: fields[0], name: fields[1], memory: memory, size: size, about: fields[4])
         }
     }
 
@@ -40,10 +45,24 @@ struct Catalog {
     /// The least memory any suggested model is meant for.
     var minimumMemory: Int? { variants.map(\.memory).min() }
 
-    /// The name to show for model `id`: its suggested name, or else its repository's.
+    /// The name to show for model `id`: its suggested name, or else its repository's, without the
+    /// variant and the format the repository's name ends in.
     func name(of id: String) -> String {
-        variants.first { $0.id == id }?.name
-            ?? String(id.split(separator: "/").last ?? Substring(id))
+        if let name = variants.first(where: { $0.id == id })?.name { return name }
+        let repository = id.split(separator: ":")[0].split(separator: "/").last.map(String.init) ?? id
+        return repository.replacing(/(?i)-(gguf|mlx)$/, with: "")
+    }
+
+    /// What tells variants of a model apart: the GGUF variant `id` names, or MLX for a model in
+    /// MLX's format, or else its repository.
+    static func variant(of id: String) -> String {
+        if let variant = id.split(separator: ":", maxSplits: 1).dropFirst().first { return String(variant) }
+        return id.localizedCaseInsensitiveContains("mlx") ? "MLX" : String(id.split(separator: "/").last ?? Substring(id))
+    }
+
+    /// The few words on model `id`, if it is a suggested one.
+    func about(of id: String) -> String? {
+        variants.first { $0.id == id }?.about
     }
 
     /// This Mac's unified memory in GB, as Apple sells it (24, 36, 48, ...).

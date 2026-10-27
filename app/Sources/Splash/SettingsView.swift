@@ -7,88 +7,80 @@ struct SettingsView: View {
     @AppStorage(Preference.port) private var port = Preference.defaultPort
     @AppStorage(Preference.serveOptions) private var serveOptions = ""
     @State private var login = SMAppService.mainApp.status
+    @State private var loginError: Error?
+    @State var advanced = false
 
     var body: some View {
         Form {
             Section {
-                Picker("Free the model’s memory when idle", selection: $idleRelease) {
+                Picker("Free memory when idle", selection: $idleRelease) {
                     ForEach(IdleRelease.allCases) { Text($0.title).tag($0) }
                 }
                 Toggle("Start the last model when Splash opens", isOn: $startOnOpen)
                 Toggle("Open Splash at login", isOn: Binding(
-                    get: { login != .notRegistered && login != .notFound },
-                    set: { enabled in
-                        try? enabled ? SMAppService.mainApp.register() : SMAppService.mainApp.unregister()
-                        login = SMAppService.mainApp.status
-                    }
+                    get: { login == .enabled || login == .requiresApproval },
+                    // A closure, not the method: Swift 6.3's compiler crashes on the method's thunk.
+                    set: { setLogin($0) }
                 ))
                 if login == .requiresApproval {
-                    LabeledContent("macOS asks you to allow Splash to open at login.") {
-                        Button("Open Login Items") { SMAppService.openSystemSettingsLoginItems() }
+                    LabeledContent("Splash needs your approval to open at login.") {
+                        Button("Open System Settings") { SMAppService.openSystemSettingsLoginItems() }
                     }
                 }
             } footer: {
-                Text("A model whose memory was freed loads again with the next message.")
+                Text("An idle model sleeps: it frees its memory and wakes with your next message.")
             }
             Section {
-                TextField("Port", value: $port, format: .number.grouping(.never))
-                TextField("More serve options", text: $serveOptions, prompt: Text("--max-context 128K"))
-            } header: {
-                Text("Advanced")
-            } footer: {
-                Text("Apps and coding agents reach the model at http://127.0.0.1:\(String(port))/v1. Chats are saved per port. More serve options are passed to splash serve as typed; see splash serve --help. Changes apply when a model next starts.")
+                DisclosureGroup("Advanced", isExpanded: $advanced) {
+                    TextField("Port", value: $port, format: .number.grouping(.never))
+                        .monospacedDigit()
+                        .onChange(of: port) { old, new in if !(1...65535).contains(new) { port = old } }
+                    LabeledContent("Server options") {
+                        TextField("Server options", text: $serveOptions, prompt: Text("None"))
+                            .labelsHidden()
+                            .monospaced()
+                            .multilineTextAlignment(.trailing)
+                    }
+                    LabeledContent("API address") {
+                        HStack {
+                            Text(verbatim: "http://127.0.0.1:\(port)/v1").monospaced().textSelection(.enabled)
+                            Button {
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString("http://127.0.0.1:\(port)/v1", forType: .string)
+                            } label: {
+                                Image(systemName: "doc.on.doc")
+                            }
+                            .buttonStyle(.borderless)
+                            .help("Copy API Address")
+                        }
+                    }
+                    Text(note).font(.callout).foregroundStyle(.secondary)
+                }
             }
         }
         .formStyle(.grouped)
-        .frame(width: 520)
+        .frame(width: 480)
         .fixedSize(horizontal: false, vertical: true)
-    }
-}
-
-/// The menu bar item's menu: what runs, and the quick actions.
-struct MenuBarMenu: View {
-    @Environment(AppState.self) private var state
-    @Environment(\.openWindow) private var openWindow
-
-    var body: some View {
-        let server = state.server
-        Text(status)
-        Divider()
-        Button("Open Splash") {
-            openWindow(id: "main")
-            NSApp.activate()
+        .alert("Couldn’t Change Login Items", isPresented: Binding(
+            get: { loginError != nil }, set: { if !$0 { loginError = nil } }
+        )) {} message: {
+            Text(loginError?.localizedDescription ?? "")
         }
-        if server.running {
-            Button("Stop Model") { server.stop() }.disabled(server.phase == .stopping)
-        }
-        Button("Copy API Address") {
-            let settings = server.running ? server.settings : ServeSettings.current()
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(settings.url.appending(path: "v1").absoluteString, forType: .string)
-        }
-        Menu("Coding Agents") {
-            ForEach(Agent.allCases) { agent in
-                Button("\(agent.title)…") {
-                    NSApp.activate()
-                    agent.open(runtime: state.runtime, port: server.settings.port)
-                }
-            }
-        }
-        .disabled(server.phase != .ready)
-        Divider()
-        SettingsLink { Text("Settings…") }
-        Button("Quit Splash") { NSApp.terminate(nil) }.keyboardShortcut("q")
     }
 
-    private var status: String {
-        let server = state.server
-        let name = server.model.map(state.catalog.name(of:)) ?? ""
-        switch server.phase {
-        case .ready: return server.asleep ? "\(name) — resting" : "\(name) — ready"
-        case .starting: return "Starting \(name)…"
-        case .stopping: return "Stopping \(name)…"
-        case .failed: return "\(name) stopped"
-        case .stopped: return "No model running"
+    private var note: String {
+        if let option = ServeSettings(options: serveOptions).reservedOption {
+            return "Leave out \(option): Splash sets it itself. Server options are flags for splash serve, such as --max-context 128K."
         }
+        return "Server options are flags for splash serve, such as --max-context 128K. Changes apply the next time a model starts."
+    }
+
+    private func setLogin(_ enabled: Bool) {
+        do {
+            try enabled ? SMAppService.mainApp.register() : SMAppService.mainApp.unregister()
+        } catch {
+            loginError = error
+        }
+        login = SMAppService.mainApp.status
     }
 }

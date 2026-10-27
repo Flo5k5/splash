@@ -6,7 +6,7 @@ import Observation
 /// serves. A model can download while another one serves.
 @MainActor @Observable
 final class Installer {
-    /// What the installer reports while it downloads one repository: the model's, after its draft's.
+    /// What the installer reports while it downloads one repository.
     struct Progress: Equatable {
         let repo: String
         let done: Int64
@@ -32,17 +32,16 @@ final class Installer {
 
     /// The model installing.
     private(set) var model: String?
-    /// The download under way, if the installer is downloading.
+    /// The download of the model's own files. A model's draft downloads first; it is small, and
+    /// a bar that filled for it and started over would mislead, so it shows as preparation.
     private(set) var progress: Progress?
-    /// The latest line the installer printed.
-    private(set) var latest = ""
     /// The last installation that failed: its model and why.
     private(set) var failure: (model: String, message: String)?
 
-    static let log = URL.libraryDirectory.appending(path: "Logs/Splash/install.log")
-
     /// Gets each model once it is installed.
     @ObservationIgnored var installed: (String) -> Void = { _ in }
+
+    static let log = URL.libraryDirectory.appending(path: "Logs/Splash/install.log")
 
     private let runtime: Runtime
     private var child: ChildProcess?
@@ -50,6 +49,8 @@ final class Installer {
     private var cancelled = false
     private var firstError: String?
     private var activity: NSObjectProtocol?
+    /// When and at how many bytes the model's own download was first reported.
+    private var began: (date: Date, done: Int64)?
 
     init(runtime: Runtime) {
         self.runtime = runtime
@@ -57,11 +58,19 @@ final class Installer {
 
     var running: Bool { child != nil }
 
+    /// About how long the download has left, once it has run for a few seconds.
+    var remaining: Duration? {
+        guard let progress, let began, progress.done > began.done else { return nil }
+        let elapsed = Date.now.timeIntervalSince(began.date)
+        guard elapsed >= 5 else { return nil }
+        return .seconds(Double(progress.total - progress.done) * elapsed / Double(progress.done - began.done))
+    }
+
     func install(_ model: String) {
         guard child == nil else { return }
         self.model = model
         progress = nil
-        latest = "Preparing \(model)…"
+        began = nil
         failure = nil
         firstError = nil
         cancelled = false
@@ -74,10 +83,11 @@ final class Installer {
                 exited: { [weak self] in self?.exited($0) }
             )
         } catch {
-            failure = (model, "The download could not start: \(error.localizedDescription)")
+            failure = (model, "The download couldn’t start: \(error.localizedDescription)")
             self.model = nil
             return
         }
+        UserDefaults.standard.set(Int(child!.pid), forKey: Preference.installerPID)
         tail = LogTail(Self.log) { [weak self] in self?.received($0) }
         // A download takes long; the Mac must not sleep through it.
         activity = ProcessInfo.processInfo.beginActivity(
@@ -96,42 +106,58 @@ final class Installer {
         }
     }
 
+    /// Clears a failure the user has read.
+    func dismissFailure() {
+        failure = nil
+    }
+
+    /// Stops the download this app started before it quit or crashed, if it still runs.
+    func stopLeftover() async {
+        let pid = pid_t(UserDefaults.standard.integer(forKey: Preference.installerPID))
+        UserDefaults.standard.removeObject(forKey: Preference.installerPID)
+        guard pid > 0, runtime.runsPython(pid) else { return }
+        await stopProcessGroup(pid)
+    }
+
     private func received(_ line: String) {
-        if let progress = Progress(line: line) {
-            self.progress = progress
-            if progress.done == 0 { checkSpace(progress) }
+        guard let event = Progress(line: line) else {
+            if firstError == nil { firstError = errorMessage(line) }
             return
         }
-        latest = line
-        if firstError == nil { firstError = errorMessage(line) }
+        if event.done == 0 { checkSpace(event) }
+        guard let model, event.repo == model.split(separator: ":")[0] else { return }
+        if began == nil { began = (.now, event.done) }
+        progress = event
     }
 
     /// Stops a download the disk has no room for, before it fills the disk. macOS frees purgeable
     /// space as it is needed, so what counts is the capacity for important use.
-    private func checkSpace(_ progress: Progress) {
+    private func checkSpace(_ event: Progress) {
         let cache = URL.homeDirectory.appending(path: ".cache")
         guard let available = try? cache.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
             .volumeAvailableCapacityForImportantUsage,
-            progress.total > available, let model
+            event.total > available, let model
         else { return }
         cancel()
-        failure = (model, "Not enough disk space: the download needs \(Format.bytes(progress.total)), "
-            + "and \(Format.bytes(available)) is available.")
+        failure = (model, "Not enough disk space: the download needs \(Format.size(event.total)), "
+            + "and \(Format.size(available)) is available.")
     }
 
     private func exited(_ status: Int32) {
         tail?.finish()
         tail = nil
         child = nil
+        UserDefaults.standard.removeObject(forKey: Preference.installerPID)
         activity.map(ProcessInfo.processInfo.endActivity)
         activity = nil
-        let model = self.model!
+        guard let model else { return }
         self.model = nil
         progress = nil
         if status == 0 {
             installed(model)
         } else if !cancelled {
-            failure = (model, firstError ?? "The download failed (exit status \(status)).")
+            failure = (model, firstError.map { plainProblem($0, model: model) }
+                ?? "The download stopped unexpectedly. The log has the details.")
         }
     }
 }

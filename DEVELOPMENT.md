@@ -4255,15 +4255,21 @@ commands, each in a process group of its own, as a terminal runs a foreground
 job, with its output appended to a log in `~/Library/Logs/Splash`:
 `install/models.py --model ID prepare --json-progress` downloads a model, and
 `splash serve --model ID --port PORT --offline` serves an installed one, ready
-once `/status` names that process; stopping is Ctrl+C's SIGINT to the group.
-Switching models stops one server and starts the next. The window shows the
-chat page from the server's origin, so its chats stay saved per port. Models,
-locks and downloads are the ones a packaged `splash` uses, in
+once the port's lock names that process and `/health` answers; stopping is
+Ctrl+C's SIGINT to the group. Switching models stops one server and starts the
+next. Models, locks and downloads are the ones a packaged `splash` uses, in
 `~/Library/Application Support/Splash` and the Hugging Face cache. The app
 offers `install/suggested-models.tsv`, per model the variant meant for the
-Mac's memory, and starts coding agents with `splash AGENT --port PORT` in
-Terminal, in a folder the user picks. `swift test --package-path app` runs its
-tests.
+Mac's memory with its download size and a few words about the model, and
+starts coding agents with `splash AGENT --port PORT` in Terminal, in a folder
+the user picks. Its chat is its own, not the chat page: it streams
+`/v1/chat/completions` and keeps each conversation as a JSON file in
+`~/Library/Application Support/Splash/Chats`, so a conversation outlives a
+switch of models. Its icon is `app/AppIcon.icon`, an Icon Composer document
+`actool` compiles, which needs the full Xcode. `swift test --package-path app`
+runs its tests; with `SPLASH_RUNTIME` naming a packaged runtime and
+`SPLASH_APP_MODELS` installed models, they also drive the app end to end and,
+with `SPLASH_APP_SNAPSHOTS`, render its windows to that folder.
 
 ### Private test releases
 

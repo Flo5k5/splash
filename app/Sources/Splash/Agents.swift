@@ -30,13 +30,7 @@ enum Agent: String, CaseIterable, Identifiable {
         }
         guard panel.runModal() == .OK, let folder = panel.url else { return }
         UserDefaults.standard.set(folder, forKey: Preference.agentFolder)
-        let script = """
-            #!/bin/sh
-            cd \(Self.quoted(folder.path)) || exit
-            clear
-            exec \(runtime.command([rawValue, "--port", String(port)]).map(Self.quoted).joined(separator: " "))
-
-            """
+        let script = script(runtime: runtime, port: port, folder: folder)
         do {
             let directory = FileManager.default.temporaryDirectory.appending(path: "Splash")
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -48,6 +42,17 @@ enum Agent: String, CaseIterable, Identifiable {
         } catch {
             NSAlert(error: error).runModal()
         }
+    }
+
+    /// The Terminal script that runs the agent in `folder`.
+    func script(runtime: Runtime, port: Int, folder: URL) -> String {
+        """
+        #!/bin/sh
+        cd \(Self.quoted(folder.path)) || exit
+        clear
+        exec \(runtime.command([rawValue, "--port", String(port)]).map(Self.quoted).joined(separator: " "))
+
+        """
     }
 
     private static func quoted(_ word: String) -> String {

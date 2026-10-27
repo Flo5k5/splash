@@ -1,171 +1,115 @@
 import SwiftUI
 
-/// The main window: the chat with the model being served, or the models to choose from.
+/// The main window: the welcome until a model is on this Mac, the chats after. Its toolbar holds
+/// the model being talked to and, while one runs, the coding agents.
 struct MainView: View {
     @Environment(AppState.self) private var state
 
     var body: some View {
         @Bindable var state = state
-        Group {
+        screen
+            .transition(.opacity)
+            .frame(minWidth: 800, minHeight: 560)
+            .navigationTitle("Splash")
+            .toolbar(removing: .title)
+            .toolbar {
+                if state.screen == .chat {
+                    ToolbarItem(placement: .navigation) { ModelMenu() }
+                        .sharedBackgroundVisibility(.hidden)
+                }
+                if state.installer.running && state.screen != .models && !state.showingModels {
+                    ToolbarItem { DownloadButton() }
+                }
+                if state.server.running {
+                    ToolbarItem { AgentsMenu() }
+                }
+            }
+            .animation(.smooth(duration: 0.25), value: state.screen)
+            .sheet(isPresented: $state.showingModels) { ModelsSheet() }
+            .onChange(of: state.screen) { _, screen in
+                if screen == .models { state.showingModels = false }
+            }
+            .onChange(of: state.status) { _, status in
+                AccessibilityNotification.Announcement(status).post()
+            }
+    }
+
+    @ViewBuilder private var screen: some View {
+        switch state.screen {
+        case .launching:
+            ProgressView().controlSize(.small).frame(maxWidth: .infinity, maxHeight: .infinity)
+        case .blocked:
             if let blocker = state.blocker {
-                ContentUnavailableView("Splash can’t run here", systemImage: "exclamationmark.triangle",
-                                       description: Text(blocker))
-            } else {
-                // The chat stays, hidden, under the models: leaving it would end the reply it is
-                // streaming, and the chat page saves an exchange only once it is complete.
-                ZStack {
-                    ChatPane()
-                        .opacity(state.tab == .chat ? 1 : 0)
-                        .allowsHitTesting(state.tab == .chat)
-                        .accessibilityHidden(state.tab != .chat)
-                    if state.tab == .models { ModelsView() }
-                }
+                ContentUnavailableView(blocker.title, systemImage: blocker.symbol, description: Text(blocker.message))
             }
-        }
-        .frame(minWidth: 800, minHeight: 560)
-        .navigationTitle("Splash")
-        .navigationSubtitle(subtitle)
-        .toolbar {
-            ToolbarItem(placement: .principal) {
-                Picker("View", selection: $state.tab) {
-                    Text("Chat").tag(AppState.Tab.chat)
-                    Text("Models").tag(AppState.Tab.models)
-                }
-                .pickerStyle(.segmented)
-                .disabled(state.blocker != nil)
-            }
-            ToolbarItemGroup(placement: .primaryAction) {
-                AgentsMenu()
-                ServerButton()
-            }
-        }
-    }
-
-    private var subtitle: String {
-        let server = state.server
-        guard let model = server.model.map(state.catalog.name(of:)) else { return "No model running" }
-        switch server.phase {
-        case .starting: return "Starting \(model)…"
-        case .stopping: return "Stopping \(model)…"
-        case .stopped: return "No model running"
-        case .failed: return "\(model) stopped"
-        case .ready:
-            if server.asleep { return "\(model) · resting, wakes on the next message" }
-            return [model, server.contextTokens.map { "\(Format.tokens($0)) context" }]
-                .compactMap { $0 }.joined(separator: " · ")
+        case .models:
+            ModelsView()
+        case .chat:
+            ChatScreen()
         }
     }
 }
 
-/// Starts the last model, or stops the one running.
-struct ServerButton: View {
+/// The model being talked to, as the window's heading, opening the models and the actions on it.
+struct ModelMenu: View {
     @Environment(AppState.self) private var state
 
     var body: some View {
         let server = state.server
-        if server.running {
-            Button("Stop", systemImage: "stop.fill") { server.stop() }
-                .help("Stop the model and free its memory")
-                .disabled(server.phase == .stopping)
-        } else {
-            Button("Start", systemImage: "play.fill") { lastModel.map(state.start) }
-                .help(lastModel.map { "Start \(state.catalog.name(of: $0))" } ?? "Choose a model to start")
-                .disabled(lastModel == nil || state.blocker != nil)
+        Menu {
+            StatusItems()
+            Divider()
+            ModelMenuItems()
+        } label: {
+            Text(server.running ? (server.next ?? server.model).map(state.displayName(of:)) ?? "" : "Choose a Model")
+                .font(.headline)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .frame(maxWidth: 280)
         }
-    }
-
-    private var lastModel: String? {
-        (state.server.model ?? UserDefaults.standard.string(forKey: Preference.lastModel))
-            .flatMap { state.isInstalled($0) ? $0 : nil }
+        .menuIndicator(.visible)
+        .help("Choose the model to talk to")
+        .accessibilityLabel("Model")
+        .accessibilityValue(state.status)
     }
 }
 
-/// Opens a coding agent on the model being served.
+/// A download under way while the models are not on screen; opens them.
+struct DownloadButton: View {
+    @Environment(AppState.self) private var state
+
+    var body: some View {
+        Button { state.showModels() } label: {
+            ProgressView(value: state.installer.progress?.fraction ?? 0)
+                .progressViewStyle(.circular)
+                .controlSize(.small)
+        }
+        .help(state.downloadStatus ?? "")
+        .accessibilityLabel("Download")
+        .accessibilityValue(state.downloadStatus ?? "")
+    }
+}
+
+/// Opens a coding agent on the running model.
 struct AgentsMenu: View {
-    @Environment(AppState.self) private var state
-
     var body: some View {
-        Menu("Coding Agents", systemImage: "terminal") {
-            ForEach(Agent.allCases) { agent in
-                Button("\(agent.title)…") {
-                    agent.open(runtime: state.runtime, port: state.server.settings.port)
-                }
-            }
+        Menu {
+            AgentMenuItems()
+        } label: {
+            Label("Coding Agents", systemImage: "terminal")
         }
-        .help("Open a coding agent on this model in Terminal")
-        .disabled(state.server.phase != .ready)
-    }
-}
-
-/// The chat page once the model is ready; until then, what the start is doing.
-struct ChatPane: View {
-    @Environment(AppState.self) private var state
-
-    var body: some View {
-        let server = state.server
-        let name = server.model.map(state.catalog.name(of:)) ?? ""
-        switch server.phase {
-        case .ready:
-            ChatWebView(url: server.settings.url, generation: server.generation)
-        case .starting:
-            StatusPanel(title: "Starting \(name)", detail: server.latest, progress: true) {
-                Button("Cancel") { server.stop() }
-            }
-        case .stopping:
-            StatusPanel(title: "Stopping \(name)", detail: "Freeing the model’s memory…", progress: true) {}
-        case .failed(let message):
-            StatusPanel(title: "\(name) stopped", detail: message, systemImage: "exclamationmark.triangle") {
-                Button("Show Log") { NSWorkspace.shared.open(Server.log) }
-                Button("Choose Another Model") { state.tab = .models }
-                if let model = server.model {
-                    Button("Try Again") { state.start(model) }.keyboardShortcut(.defaultAction)
-                }
-            }
-        case .stopped:
-            StatusPanel(title: "No model running", detail: "Start a model to chat with it here.",
-                        systemImage: "bolt") {
-                Button("Choose a Model") { state.tab = .models }.keyboardShortcut(.defaultAction)
-            }
-        }
-    }
-}
-
-/// A centred title, detail line and actions, with a spinner or a symbol above.
-struct StatusPanel<Actions: View>: View {
-    let title: String
-    let detail: String
-    var progress = false
-    var systemImage: String?
-    @ViewBuilder let actions: Actions
-
-    var body: some View {
-        VStack(spacing: 14) {
-            if progress {
-                ProgressView().controlSize(.large)
-            } else if let systemImage {
-                Image(systemName: systemImage).font(.system(size: 40)).foregroundStyle(.secondary)
-            }
-            Text(title).font(.title2.weight(.semibold))
-            Text(detail)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .lineLimit(6)
-                .textSelection(.enabled)
-                .frame(maxWidth: 560)
-            HStack { actions }.padding(.top, 6)
-        }
-        .padding(40)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .help("Open a coding agent in Terminal, connected to this model")
     }
 }
 
 enum Format {
-    static func tokens(_ count: Int) -> String {
-        count >= 1024 && count % 1024 == 0 ? "\(count / 1024)K" : count.formatted()
+    /// Decimal units, as Finder counts: 120 MB, 6.7 GB, 21 GB. Whole GB from 10 GB up, so a
+    /// model's size reads the same everywhere.
+    static func size(_ bytes: Int64) -> String {
+        let gigabytes = Double(bytes) / 1e9
+        guard gigabytes >= 1 else { return bytes.formatted(.byteCount(style: .file)) }
+        return "\(gigabytes.formatted(.number.precision(.fractionLength(gigabytes < 10 ? 1 : 0)))) GB"
     }
 
-    static func bytes(_ count: Int64) -> String {
-        count.formatted(.byteCount(style: .file))
-    }
+    static func gigabytes(_ count: Int) -> Int64 { Int64(count) * 1_000_000_000 }
 }

@@ -43,11 +43,12 @@ struct Runtime: Sendable {
     }
 
     /// The environment of the programs the app runs: the app's own (an app does not get the shell's),
-    /// kept from writing bytecode and from the user's site-packages in the programs Python starts.
+    /// kept from the user's site-packages in the programs Python starts, and without an API key the
+    /// server would require of the app. Run with -B, the launcher keeps them from writing bytecode.
     var environment: [String: String] {
         var environment = ProcessInfo.processInfo.environment
-        environment["PYTHONDONTWRITEBYTECODE"] = "1"
         environment["PYTHONNOUSERSITE"] = "1"
+        environment.removeValue(forKey: "SPLASH_API_KEY")
         environment.removeValue(forKey: "SPLASH_RUNTIME")
         return environment
     }
@@ -55,7 +56,7 @@ struct Runtime: Sendable {
     /// The models installed here: each selection link's assembly record names its model.
     func installedModels() -> [InstalledModel] {
         struct Record: Decodable {
-            struct File: Decodable { let bytes: Int64 }
+            struct File: Decodable { let path: String; let bytes: Int64 }
             let model: String
             let files: [String: File]
         }
@@ -67,7 +68,9 @@ struct Runtime: Sendable {
                 guard let data = try? Data(contentsOf: link.appending(path: "model.json")),
                       let record = try? JSONDecoder().decode(Record.self, from: data)
                 else { return nil }
-                return InstalledModel(id: record.model, bytes: record.files.values.reduce(0) { $0 + $1.bytes })
+                // An assembly can link one file under two names (a checkpoint's vision tower).
+                let files = Dictionary(record.files.values.map { ($0.path, $0.bytes) }) { first, _ in first }
+                return InstalledModel(id: record.model, bytes: files.values.reduce(0, +))
             }
             .sorted { $0.id < $1.id }
     }

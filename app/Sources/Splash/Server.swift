@@ -14,24 +14,19 @@ final class Server {
     private(set) var phase = Phase.stopped
     /// The model starting, served or last failed.
     private(set) var model: String?
+    /// The model to start once the one stopping has stopped.
+    private(set) var next: String?
     private(set) var settings = ServeSettings()
-    /// The latest line the server printed, which tells what a start is doing.
-    private(set) var latest = ""
-    /// Once ready: the context window the engine sized.
-    private(set) var contextTokens: Int?
     /// Once ready: whether the engine has given the weights back while idle.
     private(set) var asleep = false
-    /// Once ready: requests being answered.
-    private(set) var activeRequests = 0
-    /// Counts the starts that reached Ready, so the chat page reloads for each.
-    private(set) var generation = 0
+    /// Once ready: whether the model takes images.
+    private(set) var acceptsImages = false
 
     static let log = URL.libraryDirectory.appending(path: "Logs/Splash/server.log")
 
     private let runtime: Runtime
     private var child: ChildProcess?
     private var tail: LogTail?
-    private var next: String?
     private var stopRequested = false
     private var firstError: String?
     private var watch: Task<Void, Never>?
@@ -71,6 +66,12 @@ final class Server {
         }
     }
 
+    /// Clears a failure the user has read, stopping a server that still runs but serves nothing.
+    func dismissFailure() {
+        guard case .failed = phase else { return }
+        if child != nil { stop() } else { phase = .stopped }
+    }
+
     /// Stops the server this app started before it quit or crashed, if it still serves, and waits
     /// until it has given its port and memory back.
     func stopLeftover() async {
@@ -79,26 +80,24 @@ final class Server {
         let port = defaults.integer(forKey: Preference.serverPort)
         defaults.removeObject(forKey: Preference.serverPID)
         guard pid > 0, runtime.serveLockOwner(port: port) == pid, runtime.runsPython(pid) else { return }
-        killpg(pid, SIGINT)
-        for tick in 1...300 where kill(pid, 0) == 0 {
-            if tick == 200 { killpg(pid, SIGKILL) }
-            try? await Task.sleep(for: .milliseconds(100))
-        }
+        await stopProcessGroup(pid)
     }
 
     private func launch(_ model: String) {
         self.model = model
         settings = .current()
-        phase = .starting
-        latest = "Starting \(model)…"
-        firstError = nil
-        contextTokens = nil
         asleep = false
-        activeRequests = 0
+        acceptsImages = false
+        firstError = nil
         stopRequested = false
-        UserDefaults.standard.set(model, forKey: Preference.lastModel)
-        UserDefaults.standard.set(false, forKey: Preference.lastModelServed)
         resetLog(Self.log)
+        if let option = settings.reservedOption {
+            return refuse("The server options in Settings can’t include \(option): Splash sets it itself.")
+        }
+        if portInUse(settings.port) {
+            return refuse("Port \(settings.port) is in use by another app. Choose another port in Settings › Advanced.")
+        }
+        phase = .starting
         do {
             child = try ChildProcess(
                 command: runtime.command(settings.serveArguments(model: model)),
@@ -107,7 +106,7 @@ final class Server {
                 exited: { [weak self] in self?.exited($0) }
             )
         } catch {
-            phase = .failed("Splash could not start: \(error.localizedDescription)")
+            phase = .failed("Splash couldn’t start it: \(error.localizedDescription)")
             return
         }
         tail = LogTail(Self.log) { [weak self] in self?.received($0) }
@@ -117,8 +116,13 @@ final class Server {
         watch = Task { [weak self] in await self?.follow(pid) }
     }
 
+    /// Fails a start before it runs anything, saying why in the log too.
+    private func refuse(_ message: String) {
+        try? Data((message + "\n").utf8).write(to: Self.log)
+        phase = .failed(message)
+    }
+
     private func received(_ line: String) {
-        latest = line
         // Why a start fails; once serving, error lines are about requests.
         if phase == .starting, firstError == nil { firstError = errorMessage(line) }
     }
@@ -134,10 +138,10 @@ final class Server {
             launch(model)
         } else if stopRequested {
             phase = .stopped
-        } else if phase == .starting, let firstError {
-            phase = .failed(firstError)
+        } else if phase == .starting, let firstError, let model {
+            phase = .failed(plainProblem(firstError, model: model))
         } else {
-            phase = .failed("Splash stopped unexpectedly (exit status \(status)); its log tells why.")
+            phase = .failed("It stopped unexpectedly. The log has the details.")
         }
     }
 
@@ -149,10 +153,12 @@ final class Server {
             if runtime.serveLockOwner(port: settings.port) == pid,
                let (_, response) = try? await URLSession.shared.data(from: health),
                (response as? HTTPURLResponse)?.statusCode == 200,
-               !Task.isCancelled, phase == .starting {
+               !Task.isCancelled, phase == .starting, let model {
                 phase = .ready
-                generation += 1
-                UserDefaults.standard.set(true, forKey: Preference.lastModelServed)
+                // The model to start when Splash next opens, until the user stops it.
+                UserDefaults.standard.set(model, forKey: Preference.lastModel)
+                UserDefaults.standard.set(true, forKey: Preference.resume)
+                acceptsImages = await inputModalities().contains("image")
                 break
             }
             try? await Task.sleep(for: .milliseconds(500))
@@ -165,26 +171,30 @@ final class Server {
     }
 
     private func apply(_ status: Status) {
-        contextTokens = status.maximum_context_tokens ?? contextTokens
         asleep = status.weights?.released ?? false
-        activeRequests = status.http?.requests?.active ?? 0
         if status.transport?.stopped == true {
             // The engine failed again and again; the server stays up but serves nothing.
-            phase = .failed(status.transport?.error ?? "The model stopped after repeated failures.")
+            phase = .failed(status.transport?.error ?? "It stopped after failing repeatedly.")
         }
     }
 
     private struct Status: Decodable {
         struct Weights: Decodable { let released: Bool? }
         struct Transport: Decodable { let stopped: Bool?; let error: String? }
-        struct HTTP: Decodable {
-            struct Requests: Decodable { let active: Int? }
-            let requests: Requests?
-        }
-        let maximum_context_tokens: Int?
         let weights: Weights?
         let transport: Transport?
-        let http: HTTP?
+    }
+
+    /// What the served model takes: text, and images and PDFs with vision.
+    private func inputModalities() async -> [String] {
+        struct Models: Decodable {
+            struct Model: Decodable { let input_modalities: [String]? }
+            let data: [Model]
+        }
+        guard let (data, _) = try? await URLSession.shared.data(from: settings.url.appending(path: "v1/models")),
+              let models = try? JSONDecoder().decode(Models.self, from: data)
+        else { return [] }
+        return models.data.first?.input_modalities ?? []
     }
 
     private func status() async -> Status? {

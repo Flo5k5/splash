@@ -53,6 +53,7 @@ class PackageAppTests(unittest.TestCase):
                 "CFBundleShortVersionString": "1.4.1",
                 "CFBundleVersion": "1505",
                 "CFBundleIconFile": "AppIcon",
+                "CFBundleIconName": "AppIcon",
                 "LSMinimumSystemVersion": "26.4",
                 "LSApplicationCategoryType": "public.app-category.developer-tools",
                 "NSHighResolutionCapable": True,
@@ -85,6 +86,54 @@ class PackageAppTests(unittest.TestCase):
             (root / "lib/empty").write_bytes(b"")
             (root / "lib/folder.so").mkdir()
             self.assertEqual(package_app.mach_o_files(root), sorted(binaries))
+
+    def compile_icon(self, stdout, written=(), returncode=0):
+        """Run compile_icon with actool printing stdout, writing the files
+        written and exiting with returncode."""
+        with tempfile.TemporaryDirectory() as temporary:
+            resources = Path(temporary)
+
+            def actool(command, **options):
+                self.assertEqual(options, {"stdout": subprocess.PIPE})
+                for name in written:
+                    (resources / name).touch()
+                return subprocess.CompletedProcess(command, returncode, stdout)
+
+            with mock.patch.object(package_app.subprocess, "run", side_effect=actool):
+                package_app.compile_icon(resources, "26.4")
+
+    def test_an_icon_actool_fails_to_compile_stops_the_build(self):
+        compiled = {"com.apple.actool.compilation-results": {"output-files": []}}
+        # As actool reports a missing .icon, exiting 0 or not.
+        failed = {
+            **compiled,
+            "com.apple.actool.errors": [
+                {"description": "Icon export exited with status 255, signal 0"},
+                {"description": "Failed to create a catalog"},
+            ],
+        }
+        for returncode in (0, 1):
+            with (
+                self.subTest(returncode=returncode),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "^actool: Icon export exited with status 255, signal 0; "
+                    "Failed to create a catalog$",
+                ),
+            ):
+                self.compile_icon(plistlib.dumps(failed), returncode=returncode)
+        # Without errors, as when --app-icon does not name the .icon, it must
+        # still have written both files.
+        for written in ((), ("Assets.car",), ("AppIcon.icns",)):
+            with (
+                self.subTest(written=written),
+                self.assertRaisesRegex(RuntimeError, "actool wrote no "),
+            ):
+                self.compile_icon(plistlib.dumps(compiled), written)
+        self.compile_icon(plistlib.dumps(compiled), ("Assets.car", "AppIcon.icns"))
+        # xcrun prints nothing on stdout when it finds no actool.
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.compile_icon(b"", returncode=72)
 
     def signing_commands(self, identity):
         """The commands sign runs for a runtime of three Mach-O files, a link

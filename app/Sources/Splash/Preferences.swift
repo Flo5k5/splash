@@ -7,14 +7,17 @@ enum Preference {
     static let idleRelease = "idleRelease"
     static let serveOptions = "serveOptions"
     static let startOnOpen = "startOnOpen"
-    /// The model last started, and whether it reached Ready: only such a model starts on open.
+    /// The last model that reached Ready, and whether it ran until the app quit rather than until
+    /// the user stopped it: such a model starts when Splash opens.
     static let lastModel = "lastModel"
-    static let lastModelServed = "lastModelServed"
+    static let resume = "resume"
     static let agentFolder = "agentFolder"
-    /// The server the app runs, kept until it exits, to stop it on the next launch should the app
-    /// quit without stopping it.
+    static let effort = "effort"
+    /// The server and the download the app runs, kept until they exit, to stop them on the next
+    /// launch should the app quit without stopping them.
     static let serverPID = "serverPID"
     static let serverPort = "serverPort"
+    static let installerPID = "installerPID"
 
     static let defaultPort = 8000
 
@@ -36,8 +39,8 @@ enum IdleRelease: String, CaseIterable, Identifiable {
     var id: String { rawValue }
     var title: String {
         switch self {
-        case .tenMinutes: "After 10 minutes"
-        case .oneHour: "After 1 hour"
+        case .tenMinutes: "After 10 Minutes"
+        case .oneHour: "After 1 Hour"
         case .never: "Never"
         }
     }
@@ -60,13 +63,20 @@ struct ServeSettings: Equatable {
         )
     }
 
+    /// An option of `options` the app sets itself: the server would then not be the one it waits
+    /// for and shows.
+    var reservedOption: String? {
+        options.split(whereSeparator: \.isWhitespace).lazy.map { String($0.prefix { $0 != "=" }) }
+            .first { ["--port", "--model", "--host", "--api-key"].contains($0) }
+    }
+
     func serveArguments(model: String) -> [String] {
         var arguments = ["serve", "--model", model, "--port", String(port), "--offline"]
         if idleRelease != .tenMinutes { arguments += ["--idle-release", idleRelease.rawValue] }
         return arguments + options.split(whereSeparator: \.isWhitespace).map(String.init)
     }
 
-    /// The server's address. Always the loopback address and this port, so the chat page keeps one
-    /// origin, and with it its saved chats.
+    /// The server's address: it listens on the loopback address, where the app's chat, health and
+    /// status requests go.
     var url: URL { URL(string: "http://127.0.0.1:\(port)")! }
 }

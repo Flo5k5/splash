@@ -36,8 +36,6 @@ IDENTIFIERS = {
     "python/bin/python3": f"{BUNDLE_ID}.python",
     "engine/splash": f"{BUNDLE_ID}.engine",
 }
-# The iconset's sizes, each rendered at 1x and 2x (iconutil).
-ICON_SIZES = (16, 32, 128, 256, 512)
 
 
 def short_version(version):
@@ -72,10 +70,12 @@ def info_plist(version, build, macos_min):
         "CFBundleShortVersionString": short_version(version),
         "CFBundleVersion": build,
         "CFBundleIconFile": "AppIcon",
+        "CFBundleIconName": "AppIcon",
         "LSMinimumSystemVersion": macos_min,
         "LSApplicationCategoryType": "public.app-category.developer-tools",
         "NSHighResolutionCapable": True,
-        # The chat page and the API are the app's own server on 127.0.0.1.
+        # The app's chat, health and status requests go to its own server,
+        # over plain HTTP on 127.0.0.1.
         "NSAppTransportSecurity": {"NSAllowsLocalNetworking": True},
         "NSHumanReadableCopyright": "Copyright © Inco AI",
     }
@@ -114,22 +114,31 @@ def build_executable():
     return Path(products) / "Splash"
 
 
-def render_icon(svg, icns):
+def compile_icon(resources, macos_min):
+    """Compile app/AppIcon.icon, an Icon Composer icon, into resources: the
+    Assets.car macOS 26 draws it from, with its dark, tinted and clear
+    appearances, and AppIcon.icns for older readers of CFBundleIconFile.
+    actool prints its errors only on stdout, in a property list, and can
+    exit 0 having written neither file, as when --app-icon does not name
+    the .icon."""
     with tempfile.TemporaryDirectory() as temporary:
-        iconset = Path(temporary) / "AppIcon.iconset"
-        iconset.mkdir()
-        for size in ICON_SIZES:
-            for scale, suffix in ((1, ""), (2, "@2x")):
-                pixels = str(size * scale)
-                subprocess.run(
-                    ["sips", "-s", "format", "png", "-z", pixels, pixels, str(svg)]
-                    + ["--out", str(iconset / f"icon_{size}x{size}{suffix}.png")],
-                    check=True,
-                    stdout=subprocess.DEVNULL,
-                )
-        subprocess.run(
-            ["iconutil", "-c", "icns", str(iconset), "-o", str(icns)], check=True
+        compiled = subprocess.run(
+            ["xcrun", "actool", str(ROOT / "app/AppIcon.icon")]
+            + ["--compile", str(resources), "--platform", "macosx"]
+            + ["--minimum-deployment-target", macos_min, "--app-icon", "AppIcon"]
+            + ["--output-partial-info-plist", str(Path(temporary) / "icon.plist")],
+            stdout=subprocess.PIPE,
         )
+    results = plistlib.loads(compiled.stdout) if compiled.stdout else {}
+    errors = results.get("com.apple.actool.errors", [])
+    if errors:
+        raise RuntimeError(
+            "actool: " + "; ".join(error["description"] for error in errors)
+        )
+    compiled.check_returncode()
+    for name in ("Assets.car", "AppIcon.icns"):
+        if not (resources / name).is_file():
+            raise RuntimeError(f"actool wrote no {name} into {resources}")
 
 
 def assemble(app, executable, version, macos_min):
@@ -143,7 +152,7 @@ def assemble(app, executable, version, macos_min):
         plistlib.dump(info_plist(version, build_number(), macos_min), stream)
     runtime = contents / "Resources/splash"
     runtime.mkdir(parents=True)
-    render_icon(ROOT / "app/AppIcon.svg", contents / "Resources/AppIcon.icns")
+    compile_icon(contents / "Resources", macos_min)
     package.build_runtime(runtime, version)
 
 
