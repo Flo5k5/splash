@@ -42,17 +42,26 @@ def suggested():
 
 
 def candidates(name, files, suggested_models):
-    """The model IDs repository name's cached files may install as: the
-    suggested ones of the repository; else each GGUF target by the variant
-    upstream.select_gguf takes it by, its root files' names past the words
-    they share, or its split parts' folder; else the repository itself, one
-    GGUF, an MLX model, or files the installer refuses."""
+    """The model IDs repository name's cached files may install as, one for
+    each GGUF target they hold whole: the first of its suggested IDs that
+    selects it from them (upstream.select_gguf), or else its own, if that
+    does: its split parts' folder, or its root file's name past the words
+    it starts with of the model the repository is named for (the name
+    without -GGUF), and past its first at least. Repositories name their
+    files MODEL-VARIANT.gguf, so that ID selects the same file from the
+    Hub's listing of all of them. Without any, the repository itself: an
+    MLX model, or files the installer refuses."""
     from . import upstream
 
-    if name in suggested_models:
-        return suggested_models[name]
-    targets = [n for n in upstream.root_ggufs(files) if not upstream.projector_named(n)]
-    folders = sorted(
+    def selected(model_id):
+        try:
+            return upstream.select_gguf(files, models.split_model_id(model_id)[1])[0]
+        except models.ModelError:
+            return None
+
+    model = name.split("/")[1].lower().removesuffix("-gguf").split("-")
+    targets = []
+    for folder in sorted(
         {
             n.split("/")[0]
             for n in files
@@ -60,12 +69,23 @@ def candidates(name, files, suggested_models):
             and n.endswith(".gguf")
             and not upstream.projector_named(n)
         }
-    )
-    ids = [f"{name}:{folder}" for folder in folders]
-    if len(targets) > 1:
-        parts = [Path(n).stem.split("-") for n in targets]
-        shared = len(os.path.commonprefix(parts))
-        ids += [f"{name}:{'-'.join(words[shared:])}" for words in parts]
+    ):
+        try:
+            targets.append((f"{name}:{folder}", upstream.split_gguf(files, folder)))
+        except models.ModelError:
+            pass  # not a whole split GGUF
+    for file in upstream.root_ggufs(files):
+        if not upstream.projector_named(file):
+            words = Path(file).stem.split("-")
+            shared = os.path.commonprefix([[w.lower() for w in words], model])
+            variant = "-".join(words[max(len(shared), 1) :])
+            targets.append((f"{name}:{variant}" if variant else name, [file]))
+    ids = []
+    for own, target in targets:
+        for model_id in (*suggested_models.get(name, ()), own):
+            if selected(model_id) == target:
+                ids.append(model_id)
+                break
     return ids or [name]
 
 

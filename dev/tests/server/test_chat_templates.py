@@ -429,8 +429,10 @@ class ChatTemplateProbeTests(unittest.TestCase):
     def test_reasoning_names_the_efforts_a_template_tells_apart(self):
         """Qwen3.8's templates tell three efforts apart, the others rendering
         as their aliases, and reason at xhigh by default; Qwen3.6's reason or
-        not, at any effort; a template without reasoning tells none apart.
-        The server's own default effort stands in for the template's."""
+        not, at any effort; a template without reasoning tells none apart,
+        and one that rejects an effort without an alias it renders leaves
+        that effort out. The server's own default effort stands in for the
+        template's, named by the effort it renders like."""
         levels = {
             "thinks": True,
             "efforts": ["low", "medium", "xhigh"],
@@ -454,9 +456,22 @@ class ChatTemplateProbeTests(unittest.TestCase):
             ChatTemplates(chat_tokenizer(plain)).select(None).reasoning,
             {"thinks": False, "efforts": [], "default": None},
         )
+        rejecting = (
+            "{% set effort = reasoning_effort | default('high') %}"
+            "{% if effort not in ('none', 'low', 'high') %}"
+            "{{ raise_exception('Unsupported effort ' + effort) }}{% endif %}"
+            "{% for m in messages %}{{ m.content }}{% endfor %}"
+            "{% if add_generation_prompt %}<|im_start|>assistant\n"
+            "{% if effort != 'none' %}<think>{{ effort }}{% endif %}{% endif %}"
+        )
+        self.assertEqual(
+            ChatTemplates(chat_tokenizer(rejecting)).select(None).reasoning,
+            {"thinks": True, "efforts": ["low", "high"], "default": "high"},
+        )
         for effort, reasoning in (
             ("medium", {**levels, "default": "medium"}),
-            ("high", {**levels, "default": None}),
+            ("high", {**levels, "default": "xhigh"}),
+            ("minimal", {**levels, "default": "low"}),
             ("none", {**levels, "thinks": False, "default": None}),
         ):
             with self.subTest(effort=effort):

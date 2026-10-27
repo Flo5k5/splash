@@ -3,6 +3,7 @@ import dataclasses
 import fcntl
 import io
 import json
+import signal
 import tempfile
 import unittest
 from pathlib import Path
@@ -510,13 +511,43 @@ class LocalModelTest(unittest.TestCase):
                 snapshot / "model-Q4_K_M.gguf", mmproj=snapshot / "mmproj-F32.gguf"
             )
 
-        # The installation downloaded its draft by commit, which records no
-        # branch: the family's draft is the one the installation pinned.
+        # The installation recorded the commit of its draft's default branch,
+        # as a download of the branch does: the family's draft is that one.
         prepared = assembly.verify(prepare())
         self.assertEqual((fake.requests, fake.downloads), (requests, downloads))
         for key in ("family", "target_format", "vision_format", "metadata", "files"):
             self.assertEqual(prepared[key], installed[key], key)
         self.assertEqual(prepared["sources"]["draft"], installed["sources"]["draft"])
+
+    def test_the_command_line_prints_the_directory_or_ends_quietly_when_stopped(self):
+        def prepare(*args, **options):
+            print("Preparing")
+            return self.root / "prepared"
+
+        def run(prepare):
+            with (
+                mock.patch.object(local, "prepare_local_model", side_effect=prepare),
+                contextlib.redirect_stdout(io.StringIO()) as output,
+                contextlib.redirect_stderr(io.StringIO()) as errors,
+            ):
+                status = local.main([str(self.root / "m.gguf")])
+            return status, output.getvalue(), errors.getvalue()
+
+        self.assertEqual(
+            run(prepare), (0, f"{self.root / 'prepared'}\n", "Preparing\n")
+        )
+        # Ctrl+C, or a stop signal the launcher's block held from its start.
+        self.assertEqual(run(KeyboardInterrupt), (130, "", ""))
+        for number in (signal.SIGINT, signal.SIGTERM):
+            self.addCleanup(signal.signal, number, signal.getsignal(number))
+        self.addCleanup(
+            signal.pthread_sigmask,
+            signal.SIG_SETMASK,
+            signal.pthread_sigmask(signal.SIG_BLOCK, (signal.SIGINT,)),
+        )
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+        signal.raise_signal(signal.SIGINT)
+        self.assertEqual(run(prepare), (130, "", ""))
 
 
 if __name__ == "__main__":

@@ -64,9 +64,8 @@ def prepare_local_model(
     draft: the directory of a DFlash2 draft (config.json and safetensors
     weights) trained for the target's family. Without one, the draft
     released for the family is taken from the Hugging Face cache
-    (HF_HUB_CACHE), at the commit a download of its default branch, such as
-    `hf download REPO`, last recorded there, or else, where none is, the one
-    `splash serve` last installed, which downloads by commit.
+    (HF_HUB_CACHE), at the commit last recorded there for its default
+    branch, as `hf download REPO` and `splash serve` record it.
     mmproj: a GGUF target's vision projector, a GGUF file, with which it
     serves images; a GGUF target serves text only without one, as one of a
     family without a vision tower (Flint) always does. An MLX target's
@@ -284,9 +283,10 @@ def main(argv=None):
     parser.add_argument("--language-only", action="store_true")
     parser.add_argument("--models", type=Path, default=paths.MODELS)
     args = parser.parse_args(argv)
-    # The launcher starts this with the stop signals blocked; they arrive here.
-    signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGINT, signal.SIGTERM))
     try:
+        # The launcher starts this with the stop signals blocked, so that one
+        # sent while it starts is not lost; it arrives here.
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGINT, signal.SIGTERM))
         with contextlib.redirect_stdout(sys.stderr):
             directory = prepare_local_model(
                 args.target,
@@ -298,6 +298,8 @@ def main(argv=None):
     except (ModelError, OSError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
+    except KeyboardInterrupt:
+        return 130
     print(directory)
     return 0
 

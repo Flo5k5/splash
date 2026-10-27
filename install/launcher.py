@@ -151,7 +151,7 @@ def _ensure_installed(selection):
 def _prepare_local(args):
     """The directory the server loads for the files on this Mac args.model
     names (install/local.py), and the name the API reports for it: local/
-    and the file's or folder's name."""
+    and the file's or folder's name, made one the server's --model takes."""
     if args.revision is not None:
         raise LauncherError("--revision names a commit of a Hub model, not local files")
     if args.draft_model is not None and not Path(args.draft_model).is_absolute():
@@ -168,15 +168,32 @@ def _prepare_local(args):
         output.seek(0)
         directory = output.read().strip()
     stem = Path(args.model).name.removesuffix(".gguf")
-    name = re.sub(r"[^A-Za-z0-9._-]+", "-", stem).strip("-._") or "model"
+    # A repository name (serve_options.check_repo_id): each run of other
+    # characters than letters, digits and '_' becomes one '-', unless it is
+    # a single '.' or '-'; neither begins or ends the name, of at most 96
+    # characters, nor does '.git' end it.
+    name = re.sub(r"[^A-Za-z0-9_]{2,}|[^A-Za-z0-9_.-]", "-", stem)
+    name = re.sub(r"(\.git)+$", "", name.strip("-.")[:96].rstrip("-.")) or "model"
     return directory, f"local/{name}"
 
 
 def parse_model(value):
     """--model: a Hub model ID, or the absolute path of model files on this
-    Mac, which install/local.py prepares."""
+    Mac, which install/local.py prepares. A relative path to files is
+    refused, not taken for a Hub ID: the Hub would be asked for a repository
+    of that name, which anyone may own."""
     if value.startswith(("/", "~")):
-        return str(Path(value).expanduser())
+        try:
+            return str(Path(value).expanduser())
+        except RuntimeError:
+            raise argparse.ArgumentTypeError(
+                f"cannot find the home directory of {value.split('/')[0]}"
+            ) from None
+    if os.path.lexists(value):
+        raise argparse.ArgumentTypeError(
+            f"{value} names files in the working directory; give their absolute "
+            "path, or run from another directory for the Hub model"
+        )
     return serve_options.parse_model_id(value)
 
 

@@ -4,7 +4,9 @@ A source is one repository at one commit (Repository): listed by the Hub,
 read from that commit's snapshot in the Hub cache, or local files. An
 installation pins every snapshot it links with a ref of its
 own, refs/splash/<installation>/<commit>, so neither pruning the cache nor
-another installation can remove its files.
+another installation can remove its files. The commit the Hub names for a
+default branch is recorded as refs/main, as huggingface_hub records a branch
+it downloads, for installs without the Hub.
 
 huggingface_hub is imported where it is used: the launcher imports the
 installer modules before the environment that provides it exists, and the
@@ -153,18 +155,8 @@ def pin(path: Path, repo_id: str, installation: Path) -> Path:
         if existing != commit:
             raise models.ModelError(f"invalid installed snapshot reference: {ref}")
         return ref
-    ref.parent.mkdir(parents=True, exist_ok=True)
-    # A pin's content is its own name, so writers never disagree: publish it by
-    # rename, which file systems without hard links (exFAT) support too.
-    with tempfile.NamedTemporaryFile(dir=ref.parent, delete=False) as temporary:
-        pending = Path(temporary.name)
-        try:
-            temporary.write(commit.encode())
-            temporary.flush()
-            os.fsync(temporary.fileno())
-            os.replace(pending, ref)
-        finally:
-            pending.unlink(missing_ok=True)
+    # A pin's content is its own name, so writers never disagree.
+    _publish(ref, commit)
     return ref
 
 
@@ -219,8 +211,12 @@ class Repository:
         *,
         sizes=None,
         unreachable_reason=None,
+        default_branch=False,
     ):
         self.name, self.revision, self.files = name, revision, files
+        # Whether revision is the commit the Hub named for the default
+        # branch, which a download records (_record_default_branch).
+        self.default_branch = default_branch
         # Each file's local path, for a cached snapshot or local files.
         self.paths = paths
         # Hub filename -> (bytes, blob ID), to report what a download fetches.
@@ -275,13 +271,16 @@ class Repository:
         files, wherever HF_HUB_CACHE points now. A commit revision never
         moves and HF_HUB_OFFLINE forbids requests, so with installed either
         returns that commit, unlisted, without a request or a look at the
-        Hub cache. Otherwise one request resolves revision. When the Hub
-        cannot answer, installed stands in the same way, with the reason in
-        unreachable_reason; without it, the cached snapshot of a commit this
-        selection already names does (_cached_commits). unreachable, why the
-        Hub did not answer for another repository this start, stands for its
-        answer without a request. A different revision is never
-        substituted."""
+        Hub cache. Otherwise one request resolves revision, and the commit
+        it names for the default branch is recorded in the Hub cache once
+        the cache holds it, now or when a download of it ends
+        (_record_default_branch). When the Hub cannot answer, installed
+        stands in the same way, with the reason in unreachable_reason;
+        without it, the cached snapshot of a commit this selection already
+        names, or the cache records for revision, does (_cached_commits).
+        unreachable, why the Hub did not answer for another repository this
+        start, stands for its answer without a request. A different revision
+        is never substituted."""
         import httpx
         from huggingface_hub import HfApi, constants
 
@@ -308,6 +307,8 @@ class Repository:
                     raise models.ModelError(
                         f"the Hub did not resolve {name} to a commit"
                     )
+                if revision is None:
+                    _record_default_branch(name, info.sha)
                 return cls(
                     name,
                     info.sha,
@@ -320,6 +321,7 @@ class Repository:
                         for item in info.siblings
                         if item.size is not None
                     },
+                    default_branch=revision is None,
                 )
         if installed:
             return cls(name, installed, frozenset(), unreachable_reason=why)
@@ -404,6 +406,8 @@ class Repository:
                     max_workers=4,
                 )
             )
+        if self.default_branch:
+            _record_default_branch(self.name, self.revision)
         return {name: path / name for name in names}
 
     def identity(self):
@@ -423,12 +427,13 @@ def _cached_commits(name, revision, installation):
     """The commits of name whose cached snapshots may stand in for revision
     without the Hub, most specific first: revision itself when it is a
     commit; the commit installation recorded, then the ones it pinned
-    (refs/splash); then the commit the cache recorded for the branch or tag;
-    for a default branch the cache records none of, the ones other
-    installations pinned, newest first, as another Splash, such as a source
-    checkout, installed them.
-    Splash downloads by commit, which never records a branch. The record is
-    read as it is: this is how a damaged installation is rebuilt."""
+    (refs/splash); then the commit the cache recorded for the branch or tag,
+    refs/main for the default branch. Splash downloads by commit, which
+    records no branch, so it records the default branch's commit itself
+    when the Hub names it (_record_default_branch). Other installations'
+    pins never stand in: a pin does not say which revision it was installed
+    for. The record is read as it is: this is how a damaged installation is
+    rebuilt."""
     if models.is_hex_digest(revision, 40):
         return [revision.lower()]
     commits = []
@@ -456,15 +461,47 @@ def _cached_commits(name, revision, installation):
             (folder(name) / "refs" / (revision or "main")).read_text().strip()
         )
     except OSError:
-        if revision is None:
-            pinned = (folder(name) / "refs" / "splash").glob("*/*")
-            commits += [
-                ref.name
-                for ref in sorted(
-                    pinned, key=lambda ref: ref.stat().st_mtime_ns, reverse=True
-                )
-            ]
+        pass
     return list(dict.fromkeys(c for c in commits if models.is_hex_digest(c, 40)))
+
+
+def _record_default_branch(name, commit):
+    """Record commit as name's default branch in the Hub cache, refs/main,
+    as huggingface_hub does when it downloads the branch, so that a new
+    selection of it installs without the Hub (_cached_commits): once the
+    cache holds the commit's snapshot, so a resolve whose download fails or
+    never runs leaves no record of what the cache lacks, and an
+    installation whose links name another cache's files records nothing
+    here. Only a record that changes is written, so a read-only cache that
+    holds it is left alone."""
+    if not snapshot(name, commit).is_dir():
+        return
+    ref = folder(name) / "refs" / "main"
+    try:
+        if not ref.is_file() or ref.read_text().strip() != commit:
+            _publish(ref, commit)
+    except OSError:
+        # A cache this process cannot write keeps no record; the resolve
+        # stands, and only a new selection of the branch needs the Hub then.
+        pass
+
+
+def _publish(path, content):
+    """Write content to path by rename, which file systems without hard links
+    (exFAT) support too, so a reader sees all of it or none."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as temporary:
+        pending = Path(temporary.name)
+        try:
+            # Readable by every account, as huggingface_hub writes its refs:
+            # a cache may be shared.
+            os.fchmod(temporary.fileno(), 0o644)
+            temporary.write(content.encode())
+            temporary.flush()
+            os.fsync(temporary.fileno())
+            os.replace(pending, path)
+        finally:
+            pending.unlink(missing_ok=True)
 
 
 def _remove_abandoned_downloads(blobs):

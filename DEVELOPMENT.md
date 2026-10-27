@@ -687,7 +687,8 @@ installed model starts, with a line naming the reason. Without the Hub, Splash
 rebuilds a missing or damaged installation from the files it downloaded
 before, for the same revision. It pins the commits it installs in the Hugging
 Face cache (`refs/splash`), so pruning the cache keeps an installed model's
-files. [Installation](#installation) gives the mechanics.
+files, and records there the commit of a default branch, as `hf download`
+does (`refs/main`). [Installation](#installation) gives the mechanics.
 
 ### Model cache
 
@@ -707,7 +708,7 @@ are not moved.
 | Path | Holds |
 | --- | --- |
 | `~/Library/Application Support/Splash` | The data directory of a packaged install: `models/`, the installed models' links into the Hugging Face cache and the metadata derived from GGUFs; `runtime/`, the locks of running servers; and `thinking.key`, which encrypts the Messages reasoning a response hides. A source checkout keeps the first two in `install/models` and `build/runtime`. |
-| Hugging Face cache (`HF_HUB_CACHE`, by default `~/.cache/huggingface/hub`) | Model and draft downloads, with Splash's pins under `refs/splash` ([revisions](#revisions)). |
+| Hugging Face cache (`HF_HUB_CACHE`, by default `~/.cache/huggingface/hub`) | Model and draft downloads, with Splash's pins under `refs/splash` and the commit of a default branch as `refs/main` ([revisions](#revisions)). |
 | `~/Library/Caches/Splash/prefix-cache` (`--cache-dir`) | The [persistent cache](#persistent-cache), with `--persistent-cache` only, within the [SSD cache](#ssd-cache)'s limit. Every start removes the caches there that nobody used for 14 days. |
 | `$TMPDIR/splash-cache-*` | The [SSD cache](#ssd-cache)'s files, on by default, without `--persistent-cache`, or when another process holds the persistent cache's directory or it cannot be used: one of KV pages and one of states, together at most about the SSD cache's limit: under `auto` a quarter of the volume's free space beyond its floor, up to 32 GiB, or the size `--max-cache-disk` sets while the volume keeps its floor. Each is unlinked as it is created, so no directory lists it and macOS's storage settings count it as System Data, and its space returns when the engine exits, even after a crash. `--cache-dir` does not move them; they follow `TMPDIR`. |
 | `~/Library/Logs/Splash/crash` | [Crash traces](#failures-and-crash-traces), with `SPLASH_CRASH_TRACE=1` only. |
@@ -765,13 +766,14 @@ splash serve --model mlx-community/Qwen3.8-27B-4bit --default-reasoning-effort n
 
 `/v1/models` reports, as `reasoning`, what efforts do to the model's default
 template, rendered as at startup: `thinks`, whether a request without an effort
-reasons; `efforts`, the efforts besides `none` that render differently, each
-named by the one of those rendering alike that no alias stands in for (`low`,
-`medium` and `xhigh` for Qwen3.8; none for Qwen3.6, whose template switches
-reasoning on and off alike at every effort); and `default`, the one of them a
-request without an effort renders like, `--default-reasoning-effort` in place
-of the template's. For Flint, whose model decides, `thinks` is `null` and
-`efforts` empty.
+reasons; `efforts`, the efforts besides `none` that the template renders, and
+differently, each named by the one of those rendering alike that no alias
+stands in for (`low`, `medium` and `xhigh` for Qwen3.8; none for Qwen3.6, whose
+template switches reasoning on and off alike at every effort); and `default`,
+the one of them a request without an effort renders like,
+`--default-reasoning-effort` in place of the template's (`xhigh` for `high` on
+Qwen3.8). For Flint, whose model decides, `thinks` is `null` and `efforts`
+empty.
 
 `/apply-template` uses the same default. Anthropic `thinking` keeps its protocol
 semantics (off when omitted) unless the request's `chat_template_kwargs` set
@@ -2199,16 +2201,20 @@ model's source options (`--revision`, `--draft-model`, `--language-only`,
 `splash serve --model PATH` does both for the files at the absolute PATH, with
 `--draft-model` a draft directory and `--language-only` as given: it prepares
 them with `python install/local.py PATH`, which prints the directory, and
-serves it as `local/NAME`, NAME being the file's or folder's name.
+serves it as `local/NAME`, NAME being the file's or folder's name without
+`.gguf`, made a repository name: each run of other characters than letters,
+digits and `_` becomes one `-`, unless it is a single `.` or `-`; neither
+begins or ends the name, of at most 96 characters, nor does `.git` end it
+(`model` when nothing is left). A relative path to files is refused rather
+than taken for a Hub ID.
 
 - `target`: a GGUF file, any part of a split GGUF naming all its parts,
   which lie beside it; or a directory whose root holds an MLX model or else
   a single GGUF target, whole or split, beside any projectors named `mmproj`.
 - `draft`: the directory of a DFlash2 draft ([Drafts](#drafts)). Without
   one, the family's released draft is taken from the Hugging Face cache, at
-  the commit a download of its default branch last recorded there, as
-  `hf download incoai/Qwen3.8-27B-DFlash2` does, or else, as `splash serve`
-  downloads by commit, which records none, the one an installation pinned.
+  the commit last recorded there for its default branch, as `hf download
+  incoai/Qwen3.8-27B-DFlash2` and `splash serve` record it.
 - `mmproj`: a GGUF target's vision projector ([Vision](#vision)); without
   one, a GGUF target serves text only, and a target of a family without a
   vision tower refuses one. An MLX target serves images with the tower in
@@ -2386,14 +2392,20 @@ never gains `__pycache__`.
 A missing assembly, or one that no longer verifies, is built again. Without the
 Hub it is built from a cached snapshot, of the commit the `--revision` names,
 or else the one the installation recorded or pinned, or one the Hub cache
-records for the branch, never of another revision; for a default branch the
-cache records no commit of, one another installation pinned, newest first, so
-that a model another Splash, such as a source checkout, downloaded installs
-here too. Only files downloaded
-before are available, which is enough to rebuild a damaged or deleted assembly.
-`install/cached.py` installs this way every model the Hub cache holds whole
-that Splash serves, leaving out what the installer refuses, for the Mac app to
-offer. The installer never rewrites upstream files.
+records for the branch, never of another revision. Splash downloads by
+commit, which records no branch, so when the Hub names the commit of a
+default branch, Splash records it as `refs/main`, as a download of the branch
+does, once the cache holds that commit, when the Hub names it or a download of
+it ends: a model another Splash, such as a source checkout, installed from the
+default branch installs here too. Another installation's pins never stand
+in, as a pin does not say which revision it was installed for. Only files
+downloaded before are available, which is enough to rebuild a damaged or
+deleted assembly. `install/cached.py` installs this way every model the Hub
+cache holds whole that Splash serves, leaving out what the installer refuses,
+for the Mac app to offer: a GGUF by the ID `install/suggested-models.tsv`
+gives it, or else by its split parts' folder or by its name past the model's,
+`MODEL-VARIANT.gguf` as `OWNER/MODEL-GGUF:VARIANT`, an ID that selects it from
+the Hub's listing too. The installer never rewrites upstream files.
 
 ### Weight loading
 

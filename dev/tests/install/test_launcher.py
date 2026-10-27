@@ -173,6 +173,27 @@ class LauncherTests(unittest.TestCase):
                 (served.model_root, served.model),
                 ("/prepared/model", "local/My-Model-UD-Q4_K_M"),
             )
+        # Any file or folder name makes one the server's --model takes.
+        for target, name in (
+            ("/models/Qwen3.8 27B - Q4_K_M.gguf", "Qwen3.8-27B-Q4_K_M"),
+            ("/models/model..v2", "model-v2"),
+            ("/models/" + "x" * 95 + "-y.gguf", "x" * 95),
+            ("/models/repo.git", "repo"),
+            ("/models/repo.git.git", "repo"),
+            ("/models/ - .gguf", "model"),
+        ):
+            with (
+                self.subTest(target=target),
+                tempfile.TemporaryDirectory() as temporary,
+                mock.patch.object(launcher, "RUNTIME_DIR", Path(temporary)),
+                mock.patch.object(launcher.socket, "socket"),
+                mock.patch.object(launcher, "_ensure_built"),
+                mock.patch.object(launcher, "_run_held", side_effect=prepared),
+                mock.patch.object(launcher.os, "execve") as execute,
+            ):
+                launcher.main(["serve", "--model", target])
+                served = api.parse_args(server_arguments(execute.call_args.args[1]))
+                self.assertEqual(served.model, "local/" + name)
         for options, message in (
             (["--revision", "v2"], "names a commit of a Hub model"),
             (["--draft-model", "owner/draft"], "takes a draft directory"),
@@ -190,6 +211,33 @@ class LauncherTests(unittest.TestCase):
                 )
                 self.assertIn(message, error.getvalue())
                 built.assert_not_called()
+
+    def test_a_model_is_a_hub_id_or_the_absolute_path_of_files(self):
+        with tempfile.TemporaryDirectory() as temporary, contextlib.chdir(temporary):
+            Path("Downloads").mkdir()
+            Path("Downloads/m.gguf").write_text("")
+            self.assertEqual(launcher.parse_model(MODEL_ID), MODEL_ID)
+            self.assertEqual(
+                launcher.parse_model("~/m.gguf"), str(Path.home() / "m.gguf")
+            )
+            # Relative files are never looked up on the Hub, and a ~user
+            # without a home directory is an argument error, not a crash.
+            for value, message in (
+                ("Downloads/m.gguf", "Downloads/m.gguf names files in the working"),
+                ("Downloads", "Downloads names files in the working directory"),
+                (
+                    "~no-such-user-9z/m.gguf",
+                    "cannot find the home directory of ~no-such",
+                ),
+            ):
+                with (
+                    self.subTest(value=value),
+                    mock.patch("sys.stderr", io.StringIO()) as error,
+                    self.assertRaises(SystemExit) as failed,
+                ):
+                    launcher.parse_args(["serve", "--model", value])
+                self.assertEqual(failed.exception.code, 2)
+                self.assertIn(f"argument --model: {message}", error.getvalue())
 
     def test_invalid_bind_address_fails_before_model_work(self):
         with (
@@ -549,8 +597,8 @@ class LauncherTests(unittest.TestCase):
                         launcher.parse_args([*arguments, "--port", value])
 
     def test_serve_refuses_abbreviated_options(self):
-        # The Mac app refuses a user's --port, --model, --host and --api-key,
-        # which it sets itself; an abbreviation of one would slip past it.
+        # serve takes its options by their full names, as the Mac app passes
+        # every one: an abbreviation would change meaning as options are added.
         for arguments in (
             ["--po", "9000"],
             ["--po=9000"],

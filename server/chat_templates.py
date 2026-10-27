@@ -165,8 +165,10 @@ class ChatTemplate:
     generation_prompts: dict
     # The same for other options, probed on first use.
     probe: Callable
-    # What the reasoning efforts do to a question's prompt (_reasoning).
+    # What the reasoning efforts do to a question's prompt, and the listed
+    # effort each renders like (_reasoning).
     reasoning: dict
+    effort_names: dict
 
     def accepts(self, messages):
         """Whether requests with these normalized messages are served: a
@@ -299,7 +301,7 @@ def _prepare(render, encode, source):
         original,
         _generation_prompts(render, encode, source),
         probe,
-        _reasoning(render, source),
+        *_reasoning(render, source),
     )
 
 
@@ -404,11 +406,12 @@ def _effort_options(effort):
 
 def _reasoning(render, source):
     """What the reasoning efforts do to a question's prompt, as /v1/models
-    reports it: whether a request that sends none thinks; the efforts besides
-    none that render differently, each named by the one of those rendering
-    alike that its alias does not stand in for, none where all render alike;
-    and the one a request that sends none renders like, None where it is none
-    of them."""
+    reports it, and each effort's name there. The report: whether a request
+    that sends none thinks; the efforts besides none that the template
+    renders, and differently, each named by the one of those rendering alike
+    that its alias does not stand in for, none where all render alike; and
+    the one a request that sends none renders like, None where it is none of
+    them. The names: each effort that renders like one of them -> that one."""
 
     def rendered(effort):
         options = _effort_options(effort)
@@ -420,21 +423,23 @@ def _reasoning(render, source):
     groups = {}
     for effort in REASONING_EFFORTS:
         if effort != "none":
-            groups.setdefault(rendered(effort), []).append(effort)
-    efforts = []
+            prompts = rendered(effort)
+            # An effort the template rejects renders no prompt (_outcome).
+            if all(isinstance(prompt, str) for prompt in prompts):
+                groups.setdefault(prompts, []).append(effort)
+    names = {}
     if len(groups) > 1:
         for group in groups.values():
-            efforts += [
-                effort
-                for effort in group
-                if REASONING_EFFORT_ALIASES.get(effort) not in group
-            ][:1]
+            name = next(
+                e for e in group if REASONING_EFFORT_ALIASES.get(e) not in group
+            )
+            names |= dict.fromkeys(group, name)
     default = rendered(None)
     return {
         "thinks": default != rendered("none"),
-        "efforts": efforts,
-        "default": next((e for e in efforts if rendered(e) == default), None),
-    }
+        "efforts": list(dict.fromkeys(names.values())),
+        "default": names.get(groups.get(default, [None])[0]),
+    }, names
 
 
 def _generation_prompts(render, encode, source):

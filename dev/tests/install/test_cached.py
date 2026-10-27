@@ -52,13 +52,24 @@ class CachedTest(unittest.TestCase):
             return list(cached.install_cached(self.root / "app"))
 
     def test_installs_what_the_cache_holds_whole_without_the_hub(self):
-        """A model another Splash downloaded installs here from the cache;
-        a repository of no model, or one no Splash recorded a commit of,
-        installs nothing; an installed model is left as it is."""
+        """A model another Splash downloaded installs here from the cache, at
+        the commit it recorded for the default branch; a repository of no
+        model, one whose default branch no download recorded, or one only a
+        --revision installed, installs nothing; an installed model is left as
+        it is."""
         fake = fake_hub(self, self.cache)
         fake.publish(MODEL, "d" * 40, vision_target)
+        fake.publish("owner/branch-only", "e" * 40, vision_target, branch="dev")
         with contextlib.redirect_stdout(io.StringIO()):
             upstream.prepare(selection(self.root / "checkout", language_only=False))
+            upstream.prepare(
+                selection(
+                    self.root / "checkout",
+                    "owner/branch-only",
+                    revision="dev",
+                    language_only=False,
+                )
+            )
         cached_snapshot(self.cache, "someone/notes", "b" * 40, readme)
         (self.cache / "models--someone--notes/refs").mkdir()
         (self.cache / "models--someone--notes/refs/main").write_text("b" * 40)
@@ -69,29 +80,64 @@ class CachedTest(unittest.TestCase):
         self.assertEqual((fake.requests, fake.downloads), ([], []))
 
     def test_candidates_follow_the_installer_s_names(self):
-        suggested = {"owner/listed-GGUF": ["owner/listed-GGUF:UD-Q4_K_M"]}
-        self.assertEqual(
-            cached.candidates("owner/listed-GGUF", {"m-UD-IQ1_S.gguf"}, suggested),
-            ["owner/listed-GGUF:UD-Q4_K_M"],
-        )
-        self.assertEqual(
-            cached.candidates(
-                "owner/m-GGUF",
+        """One ID for each GGUF target the cached files hold whole, which
+        selects it from them and from the Hub's listing of all the
+        repository's files alike: a suggested one, or else its own."""
+        suggested = {"owner/m-GGUF": ["owner/m-GGUF:UD-Q4_K_M", "owner/m-GGUF:IQ1_S"]}
+        hub_files = {
+            f"m-{variant}.gguf"
+            for variant in ("Q4_K_M", "Q8_0", "UD-Q4_K_M", "UD-Q8_0", "UD-IQ1_S")
+        } | {"mmproj-BF16.gguf", "m.gguf"}
+        for cached_files, expected in (
+            # Variants named as on the Hub, not past the words only the
+            # cached files share.
+            (
                 {"m-UD-Q4_K_M.gguf", "m-UD-Q8_0.gguf", "mmproj-BF16.gguf"},
-                suggested,
+                ["owner/m-GGUF:UD-Q4_K_M", "owner/m-GGUF:UD-Q8_0"],
             ),
-            ["owner/m-GGUF:Q4_K_M", "owner/m-GGUF:Q8_0"],
-        )
+            ({"m-Q4_K_M.gguf"}, ["owner/m-GGUF:Q4_K_M"]),
+            # A root GGUF beside a split GGUF's folder; an incomplete split
+            # holds no model whole.
+            (
+                {
+                    "m-Q4_K_M.gguf",
+                    "BF16/m-BF16-00001-of-00002.gguf",
+                    "BF16/m-BF16-00002-of-00002.gguf",
+                    "Q2_0/m-Q2_0-00001-of-00002.gguf",
+                    "README.md",
+                },
+                ["owner/m-GGUF:BF16", "owner/m-GGUF:Q4_K_M"],
+            ),
+            # No ID selects the GGUF named as the model beside another.
+            ({"m.gguf", "m-Q8_0.gguf"}, ["owner/m-GGUF:Q8_0"]),
+        ):
+            with self.subTest(cached=sorted(cached_files)):
+                ids = cached.candidates("owner/m-GGUF", cached_files, {})
+                self.assertEqual(ids, expected)
+                for model in ids:
+                    variant = model.partition(":")[2] or None
+                    self.assertEqual(
+                        upstream.select_gguf(cached_files, variant)[0],
+                        upstream.select_gguf(
+                            hub_files | {n for n in cached_files if "/" in n},
+                            variant,
+                        )[0],
+                    )
+        # A suggested repository's cached files take its suggested IDs, and
+        # the others their own.
         self.assertEqual(
             cached.candidates(
-                "owner/m-GGUF", {"Q2_0/m-Q2_0-00001-of-00002.gguf", "README.md"}, {}
+                "owner/m-GGUF", {"m-UD-IQ1_S.gguf", "m-Q8_0.gguf"}, suggested
             ),
-            ["owner/m-GGUF:Q2_0"],
+            ["owner/m-GGUF:Q8_0", "owner/m-GGUF:IQ1_S"],
         )
+        # A file named for another model than the repository's is named past
+        # its first word.
         self.assertEqual(
-            cached.candidates("owner/m-GGUF", {"m-UD-Q4_K_M.gguf"}, {}),
-            ["owner/m-GGUF"],
+            cached.candidates("owner/x-GGUF", {"m-Q4_K_M.gguf", "m-Q8_0.gguf"}, {}),
+            ["owner/x-GGUF:Q4_K_M", "owner/x-GGUF:Q8_0"],
         )
+        self.assertEqual(cached.candidates("owner/m", {"m.gguf"}, {}), ["owner/m"])
         self.assertEqual(
             cached.candidates("owner/m-4bit", {"config.json", "model.safetensors"}, {}),
             ["owner/m-4bit"],
