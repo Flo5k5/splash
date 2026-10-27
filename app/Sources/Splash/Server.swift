@@ -22,6 +22,21 @@ final class Server {
     private(set) var asleep = false
     /// Once ready: whether the model takes images.
     private(set) var acceptsImages = false
+    /// Once ready: what a reasoning effort does to the model.
+    private(set) var reasoning: Reasoning?
+
+    /// What a reasoning effort does to the served model, as `/v1/models` reports it from its
+    /// template.
+    struct Reasoning: Decodable, Equatable {
+        /// Whether a message that asks for no effort makes the model think; nil for a model that
+        /// decides itself.
+        var thinks: Bool?
+        /// The efforts besides none the model tells apart, least first; none where its thinking
+        /// is only on or off.
+        var efforts: [String]
+        /// The one of them a message that asks for no effort gets.
+        var `default`: String?
+    }
 
     static let log = URL.libraryDirectory.appending(path: "Logs/Splash/server.log")
 
@@ -92,6 +107,7 @@ final class Server {
         self.settings = settings
         asleep = false
         acceptsImages = false
+        reasoning = nil
         firstError = nil
         stopRequested = false
         resetLog(Self.log)
@@ -102,7 +118,7 @@ final class Server {
         do {
             child = try ChildProcess(
                 command: runtime.command(settings.serveArguments(model: model)),
-                environment: runtime.environment,
+                environment: runtime.environment.merging(settings.environment) { $1 },
                 log: Self.log,
                 exited: { [weak self] in self?.exited($0) }
             )
@@ -183,7 +199,9 @@ final class Server {
                (response as? HTTPURLResponse)?.statusCode == 200,
                !Task.isCancelled, phase == .starting {
                 phase = .ready
-                acceptsImages = await inputModalities().contains("image")
+                let served = await servedModel()
+                acceptsImages = served?.input_modalities?.contains("image") ?? false
+                reasoning = served?.reasoning
                 break
             }
             try? await Task.sleep(for: .milliseconds(500))
@@ -210,20 +228,22 @@ final class Server {
         let transport: Transport?
     }
 
-    /// What the served model takes: text, and images and PDFs with vision.
-    private func inputModalities() async -> [String] {
-        struct Models: Decodable {
-            struct Model: Decodable { let input_modalities: [String]? }
-            let data: [Model]
-        }
-        guard let (data, _) = try? await URLSession.shared.data(from: settings.url.appending(path: "v1/models")),
+    private struct ServedModel: Decodable {
+        /// Text, and images and PDFs with vision.
+        let input_modalities: [String]?
+        let reasoning: Reasoning?
+    }
+
+    private func servedModel() async -> ServedModel? {
+        struct Models: Decodable { let data: [ServedModel] }
+        guard let (data, _) = try? await URLSession.shared.data(for: settings.request("v1/models")),
               let models = try? JSONDecoder().decode(Models.self, from: data)
-        else { return [] }
-        return models.data.first?.input_modalities ?? []
+        else { return nil }
+        return models.data.first
     }
 
     private func status() async -> Status? {
-        var request = URLRequest(url: settings.url.appending(path: "status"))
+        var request = settings.request("status")
         request.timeoutInterval = 2
         guard let (data, _) = try? await URLSession.shared.data(for: request) else { return nil }
         return try? JSONDecoder().decode(Status.self, from: data)

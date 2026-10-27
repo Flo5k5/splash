@@ -150,34 +150,55 @@ private struct InkCircle: ButtonStyle {
     }
 }
 
-/// The reasoning effort messages ask for, as the chat page offers it.
+/// How much the model thinks, as its template tells efforts apart: its levels and Off, or On and
+/// Off, its default marked. A model that decides itself has none.
 private struct EffortMenu: View {
     @Environment(AppState.self) private var state
 
-    private static let efforts = [("", "Auto"), ("xhigh", "Extra High"), ("medium", "Medium"), ("low", "Low"),
-                                  ("none", "Off")]
-
     var body: some View {
-        @Bindable var state = state
-        Menu {
-            Picker("Thinking", selection: $state.effort) {
-                ForEach(Self.efforts, id: \.0) { Text($0.1).tag($0.0) }
+        if let reasoning = state.server.reasoning, let thinks = reasoning.thinks {
+            let levels = !reasoning.efforts.isEmpty
+            // The choice that leaves the effort to the model: its default, by name where it has one.
+            let initial = !thinks ? "none" : levels ? reasoning.default ?? "" : "on"
+            let choices = (levels ? reasoning.efforts.reversed() : ["on"])
+                + (levels && reasoning.default == nil && thinks ? [""] : []) + ["none"]
+            let chosen = state.effort.isEmpty ? initial : !levels && state.effort != "none" ? "on" : state.effort
+            Menu {
+                Picker("Thinking", selection: Binding(get: { chosen }, set: { choice in
+                    // On, for a model whose thinking is only on or off, is any effort but none.
+                    state.effort = choice == initial ? "" : choice == "on" ? "medium" : choice
+                })) {
+                    ForEach(choices, id: \.self) { choice in
+                        Text(choice == initial ? "\(Self.title(choice)) (Default)" : Self.title(choice)).tag(choice)
+                    }
+                }
+                .pickerStyle(.inline)
+            } label: {
+                HStack(spacing: 3) {
+                    Text("Thinking: \(Self.title(chosen))")
+                    Image(systemName: "chevron.down").imageScale(.small)
+                }
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .contentShape(.rect)
             }
-            .pickerStyle(.inline)
-        } label: {
-            HStack(spacing: 3) {
-                Text("Thinking: \(Self.efforts.first { $0.0 == state.effort }?.1 ?? "Auto")")
-                Image(systemName: "chevron.down").imageScale(.small)
-            }
-            .font(.callout)
-            .foregroundStyle(.secondary)
-            .contentShape(.rect)
+            .menuStyle(.button)
+            .buttonStyle(.plain)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("How much the model thinks before it answers")
         }
-        .menuStyle(.button)
-        .buttonStyle(.plain)
-        .menuIndicator(.hidden)
-        .fixedSize()
-        .help("How much the model thinks before it answers")
+    }
+
+    /// An effort's name in the menu.
+    private static func title(_ effort: String) -> String {
+        switch effort {
+        case "": "Default"
+        case "on": "On"
+        case "none": "Off"
+        case "xhigh": "Extra High"
+        default: effort.capitalized
+        }
     }
 }
 

@@ -8,24 +8,17 @@ extension Font {
 /// The width of the conversation and of the composer under it.
 private let column: CGFloat = 680
 
-/// The conversations beside the open one.
+/// The conversations at the side of the open one. The window's toolbar is the Server's, so the
+/// switch between the two stays where it is.
 struct ChatScreen: View {
     @Environment(AppState.self) private var state
-    @State private var columns = NavigationSplitViewVisibility.all
 
     var body: some View {
-        NavigationSplitView(columnVisibility: $columns) {
+        HStack(spacing: 0) {
             ChatList()
-                .navigationSplitViewColumnWidth(min: 240, ideal: 260, max: 340)
-        } detail: {
+                .frame(width: 260)
+            Divider()
             ConversationView()
-                .toolbar {
-                    // The sidebar holds the switch; while it is hidden, the conversation does.
-                    if columns == .detailOnly {
-                        ToolbarItem(placement: .navigation) { SectionSwitch() }
-                            .sharedBackgroundVisibility(.hidden)
-                    }
-                }
         }
         .onAppear { state.draft.focus() }
     }
@@ -44,41 +37,21 @@ private struct ChatList: View {
             conversation.title.localizedStandardContains(query)
                 || conversation.messages.contains { $0.text.localizedStandardContains(query) }
         }
-        List(selection: $chats.selection) {
-            if !shown.isEmpty {
-                Section(query.isEmpty ? "Recents" : "Results") {
-                    ForEach(shown) { conversation in
-                        Text(conversation.title.isEmpty ? "New Chat" : conversation.title)
-                            .lineLimit(1)
-                            .tag(conversation.id)
-                            .contextMenu {
-                                Button("Rename…") {
-                                    title = conversation.title
-                                    renaming = conversation
-                                }
-                                Button("Delete…", role: .destructive) { deleting = conversation }
-                            }
-                    }
-                }
+        VStack(spacing: 0) {
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                TextField("Search", text: $query, prompt: Text("Search"))
+                    .textFieldStyle(.plain)
             }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .background(.quaternary.opacity(0.6), in: .rect(cornerRadius: 8))
+            .padding(.horizontal, 12)
+            .padding(.top, 10)
+            .padding(.bottom, 4)
+            list(shown)
         }
-        .searchable(text: $query, placement: .sidebar, prompt: "Search")
-        .onDeleteCommand { deleting = chats.current }
-        .toolbar {
-            // Where the Server has it: first, after the window's buttons.
-            ToolbarItem { SectionSwitch() }
-                .sharedBackgroundVisibility(.hidden)
-            // At the start of the conversation's side, as the sidebar has no room left.
-            ToolbarItem(placement: .navigation) {
-                Button {
-                    chats.newChat()
-                    state.draft.focus()
-                } label: {
-                    Label("New Chat", systemImage: "square.and.pencil")
-                }
-                .help("New Chat")
-            }
-        }
+        .background(.background.secondary)
         .confirmationDialog("Delete this chat?", isPresented: Binding(
             get: { deleting != nil }, set: { if !$0 { deleting = nil } }
         ), presenting: deleting) { conversation in
@@ -93,6 +66,43 @@ private struct ChatList: View {
             Button("Rename") { chats.rename(conversation.id, to: title) }
             Button("Cancel", role: .cancel) {}
         }
+    }
+
+    /// The conversations, the open one on a soft highlight.
+    private func list(_ shown: [Conversation]) -> some View {
+        let chats = state.chats
+        return List {
+            if !shown.isEmpty {
+                Section(query.isEmpty ? "Recents" : "Results") {
+                    ForEach(shown) { conversation in
+                        let open = chats.selection == conversation.id
+                        Button { chats.selection = conversation.id } label: {
+                            Text(conversation.title.isEmpty ? "New Chat" : conversation.title)
+                                .lineLimit(1)
+                                .foregroundStyle(.primary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .contentShape(.rect)
+                        }
+                        .buttonStyle(.plain)
+                        .listRowBackground(
+                            RoundedRectangle(cornerRadius: 8)
+                                .fill(open ? AnyShapeStyle(.quaternary) : AnyShapeStyle(.clear))
+                                .padding(.horizontal, 10)
+                        )
+                        .accessibilityAddTraits(open ? .isSelected : [])
+                        .contextMenu {
+                            Button("Rename…") {
+                                title = conversation.title
+                                renaming = conversation
+                            }
+                            Button("Delete…", role: .destructive) { deleting = conversation }
+                        }
+                    }
+                }
+            }
+        }
+        .listStyle(.sidebar)
+        .scrollContentBackground(.hidden)
     }
 }
 

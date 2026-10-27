@@ -152,6 +152,9 @@ func resetLog(_ url: URL) {
 
 /// A failure of `model`'s in words a user can act on; the log keeps the original.
 func plainProblem(_ message: String, model: String) -> String {
+    if let reason = message.firstMatch(of: /^cannot prepare .+?: (.+)$/)?.1 {
+        return "Splash can’t serve these files: \(reason)"
+    }
     if message.contains("Repository Not Found") || message.contains("404 Client Error") {
         return "Hugging Face has no public model named \(model.split(separator: ":")[0]). Check the name, then try again."
     }

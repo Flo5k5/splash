@@ -89,7 +89,7 @@ final class AppState {
     /// Whether the model that runs would start otherwise with the options set now.
     var optionsChanged: Bool {
         guard server.phase == .ready, let model = server.model else { return false }
-        return server.settings.serveArguments(model: model) != options.serveArguments(model: model)
+        return server.settings.differs(from: options, model: model)
     }
 
     /// The name to show for model `id`; its variant tells installed variants of a model apart.
@@ -99,7 +99,8 @@ final class AppState {
         return "\(name) (\(Catalog.variant(of: id)))"
     }
 
-    /// Checks this Mac and the app's location, and stops what the app left running last time.
+    /// Checks this Mac and the app's location, stops what the app left running last time, and
+    /// then, in the background, installs the models the Hugging Face cache holds.
     func launch() async {
         defer { launched = true }
         let runtime = runtime
@@ -114,6 +115,15 @@ final class AppState {
         }
         await installer.stopLeftover()
         await server.stopLeftover()
+        Task { await installCached() }
+    }
+
+    /// Installs, without downloading, the models other tools or a source checkout of Splash left
+    /// in the Hugging Face cache that Splash serves; the installer leaves out the rest.
+    private func installCached() async {
+        let runtime = runtime
+        await Task.detached { runtime.installCached() }.value
+        refresh()
     }
 
     /// Starts `model` with the launch options, stopping the one that runs first.
@@ -154,13 +164,26 @@ final class AppState {
 
     private var target: ChatTarget? {
         guard server.phase == .ready, let model = server.model else { return nil }
-        return ChatTarget(url: server.settings.url, model: model, acceptsImages: server.acceptsImages, effort: effort)
+        return ChatTarget(url: server.settings.url, model: model, acceptsImages: server.acceptsImages, effort: effort,
+                          apiKey: server.settings.apiKey)
     }
 
-    /// The reasoning effort messages ask for; empty for the model's own default.
+    /// The reasoning effort messages to the model that runs ask for, as chosen for it; empty for
+    /// its default.
     var effort: String {
-        get { access(keyPath: \.effort); return UserDefaults.standard.string(forKey: Preference.effort) ?? "" }
-        set { withMutation(keyPath: \.effort) { UserDefaults.standard.set(newValue, forKey: Preference.effort) } }
+        get {
+            access(keyPath: \.effort)
+            let efforts = UserDefaults.standard.dictionary(forKey: Preference.efforts) as? [String: String]
+            return server.model.flatMap { efforts?[$0] } ?? ""
+        }
+        set {
+            guard let model = server.model else { return }
+            withMutation(keyPath: \.effort) {
+                var efforts = UserDefaults.standard.dictionary(forKey: Preference.efforts) as? [String: String] ?? [:]
+                efforts[model] = newValue.isEmpty ? nil : newValue
+                UserDefaults.standard.set(efforts, forKey: Preference.efforts)
+            }
+        }
     }
 
     func copyAPIAddress() {
@@ -169,10 +192,31 @@ final class AppState {
         NSPasteboard.general.setString(settings.url.appending(path: "v1").absoluteString, forType: .string)
     }
 
-    /// The models installed here, the suggested ones first in the list's order.
+    /// The models installed here, the suggested ones first in the list's order, then the model files
+    /// on this Mac the user added.
     func refresh() {
         let rank = { (id: String) in self.catalog.variants.firstIndex { $0.id == id } ?? Int.max }
         installed = runtime.installedModels().sorted { (rank($0.id), $0.id) < (rank($1.id), $1.id) }
+            + localModels.map(InstalledModel.local)
+    }
+
+    private var localModels: [String] {
+        get { UserDefaults.standard.stringArray(forKey: Preference.localModels) ?? [] }
+        set { UserDefaults.standard.set(newValue, forKey: Preference.localModels) }
+    }
+
+    /// Adds model files on this Mac, a GGUF file or a model's folder, and picks them: Start has
+    /// Splash prepare them, and says why if it cannot serve them.
+    func addLocal(_ url: URL) {
+        if !localModels.contains(url.path) { localModels.append(url.path) }
+        refresh()
+        selection = url.path
+    }
+
+    /// Takes model files off the list; the files stay where they are.
+    func removeLocal(_ path: String) {
+        localModels.removeAll { $0 == path }
+        refresh()
     }
 
     func isInstalled(_ model: String) -> Bool {

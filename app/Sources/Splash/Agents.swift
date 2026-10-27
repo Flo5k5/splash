@@ -19,7 +19,7 @@ enum Agent: String, CaseIterable, Identifiable {
 
     /// Asks for the project folder, then opens the agent there in Terminal.
     @MainActor
-    func open(runtime: Runtime, port: Int) {
+    func open(runtime: Runtime, settings: ServeSettings) {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
@@ -30,7 +30,7 @@ enum Agent: String, CaseIterable, Identifiable {
         }
         guard panel.runModal() == .OK, let folder = panel.url else { return }
         UserDefaults.standard.set(folder, forKey: Preference.agentFolder)
-        let script = script(runtime: runtime, port: port, folder: folder)
+        let script = script(runtime: runtime, port: settings.port, folder: folder, apiKey: settings.apiKey != nil)
         do {
             let directory = FileManager.default.temporaryDirectory.appending(path: "Splash")
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -44,12 +44,14 @@ enum Agent: String, CaseIterable, Identifiable {
         }
     }
 
-    /// The Terminal script that runs the agent in `folder`.
-    func script(runtime: Runtime, port: Int, folder: URL) -> String {
-        """
+    /// The Terminal script that runs the agent in `folder`; with `apiKey`, it reads the server's key
+    /// from the Keychain as it runs, so that the key is never written to a file.
+    func script(runtime: Runtime, port: Int, folder: URL, apiKey: Bool = false) -> String {
+        let key = apiKey ? "export SPLASH_API_KEY=\"$(security find-generic-password -s Splash -a 'API key' -w)\"\n" : ""
+        return """
         #!/bin/sh
         cd \(Self.quoted(folder.path)) || exit
-        clear
+        \(key)clear
         exec \(runtime.command([rawValue, "--port", String(port)]).map(Self.quoted).joined(separator: " "))
 
         """

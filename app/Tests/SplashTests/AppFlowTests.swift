@@ -40,13 +40,16 @@ struct AppFlowTests {
     static let models = AppFlow.models
     static let port = AppFlow.port
 
+    /// The launch options of every run: the server's defaults, on the test's port.
+    static let defaults = ServeSettings(values: ["--port": String(port)])
+
     let state: AppState
     let model: String
     /// The conversations of this run, apart from the user's.
     let chats = FileManager.default.temporaryDirectory.appending(path: "splash-chats-\(UUID().uuidString)")
 
     init() async throws {
-        ServeSettings(port: Self.port).save()
+        Self.defaults.save()
         let runtime = try #require(Runtime.locate(), "SPLASH_RUNTIME names no runtime")
         #expect(runtime.packaged)
         state = AppState(runtime: runtime, chats: ChatStore(folder: chats))
@@ -96,16 +99,16 @@ struct AppFlowTests {
         #expect(ChatStore(folder: chats).conversations.first?.messages == conversation.messages, "saved")
         await Snapshot.save("chat-ready", MainView().environment(state))
         // Changed options ask for a restart, which starts the model with them.
-        state.options.context = .k32
+        state.options["--max-context"] = "32768"
         #expect(state.optionsChanged)
         state.section = .server
         await Snapshot.save("server-options-changed", MainView().environment(state))
         state.start(model)
         #expect(state.status.hasPrefix("Restarting "))
         try await waitFor(state.server.phase == .starting, "restarting")
-        #expect(state.server.settings.context == .k32 && !state.optionsChanged)
+        #expect(state.server.settings["--max-context"] == "32768" && !state.optionsChanged)
         try await ready()
-        state.options = ServeSettings(port: Self.port)
+        state.options = Self.defaults
         let pid = try #require(state.runtime.serveLockOwner(port: Self.port))
         state.stop()
         #expect(state.server.phase == .stopping)
@@ -143,8 +146,8 @@ struct AppFlowTests {
     }
 
     @Test func aStartThatFailsSaysWhy() async throws {
-        state.options.memoryLimit = 1
-        defer { state.options = ServeSettings(port: Self.port) }
+        state.options["--max-memory"] = "1G"
+        defer { state.options = Self.defaults }
         state.start(model)
         try await waitFor({ if case .failed = state.server.phase { true } else { false } }(), "failed")
         guard case .failed(let message) = state.server.phase else { return }
@@ -234,12 +237,32 @@ struct AppFlowTests {
         try await install(download)
     }
 
+    @Test func everyServeOptionHasItsPlace() throws {
+        // The options splash serve takes but those of one model, or that the app sets itself.
+        let process = Process()
+        let command = state.runtime.command(["serve", "--help"])
+        process.executableURL = URL(filePath: command[0])
+        process.arguments = Array(command.dropFirst())
+        let output = Pipe()
+        process.standardOutput = output
+        try process.run()
+        let help = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        process.waitUntilExit()
+        let flags = Set(help.matches(of: /(?m)^  (--[a-z-]+)/).map { String($0.1) })
+            .subtracting(["--help", "--model", "--offline", "--revision", "--draft-model"])
+        #expect(!flags.isEmpty)
+        #expect(flags == Set(LaunchOption.all.map(\.flag)))
+    }
+
     @Test func agentsRunInTheFolderPicked() {
         let folder = URL(filePath: "/tmp/it's a project")
         let script = Agent.claude.script(runtime: state.runtime, port: 8100, folder: folder)
         #expect(script.contains(#"cd '/tmp/it'\''s a project' || exit"#))
         #expect(script.contains(#"'claude' '--port' '8100'"#))
         #expect(script.contains("'-I' '-B' '-u'"))
+        #expect(!script.contains("SPLASH_API_KEY"))
+        #expect(Agent.claude.script(runtime: state.runtime, port: 8100, folder: folder, apiKey: true)
+            .contains("export SPLASH_API_KEY=\"$(security find-generic-password -s Splash -a 'API key' -w)\""))
     }
 
     // MARK: -

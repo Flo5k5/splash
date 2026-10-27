@@ -1,29 +1,15 @@
 import SwiftUI
 
-/// How a model starts: the `splash serve` options worth changing, each on Auto or the server's own
-/// default until changed. A change applies the next time a model starts.
+/// How a model starts: every `splash serve` option of `LaunchOption.all`, the main ones in a card
+/// and the others under Advanced, by their part. Each is on Auto or the server's own default until
+/// changed; a change applies the next time a model starts.
 struct LaunchOptions: View {
     @Environment(AppState.self) private var state
     @State var advanced = false
 
     var body: some View {
-        @Bindable var state = state
         Section {
-            Picker("Context length", selection: $state.options.context) {
-                ForEach(ContextLength.allCases) { Text($0.title).tag($0) }
-            }
-            .help("How much of a conversation the model keeps in mind. Auto fits it to this Mac’s memory.")
-            Picker("Memory limit", selection: $state.options.memoryLimit) {
-                Text("Auto").tag(Int?.none)
-                ForEach(ServeSettings.memoryLimits(memory: Catalog.memory, kept: state.options.memoryLimit), id: \.self) {
-                    Text("\($0) GB").tag(Int?.some($0))
-                }
-            }
-            .help("The most memory the model may use, to leave room for other apps. Auto gives it what this Mac can.")
-            Picker("Free memory when idle", selection: $state.options.idleRelease) {
-                ForEach(IdleRelease.allCases) { Text($0.title).tag($0) }
-            }
-            .help("An idle model frees its memory and loads again with the next message.")
+            ForEach(Self.options(.main)) { OptionRow(option: $0) }
             Button {
                 withAnimation(.smooth(duration: 0.2)) { advanced.toggle() }
             } label: {
@@ -40,41 +26,8 @@ struct LaunchOptions: View {
             }
             .buttonStyle(.plain)
             .accessibilityValue(advanced ? "Expanded" : "Collapsed")
-            if advanced {
-                LabeledContent("Port") {
-                    TextField("Port", value: $state.options.port, format: .number.grouping(.never))
-                        .labelsHidden()
-                        .textFieldStyle(.roundedBorder)
-                        .multilineTextAlignment(.trailing)
-                        .monospacedDigit()
-                        .frame(width: 80)
-                }
-                .help("Where other apps reach the model: http://127.0.0.1:\(String(state.options.port))/v1")
-                .onChange(of: state.options.port) { old, new in
-                    if !(1...65535).contains(new) { state.options.port = old }
-                }
-                Picker("KV cache", selection: $state.options.kvFormat) {
-                    ForEach(KVFormat.allCases) { Text($0.title).tag($0) }
-                }
-                .help("How the model keeps what it has read. 16-bit takes twice the memory.")
-                Picker("Recurrent state", selection: $state.options.stateFormat) {
-                    ForEach(StateFormat.allCases) { Text($0.title).tag($0) }
-                }
-                .help("How a hybrid model such as Qwen3.6 keeps its state. 16-bit takes half the memory.")
-                Picker("SSD cache", selection: $state.options.ssdCache) {
-                    ForEach(SSDCache.allCases) { Text($0.title).tag($0) }
-                }
-                .help("Room on the SSD for earlier prompts, so a long conversation goes on without reading it again. Auto follows the free space.")
-                Toggle("Keep SSD cache after stopping", isOn: $state.options.keepSSDCache)
-                    .disabled(state.options.ssdCache == .off)
-                    .help("The next start of the model goes on from the prompts it kept.")
-                Toggle("Neural Engine for long prompts", isOn: $state.options.neuralEngine)
-                    .help("Reads long prompts faster on models that can use it.")
-                Toggle("Keep Mac awake while answering", isOn: $state.options.keepAwake)
-                    .help("The Mac doesn’t sleep in the middle of an answer; the display still may.")
-            }
         } header: {
-            SectionTitle(text: "Launch Options")
+            SectionTitle(text: LaunchOption.Section.main.rawValue)
         } footer: {
             HStack(alignment: .firstTextBaseline) {
                 Text("Options on Auto fit themselves to this Mac. Changes apply the next time a model starts.")
@@ -85,5 +38,206 @@ struct LaunchOptions: View {
                 }
             }
         }
+        if advanced {
+            ForEach(LaunchOption.Section.allCases.dropFirst(), id: \.self) { section in
+                Section {
+                    ForEach(Self.options(section)) { OptionRow(option: $0) }
+                } header: {
+                    Text(section.rawValue).font(.subheadline.weight(.semibold)).foregroundStyle(.secondary).textCase(nil)
+                }
+            }
+        }
+    }
+
+    private static func options(_ section: LaunchOption.Section) -> [LaunchOption] {
+        LaunchOption.all.filter { $0.section == section }
+    }
+}
+
+/// One launch option, with the control its kind takes; dimmed where the others leave it no effect.
+private struct OptionRow: View {
+    @Environment(AppState.self) private var state
+    let option: LaunchOption
+
+    var body: some View {
+        @Bindable var state = state
+        let value = Binding(get: { state.options[option.flag] }, set: { state.options[option.flag] = $0 })
+        Group {
+            switch option.kind {
+            case .toggle(let on):
+                Toggle(option.title, isOn: Binding(get: { (value.wrappedValue == "true") == on },
+                                                    set: { value.wrappedValue = $0 == on ? "true" : nil }))
+            case .choice(let standard, let choices, let custom):
+                ChoicePicker(title: option.title, standard: standard, choices: choices, custom: custom, value: value)
+            case .text(let custom, _):
+                TextRow(title: option.title, custom: custom, value: value)
+            case .folder:
+                FolderRow(title: option.title, value: value)
+            case .secret:
+                SecretRow(title: option.title, value: $state.options.apiKey)
+            }
+        }
+        .help(option.help)
+        .disabled(!option.applies(state.options))
+    }
+}
+
+/// A menu of the server's default, the choices, the value set, and Custom… to type another.
+private struct ChoicePicker: View {
+    let title: String
+    let standard: String
+    let choices: [(value: String, title: String)]
+    let custom: LaunchOption.Value?
+    @Binding var value: String?
+    @State private var typing = false
+
+    /// The tag of Custom…, which is no value.
+    private static let other = "\u{0}custom"
+
+    var body: some View {
+        Picker(title, selection: Binding(get: { value }, set: { choice in
+            if choice == Self.other { typing = true } else { value = choice }
+        })) {
+            Text(standard).tag(String?.none)
+            ForEach(choices, id: \.value) { Text($0.title).tag(Optional($0.value)) }
+            if let value, let custom, !choices.contains(where: { $0.value == value }) {
+                Text(custom.title(value)).tag(Optional(value))
+            }
+            if custom != nil {
+                Divider()
+                Text("Custom…").tag(Optional(Self.other))
+            }
+        }
+        .sheet(isPresented: $typing) {
+            if let custom {
+                CustomValueSheet(title: title, custom: custom, initial: value.map(custom.text) ?? "") { value = $0 }
+            }
+        }
+    }
+}
+
+/// A value typed in a field, kept once it is one the option takes; empty for the default.
+private struct TextRow: View {
+    let title: String
+    let custom: LaunchOption.Value
+    @Binding var value: String?
+    @State private var text = ""
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        LabeledContent(title) {
+            TextField(title, text: $text, prompt: Text(custom.prompt))
+                .labelsHidden()
+                .textFieldStyle(.roundedBorder)
+                .multilineTextAlignment(.trailing)
+                .frame(maxWidth: 240)
+                .focused($focused)
+                .onSubmit(commit)
+        }
+        .onAppear { text = value.map(custom.text) ?? "" }
+        .onChange(of: value) { text = value.map(custom.text) ?? "" }
+        .onChange(of: focused) { if !focused { commit() } }
+    }
+
+    private func commit() {
+        if text.trimmingCharacters(in: .whitespaces).isEmpty {
+            value = nil
+        } else if let parsed = custom.parse(text) {
+            value = parsed
+        }
+        text = value.map(custom.text) ?? ""
+    }
+}
+
+/// A folder picked, or the server's default.
+private struct FolderRow: View {
+    let title: String
+    @Binding var value: String?
+
+    var body: some View {
+        LabeledContent(title) {
+            HStack {
+                Text(value.map { URL(filePath: $0).lastPathComponent } ?? "Default")
+                    .foregroundStyle(.secondary)
+                    .help(value ?? "")
+                if value != nil { Button("Default") { value = nil } }
+                Button("Choose…") {
+                    let panel = NSOpenPanel()
+                    panel.canChooseDirectories = true
+                    panel.canChooseFiles = false
+                    panel.canCreateDirectories = true
+                    if panel.runModal() == .OK, let url = panel.url { value = url.path }
+                }
+            }
+        }
+    }
+}
+
+/// The API key, typed in a secure field; empty for none.
+private struct SecretRow: View {
+    let title: String
+    @Binding var value: String?
+    @State private var text = ""
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        LabeledContent(title) {
+            SecureField(title, text: $text, prompt: Text("None"))
+                .labelsHidden()
+                .textFieldStyle(.roundedBorder)
+                .frame(maxWidth: 240)
+                .focused($focused)
+                .onSubmit(commit)
+        }
+        .onAppear { text = value ?? "" }
+        .onChange(of: focused) { if !focused { commit() } }
+    }
+
+    private func commit() {
+        value = text.isEmpty ? nil : text
+    }
+}
+
+/// Asks for a value the menu doesn't offer.
+private struct CustomValueSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let title: String
+    let custom: LaunchOption.Value
+    let initial: String
+    let set: (String) -> Void
+    @State private var text = ""
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        Form {
+            Section {
+                TextField(title, text: $text, prompt: Text(custom.prompt))
+                    .labelsHidden()
+                    .focused($focused)
+                    .onSubmit(done)
+            } header: {
+                Text(title).font(.headline)
+            } footer: {
+                Text(custom.message)
+            }
+        }
+        .formStyle(.grouped)
+        .frame(width: 400)
+        .onAppear {
+            text = initial
+            focused = true
+        }
+        .toolbar {
+            ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+            ToolbarItem(placement: .confirmationAction) {
+                Button("Set", action: done).disabled(custom.parse(text) == nil)
+            }
+        }
+    }
+
+    private func done() {
+        guard let value = custom.parse(text) else { return }
+        set(value)
+        dismiss()
     }
 }

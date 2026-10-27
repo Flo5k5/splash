@@ -49,6 +49,8 @@ struct Catalog {
     /// variant and the format the repository's name ends in.
     func name(of id: String) -> String {
         if let name = variants.first(where: { $0.id == id })?.name { return name }
+        // Model files on this Mac: the file's or folder's name.
+        if id.hasPrefix("/") { return URL(filePath: id).lastPathComponent.replacing(/(?i)\.gguf$/, with: "") }
         let repository = id.split(separator: ":")[0].split(separator: "/").last.map(String.init) ?? id
         return repository.replacing(/(?i)-(gguf|mlx)$/, with: "")
     }

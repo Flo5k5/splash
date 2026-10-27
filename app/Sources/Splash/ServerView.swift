@@ -58,9 +58,13 @@ struct ServerView: View {
                     } else {
                         Text("Suggested for this Mac’s \(Catalog.memory) GB of memory. Models download from Hugging Face and run privately on this Mac.")
                     }
-                    Button("Download Another Model…") { customModel = true }
-                        .buttonStyle(.link)
-                        .disabled(state.installer.running || !state.ready)
+                    HStack(spacing: 16) {
+                        Button("Download Another Model…") { customModel = true }
+                            .disabled(state.installer.running || !state.ready)
+                        Button("Add Model from This Mac…", action: addLocal)
+                            .disabled(!state.ready)
+                    }
+                    .buttonStyle(.link)
                 }
             }
         }
@@ -78,6 +82,17 @@ struct ServerView: View {
         }
         .onAppear { state.refresh() }
         .sheet(isPresented: $customModel) { CustomModelSheet() }
+    }
+
+    /// Asks for model files on this Mac: a GGUF file, or the folder of an MLX or GGUF model.
+    private func addLocal() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        panel.prompt = "Add"
+        panel.message = "Choose a GGUF file, or the folder of an MLX or GGUF model."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        state.addLocal(url)
     }
 
     /// The screen's heading before a model is on this Mac.
@@ -286,16 +301,14 @@ private struct DownloadRow: View {
     }
 }
 
-/// A model on this Mac, to pick for Start: its name, and under it what it is, the variant when
-/// another one of the model is on this Mac, and its size. The one the server runs says so.
+/// A model on this Mac, to pick for Start: its name, and under it its Hugging Face ID, which tells
+/// its variants apart, and its size. The one the server runs says so.
 private struct ModelRow: View {
     @Environment(AppState.self) private var state
     let model: InstalledModel
 
     var body: some View {
         let selected = state.selection == model.id
-        let name = state.catalog.name(of: model.id)
-        let variant = state.displayName(of: model.id) == name ? nil : Catalog.variant(of: model.id)
         Button { state.selection = model.id } label: {
             HStack(spacing: 10) {
                 Image(systemName: "checkmark")
@@ -304,11 +317,12 @@ private struct ModelRow: View {
                     .frame(width: 16)
                     .opacity(selected ? 1 : 0)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(name)
-                    Text([state.catalog.about(of: model.id), variant, Format.size(model.bytes)].compactMap { $0 }
-                        .joined(separator: " · "))
+                    Text(state.catalog.name(of: model.id))
+                    Text("\(model.id) · \(Format.size(model.bytes))")
                         .font(.callout)
                         .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
                 }
                 Spacer()
                 if let phase {
@@ -327,8 +341,15 @@ private struct ModelRow: View {
         .accessibilityLabel(state.displayName(of: model.id))
         .accessibilityValue(phase ?? "")
         .accessibilityAddTraits(selected ? .isSelected : [])
-        .help(model.id)
-        .contextMenu { CopyModelID(id: model.id) }
+        .help(state.catalog.about(of: model.id) ?? model.id)
+        .contextMenu {
+            if model.local {
+                Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([URL(filePath: model.id)]) }
+                Button("Remove from List") { state.removeLocal(model.id) }
+            } else {
+                CopyModelID(id: model.id)
+            }
+        }
     }
 
     /// What the server does with this model, if anything.

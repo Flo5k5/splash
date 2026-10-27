@@ -4284,7 +4284,13 @@ downloads are the ones a packaged `splash` uses, in
 offers `install/suggested-models.tsv`, per model the variant meant for the
 Mac's memory with its download size and a few words about the model, and
 starts coding agents with `splash AGENT --port PORT` in Terminal, in a folder
-the user picks. Its chat is its own, not the chat page: it streams
+the user picks. Its launch options are every option `splash serve` takes but
+the ones of one model (`--revision`, `--draft-model`) and the ones it sets
+itself, from one table (`LaunchOption.all`) the tests hold to `splash serve
+--help`; the API key reaches the server as `SPLASH_API_KEY`, from the
+Keychain. It serves model files on this Mac the user adds with `splash serve
+--model PATH`, and at launch it runs `install/cached.py`. Its chat is its own,
+not the chat page: it streams
 `/v1/chat/completions` and keeps each conversation as a JSON file in
 `~/Library/Application Support/Splash/Chats`, so a conversation outlives a
 switch of models. Its icon is `app/AppIcon.icon`, an Icon Composer document

@@ -46,54 +46,97 @@ struct ServeSettingsTests {
             == ["serve", "--model", "a/b:Q4", "--port", "8000", "--offline"])
     }
 
-    @Test func passesTheOptionsChanged() {
-        let settings = ServeSettings(port: 8100, context: .k128, memoryLimit: 48, idleRelease: .never, kvFormat: .bf16,
-                                     stateFormat: .bf16, ssdCache: .g16, keepSSDCache: true, neuralEngine: false,
-                                     keepAwake: false)
+    @Test func passesTheOptionsSetInTheTablesOrder() {
+        let settings = ServeSettings(values: [
+            "--port": "8100", "--max-context": "131072", "--max-memory": "48G", "--idle-release": "off",
+            "--language-only": "true", "--kv-format": "bf16", "--max-cache-disk": "16G", "--persistent-cache": "true",
+            "--host": "0.0.0.0", "--allowed-origin": "a.example, b.example", "--no-webui": "true",
+            "--thinking-end-text": "Now the answer. </think>", "--disable-ane": "true",
+        ], apiKey: "secret")
         #expect(settings.serveArguments(model: "a/b")
-            == ["serve", "--model", "a/b", "--port", "8100", "--offline", "--max-context", "128K",
-                "--max-memory", "48G", "--idle-release", "off", "--kv-format", "bf16", "--state-format", "bf16",
-                "--max-cache-disk", "16G", "--persistent-cache", "--disable-ane", "--allow-idle-sleep"])
+            == ["serve", "--model", "a/b", "--port", "8100", "--offline", "--max-context", "131072",
+                "--max-memory", "48G", "--idle-release", "off", "--language-only", "--kv-format", "bf16",
+                "--max-cache-disk", "16G", "--persistent-cache", "--host", "0.0.0.0",
+                "--allowed-origin", "a.example", "--allowed-origin", "b.example", "--no-webui",
+                "--thinking-end-text", "Now the answer. </think>", "--disable-ane"])
+        // The key reaches the server in its environment, never its command line.
+        #expect(settings.environment == ["SPLASH_API_KEY": "secret"])
+        #expect(settings.request("status").value(forHTTPHeaderField: "Authorization") == "Bearer secret")
         #expect(settings.url.absoluteString == "http://127.0.0.1:8100")
-        // An SSD cache that is off is not kept, so keeping it changes nothing.
-        #expect(ServeSettings(ssdCache: .off, keepSSDCache: true).serveArguments(model: "a/b")
-            == ServeSettings(ssdCache: .off).serveArguments(model: "a/b"))
+        #expect(settings.memoryLimit == 48)
+    }
+
+    @Test func leavesOutOptionsTheOthersLeaveNoEffect() {
+        // An SSD cache that is off keeps nothing, writes nothing and has no folder; the first other
+        // name needs one.
+        let off = ServeSettings(values: ["--max-cache-disk": "0", "--persistent-cache": "true", "--cache-dir": "/tmp/c",
+                                         "--max-cache-disk-writes": "100G", "--announce-served-name": "true"])
+        #expect(off.serveArguments(model: "a/b") == ServeSettings(values: ["--max-cache-disk": "0"]).serveArguments(model: "a/b"))
+        #expect(!off.differs(from: ServeSettings(values: ["--max-cache-disk": "0"]), model: "a/b"))
+        #expect(ServeSettings(apiKey: "new").differs(from: ServeSettings(), model: "a/b"))
+    }
+
+    @Test func readsAndNamesContextLengths() {
+        #expect(ContextLength.parse("100K") == 102_400)
+        #expect(ContextLength.parse(" 1m ") == 1_000_000)
+        #expect(ContextLength.parse("65536") == 65536)
+        #expect(ContextLength.parse("0") == nil && ContextLength.parse("12.5K") == nil && ContextLength.parse("lots") == nil)
+        #expect(ContextLength.title(32768) == "32K tokens")
+        #expect(ContextLength.title(1_000_000) == "1M tokens")
+        #expect(ContextLength.title(100_000) == "100,000 tokens")
     }
 
     @Test func offersMemoryLimitsBelowTheMacs() {
-        #expect(ServeSettings.memoryLimits(memory: 36, kept: nil) == [8, 12, 16, 24, 32])
-        #expect(ServeSettings.memoryLimits(memory: 36, kept: 20) == [8, 12, 16, 20, 24, 32])
-        #expect(ServeSettings.memoryLimits(memory: 128, kept: 96).last == 96)
+        #expect(ServeSettings.memoryLimits(memory: 36) == [8, 12, 16, 24, 32])
     }
 
     @Test func saysWhatMakesRoomForAModel() {
         let floors = "runtime bootstrap failed [resource_assembly/memory_planning]: model weights with the runtime reserves, one lane's state, the KV runway and any SSD cache state staging require 10858659840 bytes but the Metal memory budget is 1073741824 bytes"
-        #expect(Server.memoryProblem(floors, settings: ServeSettings(memoryLimit: 1))
+        #expect(Server.memoryProblem(floors, settings: ServeSettings(values: ["--max-memory": "1G"]))
             == "It needs 10.1 GB of memory but the memory limit is 1 GB. Raise the memory limit in Launch Options.")
         #expect(Server.memoryProblem(floors, settings: ServeSettings())
             == "It needs 10.1 GB of memory but this Mac can give it 1 GB. Choose a smaller model.")
         let context = { (bound: String) in
             "runtime bootstrap failed [model_creation]: --max-context 262144 exceeds the 73721 tokens the model and \(bound) allow; omit it or pass at most 73721"
         }
-        #expect(Server.memoryProblem(context("this Mac's memory"), settings: ServeSettings(context: .k256))
+        #expect(Server.memoryProblem(context("this Mac's memory"), settings: ServeSettings(values: ["--max-context": "262144"]))
             == "Its context fits up to 71K tokens on this Mac. Choose a shorter context length, or Auto.")
-        #expect(Server.memoryProblem(context("--max-memory"), settings: ServeSettings(context: .k256))
+        #expect(Server.memoryProblem(context("--max-memory"), settings: ServeSettings(values: ["--max-context": "262144"]))
             == "Its context fits up to 71K tokens within the memory limit. Choose a shorter context length, or raise the memory limit.")
-        #expect(Server.memoryProblem(context("the SSD cache's room for its KV"), settings: ServeSettings(context: .k256))
+        #expect(Server.memoryProblem(context("the SSD cache's room for its KV"), settings: ServeSettings(values: ["--max-context": "262144"]))
             == "Its context fits up to 71K tokens in the SSD cache. Choose a shorter context length, or a larger SSD cache.")
         #expect(Server.memoryProblem("error: something else", settings: ServeSettings()) == nil)
     }
 
     @Test func keepsTheOptionsAndReadsBadOnesAsDefaults() throws {
         let defaults = try #require(UserDefaults(suiteName: "splash-tests-\(UUID().uuidString)"))
-        #expect(ServeSettings.current(defaults) == ServeSettings())
-        let settings = ServeSettings(port: 9000, context: .k32, memoryLimit: 20, ssdCache: .off, keepAwake: false)
+        #expect(ServeSettings.current(defaults).values.isEmpty)
+        let settings = ServeSettings(values: ["--port": "9000", "--max-context": "32768", "--max-memory": "20G",
+                                              "--allowed-host": "mymac.local", "--allow-idle-sleep": "true"],
+                                     apiKey: Keychain.apiKey)
         settings.save(defaults)
         #expect(ServeSettings.current(defaults) == settings)
-        defaults.set(70000, forKey: "port")
-        defaults.set("1M", forKey: "context")
-        defaults.set(0, forKey: "memoryLimit")
-        #expect(ServeSettings.current(defaults) == ServeSettings(ssdCache: .off, keepAwake: false))
+        defaults.set(["--port": "70000", "--max-context": "-1", "--max-memory": "lots", "--nope": "1",
+                      "--kv-format": "bf16"], forKey: Preference.launchOptions)
+        #expect(ServeSettings.current(defaults).values == ["--kv-format": "bf16"])
+    }
+
+    @Test func typedValuesTakeServesForms() throws {
+        func custom(_ flag: String) throws -> LaunchOption.Value {
+            let option = try #require(LaunchOption.all.first { $0.flag == flag })
+            switch option.kind {
+            case .choice(_, _, let custom?): return custom
+            case .text(let custom, _): return custom
+            default: throw CancellationError()
+            }
+        }
+        #expect(try custom("--max-context").parse("100K") == "102400")
+        #expect(try custom("--max-memory").parse("40") == "40G")
+        #expect(try custom("--expert-memory").parse("2.5 g") == "2.5G")
+        #expect(try custom("--expert-memory").parse("lots") == nil)
+        #expect(try custom("--idle-release").parse("45M") == "45m")
+        #expect(try custom("--port").parse("0") == nil)
+        #expect(try custom("--served-model-name").parse("gpt-4o,  o3 ") == "gpt-4o, o3")
     }
 }
 
@@ -104,6 +147,11 @@ struct OutputTests {
             == "unable to start HTTP server: [Errno 48]")
         #expect(errorMessage("12:01:02 Loading · a/b") == nil)
         #expect(errorMessage("Warning: something") == nil)
+    }
+
+    @Test func saysWhyFilesCannotServe() {
+        #expect(plainProblem("cannot prepare /m/d: no supported model has this architecture (X)", model: "/m/d")
+            == "Splash can’t serve these files: no supported model has this architecture (X)")
     }
 
     @Test func readsDownloadEvents() {

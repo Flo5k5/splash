@@ -33,7 +33,7 @@ struct AgentMenuItems: View {
             ForEach(Agent.allCases) { agent in
                 Button("\(agent.title)…") {
                     NSApp.activate()
-                    agent.open(runtime: state.runtime, port: state.server.settings.port)
+                    agent.open(runtime: state.runtime, settings: state.server.settings)
                 }
                 .disabled(state.server.phase != .ready)
             }

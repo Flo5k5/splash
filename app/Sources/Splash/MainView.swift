@@ -11,10 +11,20 @@ struct MainView: View {
             .navigationTitle("Splash")
             .toolbar(removing: .title)
             .toolbar {
-                // The Chat's sidebar holds the switch at the same place.
-                if state.available && state.section == .server {
+                if state.available {
                     ToolbarItem(placement: .navigation) { SectionSwitch() }
                         .sharedBackgroundVisibility(.hidden)
+                }
+                if state.available && state.section == .chat {
+                    ToolbarItem(placement: .navigation) {
+                        Button {
+                            state.chats.newChat()
+                            state.draft.focus()
+                        } label: {
+                            Label("New Chat", systemImage: "square.and.pencil")
+                        }
+                        .help("New Chat (⌘N)")
+                    }
                 }
                 if state.installer.running && state.section == .chat {
                     ToolbarItem { DownloadButton() }

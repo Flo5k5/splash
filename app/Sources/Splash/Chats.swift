@@ -38,6 +38,8 @@ struct ChatTarget {
     let model: String
     let acceptsImages: Bool
     let effort: String
+    /// The key the server asks for, if any.
+    var apiKey: String?
 }
 
 /// The conversations, one JSON file each in the app's folder, and the one reply that streams.
@@ -210,6 +212,7 @@ enum ChatClient {
                     var request = URLRequest(url: server.url.appending(path: "v1/chat/completions"))
                     request.httpMethod = "POST"
                     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                    if let key = server.apiKey { request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization") }
                     request.httpBody = try body(messages, effort: server.effort, images: server.acceptsImages)
                     request.timeoutInterval = 3600
                     let (bytes, response) = try await URLSession.shared.bytes(for: request)
