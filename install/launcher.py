@@ -313,6 +313,16 @@ def serve(args):
         os.execve(command[0], command, environment)
 
 
+def _renders_later_system(port):
+    """Whether every chat template of the server renders a later system
+    message in place; a server that does not say renders none."""
+    status = _request_json("/status", port=port)
+    template = status.get("chat_template") if isinstance(status, dict) else None
+    outcome = template.get("later_system") if isinstance(template, dict) else None
+    outcomes = list(outcome.values()) if isinstance(outcome, dict) else [outcome]
+    return all(outcome in ("native", "patched") for outcome in outcomes)
+
+
 def coding_client(args):
     path = clients.find_executable(args.command)
     listing = _request_json("/v1/models", port=args.port)
@@ -353,6 +363,7 @@ def coding_client(args):
         input_modalities=models[0].get("input_modalities"),
         client_args=args.client_args,
         client_version=client_version,
+        later_system=args.command == "pi" and _renders_later_system(args.port),
     )
     print(f"Starting {args.command}: {model} · {context:,} context tokens", flush=True)
     if args.command == "claude":

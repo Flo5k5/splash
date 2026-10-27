@@ -743,8 +743,14 @@ class LauncherTests(unittest.TestCase):
                 worker.join(timeout=5)
             self.assertEqual(
                 requests,
-                [("/v1/models", "Bearer test-key")]
-                * (2 * len(launcher.clients.INSTALL_URLS)),
+                [
+                    request
+                    for name in launcher.clients.INSTALL_URLS
+                    for _ in range(2)
+                    # Pi also asks how the server renders later system messages.
+                    for request in [("/v1/models", "Bearer test-key")]
+                    + [("/status", "Bearer test-key")] * (name == "pi")
+                ],
             )
 
     def test_only_a_given_port_that_finds_no_server_mentions_the_agents_own(self):
