@@ -1516,7 +1516,7 @@ Proxy consumers can use these fields; additional fields may be added:
 | `ane_ffn.state`, `share`, `minimum_rows`, `reason` | The prefill FFN's [Neural Engine split](#neural-engine-prefill): `split` while it serves, at `share` of the FFN's channels over chunks of `minimum_rows` rows or more; `off` when the start left the GPU alone (`share` and `minimum_rows` 0); `stopped` once it stopped while serving, until the engine restarts. `reason` is the start's outcome, or why the split stopped |
 | `ane_ffn.split_commands`, `evaluations`, `ane_ms`, `reruns` | Prefill commands the split ran since engine start, the Neural Engine's evaluations in them and its milliseconds over them (each evaluation's from the GPU's signal to start it to its report); and the chunks the GPU ran again alone after the split's work for them failed |
 | `verify_rows` | The rows of a draft block decode cycles verify ([drafts](#drafts), `--verify-rows`): `auto` where the verify budget chooses them (a MoE target under the default), `all` where they verify every row the output limit leaves (a dense target, or `--verify-rows all`) |
-| `model_timing.prefill.last_gpu_ms`, `total_gpu_ms` | GPU time of the last prefill command, and of all since engine start, warmup included: each from its first Metal command buffer's start to its last one's end, so with the Neural Engine split it spans the GPU's waits on the Neural Engine; a chunk run again adds the rerun's |
+| `model_timing.prefill.last_gpu_ms`, `total_gpu_ms` | GPU time of the last prefill command, and of all since engine start, warmup included: each from its first Metal command buffer's start to its last one's end, so with the Neural Engine split it spans the GPU's waits on the Neural Engine; a chunk's image encodes, a command of their own ahead of it, add theirs, as a chunk run again adds the rerun's |
 | `metrics.decode_tokens_per_second` | Aggregate native decode throughput, not a request's end-to-end rate |
 | `metrics.decode_wall_ms` | Total wall time of the decode commands on the GPU, from submission to completion |
 | `metrics.decode_cycle_ms` | Total engine time of the decode commands, each from the previous command's completion (or its plan after idleness) to its own: the GPU command plus the host work between commands |
@@ -1709,8 +1709,10 @@ each quantized tensor in the format mlx-lm infers from its tensors, an affine
 NVFP4, at the checkpoint's bits per weight (NVFP4's at 4.625, its tensor scale
 stored once per 256 weights); projections and experts as block planes, a
 quantized token table as native rows and an unquantized one as its bf16 rows.
-The block MoE kernels read the router and the shared-expert gate in F32, so
-these load as the F32 values of their quantization, and so do GDN alpha and
+The MoE router keeps its format too, a quantized one as native rows, an
+unquantized one as its bf16 or F32 rows, which the float projection runs
+([Kernels](#kernels)). The MoE selection reads the shared-expert gate in F32,
+so it loads as the F32 values of its quantization, and so do GDN alpha and
 beta unless both are in one format. Norms stay bf16 and the GDN value heads in
 MLX's grouped order.
 
@@ -1776,7 +1778,9 @@ and lists every unsupported tensor in one error:
   IQ4_NL, MXFP4, NVFP4, PQ2_0, Q2_0, BF16 or F16;
 - token embeddings: any of the linears' formats;
 - norms: F32, BF16 or F16, loaded as the F32 values they hold;
-- the MoE router: F32 or BF16, which the float projection runs as stored;
+- the MoE router: F32, BF16 or any of the linears' quantized formats (not
+  F16), which the float projection runs as stored, a quantized one as its
+  native rows (as an MLX target's quantized router loads);
 - the shared-expert scalar gate: F32, BF16 or Q8_0, loaded as the F32 values
   it holds;
 - the GDN convolution, decay and time-step bias: F32;
@@ -2022,6 +2026,15 @@ Unsloth's mmproj stores its 1-D tensors, patch embedding and position table as
 F32, all of them BF16-exact, and loads byte-identical to the MLX tower.
 Quantized MLX towers, deepstack projectors and mmproj tensors the tower does not
 use are rejected.
+
+A prefill command encodes the images whose rows begin in it, from no cached
+rows, in a command of its own, and is submitted once that command has
+completed: an encode takes about 0.3 s for a 1000 x 1400 page on an M5 Max
+and seconds for a 4-megapixel image on a small GPU, which Metal would count
+against the 5 s it gives the prefill command's first host step or Neural
+Engine wait ([Host steps](#host-steps)). The scheduler counts the encodes'
+time in what the prefill owes decoding requests, and leaves it out of its
+prefill estimate.
 
 `--language-only` links and loads no vision weights and removes them from
 memory accounting. It skips a GGUF's mmproj download and an MLX shard that
@@ -2354,7 +2367,7 @@ Loading never rounds a target or vision weight but in the F32 values of
 quantized tensors the kernels read unquantized, in the Q8_0 of Flash-Next's
 BF16 or F16 hyper-connection projections ([GGUF targets](#gguf-targets)), and
 in two conversions: the GDN decay above and the RMSNorm weights below. The first are a safetensors
-target's quantized router and shared-expert gate, and its quantized GDN alpha
+target's quantized shared-expert gate, and its quantized GDN alpha
 or beta beside one of another format or an unquantized one, an MLX target's
 ([MLX targets](#mlx-targets)) or a Model Optimizer or compressed-tensors
 target's in NVFP4 or FP8, and a GGUF's quantized alpha or beta beside one of
@@ -2516,20 +2529,56 @@ for decode.
 
 ### Kernels
 
-Every tensor keeps its stored format: the F32 norm multipliers, GDN decay, the
-MoE router and shared-expert scalar gate, and GDN alpha/beta when a file
-stores them as F32 stay F32 and run in fp32, as llama.cpp keeps them (Apple10
-prefill chunks multiply the router and alpha/beta on the neural accelerator as
-three bf16 parts per weight that sum to it exactly, so only fp32 accumulation
-rounds). The GDN convolution and time-step bias become bf16 under the exact
-rule.
+Every tensor keeps its stored format: the F32 norm multipliers, GDN decay,
+shared-expert scalar gate, and GDN alpha/beta when a file stores them as F32
+stay F32 and run in fp32, as llama.cpp keeps them. The MoE router runs in fp32
+in the format its checkpoint holds it: a GGUF's F32 or BF16 values, or the
+native rows of a quantized router (an MLX checkpoint's 8-bit affine one), each
+weight the fp32 value the token gather decodes, so its scores are those of the
+F32 tensor of its values bit for bit (Apple10 prefill chunks multiply the
+router and alpha/beta on the neural accelerator as three bf16 parts per weight
+that sum to it exactly, so only fp32 accumulation rounds). Its scores pick the
+experts, so it stays off the block tiles, whose staged and prefill tiles round
+the weights to half; in decode they are slower on its narrow grid as well: on a
+32-core M5 Max the 35B's router as 8-bit planes takes 6.3, 8.7, 11.1 and 15.6
+us at one to four lanes on the register tile, its native rows 5.2, 6.3, 7.4 and
+8.5 us on the float projection (prefill chunks: 58-74 us on the prefill tile at
+64 to 2048 rows, 10-184 us on the float tiles, faster up to about 550 rows;
+weights DRAM-cold). The GDN convolution and time-step bias become bf16 under
+the exact rule.
 
 Decode runs one of two kernel families, chosen by GPU family in `runtime/ops/LinearGguf.cpp`. On
 Apple9 (M3, M4) the register tile (`LinearTile::GgufRegister`) runs the kernels of
 `runtime/metal/kernels/decode/linear_gguf_sgmatrix.metal`, which feed the codes themselves to
-bf16 matrix operations with one fp32 epilogue per coefficient group, so every output is the bf16
-rounding of its fp32-accumulated sum. They read their activations as the Table16 table
-(`kernels/common/gguf_sgmatrix.h`) that the input's producer writes, or
+bf16 matrix operations, each chain of 32 inputs (16 for 16-input scales) closed by its fp32 scale,
+so every output is the bf16 rounding of its fp32-accumulated sum. The coefficient
+group is the inputs one scale covers (a format's `Group`: 16, 32, or the groups of a meta unit that
+share one, as MLX affine's groups of 64 and 128, PQ2_0, Q2_0, FP8 and BF16 do): a simdgroup decodes
+a column's coefficients into threadgroup memory once per group, and a format with a min adds its
+term, the min times the sum of those inputs, once per group but at least once per 64-input span of
+the table, from that span's sums (a group of 128 gathering four sums across two spans took 4.5-8.8%
+more time at four lanes than a term per span). The MMA shares Apple9's FP32 pipe with that epilogue;
+on a 10-core M4, against a decode and min term per 32 inputs, MLX 4-bit g64 at the 19 projection
+shapes of the 27B and 35B and their drafts takes up to 2.7% less time per shape at one lane (none on
+the 35B's GDN in-projection, most on the LM heads and the 35B draft's down projection), 1.7-3.7% at
+two and three and 3.3-4.6% at four, which over a B1 DFlash2 cycle's calls of those shapes is 16.67
+instead of 16.89 ms on the 35B and 165.80 instead of 168.06 ms on the 27B; MLX g128 takes 1.7-1.9%
+less in total at one to three lanes and 3.6% at four, though not 4-bit 2048 x 4096 at one to three.
+A chain over a whole 64-input group instead leaves a lane two dependent chains per simdgroup where
+it has four, and took 1-6% more time at one to three lanes. A zero point is such a term too,
+entered where it costs no epilogue: codes with one enter as 160 + code - zero, and the term's last
+chain starts from -160 times the sum of its inputs, from the table's sums of 32 once per group and
+span where a scale covers 32 inputs or more (Q4_0, Q5_0, IQ1_S, PQ2_0, Q2_0), and from the table's
+seed of 16 inputs per chain where scales cover 16 (Q6_K, Q3_K, IQ1_M). On the 10-core M4, against a
+decode and a seeded chain per 16 inputs, those five formats at projection shapes of 2048 to 17408
+columns take 1.4-7.1% less time at one lane and 3.5-8.0% at two to four. The zero point as an
+epilogue term instead, b * sum with b = -(128 + zero) s, took up to 3.3 points more (IQ1_S at one
+lane, 2.0-2.7 in Q4_0 and Q5_0 at two to four), and so did chains of 32 seeded with the sum of two
+16-input seeds; code - zero as the operand, its chains starting from zero, took 2.0-5.9% less time
+than seeded chains at three and four lanes in Q6_K, Q3_K and IQ1_M but up to 3.5% more at one and
+two (Q3_K at one lane), and on the 32-core M5 Max up to 3.9% more at one lane (IQ1_M at 512 x
+2048). They read their activations as the
+Table16 table (`kernels/common/gguf_sgmatrix.h`) that the input's producer writes, or
 `decode_linear_gguf_prepare` when none did. The formats whose operands those kernels build from
 grid lookups, IQ3_XXS, the IQ2 formats and IQ1 (`apple9StagesFormat`), and Q2_K from two lanes
 decode faster on the staged tile there, which a projection all of whose segments are in them
@@ -2545,7 +2594,17 @@ threadgroup memory (`kernels/common/gguf_staged.h`) for MPP `matmul2d`, the neur
 path, on bf16 activations. A decode step whose grid is narrow there, fewer than one and a half
 threadgroups per core (half that in formats of fewer than four bits per weight), runs on the
 register tile instead, whose 128 threads per column tile keep more of its cores' loads in flight
-than the staged tile's 64 (`apple10Registers`). A step's weights, and
+than the staged tile's 64 (`apple10Registers`). Its coefficient groups apply there too: on the
+32-core M5 Max the 35B's MLX 4-bit g64 projections of 2048 columns, which take the register tile
+at one lane, take 1.6-2.2% less time at their splits (GDN out, the draft's down and its context
+commit's fc), and the 320 x 10240 hyper-connection projections, which take it at every lane,
+0.4-1.8% less in MLX 4-bit and 8-bit g64 at one to three lanes and 4.4-5.2% at four, BF16 the
+same; with a zero point's term per group, against a decode and a seeded chain per 16 inputs, Q4_0,
+Q5_0, Q2_0, PQ2_0 and IQ1_S at 320 to 2048 columns, at the lanes that take the tile, take 1.0-4.2%
+less time at one lane and 2.1-5.9% at two to four. Partitions of under 512 inputs at sixteen splits
+(one or two coefficient units) take 2-10%
+more time at one to three lanes, which the tiers never pick, as sixteen keep 512 inputs per
+partition; at eight, partitions of one unit took 4.1% less to 0.8% more. A step's weights, and
 its meta unit when it enters a new one, load while the previous step's matmul runs
 (`gguf_staged_steps`): their DRAM round trips overlap a matmul. On Apple10 from 16 cores each
 column tile of a decode projection starts its walk over its K partition at its own step
@@ -2668,8 +2727,35 @@ of one request.
 The float router, QSA indexer and alpha/beta projections run in `kernels/shared/gguf_float.metal`,
 which runs two projections of one input in one dispatch where they take the same tile (the
 indexer's query and key, each on the tile of its own width), and the token rows are gathered by
-one template in `kernels/shared/embedding.metal`. These plans are fixed rules of GPU family, core
-count, shape and format.
+one template in `kernels/shared/embedding.metal`. The float projection reads a quantized format's
+rows (`QuantizedSegment::rows`) through the gather's decode
+(`kernels/common/gguf_embedding_formats.h`), the MLX affine formats as runs of 8 codes with their
+block's scale and bias, read a step ahead and decoded once for the step's products, and writes
+their products in fp32, the router's scores. The 35B's 8-bit affine router (256 x 2048, 0.56 MB
+a layer against its F32 values' 2.1 MB) trades the bytes it saves for its decode: at one to four
+lanes it takes 5.2, 6.3, 7.4 and 8.5 us on a 32-core M5 Max against 6.7, 7.1, 7.5 and 8.2 for its
+F32 values (4% slower at four lanes), 6.3, 8.3, 10.4 and 12.6 against 14.7, 16.1, 16.5 and 17.9
+on a 12-core M6, and 10.9, 14.7, 17.9 and 21.1 against 22.2, 23.9, 26.2 and 28.0 on a 10-core M4;
+the 122B's (256 x 3072) 6.7, 8.4, 10.0 and 11.5 against 9.0, 9.5, 10.0 and 10.9 on the M5 Max
+(`gguf-projection-benchmark float-af8g64 256 2048`, weights DRAM-cold). In the 35B's one-lane
+decode on the M5 Max its dispatch takes 8.4 us a layer against 9.45 (`decode-profile`, ABBA, 4
+runs of 96 cycles a build): 0.04 ms of a 14.7 ms cycle, within the cycle's noise. Prefill chunks
+of 1024 to 2048 rows on the M5 Max's accelerator tile, where the decode lies on each step's
+critical path, take -10% to +7% of the F32 values' time, and the M4's simdgroup tile -3% to +6%
+at 64 to 2048 rows.
+A float projection takes the neural accelerator tile on Apple10 from 16 rows and a grid of its
+64 x 32 tiles of 1.5 per core for BF16 values, 2 for F32 values and 3 for a quantized format's rows,
+by the bf16 parts the tile stages a weight as (one, three, three decoded; `Linear::ggufFloatTile`).
+Where the two tiles take the same time on a 32-core M5 Max and a 12-core M6
+(`gguf-projection-benchmark float-<format>`, rows in steps of 64): F32 at 2.0-2.67 tiles per core
+for 256 columns of 2048 or 3072 inputs, and 1.75-2.0 (M6) or 2.0 and above (M5 Max) for the 64 and
+96 of GDN alpha/beta; quantized rows at 2.67-4.0 (8-bit and 4-bit affine, Q8_0, Q4_K). Over those
+points the rule's tile takes at most 13% (F32) and 6% (quantized rows) longer than the faster one,
+where 1.5 for every weight took up to 42% and 61% longer; on the M5 Max the 35B's native router rows
+take 52.6 us at 512 rows on the simdgroup tile against 71.8 on the accelerator's. BF16 crosses at
+0.67-1.33, under its rule, which keeps a decode step's 16 to 32 rows of a 512-column router off the
+accelerator tile on 12 cores (1.6-1.8x the simdgroup tile's time there). These plans are fixed
+rules of GPU family, core count, shape and format.
 
 A rotated projection rotates its input once into `LinearScratch::rotated`
 (`gguf_rotate`, in fp32 and rounded once to bf16) before its quantized segments,
@@ -2726,16 +2812,17 @@ shared slices. The goldens and how to regenerate them are
 in `dev/tests/fixtures/weight-goldens/`; with `SPLASH_GGML_ORACLE=<libggml-base.dylib>`,
 `gguf-reference` also compares the reference with GGML directly and prints GGML's hashes.
 
-Two benchmark tools repeat the measurements behind the GGUF split law and tiers and the MoE
-plans, with the weights DRAM-cold.
-`make benchmark-gguf-projection GGUF_PROJECTION_ARGS='q4k 5120 8192'` times one projection (up
-to three fused formats and widths, then `K` and an optional epilogue) on both decode tiles at
-one to four lanes (one lane also on the staged 16-row tile, `staged16`; a gate/up pair on the
-staged tile in two passes, `staged`, and where the walks spread also in one, `pair` and
-`pair16`) and every K split, and marks the device policy's pick; widths emulate core counts,
-since the policy counts threadgroups per core. Or, with a trailing `prefill=R[,R...]` after the
-epilogue and the round count, one format's 128-row prefill tile at each chunk of `R` rows (more
-than 32); the formats `float-bf16` and `float-f32` time the float projection
+Two benchmark tools repeat the measurements behind the GGUF split law and tiers and the MoE plans,
+with the weights DRAM-cold (each command of the projection benchmark reads a ring of weight copies
+of at least 384 MiB, however small the tensor). `make benchmark-gguf-projection
+GGUF_PROJECTION_ARGS='q4k 5120 8192'` times one projection (up to three fused formats and widths,
+then `K` and an optional epilogue) on both decode tiles at one to four lanes (one lane also on the
+staged 16-row tile, `staged16`; a gate/up pair on the staged tile in two passes, `staged`, and where
+the walks spread also in one, `pair` and `pair16`) and every K split, and marks the device policy's
+pick; widths emulate core counts, since the policy counts threadgroups per core. Or, with a trailing
+`prefill=R[,R...]` after the epilogue and the round count, one format's 128-row prefill tile at each
+chunk of `R` rows (more than 32); the formats `float-bf16` and `float-f32`, and `float-<format>` for
+a quantized format's native rows (such as `float-af8g64`), time the float projection
 (`ops::addGgufFloat`, widths of any multiple of 8) on both float tiles instead, marking
 `Linear::ggufFloatTile`'s pick; `make benchmark-gguf-moe` times one MoE layer at the 35B shape,
 or at Qwen3.8-Flash-Next's or Flint's (`GGUF_MOE_ARGS='flash-next'` or `'flint'`), on the
@@ -3057,6 +3144,19 @@ threw, and must not throw: the command may have completed by then, so a
 submitCommandAsync or wait() threw (its encoding failed after its first
 buffers were committed, or the watchdog or a shutdown gave the command up),
 so the work owns what it touches.
+
+Metal fails a command buffer whose event wait is still unmet 5 s after its
+queue reached the wait ("Caused GPU Timeout Error"), and with it the command
+and the engine. The backend commits a command's buffers as it encodes them, so
+the queue reaches a command's first host step, or Neural Engine wait, as the
+command is submitted, whatever GPU work runs ahead of it, and each later one
+once the one before it was met (macOS 27, M5 Max and M5 Pro; a wait committed
+behind 4.5 s of work and met 1 s after it fails at 5.0 s). The work between
+two steps, with the step, must therefore end within 5 s, which the
+scheduler's prefill slices keep with room to spare. Work outside them runs as
+a command of its own: a prefill command's image encodes, seconds of GPU work
+on a small GPU, run first, and the prefill command is submitted once they
+have completed ([Vision](#vision)).
 
 A step about as short as the GPU's wake-up can keep the GPU awake: one GPU
 thread spins through it until the CPU ends it, so the work after it starts at
