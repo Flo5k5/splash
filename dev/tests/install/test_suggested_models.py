@@ -30,18 +30,25 @@ def readme_models():
 
 
 class SuggestedModelsTests(unittest.TestCase):
-    def test_rows_are_model_name_and_memory(self):
+    def test_rows_are_model_name_memory_size_and_about(self):
         rows = suggested_rows()
         self.assertTrue(rows)
         for row in rows:
             with self.subTest(row=row):
-                self.assertEqual(len(row), 3)
-                model, name, memory = row
+                self.assertEqual(len(row), 5)
+                model, name, memory, size, about = row
                 self.assertEqual(serve_options.parse_model_id(model), model)
                 self.assertTrue(name)
                 self.assertRegex(memory, r"^[1-9][0-9]*$")
+                self.assertRegex(size, r"^[1-9][0-9]*$")
+                self.assertTrue(about)
+                self.assertFalse(about.endswith("."))
         counts = collections.Counter(row[0] for row in rows)
         self.assertEqual([model for model, count in counts.items() if count > 1], [])
+        abouts = collections.defaultdict(set)
+        for _, name, _, _, about in rows:
+            abouts[name].add(about)
+        self.assertEqual([name for name, about in abouts.items() if len(about) > 1], [])
 
     def test_readme_models_table_lists_only_suggested_models(self):
         suggested = {row[0] for row in suggested_rows()}

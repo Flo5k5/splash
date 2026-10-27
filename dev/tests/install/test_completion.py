@@ -92,8 +92,10 @@ class CompletionTests(unittest.TestCase):
         directory = root / "install/completions"
         shutil.copytree(COMPLETIONS, directory)
         (root / "install/suggested-models.tsv").write_text(
-            "# MODEL<TAB>NAME<TAB>MEMORY\n"
-            + "".join(f"{model}\tModel\t24\n" for model in SUGGESTED)
+            "# MODEL<TAB>NAME<TAB>MEMORY<TAB>SIZE<TAB>ABOUT\n"
+            + "".join(
+                f"{model}\tModel\t24\t16\tFast all-rounder\n" for model in SUGGESTED
+            )
         )
         if release:
             (root / "release.json").write_text("{}")
