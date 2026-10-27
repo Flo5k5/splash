@@ -46,19 +46,15 @@ struct AppFlowTests {
     let chats = FileManager.default.temporaryDirectory.appending(path: "splash-chats-\(UUID().uuidString)")
 
     init() async throws {
-        Preference.register()
-        let defaults = UserDefaults.standard
-        defaults.set(Self.port, forKey: Preference.port)
-        defaults.set("", forKey: Preference.serveOptions)
-        defaults.set(IdleRelease.tenMinutes.rawValue, forKey: Preference.idleRelease)
-        // The tests start models themselves.
-        defaults.set(false, forKey: Preference.startOnOpen)
+        ServeSettings(port: Self.port).save()
         let runtime = try #require(Runtime.locate(), "SPLASH_RUNTIME names no runtime")
         #expect(runtime.packaged)
         state = AppState(runtime: runtime, chats: ChatStore(folder: chats))
         model = Self.models![0]
         await state.launch()
-        #expect(state.screen == (state.installed.isEmpty ? .models : .chat))
+        // The window opens on the Server, and nothing starts until the user starts it.
+        #expect(state.section == .server)
+        #expect(!state.server.running)
     }
 
     @Test func thisMacIsSupportedAndGetsSuggestions() async throws {
@@ -66,29 +62,31 @@ struct AppFlowTests {
         let suggestions = state.catalog.suggestions(memory: Catalog.memory)
         print("Suggested for \(Catalog.memory) GB: \(suggestions.map(\.id))")
         #expect(!suggestions.isEmpty)
-        await Snapshot.save("models", size: CGSize(width: 560, height: 600), ModelsSheet().environment(state))
+        await Snapshot.save("server", MainView().environment(state))
+        await Snapshot.save("server-advanced", size: CGSize(width: 1120, height: 1100), ServerView(advanced: true).environment(state))
+        state.section = .chat
         await Snapshot.save("chat-stopped", MainView().environment(state))
-        await Snapshot.save("settings", size: CGSize(width: 480, height: 300), SettingsView())
-        await Snapshot.save("settings-advanced", size: CGSize(width: 480, height: 520), SettingsView(advanced: true))
         // A Mac with no model yet: a runtime whose models folder is empty.
         let fresh = FileManager.default.temporaryDirectory.appending(path: "splash-first-run-\(getpid())")
         try FileManager.default.createDirectory(at: fresh.appending(path: "install"), withIntermediateDirectories: true)
         try? FileManager.default.copyItem(at: state.runtime.suggestedModels, to: Runtime(root: fresh).suggestedModels)
         let first = AppState(runtime: Runtime(root: fresh))
-        #expect(first.installed.isEmpty)
-        await Snapshot.save("models-first-run", ModelsView().environment(first))
+        #expect(first.installed.isEmpty && first.selection == nil)
+        await first.launch()
+        await Snapshot.save("server-first-run", MainView().environment(first))
     }
 
     @Test func aModelInstallsStartsServesAndStops() async throws {
         try await install(model)
         state.start(model)
+        #expect(state.selection == model)
         try await waitFor(state.server.phase == .starting, "starting")
-        #expect(state.screen == .chat)
-        await Snapshot.save("chat-starting", MainView().environment(state))
+        await Snapshot.save("server-starting", MainView().environment(state))
         try await ready()
+        await Snapshot.save("server-ready", MainView().environment(state))
         let reply = try await chat("Reply with one word: hello")
         #expect(!reply.isEmpty)
-        #expect(state.screen == .chat)
+        state.section = .chat
         await Snapshot.save("chat-new", MainView().environment(state))
         // The app's own chat: the reply streams into a conversation it keeps.
         try await converse("Write a haiku about the sea, then a Swift function that adds two numbers.")
@@ -97,14 +95,22 @@ struct AppFlowTests {
         #expect(conversation.messages[1].model == model)
         #expect(ChatStore(folder: chats).conversations.first?.messages == conversation.messages, "saved")
         await Snapshot.save("chat-ready", MainView().environment(state))
-        await Snapshot.save("models-sheet", size: CGSize(width: 560, height: 600), ModelsSheet().environment(state))
+        // Changed options ask for a restart, which starts the model with them.
+        state.options.context = .k32
+        #expect(state.optionsChanged)
+        state.section = .server
+        await Snapshot.save("server-options-changed", MainView().environment(state))
+        state.start(model)
+        #expect(state.status.hasPrefix("Restarting "))
+        try await waitFor(state.server.phase == .starting, "restarting")
+        #expect(state.server.settings.context == .k32 && !state.optionsChanged)
+        try await ready()
+        state.options = ServeSettings(port: Self.port)
         let pid = try #require(state.runtime.serveLockOwner(port: Self.port))
         state.stop()
         #expect(state.server.phase == .stopping)
         try await waitFor(state.server.phase == .stopped, "stopped", seconds: 60)
         #expect(kill(pid, 0) != 0)
-        #expect(state.screen == .chat)
-        #expect(!UserDefaults.standard.bool(forKey: Preference.resume))
     }
 
     @Test func switchingStopsOneModelAndStartsTheNext() async throws {
@@ -114,12 +120,16 @@ struct AppFlowTests {
         try await ready()
         try await converse("Say hi.")
         let first = try #require(state.runtime.serveLockOwner(port: Self.port))
+        // Picking another model on the Server offers the switch; it switches only when asked to.
+        state.selection = models[1]
+        #expect(state.server.model == model && state.server.phase == .ready)
+        await Snapshot.save("server-switch", MainView().environment(state))
         state.start(models[1])
         #expect(state.server.phase == .stopping)
         #expect(state.server.next == models[1])
-        #expect(state.status.hasPrefix("Starting "))
-        // The conversation stays on screen while the next model starts.
-        #expect(state.screen == .chat)
+        #expect(state.status.hasPrefix("Switching to "))
+        // The conversation stays while the next model starts.
+        state.section = .chat
         await Snapshot.save("chat-switching", MainView().environment(state))
         try await waitFor(state.server.model == models[1] && state.server.phase != .stopping, "next starting")
         #expect(state.server.phase == .starting)
@@ -133,31 +143,30 @@ struct AppFlowTests {
     }
 
     @Test func aStartThatFailsSaysWhy() async throws {
-        UserDefaults.standard.set("--no-such-option", forKey: Preference.serveOptions)
-        defer { UserDefaults.standard.set("", forKey: Preference.serveOptions) }
+        state.options.memoryLimit = 1
+        defer { state.options = ServeSettings(port: Self.port) }
         state.start(model)
         try await waitFor({ if case .failed = state.server.phase { true } else { false } }(), "failed")
         guard case .failed(let message) = state.server.phase else { return }
-        #expect(message.contains("--no-such-option"), "\(message)")
-        #expect(message.contains("Settings › Advanced"), "\(message)")
+        #expect(message.hasPrefix("It needs ")
+                && message.hasSuffix("but the memory limit is 1 GB. Raise the memory limit in Launch Options."),
+                "\(message)")
+        await Snapshot.save("server-failed", MainView().environment(state))
+        state.section = .chat
         await Snapshot.save("chat-failed", MainView().environment(state))
+        state.section = .server
         // A download that fails says why too.
         state.installer.install("splash-app-test/no-such-model")
         try await waitFor(!state.installer.running, "the download failed", seconds: 120)
         #expect(state.installer.failure?.model == "splash-app-test/no-such-model")
         #expect(state.installer.failure?.message.contains("Hugging Face has no public model") == true)
-        await Snapshot.save("models-failed", size: CGSize(width: 560, height: 600), ModelsSheet().environment(state))
+        await Snapshot.save("server-download-failed", MainView().environment(state))
         state.installer.dismissFailure()
         state.server.dismissFailure()
         #expect(state.installer.failure == nil && state.server.phase == .stopped)
     }
 
-    @Test func optionsTheAppSetsAndABusyPortFailAtOnce() async throws {
-        UserDefaults.standard.set("--port 1", forKey: Preference.serveOptions)
-        state.start(model)
-        #expect(state.server.phase == .failed("The server options in Settings can’t include --port: Splash sets it itself."))
-        #expect(!state.server.running)
-        UserDefaults.standard.set("", forKey: Preference.serveOptions)
+    @Test func aBusyPortFailsAtOnce() async throws {
         let listener = Process()
         listener.executableURL = URL(filePath: "/usr/bin/python3")
         listener.arguments = ["-m", "http.server", "--bind", "127.0.0.1", String(Self.port)]
@@ -186,9 +195,8 @@ struct AppFlowTests {
         #expect(!state.server.running)
         state.start(model)
         #expect(!state.server.running)
-        // Quitting is no stop of the user's: the model starts when Splash next opens.
-        #expect(UserDefaults.standard.bool(forKey: Preference.resume))
-        #expect(UserDefaults.standard.string(forKey: Preference.lastModel) == model)
+        // The model stays picked for the next launch, which starts nothing by itself.
+        #expect(AppState(runtime: state.runtime).selection == model)
     }
 
     @Test func aRelaunchStopsTheServerACrashLeftBehind() async throws {
@@ -209,7 +217,7 @@ struct AppFlowTests {
         try await waitFor((installer.progress?.done ?? 0) > 0, "progress", seconds: 120)
         #expect(installer.progress?.repo == String(download.split(separator: ":")[0]))
         #expect(state.downloadStatus?.hasPrefix("Downloading ") == true)
-        await Snapshot.save("models-downloading", size: CGSize(width: 560, height: 600), ModelsSheet().environment(state))
+        await Snapshot.save("server-downloading", MainView().environment(state))
         let clock = ContinuousClock.now
         installer.cancel()
         try await waitFor(!installer.running, "cancelled", seconds: 30)
@@ -224,7 +232,6 @@ struct AppFlowTests {
         #expect(kill(pid, 0) != 0)
         try await waitFor(!installer.running, "noticed", seconds: 30)
         try await install(download)
-        try await stop()
     }
 
     @Test func agentsRunInTheFolderPicked() {
@@ -244,8 +251,8 @@ struct AppFlowTests {
         try await waitFor(!state.installer.running, "installed \(model)", seconds: 3600)
         #expect(state.installer.failure == nil, "\(String(describing: state.installer.failure))")
         #expect(state.isInstalled(model))
-        // A model installed while none runs starts.
-        if state.server.running { try await stop() }
+        // A model downloaded is picked, not started.
+        #expect(state.selection == model && !state.server.running)
     }
 
     private func ready() async throws {

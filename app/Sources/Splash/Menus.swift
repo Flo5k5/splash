@@ -10,33 +10,17 @@ struct StatusItems: View {
     }
 }
 
-/// The models on this Mac to run, and stopping the one running.
-struct ModelMenuItems: View {
+/// Stopping the model that runs, and the coding agents on it; models start on the Server screen.
+struct ServerMenuItems: View {
     @Environment(AppState.self) private var state
-    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         let server = state.server
-        let current = server.running ? server.next ?? server.model : nil
-        Picker("Model", selection: Binding(get: { current }, set: { model in
-            if let model, model != current { state.start(model) }
-        })) {
-            ForEach(state.installed) { Text(state.displayName(of: $0.id)).tag(Optional($0.id)) }
+        if server.running, let model = server.next ?? server.model {
+            Button("Stop \(state.displayName(of: model))") { state.stop() }
+                .disabled(server.phase == .stopping && server.next == nil)
         }
-        .pickerStyle(.inline)
-        .labelsHidden()
-        .disabled(!state.ready)
-        Divider()
-        if let current {
-            Button("Stop \(state.displayName(of: current))") { state.stop() }
-                .disabled(server.phase == .stopping)
-        }
-        Button("Download Models…") {
-            openWindow(id: "main")
-            NSApp.activate()
-            state.showModels()
-        }
-        .disabled(!state.ready)
+        Menu("Coding Agents") { AgentMenuItems() }
     }
 }
 
@@ -67,16 +51,17 @@ struct MenuBarMenu: View {
     var body: some View {
         StatusItems()
         Divider()
-        Button("Open Splash") {
-            openWindow(id: "main")
-            NSApp.activate()
-        }
+        Button("Open Server") { show(.server) }
+        Button("Open Chat") { show(.chat) }
         Divider()
-        ModelMenuItems()
+        ServerMenuItems()
         Divider()
-        Menu("Coding Agents") { AgentMenuItems() }
-        Divider()
-        SettingsLink { Text("Settings…") }.keyboardShortcut(",")
         Button("Quit Splash") { NSApp.terminate(nil) }.keyboardShortcut("q")
+    }
+
+    private func show(_ section: AppState.Section) {
+        state.section = section
+        openWindow(id: "main")
+        NSApp.activate()
     }
 }

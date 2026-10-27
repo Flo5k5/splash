@@ -74,6 +74,13 @@ struct Composer: View {
                     .accessibilityLabel("Attach Images")
                 EffortMenu()
                 Spacer()
+                if state.server.phase == .ready, let model = state.server.model {
+                    Text(state.displayName(of: model))
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .help("The model that answers. Models change on the Server screen.")
+                }
                 if streaming {
                     Button { state.chats.stop() } label: { Image(systemName: "stop.fill").font(.system(size: 10, weight: .bold)) }
                         .keyboardShortcut(".", modifiers: .command)

@@ -1,85 +1,87 @@
 import SwiftUI
 
-/// The main window: the welcome until a model is on this Mac, the chats after. Its toolbar holds
-/// the model being talked to and, while one runs, the coding agents.
+/// The main window: the Server or the Chat, as the switch at the toolbar's start picks. Its toolbar
+/// holds, besides, a download under way while the Chat shows.
 struct MainView: View {
     @Environment(AppState.self) private var state
 
     var body: some View {
-        @Bindable var state = state
-        screen
-            .transition(.opacity)
+        content
             .frame(minWidth: 800, minHeight: 560)
             .navigationTitle("Splash")
             .toolbar(removing: .title)
             .toolbar {
-                if state.screen == .chat {
-                    ToolbarItem(placement: .navigation) { ModelMenu() }
+                // The Chat's sidebar holds the switch at the same place.
+                if state.available && state.section == .server {
+                    ToolbarItem(placement: .navigation) { SectionSwitch() }
                         .sharedBackgroundVisibility(.hidden)
                 }
-                if state.installer.running && state.screen != .models && !state.showingModels {
+                if state.installer.running && state.section == .chat {
                     ToolbarItem { DownloadButton() }
                 }
-                if state.server.running {
-                    ToolbarItem { AgentsMenu() }
-                }
-            }
-            .animation(.smooth(duration: 0.25), value: state.screen)
-            .sheet(isPresented: $state.showingModels) { ModelsSheet() }
-            .onChange(of: state.screen) { _, screen in
-                if screen == .models { state.showingModels = false }
             }
             .onChange(of: state.status) { _, status in
                 AccessibilityNotification.Announcement(status).post()
             }
     }
 
-    @ViewBuilder private var screen: some View {
-        switch state.screen {
-        case .launching:
+    @ViewBuilder private var content: some View {
+        if let blocker = state.blocker {
+            ContentUnavailableView(blocker.title, systemImage: blocker.symbol, description: Text(blocker.message))
+        } else if !state.launched {
             ProgressView().controlSize(.small).frame(maxWidth: .infinity, maxHeight: .infinity)
-        case .blocked:
-            if let blocker = state.blocker {
-                ContentUnavailableView(blocker.title, systemImage: blocker.symbol, description: Text(blocker.message))
+        } else {
+            switch state.section {
+            case .server: ServerView()
+            case .chat: ChatScreen()
             }
-        case .models:
-            ModelsView()
-        case .chat:
-            ChatScreen()
         }
     }
 }
 
-/// The model being talked to, as the window's heading, opening the models and the actions on it.
-struct ModelMenu: View {
+/// The switch between the Server and the Chat.
+struct SectionSwitch: View {
     @Environment(AppState.self) private var state
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
-        let server = state.server
-        Menu {
-            StatusItems()
-            Divider()
-            ModelMenuItems()
-        } label: {
-            Text(server.running ? (server.next ?? server.model).map(state.displayName(of:)) ?? "" : "Choose a Model")
-                .font(.headline)
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .frame(maxWidth: 280)
+        HStack(spacing: 2) {
+            segment("Server", .server, help: "Models and how they run (⌘1)")
+            segment("Chat", .chat, help: "Chat with the model that runs (⌘2)")
         }
-        .menuIndicator(.visible)
-        .help("Choose the model to talk to")
-        .accessibilityLabel("Model")
-        .accessibilityValue(state.status)
+        .padding(2)
+        .background(.primary.opacity(colorScheme == .dark ? 0.08 : 0.06), in: .capsule)
+    }
+
+    private func segment(_ title: String, _ section: AppState.Section, help: String) -> some View {
+        let selected = state.section == section
+        return Button { state.section = section } label: {
+            Text(title)
+                .font(.callout.weight(.medium))
+                .foregroundStyle(selected ? .primary : .secondary)
+                .padding(.horizontal, 14)
+                .frame(height: 28)
+                .background {
+                    if selected {
+                        Capsule()
+                            .fill(colorScheme == .dark ? AnyShapeStyle(.white.opacity(0.16)) : AnyShapeStyle(.white))
+                            .shadow(color: .black.opacity(0.12), radius: 1.5, y: 0.5)
+                    }
+                }
+                .contentShape(.capsule)
+        }
+        .buttonStyle(.plain)
+        .help(help)
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 }
 
-/// A download under way while the models are not on screen; opens them.
+/// A download under way while the Chat shows; opens the Server.
 struct DownloadButton: View {
     @Environment(AppState.self) private var state
 
     var body: some View {
-        Button { state.showModels() } label: {
+        Button { state.section = .server } label: {
             ProgressView(value: state.installer.progress?.fraction ?? 0)
                 .progressViewStyle(.circular)
                 .controlSize(.small)
@@ -87,18 +89,6 @@ struct DownloadButton: View {
         .help(state.downloadStatus ?? "")
         .accessibilityLabel("Download")
         .accessibilityValue(state.downloadStatus ?? "")
-    }
-}
-
-/// Opens a coding agent on the running model.
-struct AgentsMenu: View {
-    var body: some View {
-        Menu {
-            AgentMenuItems()
-        } label: {
-            Label("Coding Agents", systemImage: "terminal")
-        }
-        .help("Open a coding agent in Terminal, connected to this model")
     }
 }
 

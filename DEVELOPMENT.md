@@ -4254,10 +4254,13 @@ The app adds no second way to serve. It runs the packaged runtime's own
 commands, each in a process group of its own, as a terminal runs a foreground
 job, with its output appended to a log in `~/Library/Logs/Splash`:
 `install/models.py --model ID prepare --json-progress` downloads a model, and
-`splash serve --model ID --port PORT --offline` serves an installed one, ready
-once the port's lock names that process and `/health` answers; stopping is
-Ctrl+C's SIGINT to the group. Switching models stops one server and starts the
-next. Models, locks and downloads are the ones a packaged `splash` uses, in
+`splash serve --model ID --port PORT --offline` serves an installed one, with
+the launch options picked in the app that differ from the server's defaults,
+ready once the port's lock names that process and `/health` answers; stopping
+is Ctrl+C's SIGINT to the group. Switching models stops one server and starts
+the next. The app starts nothing by itself: its window opens on the Server,
+where models download, start and switch, beside the Chat. Models, locks and
+downloads are the ones a packaged `splash` uses, in
 `~/Library/Application Support/Splash` and the Hugging Face cache. The app
 offers `install/suggested-models.tsv`, per model the variant meant for the
 Mac's memory with its download size and a few words about the model, and

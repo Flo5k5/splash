@@ -14,8 +14,9 @@ final class Server {
     private(set) var phase = Phase.stopped
     /// The model starting, served or last failed.
     private(set) var model: String?
-    /// The model to start once the one stopping has stopped.
-    private(set) var next: String?
+    /// The start to make once the model stopping has stopped.
+    private var queued: (model: String, settings: ServeSettings)?
+    /// The options of the model starting, served or last failed.
     private(set) var settings = ServeSettings()
     /// Once ready: whether the engine has given the weights back while idle.
     private(set) var asleep = false
@@ -37,13 +38,16 @@ final class Server {
 
     var running: Bool { child != nil }
 
-    /// Starts installed `model`, stopping the one being served first.
-    func start(_ model: String) {
+    /// The model to start once the one stopping has stopped: another one, or the same one again.
+    var next: String? { queued?.model }
+
+    /// Starts installed `model` with `settings`, stopping the one being served first.
+    func start(_ model: String, settings: ServeSettings) {
         if child != nil {
             stop()
-            next = model
+            queued = (model, settings)
         } else {
-            launch(model)
+            launch(model, settings: settings)
         }
     }
 
@@ -51,7 +55,7 @@ final class Server {
     /// sends; a second one after 10 s, on which the server stops the engine at once; SIGKILL if
     /// anything still runs 20 s later.
     func stop() {
-        next = nil
+        queued = nil
         guard let child, phase != .stopping else { return }
         stopRequested = true
         phase = .stopping
@@ -83,19 +87,16 @@ final class Server {
         await stopProcessGroup(pid)
     }
 
-    private func launch(_ model: String) {
+    private func launch(_ model: String, settings: ServeSettings) {
         self.model = model
-        settings = .current()
+        self.settings = settings
         asleep = false
         acceptsImages = false
         firstError = nil
         stopRequested = false
         resetLog(Self.log)
-        if let option = settings.reservedOption {
-            return refuse("The server options in Settings can’t include \(option): Splash sets it itself.")
-        }
         if portInUse(settings.port) {
-            return refuse("Port \(settings.port) is in use by another app. Choose another port in Settings › Advanced.")
+            return refuse("Port \(settings.port) is in use by another app. Quit that app, or choose another port in Launch Options › Advanced.")
         }
         phase = .starting
         do {
@@ -133,16 +134,43 @@ final class Server {
         child = nil
         watch?.cancel()
         UserDefaults.standard.removeObject(forKey: Preference.serverPID)
-        if let model = next {
-            next = nil
-            launch(model)
+        if let queued {
+            self.queued = nil
+            launch(queued.model, settings: queued.settings)
         } else if stopRequested {
             phase = .stopped
         } else if phase == .starting, let firstError, let model {
-            phase = .failed(plainProblem(firstError, model: model))
+            phase = .failed(Self.memoryProblem(firstError, settings: settings) ?? plainProblem(firstError, model: model))
         } else {
             phase = .failed("It stopped unexpectedly. The log has the details.")
         }
+    }
+
+    /// A start the engine refuses for want of memory, in the words of the launch options: the
+    /// model, with its reserves, needs more than the budget, the memory limit set or this Mac's own;
+    /// or the context length set is more than the memory left, or the SSD cache, holds.
+    nonisolated static func memoryProblem(_ message: String, settings: ServeSettings) -> String? {
+        if let match = message.firstMatch(of: /require (\d+) bytes but the Metal memory budget is (\d+) bytes/),
+           let need = Int64(match.1), let budget = Int64(match.2) {
+            let size = { (bytes: Int64) in
+                "\((Double(bytes) / Double(1 << 30)).formatted(.number.precision(.fractionLength(0...1)))) GB"
+            }
+            if let limit = settings.memoryLimit, Int64(limit) << 30 == budget {
+                return "It needs \(size(need)) of memory but the memory limit is \(size(budget)). Raise the memory limit in Launch Options."
+            }
+            return "It needs \(size(need)) of memory but this Mac can give it \(size(budget)). Choose a smaller model."
+        }
+        if let match = message.firstMatch(of: /exceeds the (\d+) tokens the model and (.+) allow/), let most = Int(match.1) {
+            let tokens = most >= 1024 ? "\(most / 1024)K" : "\(most)"
+            if match.2.contains("--max-memory") {
+                return "Its context fits up to \(tokens) tokens within the memory limit. Choose a shorter context length, or raise the memory limit."
+            }
+            if match.2.contains("SSD cache") {
+                return "Its context fits up to \(tokens) tokens in the SSD cache. Choose a shorter context length, or a larger SSD cache."
+            }
+            return "Its context fits up to \(tokens) tokens on this Mac. Choose a shorter context length, or Auto."
+        }
+        return nil
     }
 
     /// Waits until this start's server answers, then follows its status. The port's lock names the
@@ -153,11 +181,8 @@ final class Server {
             if runtime.serveLockOwner(port: settings.port) == pid,
                let (_, response) = try? await URLSession.shared.data(from: health),
                (response as? HTTPURLResponse)?.statusCode == 200,
-               !Task.isCancelled, phase == .starting, let model {
+               !Task.isCancelled, phase == .starting {
                 phase = .ready
-                // The model to start when Splash next opens, until the user stops it.
-                UserDefaults.standard.set(model, forKey: Preference.lastModel)
-                UserDefaults.standard.set(true, forKey: Preference.resume)
                 acceptsImages = await inputModalities().contains("image")
                 break
             }

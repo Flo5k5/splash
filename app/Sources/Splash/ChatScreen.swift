@@ -11,13 +11,21 @@ private let column: CGFloat = 680
 /// The conversations beside the open one.
 struct ChatScreen: View {
     @Environment(AppState.self) private var state
+    @State private var columns = NavigationSplitViewVisibility.all
 
     var body: some View {
-        NavigationSplitView {
+        NavigationSplitView(columnVisibility: $columns) {
             ChatList()
-                .navigationSplitViewColumnWidth(min: 200, ideal: 240, max: 320)
+                .navigationSplitViewColumnWidth(min: 240, ideal: 260, max: 340)
         } detail: {
             ConversationView()
+                .toolbar {
+                    // The sidebar holds the switch; while it is hidden, the conversation does.
+                    if columns == .detailOnly {
+                        ToolbarItem(placement: .navigation) { SectionSwitch() }
+                            .sharedBackgroundVisibility(.hidden)
+                    }
+                }
         }
         .onAppear { state.draft.focus() }
     }
@@ -57,7 +65,11 @@ private struct ChatList: View {
         .searchable(text: $query, placement: .sidebar, prompt: "Search")
         .onDeleteCommand { deleting = chats.current }
         .toolbar {
-            ToolbarItem {
+            // Where the Server has it: first, after the window's buttons.
+            ToolbarItem { SectionSwitch() }
+                .sharedBackgroundVisibility(.hidden)
+            // At the start of the conversation's side, as the sidebar has no room left.
+            ToolbarItem(placement: .navigation) {
                 Button {
                     chats.newChat()
                     state.draft.focus()
@@ -163,60 +175,32 @@ private struct ConversationView: View {
     }
 }
 
-/// What keeps the chat from answering now, or what it can do next, in one line above the
-/// composer: a model starting or stopping, a problem, none running, another one downloaded.
+/// What keeps the chat from answering now, in one line above the composer: a model starting or
+/// stopping, a problem, none running. Models start on the Server screen.
 private struct StatusLine: View {
     @Environment(AppState.self) private var state
 
     var body: some View {
-        let server = state.server
-        let name = server.model.map(state.displayName(of:)) ?? ""
         HStack(spacing: 8) {
-            switch server.phase {
-            case .starting:
+            switch state.server.phase {
+            case .starting, .stopping:
                 ProgressView().controlSize(.small)
-                Text(loading(name))
-                Button("Cancel") { state.stop() }
-            case .stopping:
-                ProgressView().controlSize(.small)
-                if let next = server.next {
-                    Text("Switching to \(state.displayName(of: next))…")
-                    Button("Cancel") { state.stop() }
-                } else {
-                    Text("Stopping \(name)…")
-                }
+                Text(state.status).foregroundStyle(.secondary)
             case .failed:
                 Image(systemName: "exclamationmark.triangle.fill").symbolRenderingMode(.multicolor)
-                Text("\(name) ran into a problem.")
-                Button("Details…") { state.showModels() }
-                if let model = server.model { Button("Try Again") { state.start(model) } }
+                Text("\(state.status).").foregroundStyle(.secondary)
+                Button("Open Server") { state.section = .server }
             case .stopped:
-                Text("No model is running.")
-                if let last = state.lastModel {
-                    Button("Start \(state.displayName(of: last))") { state.start(last) }
-                } else {
-                    Button("Choose a Model…") { state.showModels() }
-                }
+                Text(state.installed.isEmpty ? "Download a model to start chatting." : "No model is running.")
+                    .foregroundStyle(.secondary)
+                Button("Open Server") { state.section = .server }
             case .ready:
-                if let model = state.downloaded {
-                    Text("\(state.displayName(of: model)) is ready.")
-                    Button("Switch to It") { state.start(model) }
-                } else if let failure = state.installer.failure {
-                    Image(systemName: "exclamationmark.triangle.fill").symbolRenderingMode(.multicolor)
-                    Text("\(state.displayName(of: failure.model)) couldn’t download.")
-                    Button("Details…") { state.showModels() }
-                }
+                EmptyView()
             }
         }
         .font(.callout)
-        .foregroundStyle(.secondary)
         .buttonStyle(.link)
         .padding(.horizontal, 4)
-    }
-
-    private func loading(_ name: String) -> String {
-        let size = state.installed.first { $0.id == state.server.model }.map { Format.size($0.bytes) }
-        return size.map { "Loading \(name) (\($0)) into memory…" } ?? "Loading \(name) into memory…"
     }
 }
 
@@ -265,7 +249,15 @@ private struct MessageView: View {
                     Thinking(text: message.reasoning, live: live && message.text.isEmpty)
                 }
                 if message.isEmpty && live {
-                    ProgressView().controlSize(.small)
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        // After the idle release, the model loads again before it answers.
+                        if state.server.asleep, let model = state.server.model {
+                            Text("Loading \(state.displayName(of: model)) back into memory…")
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
                 } else if !message.text.isEmpty {
                     MarkdownView(text: message.text)
                 }

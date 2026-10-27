@@ -15,30 +15,30 @@ struct SplashApp: App {
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button("New Chat") {
+                    state.section = .chat
                     state.chats.newChat()
                     state.draft.focus()
                 }
-                    .keyboardShortcut("n")
-                    .disabled(state.screen != .chat)
+                .keyboardShortcut("n")
+                .disabled(!state.available)
             }
-            // The toolbar holds the model's controls; it is not to be hidden.
-            CommandGroup(replacing: .toolbar) {}
-            CommandMenu("Model") {
-                Group {
-                    ModelMenuItems()
-                    Divider()
-                    Menu("Coding Agents") { AgentMenuItems() }
-                }
-                .environment(state)
+            // The toolbar holds the switch between the Server and the Chat; it is not to be hidden.
+            CommandGroup(replacing: .toolbar) {
+                Button("Server") { state.section = .server }
+                    .keyboardShortcut("1")
+                    .disabled(!state.available)
+                Button("Chat") { state.section = .chat }
+                    .keyboardShortcut("2")
+                    .disabled(!state.available)
+            }
+            CommandMenu("Server") {
+                ServerMenuItems()
+                    .environment(state)
             }
             CommandGroup(replacing: .help) {
                 Button("Show Server Log") { NSWorkspace.shared.open(Server.log) }
                 Button("Show Download Log") { NSWorkspace.shared.open(Installer.log) }
             }
-        }
-
-        Settings {
-            SettingsView()
         }
 
         MenuBarExtra {
@@ -56,7 +56,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let state: AppState
 
     override init() {
-        Preference.register()
         guard let runtime = Runtime.locate() else {
             let alert = NSAlert()
             alert.messageText = "Splash is damaged"

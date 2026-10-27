@@ -6,8 +6,9 @@ import Observation
 /// conversations.
 @MainActor @Observable
 final class AppState {
-    /// What fills the window: the chats, once a model is on this Mac; the welcome until then.
-    enum Screen: Hashable { case launching, blocked, models, chat }
+    /// The window's two parts: the Server, where models download, start and change, and the Chat
+    /// with the model that runs. The window opens on the Server.
+    enum Section: Hashable { case server, chat }
 
     /// Why the app cannot run models here.
     struct Blocker: Equatable {
@@ -27,12 +28,13 @@ final class AppState {
     private(set) var blocker: Blocker?
     /// Whether the checks of `launch` are done; nothing starts before.
     private(set) var launched = false
-    /// The models, as a sheet over the chat.
-    var showingModels = false
+    var section = Section.server
+    /// The launch options the next start uses.
+    var options = ServeSettings.current() {
+        didSet { options.save() }
+    }
     /// Set once the app quits: nothing starts any more.
     private(set) var quitting = false
-    /// A model that downloaded while another one ran, to switch to.
-    private(set) var downloaded: String?
 
     init(runtime: Runtime, chats: ChatStore = ChatStore()) {
         self.runtime = runtime
@@ -44,22 +46,22 @@ final class AppState {
         refresh()
     }
 
-    var screen: Screen {
-        if blocker != nil { return .blocked }
-        if !launched { return .launching }
-        return installed.isEmpty && !server.running ? .models : .chat
-    }
+    /// Whether the app runs on this Mac and has done its checks: the window then shows the Server
+    /// and the Chat.
+    var available: Bool { launched && blocker == nil }
 
     /// Whether models can start and download.
-    var ready: Bool { launched && blocker == nil && !quitting }
+    var ready: Bool { available && !quitting }
 
-    /// What runs, in the words the menus use.
+    /// What runs, in the words the menus and the Chat use.
     var status: String {
         let name = server.model.map(displayName(of:)) ?? ""
         switch server.phase {
         case .stopped: return "No model running"
-        case .starting: return "Starting \(name)…"
-        case .stopping: return server.next.map { "Starting \(displayName(of: $0))…" } ?? "Stopping \(name)…"
+        case .starting: return "Loading \(name) into memory…"
+        case .stopping:
+            guard let next = server.next else { return "Stopping \(name)…" }
+            return next == server.model ? "Restarting \(name)…" : "Switching to \(displayName(of: next))…"
         case .ready: return "\(name) · \(server.asleep ? "Sleeping" : "Running")"
         case .failed: return "\(name) ran into a problem"
         }
@@ -73,10 +75,21 @@ final class AppState {
         return "Downloading \(name) · \(progress.fraction.formatted(.percent.precision(.fractionLength(0))))"
     }
 
-    /// The model the next start would start: the one running or starting, else the last one.
-    var lastModel: String? {
-        (server.next ?? server.model ?? UserDefaults.standard.string(forKey: Preference.lastModel))
-            .flatMap { isInstalled($0) ? $0 : nil }
+    /// The model picked on the Server screen: the last one picked if it is still on this Mac, else
+    /// the first one that is.
+    var selection: String? {
+        get {
+            access(keyPath: \.selection)
+            let picked = UserDefaults.standard.string(forKey: Preference.model)
+            return picked.flatMap { isInstalled($0) ? $0 : nil } ?? installed.first?.id
+        }
+        set { withMutation(keyPath: \.selection) { UserDefaults.standard.set(newValue, forKey: Preference.model) } }
+    }
+
+    /// Whether the model that runs would start otherwise with the options set now.
+    var optionsChanged: Bool {
+        guard server.phase == .ready, let model = server.model else { return false }
+        return server.settings.serveArguments(model: model) != options.serveArguments(model: model)
     }
 
     /// The name to show for model `id`; its variant tells installed variants of a model apart.
@@ -86,8 +99,7 @@ final class AppState {
         return "\(name) (\(Catalog.variant(of: id)))"
     }
 
-    /// Checks this Mac and the app's location, stops what the app left running last time, and
-    /// starts the last model if it ran until the app quit.
+    /// Checks this Mac and the app's location, and stops what the app left running last time.
     func launch() async {
         defer { launched = true }
         let runtime = runtime
@@ -102,25 +114,17 @@ final class AppState {
         }
         await installer.stopLeftover()
         await server.stopLeftover()
-        let defaults = UserDefaults.standard
-        if defaults.bool(forKey: Preference.startOnOpen), defaults.bool(forKey: Preference.resume),
-           let model = defaults.string(forKey: Preference.lastModel), isInstalled(model) {
-            launched = true
-            start(model)
-        }
     }
 
+    /// Starts `model` with the launch options, stopping the one that runs first.
     func start(_ model: String) {
         guard ready else { return }
-        showingModels = false
-        downloaded = nil
+        selection = model
         chats.stop()
-        server.start(model)
+        server.start(model, settings: options)
     }
 
-    /// Stops the model the user asked to stop: it no longer starts when Splash opens.
     func stop() {
-        UserDefaults.standard.set(false, forKey: Preference.resume)
         chats.stop()
         server.stop()
     }
@@ -159,13 +163,8 @@ final class AppState {
         set { withMutation(keyPath: \.effort) { UserDefaults.standard.set(newValue, forKey: Preference.effort) } }
     }
 
-    /// The models over the chat; before a model is installed they are the window itself.
-    func showModels() {
-        if screen == .chat { showingModels = true }
-    }
-
     func copyAPIAddress() {
-        let settings = server.running ? server.settings : ServeSettings.current()
+        let settings = server.running ? server.settings : options
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(settings.url.appending(path: "v1").absoluteString, forType: .string)
     }
@@ -180,14 +179,11 @@ final class AppState {
         installed.contains { $0.id == model }
     }
 
+    /// Picks the model downloaded, for the user to start.
     private func didInstall(_ model: String) {
         refresh()
-        if server.running {
-            downloaded = model
-            if !NSApp.isActive { NSApp.requestUserAttention(.informationalRequest) }
-        } else {
-            start(model)
-        }
+        selection = model
+        if NSApp?.isActive == false { NSApp.requestUserAttention(.informationalRequest) }
     }
 
     /// Whether the app at `bundle` runs from the disk image or a translocated copy: its path then

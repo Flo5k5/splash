@@ -152,9 +152,6 @@ func resetLog(_ url: URL) {
 
 /// A failure of `model`'s in words a user can act on; the log keeps the original.
 func plainProblem(_ message: String, model: String) -> String {
-    if let option = message.firstMatch(of: /unrecognized arguments: (.+)/)?.1 {
-        return "The server options in Settings include \(option), which the server doesn’t recognize. Change them in Settings › Advanced."
-    }
     if message.contains("Repository Not Found") || message.contains("404 Client Error") {
         return "Hugging Face has no public model named \(model.split(separator: ":")[0]). Check the name, then try again."
     }
