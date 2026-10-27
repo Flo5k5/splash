@@ -136,6 +136,32 @@ class InstallerTest(unittest.TestCase):
         args = installer.parse_args(["--model", self.MODEL_ID, "prepare"])
         self.assertEqual((args.command, args.model), ("prepare", self.MODEL_ID))
 
+    def test_prepare_json_progress_has_downloads_report_their_progress(self):
+        reporting = []
+        base = ["--models", str(self.root), "--model", self.MODEL_ID, "prepare"]
+        with (
+            mock.patch.object(hub, "json_progress", False),
+            mock.patch("huggingface_hub.utils.disable_progress_bars") as bars,
+            mock.patch(
+                "install.upstream.prepare",
+                side_effect=lambda selection: reporting.append(
+                    (hub.json_progress, bars.call_count)
+                ),
+            ),
+        ):
+            self.assertEqual(installer.main(base), 0)
+            self.assertEqual(installer.main([*base, "--json-progress"]), 0)
+        # JSON lines in place of huggingface_hub's bars, which would break them.
+        self.assertEqual(reporting, [(False, 0), (True, 1)])
+        # Only prepare downloads.
+        with (
+            contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaises(SystemExit),
+        ):
+            installer.parse_args(
+                ["--model", self.MODEL_ID, "verify", "--json-progress"]
+            )
+
     def test_variant_model_ids_parse_and_name_selection_links(self):
         self.assertEqual(
             installer.split_model_id("owner/repo:UD-Q4_K_M"),

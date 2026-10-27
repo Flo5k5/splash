@@ -15,8 +15,11 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import json
 import os
+import sys
 import tempfile
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -25,6 +28,24 @@ from . import models
 # Seconds the Hub may take to resolve a revision before the installed
 # assembly starts without it.
 HUB_TIMEOUT = 5
+# Seconds between two measurements of a download's progress.
+PROGRESS_INTERVAL = 0.25
+
+# Whether Repository.download reports its progress as JSON lines on stdout,
+# for a front end (report_json_progress).
+json_progress = False
+
+
+def report_json_progress():
+    """Have every download report its progress as JSON lines on stdout
+    (_download_progress), as `install/models.py ... prepare --json-progress`
+    asks, and huggingface_hub draw no progress bars: their carriage returns
+    would run into those lines and the installer's own."""
+    global json_progress
+    from huggingface_hub.utils import disable_progress_bars
+
+    disable_progress_bars()
+    json_progress = True
 
 
 def token():
@@ -345,7 +366,9 @@ class Repository:
         )
 
     def download(self, names):
-        """Each of names -> its local path, downloading what the cache lacks."""
+        """Each of names -> its local path, downloading what the cache lacks.
+        Before a download, the partial files a killed one left of the blobs
+        it fetches are removed."""
         for name in names:
             self._require(name)
         if self.paths is not None:
@@ -353,25 +376,29 @@ class Repository:
         from huggingface_hub import snapshot_download
 
         blobs = folder(self.name) / "blobs"
+        # (bytes, blob ID) of each file whose blob the cache lacks.
         fetch = [
-            size
+            (size, blob)
             for size, blob in (self.sizes[n] for n in names if n in self.sizes)
             if not (blob and (blobs / blob).exists())
         ]
+        total = sum(size for size, _ in fetch)
         if fetch:
+            _remove_abandoned_downloads(blobs, fetch)
             print(
-                f"Fetching {len(fetch)} file(s), {sum(fetch) / 1e9:.2f} GB, "
+                f"Fetching {len(fetch)} file(s), {total / 1e9:.2f} GB, "
                 f"from {self.name}@{self.revision[:12]}; cached files are reused.",
                 flush=True,
             )
-        path = Path(
-            snapshot_download(
-                self.name,
-                revision=self.revision,
-                allow_patterns=sorted(names),
-                max_workers=4,
+        with _download_progress(self.name, blobs, fetch):
+            path = Path(
+                snapshot_download(
+                    self.name,
+                    revision=self.revision,
+                    allow_patterns=sorted(names),
+                    max_workers=4,
+                )
             )
-        )
         return {name: path / name for name in names}
 
     def identity(self):
@@ -423,3 +450,91 @@ def _cached_commits(name, revision, installation):
     except OSError:
         pass
     return list(dict.fromkeys(c for c in commits if models.is_hex_digest(c, 40)))
+
+
+def _remove_abandoned_downloads(blobs, fetch):
+    """Remove the partial files of fetch's blobs, (bytes, blob ID) pairs in
+    the blobs folder, that no live download writes. huggingface_hub writes a
+    blob to <blob>.<random>.incomplete, a name no later download reuses, and
+    holds <Hub cache>/.locks/<repository folder>/<blob>.lock until it renames
+    or removes that file; a killed download leaves it behind. A blob's
+    partial files are removed only while that lock is taken here without
+    waiting, as huggingface_hub takes it, so a live download, of any process,
+    keeps its own and none starts meanwhile."""
+    from filelock import FileLock, Timeout
+
+    locks = blobs.parent.parent / ".locks" / blobs.parent.name
+    for blob in {blob for _, blob in fetch if blob}:
+        partial = list(blobs.glob(f"{blob}.*.incomplete"))
+        if not partial:
+            continue
+        try:
+            # Created group-writable when missing, as huggingface_hub does.
+            with FileLock(locks / f"{blob}.lock", mode=0o664, blocking=False):
+                for path in partial:
+                    path.unlink(missing_ok=True)
+        except Timeout:
+            pass  # a live download holds it
+
+
+@contextmanager
+def _download_progress(repo_id, blobs, fetch):
+    """With json_progress, report the download in the block of fetch,
+    (bytes, blob ID) pairs in the blobs folder, as JSON lines on stdout:
+    done 0 first, then the bytes the folder holds of them, measured every
+    PROGRESS_INTERVAL, whenever that grew, and done == total once the block
+    succeeds. The folder is measured, not huggingface_hub's progress bars,
+    which are off without a terminal and count network bytes under Xet."""
+    if not (json_progress and fetch):
+        yield
+        return
+    total = sum(size for size, _ in fetch)
+    stop = threading.Event()
+
+    def measure():
+        done = 0
+        while not stop.wait(PROGRESS_INTERVAL):
+            held = _blob_bytes(blobs)
+            now = sum(min(size, held.get(blob, 0)) for size, blob in fetch)
+            # A partial file renamed to its blob between the listing and its
+            # size goes uncounted once, so only growth is reported.
+            if now > done:
+                done = now
+                _report_progress(repo_id, done, total)
+
+    _report_progress(repo_id, 0, total)
+    thread = threading.Thread(target=measure)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join()
+    _report_progress(repo_id, total, total)
+
+
+def _blob_bytes(blobs):
+    """Each blob in the blobs folder -> the most bytes a file of it holds,
+    <blob> itself or a partial <blob>.<random>.incomplete; none before the
+    folder exists."""
+    try:
+        entries = list(os.scandir(blobs))
+    except FileNotFoundError:
+        return {}
+    held = {}
+    for entry in entries:
+        try:
+            size = entry.stat().st_size
+        except FileNotFoundError:
+            continue  # renamed to its blob or removed since the listing
+        blob = entry.name.partition(".")[0]
+        held[blob] = max(held.get(blob, 0), size)
+    return held
+
+
+def _report_progress(repo_id, done, total):
+    # One write per line, newline included, then a flush, so a front end
+    # reading stdout, or the log it shares with stderr, sees whole lines.
+    event = {"event": "download", "repo": repo_id, "done": done, "total": total}
+    sys.stdout.write(json.dumps(event) + "\n")
+    sys.stdout.flush()
