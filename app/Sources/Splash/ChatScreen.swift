@@ -127,7 +127,10 @@ private struct ConversationView: View {
         VStack(spacing: 0) {
             if let conversation, !conversation.messages.isEmpty {
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 28) {
+                    // Every message laid out, as a web page lays a chat out: a lazy stack places the
+                    // rows it hasn't drawn by estimated heights, and a jump to the latest from far
+                    // up landed where it drew none, leaving the conversation blank.
+                    VStack(alignment: .leading, spacing: 28) {
                         ForEach(conversation.messages) { message in
                             MessageView(message: message, last: message.id == conversation.messages.last?.id,
                                         streaming: state.chats.streaming == conversation.id)
@@ -156,8 +159,6 @@ private struct ConversationView: View {
                 }
                 .onChange(of: conversation.messages.count) {
                     atBottom = true
-                    // At once: a new message makes the lazy stack re-estimate the rows it hasn't laid
-                    // out, and a scroll that glides there starts past the end, over nothing.
                     position.scrollTo(edge: .bottom)
                 }
                 .onChange(of: conversation.messages.last.map { $0.text.count + $0.reasoning.count }) {
