@@ -444,16 +444,31 @@ private struct CodeBlock: View {
             .padding(.trailing, 8)
             .frame(height: 32)
             Divider()
-            ScrollView(.horizontal) {
+            Overflow {
                 Text(code)
                     .font(.system(size: 13, design: .monospaced))
                     .lineSpacing(3)
                     .padding(14)
             }
-            .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .overlay { RoundedRectangle(cornerRadius: 10).strokeBorder(.separator) }
+    }
+}
+
+/// Content that scrolls sideways only when it's wider than the reply. A scroll view is an AppKit
+/// view, and every update of the window passes over each one in the conversation, so code and
+/// tables that fit stay plain.
+private struct Overflow<Content: View>: View {
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        ViewThatFits(in: .horizontal) {
+            // At the width it would have in the scroll view, however short of room the reply is.
+            content.fixedSize(horizontal: true, vertical: false)
+            ScrollView(.horizontal) { content }
+                .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
+        }
     }
 }
 
@@ -499,7 +514,7 @@ private struct TableBlock: View {
     let rows: [[String]]
 
     var body: some View {
-        ScrollView(.horizontal) {
+        Overflow {
             Grid(alignment: .topLeading, horizontalSpacing: 20, verticalSpacing: 8) {
                 GridRow {
                     ForEach(header.indices, id: \.self) { cell(header[$0]).fontWeight(.semibold) }
@@ -512,7 +527,6 @@ private struct TableBlock: View {
                 }
             }
         }
-        .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
     }
 
     private func cell(_ text: String) -> some View {
@@ -520,8 +534,9 @@ private struct TableBlock: View {
     }
 }
 
-/// A table cell at the width its text needs, wrapped at 320 points. The scroll view proposes no
-/// width, and `frame(maxWidth:)` would measure the text unwrapped there and clip its other lines.
+/// A table cell at the width its text needs, wrapped at 320 points. A table is measured with no
+/// width proposed, for its own width and in its scroll view, and `frame(maxWidth:)` would measure
+/// the text unwrapped there and clip its other lines.
 private struct CellLayout: Layout {
     func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
         guard let text = subviews.first else { return .zero }

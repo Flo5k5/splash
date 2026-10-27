@@ -120,55 +120,67 @@ private struct ConversationView: View {
     /// Whether the conversation follows the latest message: until the reader scrolls up, and again
     /// once they scroll back to the bottom.
     @State private var atBottom = true
-    @State private var scrolling = false
+    @State private var reader = Reader()
+
+    /// The reader's own scrolling: a drag, the wheel, and the glide after them; not the
+    /// conversation's own following. Only the following reads it, so it's kept where a change
+    /// draws nothing, and a gesture's start and end don't lay the conversation out again.
+    private final class Reader {
+        var scrolling = false
+    }
 
     var body: some View {
         let conversation = state.chats.current
         VStack(spacing: 0) {
             if let conversation, !conversation.messages.isEmpty {
-                ScrollView {
-                    // Every message laid out, as a web page lays a chat out: a lazy stack places the
-                    // rows it hasn't drawn by estimated heights, and a jump to the latest from far
-                    // up landed where it drew none, leaving the conversation blank.
-                    VStack(alignment: .leading, spacing: 28) {
-                        ForEach(conversation.messages) { message in
-                            MessageView(message: message, last: message.id == conversation.messages.last?.id,
-                                        streaming: state.chats.streaming == conversation.id)
+                // The window works out its least size from its content; through the scroll view,
+                // that laid the whole conversation out again at another width, a stall on the
+                // first scroll.
+                Offered {
+                    ScrollView {
+                        // Every message laid out, as a web page lays a chat out: a lazy stack
+                        // places the rows it hasn't drawn by estimated heights, and a jump to the
+                        // latest from far up landed where it drew none, leaving the conversation
+                        // blank.
+                        VStack(alignment: .leading, spacing: 28) {
+                            ForEach(conversation.messages) { message in
+                                MessageView(message: message, last: message.id == conversation.messages.last?.id,
+                                            streaming: state.chats.streaming == conversation.id)
+                            }
                         }
+                        .frame(maxWidth: column)
+                        .padding(.horizontal, 32)
+                        .padding(.vertical, 28)
+                        .frame(maxWidth: .infinity)
                     }
-                    .frame(maxWidth: column)
-                    .padding(.horizontal, 32)
-                    .padding(.vertical, 28)
-                    .frame(maxWidth: .infinity)
+                    .scrollPosition($position)
+                    // Opens at the latest message and follows a reply while the reader is at
+                    // the bottom; a short conversation still reads from the top.
+                    .defaultScrollAnchor(.bottom, for: .initialOffset)
+                    .defaultScrollAnchor(atBottom ? .bottom : nil, for: .sizeChanges)
+                    .onScrollPhaseChange { _, phase in reader.scrolling = [.tracking, .interacting, .decelerating].contains(phase) }
+                    .onScrollGeometryChange(for: Bool.self) { geometry in
+                        // The visible part's bottom, insets and all, as the toolbar's has to be
+                        // counted.
+                        geometry.visibleRect.maxY >= geometry.contentSize.height - 40
+                    } action: { _, bottom in
+                        // A reply that grows leaves the bottom behind; only the reader's
+                        // scrolling stops the following.
+                        if bottom || reader.scrolling { atBottom = bottom }
+                    }
+                    .onChange(of: conversation.messages.count) {
+                        atBottom = true
+                        position.scrollTo(edge: .bottom)
+                    }
+                    .onChange(of: conversation.messages.last.map { $0.text.count + $0.reasoning.count }) {
+                        if atBottom && !reader.scrolling { position.scrollTo(edge: .bottom) }
+                    }
+                    .onChange(of: conversation.id) {
+                        atBottom = true
+                        position.scrollTo(edge: .bottom)
+                    }
+                    .overlay(alignment: .bottom) { latest.padding(.bottom, 12) }
                 }
-                .scrollPosition($position)
-                // Opens at the latest message and follows a reply while the reader is at the
-                // bottom; a short conversation still reads from the top.
-                .defaultScrollAnchor(.bottom, for: .initialOffset)
-                .defaultScrollAnchor(atBottom ? .bottom : nil, for: .sizeChanges)
-                // The reader's own scrolling: a drag, the wheel, and the glide after them; not the
-                // conversation's own following.
-                .onScrollPhaseChange { _, phase in scrolling = [.tracking, .interacting, .decelerating].contains(phase) }
-                .onScrollGeometryChange(for: Bool.self) { geometry in
-                    // The visible part's bottom, insets and all, as the toolbar's has to be counted.
-                    geometry.visibleRect.maxY >= geometry.contentSize.height - 40
-                } action: { _, bottom in
-                    // A reply that grows leaves the bottom behind; only the reader's scrolling
-                    // stops the following.
-                    if bottom || scrolling { atBottom = bottom }
-                }
-                .onChange(of: conversation.messages.count) {
-                    atBottom = true
-                    position.scrollTo(edge: .bottom)
-                }
-                .onChange(of: conversation.messages.last.map { $0.text.count + $0.reasoning.count }) {
-                    if atBottom && !scrolling { position.scrollTo(edge: .bottom) }
-                }
-                .onChange(of: conversation.id) {
-                    atBottom = true
-                    position.scrollTo(edge: .bottom)
-                }
-                .overlay(alignment: .bottom) { latest.padding(.bottom, 12) }
                 footer
             } else {
                 // A new chat: the mark, showing what the Server does, over the composer.
@@ -212,12 +224,32 @@ private struct ConversationView: View {
     }
 }
 
+/// Takes the space it's offered without asking its content, as a shape does.
+private struct Offered: Layout {
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        proposal.replacingUnspecifiedDimensions()
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        for subview in subviews {
+            subview.place(at: bounds.origin, proposal: ProposedViewSize(bounds.size))
+        }
+    }
+
+    // No alignment guides of its own either, which would otherwise be looked for in its content.
+    func explicitAlignment(of guide: HorizontalAlignment, in bounds: CGRect, proposal: ProposedViewSize,
+                           subviews: Subviews, cache: inout ()) -> CGFloat? { nil }
+
+    func explicitAlignment(of guide: VerticalAlignment, in bounds: CGRect, proposal: ProposedViewSize,
+                           subviews: Subviews, cache: inout ()) -> CGFloat? { nil }
+}
+
 private struct MessageView: View {
     @Environment(AppState.self) private var state
     let message: ChatMessage
     let last: Bool
     let streaming: Bool
-    @State private var hovering = false
+    @State private var pointer = Pointer()
 
     var body: some View {
         switch message.role {
@@ -251,9 +283,6 @@ private struct MessageView: View {
             }
         case .assistant:
             let live = streaming && last
-            // The reply's actions keep their place, so that the reply doesn't grow as it ends; they
-            // show under the pointer and on the latest reply, a little slower to come than to go.
-            let shown = !live && (hovering || last)
             VStack(alignment: .leading, spacing: 10) {
                 if (live && message.text.isEmpty) || !message.reasoning.isEmpty {
                     ReplyLine(message: message, live: live ? state.chats.live : nil)
@@ -269,18 +298,31 @@ private struct MessageView: View {
                     }
                     .font(.callout)
                 }
-                actions
-                    .opacity(shown ? 1 : 0)
-                    .allowsHitTesting(shown)
-                    // For VoiceOver, which never hovers, they are there but while the reply streams.
-                    .accessibilityHidden(live)
-                    .animation(shown ? Motion.quick.delay(0.08) : Motion.quick, value: shown)
+                ReplyActions(message: message, last: last, live: live, pointer: pointer)
             }
-            .onHover { hovering = $0 }
+            .onHover { pointer.over = $0 }
         }
     }
+}
 
-    private var actions: some View {
+/// Whether the pointer is over a message. Only the reply's actions read it, so that the pointer
+/// passing over a message, as the conversation scrolls under it, draws them alone.
+@MainActor @Observable
+private final class Pointer {
+    var over = false
+}
+
+/// A reply's Copy, Ask Again and figures. They keep their place, so that the reply doesn't grow as
+/// it ends; they show under the pointer and on the latest reply, a little slower to come than to go.
+private struct ReplyActions: View {
+    @Environment(AppState.self) private var state
+    let message: ChatMessage
+    let last: Bool
+    let live: Bool
+    let pointer: Pointer
+
+    var body: some View {
+        let shown = !live && (pointer.over || last)
         HStack(spacing: 0) {
             CopyButton(copy: { NSPasteboard.put(message.text) })
             .help("Copy")
@@ -300,6 +342,11 @@ private struct MessageView: View {
         .padding(.leading, -6)
         .font(.callout)
         .foregroundStyle(.secondary)
+        .opacity(shown ? 1 : 0)
+        .allowsHitTesting(shown)
+        // For VoiceOver, which never hovers, they are there but while the reply streams.
+        .accessibilityHidden(live)
+        .animation(shown ? Motion.quick.delay(0.08) : Motion.quick, value: shown)
     }
 
     /// The model that answered, how fast, and whether it was stopped.
