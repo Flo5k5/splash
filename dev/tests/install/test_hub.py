@@ -1,9 +1,11 @@
+import _thread
 import contextlib
 import fcntl
 import hashlib
 import io
 import json
 import os
+import signal
 import tempfile
 import threading
 import time
@@ -184,35 +186,96 @@ class DownloadTest(unittest.TestCase):
         # The measuring thread is stopped.
         self.assertEqual(set(threading.enumerate()), threads)
 
+    def test_the_download_thread_returns_or_raises_to_the_caller(self):
+        downloading = []
+        error = OSError("connection reset")
+
+        def fail(done):
+            downloading.append(threading.current_thread())
+            raise error
+
+        self.after_chunk = fail
+        with self.assertRaises(OSError) as raised:
+            self.download()
+        self.assertIs(raised.exception, error)
+        self.after_chunk = lambda done: downloading.append(threading.current_thread())
+        self.assertEqual(
+            self.download(), {name: self.snapshot / name for name in WEIGHTS}
+        )
+        self.assertNotIn(threading.current_thread(), downloading)
+
+    def test_ctrl_c_stops_the_wait_for_a_download_at_once(self):
+        # Interrupted, huggingface_hub would first wait for each thread of its
+        # pool to finish its file; this download goes on until released.
+        started, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        downloading, interrupted = [], []
+
+        def snapshot_download(repo_id, **options):
+            downloading.append(threading.current_thread())
+            started.set()
+            release.wait(60)
+            return str(self.snapshot)
+
+        def interrupt():
+            started.wait()
+            interrupted.append(time.monotonic())
+            _thread.interrupt_main()
+
+        # A test run as a background job inherits SIGINT ignored, which
+        # interrupt_main would not raise.
+        self.addCleanup(signal.signal, signal.SIGINT, signal.getsignal(signal.SIGINT))
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+        threads = set(threading.enumerate())
+        interrupter = threading.Thread(target=interrupt)
+        interrupter.start()
+        with (
+            mock.patch("huggingface_hub.snapshot_download", snapshot_download),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            self.download()
+        self.assertLess(time.monotonic() - interrupted[0], 2)
+        interrupter.join()
+        # Only the download goes on: the measuring thread is stopped, and the
+        # download reports no completion.
+        self.assertEqual(set(threading.enumerate()) - threads, set(downloading))
+        self.assertEqual([event["done"] for event in self.events()], [0])
+        release.set()
+        downloading[0].join()
+
     def test_partial_files_a_killed_download_left_are_removed(self):
         killed = self.blobs / f"{blob('model-1.safetensors')}.deadbeef.incomplete"
         killed.write_bytes(b"1" * 150)
-        # Of a blob this download does not fetch.
+        # Of a blob this download does not fetch, as a cancelled download of
+        # another file of the repository leaves.
         other = self.blobs / f"{'e' * 64}.deadbeef.incomplete"
         other.write_bytes(b"e")
         self.after_chunk = lambda done: self.assertFalse(killed.exists())
         self.download()
         self.assertFalse(killed.exists())
-        self.assertTrue(other.exists())
+        self.assertFalse(other.exists())
 
     def test_a_partial_file_whose_download_holds_its_lock_is_kept(self):
-        # Another process downloading the same blob, as huggingface_hub
-        # locks it.
-        live = self.blobs / f"{blob('model-1.safetensors')}.feedface.incomplete"
-        live.write_bytes(b"1" * 150)
+        # Other processes downloading a blob this download fetches and one it
+        # does not, as huggingface_hub locks them.
         self.locks.mkdir(parents=True)
-        lock = os.open(self.locks / f"{blob('model-1.safetensors')}.lock", os.O_CREAT)
-        self.addCleanup(os.close, lock)
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        live, locks = [], []
+        for held in (blob("model-1.safetensors"), "e" * 64):
+            live.append(self.blobs / f"{held}.feedface.incomplete")
+            live[-1].write_bytes(b"1" * 150)
+            locks.append(os.open(self.locks / f"{held}.lock", os.O_CREAT))
+            self.addCleanup(os.close, locks[-1])
+            fcntl.flock(locks[-1], fcntl.LOCK_EX | fcntl.LOCK_NB)
         self.download()
-        self.assertTrue(live.exists())
-        # Once that download ends, a later one removes it.
-        fcntl.flock(lock, fcntl.LOCK_UN)
+        self.assertEqual([path.exists() for path in live], [True, True])
+        # Once those downloads end, a later one removes their partial files.
+        for lock in locks:
+            fcntl.flock(lock, fcntl.LOCK_UN)
         for name in WEIGHTS:
             (self.blobs / blob(name)).unlink()
             (self.snapshot / name).unlink()
         self.download()
-        self.assertFalse(live.exists())
+        self.assertEqual([path.exists() for path in live], [False, False])
 
 
 if __name__ == "__main__":

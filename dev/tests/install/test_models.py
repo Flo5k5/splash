@@ -435,6 +435,41 @@ class ScriptEntryTests(unittest.TestCase):
             )
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_an_interrupted_installer_exits_without_waiting_for_its_downloads(self):
+        # Interrupted, a download goes on in huggingface_hub's pool, whose
+        # thread the interpreter would join at exit, a minute here.
+        script = (
+            "import runpy, time\n"
+            "from concurrent.futures import ThreadPoolExecutor\n"
+            "from install import upstream\n"
+            "def prepare(selection):\n"
+            "    ThreadPoolExecutor(1).submit(time.sleep, 60)\n"
+            "    raise KeyboardInterrupt\n"
+            "upstream.prepare = prepare\n"
+            "runpy.run_path('install/models.py', run_name='__main__')\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    script,
+                    "--models",
+                    temporary,
+                    "--model",
+                    "someone/model",
+                    "prepare",
+                ],
+                cwd=Path(installer.__file__).resolve().parents[1],
+                env={"HOME": temporary, "HF_HUB_OFFLINE": "1"},
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        self.assertEqual(
+            (result.returncode, result.stdout, result.stderr), (130, "", "")
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

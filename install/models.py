@@ -430,4 +430,12 @@ if __name__ == "__main__":
     import importlib
 
     installer = importlib.import_module("install.models")
-    raise SystemExit(installer.main())
+    status = installer.main()
+    if status == 130:
+        # Interrupted, a download goes on in huggingface_hub's threads, which
+        # the interpreter would wait for at exit (hub._interruptible): end
+        # the process at once, its output written.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(status)
+    raise SystemExit(status)

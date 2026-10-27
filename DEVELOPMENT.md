@@ -2332,13 +2332,25 @@ other pins, in the repositories it links and in those its predecessor linked,
 so pruning can free what no installation links any more.
 
 `hub.Repository.download` first removes the partial files
-(`<blob>.<random>.incomplete`) a killed download left of the blobs it fetches,
-under huggingface_hub's lock on each. Front ends such as the Mac app run `install/models.py --model ID
-prepare --json-progress`, with which each download also reports its progress
-as JSON lines on stdout, `{"event": "download", "repo": REPO, "done": BYTES,
-"total": BYTES}`: done 0 first, at most four a second as the Hub cache grows,
-and done equal to total once it succeeds. It is an interface between Splash's
-front ends and its installer, not a public one.
+(`<blob>.<random>.incomplete`) killed downloads left in the repository's blobs
+folder, of any blob, each under huggingface_hub's lock on its blob. Front ends
+such as the Mac app run `install/models.py --model ID prepare --json-progress`,
+with which each download also reports its progress as JSON lines on stdout,
+`{"event": "download", "repo": REPO, "done": BYTES, "total": BYTES}`: done 0
+first, at most four a second as the Hub cache grows, and done equal to total
+once it succeeds. It is an interface between Splash's front ends and its
+installer, not a public one.
+
+huggingface_hub downloads on threads it joins, which finish their files
+before an interrupt reaches the program, so the download runs on a thread of
+its own (`hub._interruptible`) and Ctrl+C stops the installer within a
+fraction of a second: it unwinds its temporary files and ends without waiting
+for those threads, and the repository's next download removes the partial
+files they leave. A launcher run without writing bytecode (`-B` or
+`PYTHONDONTWRITEBYTECODE`) sets `PYTHONDONTWRITEBYTECODE=1` in its environment
+before `serve` starts anything, so the installer, the server and the server's
+PDF workers write none either, and a packaged runtime inside a signed app
+never gains `__pycache__`.
 
 `hub.Repository.resolve` alone decides whether a start asks the Hub
 ([Revisions](#revisions)), each request within `hub.HUB_TIMEOUT`:

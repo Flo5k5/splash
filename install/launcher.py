@@ -194,6 +194,12 @@ def serve(args):
     if args.offline:
         # The installer and the server both read it.
         os.environ["HF_HUB_OFFLINE"] = "1"
+    if sys.flags.dont_write_bytecode:
+        # A child inherits the environment, not -B: every Python program
+        # serve starts, down to the server's PDF workers, writes no bytecode
+        # either, so a runtime inside a signed app never gains __pycache__
+        # folders, which break its signature.
+        os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
     # Keep both locks across exec until the foreground server exits.
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     with (
@@ -388,6 +394,7 @@ def parse_args(argv=None):
             "/status report the effective context limit; a client may impose a\n"
             "smaller one. Keep this terminal open; Ctrl+C stops serving."
         ),
+        allow_abbrev=False,
     )
     # The launcher's own options join the shared options' groups: the model
     # options first, --port among the network options.

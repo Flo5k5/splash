@@ -30,6 +30,9 @@ from . import models
 HUB_TIMEOUT = 5
 # Seconds between two measurements of a download's progress.
 PROGRESS_INTERVAL = 0.25
+# Seconds a download's caller waits on it at a time, the longest Ctrl+C
+# takes to reach that caller (_interruptible).
+INTERRUPT_INTERVAL = 0.1
 
 # Whether Repository.download reports its progress as JSON lines on stdout,
 # for a front end (report_json_progress).
@@ -367,8 +370,9 @@ class Repository:
 
     def download(self, names):
         """Each of names -> its local path, downloading what the cache lacks.
-        Before a download, the partial files a killed one left of the blobs
-        it fetches are removed."""
+        Before a download, the partial files killed ones left in the
+        repository's blobs folder are removed. Ctrl+C stops the wait for it
+        at once (_interruptible)."""
         for name in names:
             self._require(name)
         if self.paths is not None:
@@ -384,7 +388,7 @@ class Repository:
         ]
         total = sum(size for size, _ in fetch)
         if fetch:
-            _remove_abandoned_downloads(blobs, fetch)
+            _remove_abandoned_downloads(blobs)
             print(
                 f"Fetching {len(fetch)} file(s), {total / 1e9:.2f} GB, "
                 f"from {self.name}@{self.revision[:12]}; cached files are reused.",
@@ -392,7 +396,8 @@ class Repository:
             )
         with _download_progress(self.name, blobs, fetch):
             path = Path(
-                snapshot_download(
+                _interruptible(
+                    snapshot_download,
                     self.name,
                     revision=self.revision,
                     allow_patterns=sorted(names),
@@ -452,29 +457,57 @@ def _cached_commits(name, revision, installation):
     return list(dict.fromkeys(c for c in commits if models.is_hex_digest(c, 40)))
 
 
-def _remove_abandoned_downloads(blobs, fetch):
-    """Remove the partial files of fetch's blobs, (bytes, blob ID) pairs in
-    the blobs folder, that no live download writes. huggingface_hub writes a
-    blob to <blob>.<random>.incomplete, a name no later download reuses, and
-    holds <Hub cache>/.locks/<repository folder>/<blob>.lock until it renames
-    or removes that file; a killed download leaves it behind. A blob's
-    partial files are removed only while that lock is taken here without
-    waiting, as huggingface_hub takes it, so a live download, of any process,
-    keeps its own and none starts meanwhile."""
+def _remove_abandoned_downloads(blobs):
+    """Remove the partial files in the blobs folder that no live download
+    writes, of whichever blob. huggingface_hub writes a blob to
+    <blob>.<random>.incomplete, a name no later download reuses, and holds
+    <Hub cache>/.locks/<repository folder>/<blob>.lock until it renames or
+    removes that file; a killed download leaves it behind, and a cancelled
+    one never retried would keep it. A blob's partial files are removed only
+    while that lock is taken here without waiting, as huggingface_hub takes
+    it, so a live download, of any process, keeps its own and none starts
+    meanwhile."""
     from filelock import FileLock, Timeout
 
     locks = blobs.parent.parent / ".locks" / blobs.parent.name
-    for blob in {blob for _, blob in fetch if blob}:
-        partial = list(blobs.glob(f"{blob}.*.incomplete"))
-        if not partial:
-            continue
+    partial = {}
+    for path in blobs.glob("*.*.incomplete"):
+        partial.setdefault(path.name.split(".", 1)[0], []).append(path)
+    for blob, paths in partial.items():
         try:
             # Created group-writable when missing, as huggingface_hub does.
             with FileLock(locks / f"{blob}.lock", mode=0o664, blocking=False):
-                for path in partial:
+                for path in paths:
                     path.unlink(missing_ok=True)
         except Timeout:
             pass  # a live download holds it
+
+
+def _interruptible(call, *args, **kwargs):
+    """call(*args, **kwargs) on a thread of its own: its result returned
+    here, or its exception raised. This thread waits on it in joins of
+    INTERRUPT_INTERVAL, so Ctrl+C reaches the caller at once, as
+    KeyboardInterrupt, and every block above it unwinds. Interrupted in its
+    own thread, snapshot_download would first wait for each thread of its
+    pool to finish its file, tens of seconds. An interrupted call goes on,
+    with its pool, which the interpreter would wait for at exit
+    (concurrent.futures joins every pool thread then, daemon or not):
+    install/models.py ends an interrupted installer without that wait."""
+    outcome = {}
+
+    def run():
+        try:
+            outcome["result"] = call(*args, **kwargs)
+        except BaseException as error:
+            outcome["error"] = error
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    while thread.is_alive():
+        thread.join(INTERRUPT_INTERVAL)
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["result"]
 
 
 @contextmanager
