@@ -147,7 +147,8 @@ private struct ConversationView: View {
                 // conversation's own following.
                 .onScrollPhaseChange { _, phase in scrolling = [.tracking, .interacting, .decelerating].contains(phase) }
                 .onScrollGeometryChange(for: Bool.self) { geometry in
-                    geometry.contentOffset.y + geometry.containerSize.height >= geometry.contentSize.height - 40
+                    // The visible part's bottom, insets and all, as the toolbar's has to be counted.
+                    geometry.visibleRect.maxY >= geometry.contentSize.height - 40
                 } action: { _, bottom in
                     // A reply that grows leaves the bottom behind; only the reader's scrolling
                     // stops the following.
@@ -155,7 +156,9 @@ private struct ConversationView: View {
                 }
                 .onChange(of: conversation.messages.count) {
                     atBottom = true
-                    withAnimation(Motion.glide) { position.scrollTo(edge: .bottom) }
+                    // At once: a new message makes the lazy stack re-estimate the rows it hasn't laid
+                    // out, and a scroll that glides there starts past the end, over nothing.
+                    position.scrollTo(edge: .bottom)
                 }
                 .onChange(of: conversation.messages.last.map { $0.text.count + $0.reasoning.count }) {
                     if atBottom && !scrolling { position.scrollTo(edge: .bottom) }

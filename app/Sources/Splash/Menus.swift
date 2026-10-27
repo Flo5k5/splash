@@ -105,13 +105,21 @@ struct MenuBarPanel: View {
         }
     }
 
-    /// How the model does since it started: answering speed, requests and memory.
+    /// How the model does since it started: answering speed, requests and memory; the tokens it
+    /// generated, read and took from its cache.
     private func totals(_ activity: Server.Activity) -> some View {
         let memory = activity.memory.map { Format.parts(Format.size($0)) }
-        return HStack(spacing: 0) {
-            Figure(value: activity.generation.map(Format.whole), unit: "tok/s", caption: "Answering", compact: true)
-            Figure(value: activity.served.formatted(), caption: "Requests", compact: true)
-            Figure(value: memory?.0, unit: memory?.1, caption: "Memory", compact: true)
+        return VStack(spacing: 10) {
+            HStack(spacing: 0) {
+                Figure(value: activity.generation.map(Format.whole), unit: "tok/s", caption: "Answering", compact: true)
+                Figure(value: activity.served.formatted(), caption: "Requests", compact: true)
+                Figure(value: memory?.0, unit: memory?.1, caption: "Memory", compact: true)
+            }
+            HStack(spacing: 0) {
+                Figure(value: Format.count(activity.generated), caption: "Generated", compact: true)
+                Figure(value: Format.count(activity.read), caption: "Prompt read", compact: true)
+                Figure(value: Format.count(activity.cached), caption: "From cache", compact: true)
+            }
         }
         .padding(.horizontal, 10)
         .padding(.bottom, 8)

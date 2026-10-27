@@ -310,7 +310,7 @@ private struct ActivityFigures: View {
 }
 
 /// The requests since the model started, their totals on the row, and when opened, one line for
-/// each, the latest first; past six they scroll.
+/// each in a box of its own that scrolls, from the top down, following the latest once full.
 private struct RequestLog: View {
     let entries: [RequestEntry]
     let totals: String?
@@ -324,13 +324,18 @@ private struct RequestLog: View {
                     if entries.isEmpty {
                         Text("No requests yet.").font(.callout).foregroundStyle(.tertiary).frame(height: 22)
                     }
-                    ForEach(Array(entries.reversed().enumerated()), id: \.offset) { _, entry in
+                    ForEach(Array(entries.enumerated()), id: \.offset) { _, entry in
                         RequestRow(entry: entry)
                     }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(10)
             }
-            .frame(height: CGFloat(min(max(entries.count, 1), 6)) * 22)
-            .padding(.leading, 18)
+            .frame(height: 180)
+            .defaultScrollAnchor(.top, for: .alignment)
+            .defaultScrollAnchor(.bottom, for: .initialOffset)
+            .defaultScrollAnchor(.bottom, for: .sizeChanges)
+            .background(.quaternary.opacity(0.5), in: .rect(cornerRadius: 8))
         }
     }
 
@@ -491,16 +496,16 @@ private struct DownloadRow: View {
     }
 }
 
-/// A model on this Mac, to pick for Start: its name, and under it what tells its variants apart and
-/// its size; what the server does with it and the check of the one picked at the right. Its
-/// Hugging Face ID is a hover away.
+/// A model on this Mac, to pick for Start: its name, and under it its Hugging Face ID, which tells its
+/// variants apart, and its size; what the server does with it and the check of the one picked at
+/// the right.
 private struct ModelRow: View {
     @Environment(AppState.self) private var state
     let model: InstalledModel
 
     var body: some View {
         let selected = state.selection == model.id
-        let detail = ([Catalog.variant(of: model.id), model.missing ? "Not found" : model.bytes.map(Format.size)] as [String?])
+        let detail = ([model.id, model.missing ? "Not found" : model.bytes.map(Format.size)] as [String?])
             .compactMap { $0 }.joined(separator: " · ")
         Button { state.selection = model.id } label: {
             HStack(spacing: 8) {
@@ -527,7 +532,7 @@ private struct ModelRow: View {
         .accessibilityLabel("\(state.displayName(of: model.id)), \(detail)")
         .accessibilityValue(phase ?? "")
         .accessibilityAddTraits(selected ? .isSelected : [])
-        .help(([state.catalog.about(of: model.id), model.id] as [String?]).compactMap { $0 }.joined(separator: "\n"))
+        .help(state.catalog.about(of: model.id) ?? model.id)
         .contextMenu {
             if model.local {
                 Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([URL(filePath: model.id)]) }

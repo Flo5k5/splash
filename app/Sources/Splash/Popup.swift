@@ -66,9 +66,14 @@ struct PopupList: View {
         .padding(5)
         .frame(minWidth: 200, alignment: .leading)
         .fixedSize()
-        .background { PopoverMaterial().clipShape(.rect(cornerRadius: 12)) }
+        .background(Self.ground, in: .rect(cornerRadius: 12))
         .overlay { RoundedRectangle(cornerRadius: 12).strokeBorder(.separator) }
     }
+
+    /// What the panel stands on: white, or near black in dark mode, solid.
+    private static let ground = Color(nsColor: NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua ? NSColor(white: 0.17, alpha: 1) : .white
+    })
 }
 
 /// An item, highlighted as `HoverStyle` highlights, but one at a time, for the pointer and the
@@ -111,19 +116,6 @@ private struct PopupRow: View {
         }
         .accessibilityAddTraits(chosen ? .isSelected : [])
     }
-}
-
-/// The material of the system's popovers and menus, behind a popup's items.
-private struct PopoverMaterial: NSViewRepresentable {
-    func makeNSView(context: Context) -> NSVisualEffectView {
-        let view = NSVisualEffectView()
-        view.material = .popover
-        view.blendingMode = .behindWindow
-        view.state = .active
-        return view
-    }
-
-    func updateNSView(_ view: NSVisualEffectView, context: Context) {}
 }
 
 /// The open panel of a `PopupMenu`: a borderless child window of the control's, at its trailing

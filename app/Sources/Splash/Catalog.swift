@@ -52,7 +52,9 @@ struct Catalog {
         // Model files on this Mac: the file's or folder's name.
         if id.hasPrefix("/") { return URL(filePath: id).lastPathComponent.replacing(/(?i)\.gguf$/, with: "") }
         let repository = id.split(separator: ":")[0].split(separator: "/").last.map(String.init) ?? id
-        return repository.replacing(/(?i)-(gguf|mlx)$/, with: "")
+        // Plain string checks: views ask for names on every render.
+        let lower = repository.lowercased()
+        return lower.hasSuffix("-gguf") ? String(repository.dropLast(5)) : lower.hasSuffix("-mlx") ? String(repository.dropLast(4)) : repository
     }
 
     /// What tells variants of a model apart: the folder of model files on this Mac, the GGUF variant
