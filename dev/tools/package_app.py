@@ -1,0 +1,306 @@
+#!/usr/bin/env python3
+"""Build Splash.app around the packaged runtime, sign it, and wrap it in a DMG."""
+
+import argparse
+import plistlib
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+
+from dev.tools import package  # noqa: E402
+
+BUNDLE_ID = "ai.inco.splash"
+# The first four bytes of a Mach-O file: a 64- or 32-bit image in either byte
+# order, or a universal one. The runtime's interpreter and engine have no
+# extension, so its Mach-O files are found by content, not by name.
+MACH_O_MAGICS = frozenset(
+    bytes.fromhex(magic)
+    for magic in (
+        "cffaedfe",
+        "cefaedfe",
+        "feedfacf",
+        "feedface",
+        "cafebabe",
+        "cafebabf",
+    )
+)
+# Signing identifiers of the runtime's two programs, by their paths in the
+# runtime; codesign names every other file after itself.
+IDENTIFIERS = {
+    "python/bin/python3": f"{BUNDLE_ID}.python",
+    "engine/splash": f"{BUNDLE_ID}.engine",
+}
+# The iconset's sizes, each rendered at 1x and 2x (iconutil).
+ICON_SIZES = (16, 32, 128, 256, 512)
+
+
+def short_version(version):
+    """CFBundleShortVersionString for a release version: its x.y.z, which
+    `git describe` suffixes (1.4.1-36-g6e9dfe3f), or None for a version that
+    does not start with one."""
+    match = re.fullmatch(r"(\d+\.\d+\.\d+)(-[A-Za-z0-9._-]+)?", version)
+    return match and match[1]
+
+
+def build_number():
+    """CFBundleVersion: the number of commits HEAD has. It grows with every
+    commit on main, so builds of one release version, as `git describe` names
+    them, differ, and a later build has the larger number macOS prefers. It
+    needs the full history, not a shallow clone."""
+    return subprocess.run(
+        ["git", "rev-list", "--count", "HEAD"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def info_plist(version, build, macos_min):
+    return {
+        "CFBundleIdentifier": BUNDLE_ID,
+        "CFBundleName": "Splash",
+        "CFBundleDisplayName": "Splash",
+        "CFBundleExecutable": "Splash",
+        "CFBundlePackageType": "APPL",
+        "CFBundleShortVersionString": short_version(version),
+        "CFBundleVersion": build,
+        "CFBundleIconFile": "AppIcon",
+        "LSMinimumSystemVersion": macos_min,
+        "LSApplicationCategoryType": "public.app-category.developer-tools",
+        "NSHighResolutionCapable": True,
+        # The chat page and the API are the app's own server on 127.0.0.1.
+        "NSAppTransportSecurity": {"NSAllowsLocalNetworking": True},
+        "NSHumanReadableCopyright": "Copyright © Inco AI",
+    }
+
+
+def mach_o_files(root):
+    """The Mach-O files under root, symbolic links aside."""
+    found = []
+    for path in sorted(root.rglob("*")):
+        if path.is_file() and not path.is_symlink():
+            with path.open("rb") as stream:
+                if stream.read(4) in MACH_O_MAGICS:
+                    found.append(path)
+    return found
+
+
+def build_executable():
+    """Build the app's executable, arm64 in release configuration, and return
+    its path."""
+    command = [
+        "swift",
+        "build",
+        "-c",
+        "release",
+        "--arch",
+        "arm64",
+        "--package-path",
+        str(ROOT / "app"),
+        "--product",
+        "Splash",
+    ]
+    subprocess.run(command, check=True)
+    products = subprocess.run(
+        [*command, "--show-bin-path"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    return Path(products) / "Splash"
+
+
+def render_icon(svg, icns):
+    with tempfile.TemporaryDirectory() as temporary:
+        iconset = Path(temporary) / "AppIcon.iconset"
+        iconset.mkdir()
+        for size in ICON_SIZES:
+            for scale, suffix in ((1, ""), (2, "@2x")):
+                pixels = str(size * scale)
+                subprocess.run(
+                    ["sips", "-s", "format", "png", "-z", pixels, pixels, str(svg)]
+                    + ["--out", str(iconset / f"icon_{size}x{size}{suffix}.png")],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                )
+        subprocess.run(
+            ["iconutil", "-c", "icns", str(iconset), "-o", str(icns)], check=True
+        )
+
+
+def assemble(app, executable, version, macos_min):
+    """Lay out app: the executable, Info.plist, the icon and, in
+    Resources/splash, the runtime build_runtime builds, whose layout
+    install/paths.py resolves."""
+    contents = app / "Contents"
+    (contents / "MacOS").mkdir(parents=True)
+    shutil.copy2(executable, contents / "MacOS/Splash")
+    with (contents / "Info.plist").open("wb") as stream:
+        plistlib.dump(info_plist(version, build_number(), macos_min), stream)
+    runtime = contents / "Resources/splash"
+    runtime.mkdir(parents=True)
+    render_icon(ROOT / "app/AppIcon.svg", contents / "Resources/AppIcon.icns")
+    package.build_runtime(runtime, version)
+
+
+def codesign(path, identity, *options):
+    """Sign path ad hoc ("-") or with identity and the secure timestamp
+    notarization requires."""
+    timestamp = "--timestamp=none" if identity == "-" else "--timestamp"
+    subprocess.run(
+        ["codesign", "--force", "--sign", identity, timestamp, *options, str(path)],
+        check=True,
+    )
+
+
+def sign(app, identity):
+    """Sign every Mach-O file of app's runtime, then app, and verify them;
+    return the number of runtime files signed.
+
+    codesign --deep signs and checks only the code a bundle nests where code
+    belongs, not the runtime's files in Resources, so each is signed on its
+    own. The hardened runtime's library validation loads only libraries signed
+    by the process's own team, and an ad-hoc signature names none, so an
+    ad-hoc build signs without it."""
+    hardened = () if identity == "-" else ("--options", "runtime")
+    runtime = app / "Contents/Resources/splash"
+    identifiers = {
+        (runtime / path).resolve(): identifier
+        for path, identifier in IDENTIFIERS.items()
+    }
+    binaries = mach_o_files(runtime)
+    for binary in binaries:
+        identifier = identifiers.get(binary.resolve())
+        named = ("--identifier", identifier) if identifier else ()
+        codesign(binary, identity, *hardened, *named)
+    codesign(app, identity, *hardened)
+    for binary in binaries:
+        subprocess.run(["codesign", "--verify", "--strict", str(binary)], check=True)
+    subprocess.run(
+        ["codesign", "--verify", "--deep", "--strict", "--verbose=2", str(app)],
+        check=True,
+    )
+    return len(binaries)
+
+
+def check_signed(app):
+    """Run the signed runtime as the app does, its libraries loading under
+    their new signatures, then check that it left the bundle sealed: a
+    bytecode file written into it would break the seal."""
+    runtime = app / "Contents/Resources/splash"
+    subprocess.run(
+        [str(runtime / "python/bin/python3"), "-I", "-B", "-c"]
+        + [
+            "import sys; sys.path.insert(0, '.'); "
+            "import tokenizers, llguidance, numpy, PIL, transformers, huggingface_hub, "
+            "pypdfium2, cryptography.fernet; import server.server, install.launcher"
+        ],
+        cwd=runtime,
+        check=True,
+    )
+    subprocess.run([str(runtime / "engine/splash"), "device-check"], check=True)
+    if any(app.rglob("__pycache__")):
+        raise RuntimeError(f"{app} holds bytecode")
+    subprocess.run(["codesign", "--verify", "--deep", "--strict", str(app)], check=True)
+
+
+def build_image(app, image, identity, notary_profile):
+    """Write image, a DMG of app beside a link to /Applications, signed with
+    identity unless that is ad hoc, and notarized and stapled with
+    notary_profile when one is given."""
+    with tempfile.TemporaryDirectory(
+        prefix=".package-app-", dir=image.parent
+    ) as temporary:
+        folder = Path(temporary) / "Splash"
+        folder.mkdir()
+        subprocess.run(["ditto", str(app), str(folder / app.name)], check=True)
+        (folder / "Applications").symlink_to("/Applications")
+        temporary_image = Path(temporary) / image.name
+        subprocess.run(
+            ["hdiutil", "create", "-volname", "Splash", "-srcfolder", str(folder)]
+            + ["-format", "ULMO", str(temporary_image)],
+            check=True,
+        )
+        if identity != "-":
+            codesign(temporary_image, identity)
+        if notary_profile:
+            subprocess.run(
+                ["xcrun", "notarytool", "submit", str(temporary_image)]
+                + ["--keychain-profile", notary_profile, "--wait"],
+                check=True,
+            )
+            subprocess.run(
+                ["xcrun", "stapler", "staple", str(temporary_image)], check=True
+            )
+            subprocess.run(
+                ["spctl", "-a", "-t", "open", "--context", "context:primary-signature"]
+                + ["-v", str(temporary_image)],
+                check=True,
+            )
+            subprocess.run(
+                ["xcrun", "stapler", "validate", str(temporary_image)], check=True
+            )
+        temporary_image.replace(image)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "target",
+        choices=("app", "dmg"),
+        help="app builds dist/Splash.app; dmg also wraps it in dist/Splash-VERSION.dmg",
+    )
+    parser.add_argument("--version", required=True)
+    parser.add_argument("--macos-min", required=True, help="minimum macOS, e.g. 26.4")
+    parser.add_argument(
+        "--sign",
+        default="-",
+        metavar="IDENTITY",
+        help="codesign identity, a Developer ID Application; ad hoc (-) by default",
+    )
+    parser.add_argument(
+        "--notary-profile",
+        metavar="NAME",
+        help="notarytool keychain profile to notarize the DMG with",
+    )
+    args = parser.parse_args(argv)
+    if not short_version(args.version):
+        parser.error("release version must start with x.y.z, e.g. 1.4.1-36-g6e9dfe3f")
+    if args.notary_profile and (args.target != "dmg" or args.sign == "-"):
+        parser.error("--notary-profile notarizes a dmg signed with a --sign identity")
+    dist = ROOT / "dist"
+    dist.mkdir(exist_ok=True)
+    app = dist / "Splash.app"
+    image = dist / f"Splash-{args.version}.dmg"
+    if args.target == "dmg" and image.exists():
+        parser.error(f"release already exists: {image}")
+    executable = build_executable()
+    with tempfile.TemporaryDirectory(prefix=".package-app-", dir=dist) as temporary:
+        bundle = Path(temporary) / app.name
+        assemble(bundle, executable, args.version, args.macos_min)
+        signed = sign(bundle, args.sign)
+        check_signed(bundle)
+        if app.exists():
+            shutil.rmtree(app)
+        bundle.replace(app)
+    print(f"Built {app}; signed it and the {signed} Mach-O files of its runtime.")
+    if args.target == "app":
+        return
+    build_image(app, image, args.sign, args.notary_profile)
+    print(f"Built {image}.")
+    if not args.notary_profile:
+        print(
+            f"{image.name} is not notarized and is for local testing only: on another "
+            "Mac, Gatekeeper blocks the Splash.app copied from it until it is "
+            "allowed with Open Anyway in System Settings › Privacy & Security, or "
+            "its quarantine is removed with "
+            "xattr -dr com.apple.quarantine /Applications/Splash.app."
+        )
+
+
+if __name__ == "__main__":
+    main()

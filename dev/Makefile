@@ -14,6 +14,26 @@ package-bottle:
 package-check:
 	$(PYTHON) dev/tools/package_brew.py check --version "$(RELEASE_VERSION)"
 
+# dist/Splash.app, app/ around the runtime make package ships, signed ad hoc
+# or, with SIGN_IDENTITY, a Developer ID Application identity, for the
+# hardened runtime. dmg also wraps it in dist/Splash-RELEASE_VERSION.dmg, which
+# NOTARY_PROFILE, a notarytool keychain profile, notarizes.
+SIGN_IDENTITY ?=
+NOTARY_PROFILE ?=
+APP_ARGS = --version "$(RELEASE_VERSION)" --macos-min "$(MACOS_MIN_VERSION)" \
+	$(if $(SIGN_IDENTITY),--sign "$(SIGN_IDENTITY)")
+.PHONY: app dmg check-app
+app: install-environment all
+	$(PYTHON) dev/tools/package_app.py app $(APP_ARGS)
+
+dmg: install-environment all
+	$(PYTHON) dev/tools/package_app.py dmg $(APP_ARGS) \
+		$(if $(NOTARY_PROFILE),--notary-profile "$(NOTARY_PROFILE)")
+
+# The app's own tests; the Python ones cover what packages it.
+check-app:
+	swift test --package-path app
+
 # Uploads the built RELEASE_VERSION archive, its checksum, the tester installer
 # and the `latest` pointer to the private Hugging Face repo testers install
 # from. Uses the developer's own `hf auth login`.
@@ -99,7 +119,7 @@ check-python: install-development test-python
 architecture-check: install-environment
 	$(PYTHON) dev/tools/check_architecture.py
 
-check: check-source check-native-engine check-python
+check: check-source check-native-engine check-python check-app
 
 check-source: architecture-check
 	@git diff --check

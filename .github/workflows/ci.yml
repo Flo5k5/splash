@@ -45,6 +45,8 @@ jobs:
         run: make check-native-build
       - name: Run native sanitizers
         run: make test-sanitizers
+      - name: Test the Mac app
+        run: make check-app
 
   python-compatibility:
     name: Python compatibility ${{ matrix.python-version }}

@@ -4218,6 +4218,41 @@ The runtime package allowlists engine, Python, server and launcher files; tests,
 benchmarks and developer documents are excluded. User model links survive
 upgrades; downloads remain in the Hugging Face cache.
 
+### Mac app
+
+`app/` is Splash for Mac, a SwiftUI app distributed as a disk image:
+
+```sh
+make app RELEASE_VERSION=$VERSION   # dist/Splash.app, signed ad hoc
+make dmg RELEASE_VERSION=$VERSION SIGN_IDENTITY="Developer ID Application: ..." \
+    NOTARY_PROFILE=splash-notary    # dist/Splash-<version>.dmg, notarized
+```
+
+`dev/tools/package_app.py` builds the app with `swift build`, puts the runtime
+`make package` ships, staged by the same function, under
+`Contents/Resources/splash`, signs each of its Mach-O files and then the app,
+and verifies them. Without `SIGN_IDENTITY` the signature is ad hoc, without the
+hardened runtime, which cannot load the wheels' libraries under an ad hoc
+signature: such a disk image is for local testing, opened with Open Anyway in
+System Settings › Privacy & Security. A Developer ID signature adds the
+hardened runtime, which needs no entitlements, and `NOTARY_PROFILE`, a
+`notarytool` keychain profile, notarizes and staples the disk image.
+
+The app adds no second way to serve. It runs the packaged runtime's own
+commands, each in a process group of its own, as a terminal runs a foreground
+job, with its output appended to a log in `~/Library/Logs/Splash`:
+`install/models.py --model ID prepare --json-progress` downloads a model, and
+`splash serve --model ID --port PORT --offline` serves an installed one, ready
+once `/status` names that process; stopping is Ctrl+C's SIGINT to the group.
+Switching models stops one server and starts the next. The window shows the
+chat page from the server's origin, so its chats stay saved per port. Models,
+locks and downloads are the ones a packaged `splash` uses, in
+`~/Library/Application Support/Splash` and the Hugging Face cache. The app
+offers `install/suggested-models.tsv`, per model the variant meant for the
+Mac's memory, and starts coding agents with `splash AGENT --port PORT` in
+Terminal, in a folder the user picks. `swift test --package-path app` runs its
+tests.
+
 ### Private test releases
 
 Testers can install a build before it is public, from a private Hugging Face
