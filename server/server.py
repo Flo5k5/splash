@@ -1313,7 +1313,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
         def close_item(index, block):
             item = responses_item(job, block, index)
-            if item["type"] == "custom_tool_call":
+            if is_custom_call(job, block):
                 for event, field in (("delta", "delta"), ("done", "input")):
                     send(
                         f"response.custom_tool_call_input.{event}",

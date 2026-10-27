@@ -347,26 +347,21 @@ def normalize_responses_input(instructions, items):
                 }
             )
         elif kind == "custom_tool_call":
-            call_id, name, value = (
+            call_id, name, text = (
                 item.get("call_id"),
                 item.get("name"),
                 item.get("input"),
             )
             if not all(isinstance(value, str) and value for value in (call_id, name)):
                 raise APIError(400, "custom_tool_call requires call_id and name")
-            if not isinstance(value, str):
+            if not isinstance(text, str):
                 raise APIError(400, "custom_tool_call input must be a string")
             # The call as the function the model made it (_custom_function).
             assistant().setdefault("tool_calls", []).append(
                 {
                     "id": call_id,
                     "type": "function",
-                    "function": {
-                        "name": name,
-                        "arguments": json.dumps(
-                            {CUSTOM_INPUT: value}, ensure_ascii=False
-                        ),
-                    },
+                    "function": {"name": name, "arguments": {CUSTOM_INPUT: text}},
                 }
             )
         elif kind in ("function_call_output", "custom_tool_call_output"):
@@ -538,9 +533,10 @@ def _responses_format(text):
 
 
 def responses_to_chat_body(body, items):
-    """A Responses request as a Chat body, and the namespace and name of
-    each namespaced tool by its alias. `items` are the request's canonical
-    input items after those of the response it continues."""
+    """A Responses request as a Chat body, and how the request names each
+    tool the model sees under another name or shape (normalize_responses_tools).
+    `items` are the request's canonical input items after those of the
+    response it continues."""
     if body.get("conversation") is not None:
         raise APIError(400, "conversation is not supported")
     if body.get("background") not in (None, False):
@@ -1267,18 +1263,14 @@ def is_custom_call(job, block):
 
 def custom_input(arguments):
     """A custom tool's input from the arguments of the function the model
-    called: its one string, or the arguments as written when they are cut
-    short or hold anything else."""
+    called: their input string, or the arguments as written when they are
+    cut short or hold none."""
     try:
         value = json_codec.loads(arguments)
     except ValueError:
         return arguments
-    if isinstance(value, dict):
-        strings = [item for item in value.values() if isinstance(item, str)]
-        if isinstance(value.get(CUSTOM_INPUT), str):
-            return value[CUSTOM_INPUT]
-        if len(value) == 1 and strings:
-            return strings[0]
+    if isinstance(value, dict) and isinstance(value.get(CUSTOM_INPUT), str):
+        return value[CUSTOM_INPUT]
     return arguments
 
 
@@ -1294,7 +1286,7 @@ def responses_item(job, block, index):
             "status": status,
             "call_id": block.call_id,
             "name": block.name,
-            "input": custom_input(text) if text else "",
+            "input": custom_input(text),
         }
     item_id = responses_item_id(job, block.kind, index)
     if block.kind == "reasoning":

@@ -170,11 +170,9 @@ class CustomToolTests(HarnessTestCase):
         self.assertEqual(status, 200, payload)
         messages = harness.tokenizer.templates[-1][0]
         call = messages[-2]["tool_calls"][0]
-        self.assertEqual(call["function"]["name"], "apply_patch")
-        arguments = call["function"]["arguments"]
-        if isinstance(arguments, str):
-            arguments = json.loads(arguments)
-        self.assertEqual(arguments, {"input": PATCH})
+        self.assertEqual(
+            call["function"], {"name": "apply_patch", "arguments": {"input": PATCH}}
+        )
         self.assertEqual(messages[-1]["role"], "tool")
         self.assertIn("M notes.txt", json.dumps(messages[-1]["content"]))
 
@@ -185,6 +183,7 @@ class CustomToolTests(HarnessTestCase):
             "/v1/responses",
             responses_body(tools=[APPLY_PATCH], reasoning={"effort": "none"}),
         )
+        self.assertEqual(status, 200, payload)
         first = json.loads(payload)
         call = first["output"][-1]
         status, _, payload = harness.request(
@@ -205,6 +204,11 @@ class CustomToolTests(HarnessTestCase):
         )
         self.assertEqual(status, 200, payload)
         self.assertEqual(json.loads(payload)["status"], "completed")
+        [stored] = harness.tokenizer.templates[-1][0][-2]["tool_calls"]
+        self.assertEqual(stored["id"], call["call_id"])
+        self.assertEqual(
+            stored["function"], {"name": "apply_patch", "arguments": {"input": PATCH}}
+        )
 
     def test_a_named_custom_tool_choice_names_its_function(self):
         body = responses_body(
@@ -257,12 +261,11 @@ class CustomToolTests(HarnessTestCase):
                 status, _, _ = harness.request("POST", "/v1/responses", body)
                 self.assertEqual(status, 400)
 
-    def test_custom_input_reads_the_one_string_of_the_arguments(self):
+    def test_custom_input_is_the_input_string_or_the_arguments_as_written(self):
         for arguments, expected in (
             ('{"input": "patch"}', "patch"),
-            ('{"patch": "text"}', "text"),
+            ('{"patch": "text"}', '{"patch": "text"}'),
             ('{"input": "a", "other": 1}', "a"),
-            ('{"a": "x", "b": "y"}', '{"a": "x", "b": "y"}'),
             ('{"input": "cut', '{"input": "cut'),
             ("[1]", "[1]"),
         ):
