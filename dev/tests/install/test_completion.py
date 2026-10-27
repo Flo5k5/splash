@@ -152,7 +152,9 @@ class CompletionTests(unittest.TestCase):
         self.assertEqual(result.stderr, "")
         return result.stdout.splitlines()
 
-    def bash_complete(self, shell, script, words, *, upgrade=None, unbroken=""):
+    def bash_complete(
+        self, shell, script, words, *, upgrade=None, unbroken="", cwd=None
+    ):
         setup = ""
         if upgrade:
             link, new, old = upgrade
@@ -183,6 +185,7 @@ class CompletionTests(unittest.TestCase):
                 str(script),
                 *words,
             ],
+            cwd=cwd,
             env=self.env,
             capture_output=True,
             timeout=10,
@@ -316,32 +319,36 @@ class CompletionTests(unittest.TestCase):
 
     def test_bash_completes_local_model_paths_with_spaces(self):
         _, directory = self.layout()
-        target = self.root / "local target.gguf"
-        target.touch()
+        (self.root / "local dir").mkdir()
+        (self.root / "local dir/target.gguf").touch()
         for shell in bash_paths():
             for flag in ("--model-dir", "--draft-model", "--mmproj"):
-                with self.subTest(shell=shell, flag=flag):
-                    self.assertEqual(
-                        self.bash_complete(
-                            shell,
+                # Words as Bash 4 and later split flag= and flag=t.
+                for words in ([flag, "="], [flag, "=", "t"]):
+                    with self.subTest(shell=shell, words=words):
+                        self.assertEqual(
+                            self.bash_complete(
+                                shell,
+                                directory / "splash.bash",
+                                ["splash", "serve", *words],
+                                cwd=self.root / "local dir",
+                            ),
+                            ["target.gguf"],
+                        )
+                # Readline quotes the space and ends the directory with '/'.
+                for typed, unbroken, expected in (
+                    (f"{flag} local\\ d\t", "", [flag, "local dir/target.gguf"]),
+                    (f"{flag}=local\\ d\t", "", [f"{flag}=local dir/target.gguf"]),
+                    (f"{flag}=local\\ dir/t", "=", [f"{flag}=local dir/target.gguf"]),
+                ):
+                    with self.subTest(shell=shell, typed=typed, unbroken=unbroken):
+                        actual = self.shell_tab(
                             directory / "splash.bash",
-                            ["splash", "serve", flag, str(self.root / "local t")],
-                        ),
-                        [str(target)],
-                    )
-                    self.assertEqual(
-                        self.bash_complete(
-                            shell,
-                            directory / "splash.bash",
-                            [
-                                "splash",
-                                "serve",
-                                flag + "=" + str(self.root / "local t"),
-                            ],
-                            unbroken="=",
-                        ),
-                        [flag + "=" + str(target)],
-                    )
+                            f"splash serve {typed}",
+                            shell=shell,
+                            unbroken=unbroken,
+                        )
+                        self.assertEqual(actual.splitlines(), ["serve", *expected])
 
     def test_zsh_completes_local_model_paths_with_spaces(self):
         _, directory = self.layout()
@@ -521,6 +528,8 @@ class CompletionTests(unittest.TestCase):
                     for typed, model in (
                         ("community/l", LOCAL[1]),
                         ("unsloth/Model-GGUF:UD", GGUF[1]),
+                        # The first tab inserts the ':' itself.
+                        ("unsloth/Model-GGUF\tUD", GGUF[1]),
                     ):
                         with self.subTest(
                             shell=shell,
