@@ -2527,8 +2527,8 @@ rule.
 Decode runs one of two kernel families, chosen by GPU family in `runtime/ops/LinearGguf.cpp`. On
 Apple9 (M3, M4) the register tile (`LinearTile::GgufRegister`) runs the kernels of
 `runtime/metal/kernels/decode/linear_gguf_sgmatrix.metal`, which feed the codes themselves to
-bf16 matrix operations, each chain of 32 inputs (16 for zero-point codes and 16-input scales) closed
-by its fp32 scale, so every output is the bf16 rounding of its fp32-accumulated sum. The coefficient
+bf16 matrix operations, each chain of 32 inputs (16 for 16-input scales) closed by its fp32 scale,
+so every output is the bf16 rounding of its fp32-accumulated sum. The coefficient
 group is the inputs one scale covers (a format's `Group`: 16, 32, or the groups of a meta unit that
 share one, as MLX affine's groups of 64 and 128, PQ2_0, Q2_0, FP8 and BF16 do): a simdgroup decodes
 a column's coefficients into threadgroup memory once per group, and a format with a min adds its
@@ -2542,7 +2542,19 @@ two and three and 3.3-4.6% at four, which over a B1 DFlash2 cycle's calls of tho
 instead of 16.89 ms on the 35B and 165.80 instead of 168.06 ms on the 27B; MLX g128 takes 1.7-1.9%
 less in total at one to three lanes and 3.6% at four, though not 4-bit 2048 x 4096 at one to three.
 A chain over a whole 64-input group instead leaves a lane two dependent chains per simdgroup where
-it has four, and took 1-6% more time at one to three lanes. They read their activations as the
+it has four, and took 1-6% more time at one to three lanes. A zero point is such a term too,
+entered where it costs no epilogue: codes with one enter as 160 + code - zero, and the term's last
+chain starts from -160 times the sum of its inputs, from the table's sums of 32 once per group and
+span where a scale covers 32 inputs or more (Q4_0, Q5_0, IQ1_S, PQ2_0, Q2_0), and from the table's
+seed of 16 inputs per chain where scales cover 16 (Q6_K, Q3_K, IQ1_M). On the 10-core M4, against a
+decode and a seeded chain per 16 inputs, those five formats at projection shapes of 2048 to 17408
+columns take 1.4-7.1% less time at one lane and 3.5-8.0% at two to four. The zero point as an
+epilogue term instead, b * sum with b = -(128 + zero) s, took up to 3.3 points more (IQ1_S at one
+lane, 2.0-2.7 in Q4_0 and Q5_0 at two to four), and so did chains of 32 seeded with the sum of two
+16-input seeds; code - zero as the operand, its chains starting from zero, took 2.0-5.9% less time
+than seeded chains at three and four lanes in Q6_K, Q3_K and IQ1_M but up to 3.5% more at one and
+two (Q3_K at one lane), and on the 32-core M5 Max up to 3.9% more at one lane (IQ1_M at 512 x
+2048). They read their activations as the
 Table16 table (`kernels/common/gguf_sgmatrix.h`) that the input's producer writes, or
 `decode_linear_gguf_prepare` when none did. The formats whose operands those kernels build from
 grid lookups, IQ3_XXS, the IQ2 formats and IQ1 (`apple9StagesFormat`), and Q2_K from two lanes
@@ -2564,7 +2576,10 @@ than the staged tile's 64 (`apple10Registers`). Its coefficient groups apply the
 at one lane, take 1.6-2.2% less time at their splits (GDN out, the draft's down and its context
 commit's fc), and the 320 x 10240 hyper-connection projections, which take it at every lane,
 0.4-1.8% less in MLX 4-bit and 8-bit g64 at one to three lanes and 4.4-5.2% at four, BF16 the
-same. Partitions of under 512 inputs at sixteen splits (one or two coefficient units) take 2-10%
+same; with a zero point's term per group, against a decode and a seeded chain per 16 inputs, Q4_0,
+Q5_0, Q2_0, PQ2_0 and IQ1_S at 320 to 2048 columns, at the lanes that take the tile, take 1.0-4.2%
+less time at one lane and 2.1-5.9% at two to four. Partitions of under 512 inputs at sixteen splits
+(one or two coefficient units) take 2-10%
 more time at one to three lanes, which the tiers never pick, as sixteen keep 512 inputs per
 partition; at eight, partitions of one unit took 4.1% less to 0.8% more. A step's weights, and
 its meta unit when it enters a new one, load while the previous step's matmul runs
