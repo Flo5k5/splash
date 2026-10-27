@@ -15,8 +15,13 @@ struct MainView: View {
                     ToolbarItem(placement: .navigation) { SectionSwitch() }
                         .sharedBackgroundVisibility(.hidden)
                 }
+                if state.installer.running && state.section == .chat {
+                    ToolbarItem { DownloadButton() }
+                }
                 if state.available && state.section == .chat {
-                    ToolbarItem(placement: .navigation) {
+                    // At the toolbar's end, clear of the sidebar.
+                    ToolbarSpacer(.flexible)
+                    ToolbarItem {
                         Button {
                             state.chats.newChat()
                             state.draft.focus()
@@ -25,9 +30,6 @@ struct MainView: View {
                         }
                         .help("New Chat (⌘N)")
                     }
-                }
-                if state.installer.running && state.section == .chat {
-                    ToolbarItem { DownloadButton() }
                 }
             }
             .onChange(of: state.status) { _, status in

@@ -174,8 +174,9 @@ private struct EffortMenu: View {
                 }
                 .pickerStyle(.inline)
             } label: {
-                HStack(spacing: 3) {
-                    Text("Thinking: \(Self.title(chosen))")
+                HStack(spacing: 4) {
+                    Image(systemName: "brain").imageScale(.small)
+                    Text(Self.title(chosen))
                     Image(systemName: "chevron.down").imageScale(.small)
                 }
                 .font(.callout)
@@ -186,7 +187,9 @@ private struct EffortMenu: View {
             .buttonStyle(.plain)
             .menuIndicator(.hidden)
             .fixedSize()
-            .help("How much the model thinks before it answers")
+            .help("Thinking: how much the model thinks before it answers")
+            .accessibilityLabel("Thinking")
+            .accessibilityValue(Self.title(chosen))
         }
     }
 

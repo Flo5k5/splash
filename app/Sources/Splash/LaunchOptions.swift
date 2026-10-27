@@ -6,12 +6,19 @@ import SwiftUI
 struct LaunchOptions: View {
     @Environment(AppState.self) private var state
     @State var advanced = false
+    /// Brings the Advanced options into view once they open.
+    var reveal: () -> Void = {}
+
+    /// The Advanced row's ID, to scroll to.
+    static let advancedID = "advanced"
 
     var body: some View {
         Section {
             ForEach(Self.options(.main)) { OptionRow(option: $0) }
             Button {
                 withAnimation(.smooth(duration: 0.2)) { advanced.toggle() }
+                // Once the options are laid out under the row.
+                if advanced { Task { reveal() } }
             } label: {
                 HStack(spacing: 6) {
                     Image(systemName: "chevron.right")
@@ -26,6 +33,7 @@ struct LaunchOptions: View {
             }
             .buttonStyle(.plain)
             .accessibilityValue(advanced ? "Expanded" : "Collapsed")
+            .id(Self.advancedID)
         } header: {
             SectionTitle(text: LaunchOption.Section.main.rawValue)
         } footer: {

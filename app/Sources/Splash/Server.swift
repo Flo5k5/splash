@@ -24,6 +24,21 @@ final class Server {
     private(set) var acceptsImages = false
     /// Once ready: what a reasoning effort does to the model.
     private(set) var reasoning: Reasoning?
+    /// Once ready: the work the server reports, as its status gives it.
+    private(set) var activity = Activity()
+
+    /// The server's work since it started, from `/status`: requests served and running, the speed
+    /// of answers and of reading prompts in tokens a second, the median time to an answer's first
+    /// token, the memory the engine holds, and the context it serves.
+    struct Activity: Equatable {
+        var served = 0
+        var running = 0
+        var generation: Double?
+        var reading: Double?
+        var firstToken: Duration?
+        var memory: Int64?
+        var context: Int?
+    }
 
     /// What a reasoning effort does to the served model, as `/v1/models` reports it from its
     /// template.
@@ -106,6 +121,7 @@ final class Server {
         self.model = model
         self.settings = settings
         asleep = false
+        activity = Activity()
         acceptsImages = false
         reasoning = nil
         firstError = nil
@@ -209,12 +225,22 @@ final class Server {
         // The status, unless the server was started with an API key it asks for.
         while !Task.isCancelled, phase == .ready {
             if let status = await status(), phase == .ready { apply(status) }
-            try? await Task.sleep(for: .seconds(3))
+            try? await Task.sleep(for: .seconds(2))
         }
     }
 
     private func apply(_ status: Status) {
         asleep = status.weights?.released ?? false
+        let metrics = status.metrics
+        activity = Activity(
+            served: status.requests?.completed ?? 0,
+            running: status.active_requests?.count ?? 0,
+            generation: metrics?.decode_tokens_per_second.flatMap { $0 > 0 ? $0 : nil },
+            reading: metrics?.prefill_tokens_per_second.flatMap { $0 > 0 ? $0 : nil },
+            firstToken: metrics?.ttft_ms?.p50.flatMap { $0 > 0 ? .milliseconds($0) : nil },
+            memory: status.memory_actual?.current_bytes,
+            context: status.maximum_context_tokens
+        )
         if status.transport?.stopped == true {
             // The engine failed again and again; the server stays up but serves nothing.
             phase = .failed(status.transport?.error ?? "It stopped after failing repeatedly.")
@@ -224,8 +250,22 @@ final class Server {
     private struct Status: Decodable {
         struct Weights: Decodable { let released: Bool? }
         struct Transport: Decodable { let stopped: Bool?; let error: String? }
+        struct Requests: Decodable { let completed: Int? }
+        struct Request: Decodable {}
+        struct Metrics: Decodable {
+            struct Percentiles: Decodable { let p50: Double? }
+            let decode_tokens_per_second: Double?
+            let prefill_tokens_per_second: Double?
+            let ttft_ms: Percentiles?
+        }
+        struct Memory: Decodable { let current_bytes: Int64? }
         let weights: Weights?
         let transport: Transport?
+        let requests: Requests?
+        let active_requests: [Request]?
+        let metrics: Metrics?
+        let memory_actual: Memory?
+        let maximum_context_tokens: Int?
     }
 
     private struct ServedModel: Decodable {

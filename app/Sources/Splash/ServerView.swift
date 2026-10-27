@@ -19,56 +19,57 @@ struct ServerView: View {
         let available = suggestions.filter { !installedNames.contains($0.name) && $0.id != state.installer.model }
         let first = state.installed.isEmpty
         let failed = if case .failed = state.server.phase { true } else { false }
-        Form {
-            if first || failed || state.installer.failure != nil || state.installer.running {
-                Section {
-                    if case .failed(let message) = state.server.phase, let model = state.server.model {
-                        ProblemRow(title: "\(state.displayName(of: model)) ran into a problem", message: message,
-                                   log: Server.log, dismiss: state.server.dismissFailure)
+        ScrollViewReader { scroll in
+            Form {
+                if state.server.phase == .ready {
+                    Section {
+                        ActivityRow(activity: state.server.activity)
+                    } header: {
+                        SectionTitle(text: "Activity")
                     }
-                    if let failure = state.installer.failure {
-                        ProblemRow(title: "\(state.displayName(of: failure.model)) couldn’t download",
-                                   message: failure.message, log: Installer.log, dismiss: state.installer.dismissFailure,
-                                   retry: ("Download Again", { state.download(failure.model) }))
+                }
+                if first || failed || state.installer.failure != nil || state.installer.running {
+                    Section {
+                        if case .failed(let message) = state.server.phase, let model = state.server.model {
+                            ProblemRow(title: "\(state.displayName(of: model)) ran into a problem", message: message,
+                                       log: Server.log, dismiss: state.server.dismissFailure)
+                        }
+                        if let failure = state.installer.failure {
+                            ProblemRow(title: "\(state.displayName(of: failure.model)) couldn’t download",
+                                       message: failure.message, log: Installer.log, dismiss: state.installer.dismissFailure,
+                                       retry: ("Download Again", { state.download(failure.model) }))
+                        }
+                        if state.installer.running { DownloadRow() }
+                    } header: {
+                        if first { welcome }
                     }
-                    if state.installer.running { DownloadRow() }
-                } header: {
-                    if first { welcome }
                 }
-            }
-            if !first {
+                if !first {
+                    Section {
+                        ForEach(state.installed) { ModelRow(model: $0) }
+                    } header: {
+                        SectionTitle(text: "Models on This Mac")
+                    } footer: {
+                        otherModels
+                    }
+                    LaunchOptions(advanced: advanced) { withAnimation(.smooth) { scroll.scrollTo(LaunchOptions.advancedID, anchor: .top) } }
+                }
                 Section {
-                    ForEach(state.installed) { ModelRow(model: $0) }
+                    ForEach(available, id: \.id) { variant in
+                        SuggestedRow(variant: variant, recommended: variant == suggestions.first,
+                                     lead: first && !state.installer.running && variant == suggestions.first)
+                    }
                 } header: {
-                    SectionTitle(text: "Models on This Mac")
-                }
-                LaunchOptions(advanced: advanced)
-            }
-            Section {
-                ForEach(available, id: \.id) { variant in
-                    SuggestedRow(variant: variant, recommended: variant == suggestions.first,
-                                 lead: first && !state.installer.running && variant == suggestions.first)
-                }
-            } header: {
-                if !available.isEmpty { SectionTitle(text: "Available to Download") }
-            } footer: {
-                VStack(alignment: .leading, spacing: 6) {
+                    if !available.isEmpty { SectionTitle(text: "Available to Download") }
+                } footer: {
                     if suggestions.isEmpty, let minimum = state.catalog.minimumMemory {
                         Text("The suggested models need a Mac with at least \(minimum) GB of memory; this one has \(Catalog.memory) GB.")
-                    } else {
-                        Text("Suggested for this Mac’s \(Catalog.memory) GB of memory. Models download from Hugging Face and run privately on this Mac.")
                     }
-                    HStack(spacing: 16) {
-                        Button("Download Another Model…") { customModel = true }
-                            .disabled(state.installer.running || !state.ready)
-                        Button("Add Model from This Mac…", action: addLocal)
-                            .disabled(!state.ready)
-                    }
-                    .buttonStyle(.link)
+                    if first { otherModels }
                 }
             }
+            .formStyle(.grouped)
         }
-        .formStyle(.grouped)
         .contentMargins(.horizontal, max(0, (width - column) / 2), for: .scrollContent)
         .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width = $0 }
         .safeAreaInset(edge: .bottom, spacing: 0) {
@@ -82,6 +83,17 @@ struct ServerView: View {
         }
         .onAppear { state.refresh() }
         .sheet(isPresented: $customModel) { CustomModelSheet() }
+    }
+
+    /// Ways to models the list doesn't offer: one from Hugging Face by its ID, or files on this Mac.
+    private var otherModels: some View {
+        HStack(spacing: 16) {
+            Button("Download Another Model…") { customModel = true }
+                .disabled(state.installer.running || !state.ready)
+            Button("Add Model from This Mac…", action: addLocal)
+                .disabled(!state.ready)
+        }
+        .buttonStyle(.link)
     }
 
     /// Asks for model files on this Mac: a GGUF file, or the folder of an MLX or GGUF model.
@@ -163,8 +175,7 @@ private struct ControlBar: View {
         let server = state.server
         switch server.phase {
         case .starting:
-            let size = state.installed.first { $0.id == server.model }.map { Format.size($0.bytes) }
-            Text(size.map { "Loading \($0) into memory…" } ?? "Loading into memory…")
+            Text("Loading into memory…")
         case .stopping:
             if let next = server.next {
                 Text(next == server.model ? "Restarting…" : "Switching to \(state.displayName(of: next))…")
@@ -221,6 +232,43 @@ private struct ControlBar: View {
                 }
             }
         }
+    }
+}
+
+/// What the model that runs has done, in a row of figures: requests served and running, how fast
+/// it answers and reads prompts, how soon an answer starts, the memory it holds and its context.
+private struct ActivityRow: View {
+    let activity: Server.Activity
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 0) {
+            figure(activity.served.formatted(), activity.running > 0 ? "Requests · \(activity.running) running" : "Requests")
+            figure(rate(activity.generation), "Answering")
+            figure(rate(activity.reading), "Reading prompts")
+            figure(activity.firstToken.map { $0.formatted(.units(allowed: [.seconds, .milliseconds], width: .narrow, maximumUnitCount: 1)) } ?? "–",
+                   "To first token")
+            figure(activity.memory.map(Format.size) ?? "–", "Memory")
+        }
+        .padding(.vertical, 6)
+    }
+
+    private func rate(_ value: Double?) -> String {
+        value.map { "\($0.formatted(.number.precision(.fractionLength(0)))) tok/s" } ?? "–"
+    }
+
+    private func figure(_ value: String, _ caption: String) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(value)
+                .font(.title3.weight(.semibold))
+                .monospacedDigit()
+                .contentTransition(.numericText())
+            Text(caption)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .lineLimit(1)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine)
     }
 }
 

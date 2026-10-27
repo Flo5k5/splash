@@ -109,7 +109,10 @@ private struct ChatList: View {
 private struct ConversationView: View {
     @Environment(AppState.self) private var state
     @State private var position = ScrollPosition()
+    /// Whether the conversation follows the latest message: until the reader scrolls up, and again
+    /// once they scroll back to the bottom.
     @State private var atBottom = true
+    @State private var scrolling = false
 
     var body: some View {
         let conversation = state.chats.current
@@ -132,12 +135,21 @@ private struct ConversationView: View {
                 // bottom; a short conversation still reads from the top.
                 .defaultScrollAnchor(.bottom, for: .initialOffset)
                 .defaultScrollAnchor(atBottom ? .bottom : nil, for: .sizeChanges)
+                .onScrollPhaseChange { _, phase in scrolling = phase != .idle }
                 .onScrollGeometryChange(for: Bool.self) { geometry in
                     geometry.contentOffset.y + geometry.containerSize.height >= geometry.contentSize.height - 40
                 } action: { _, bottom in
-                    atBottom = bottom
+                    // A reply that grows leaves the bottom behind; only the reader's scrolling
+                    // stops the following.
+                    if bottom || scrolling { atBottom = bottom }
                 }
-                .onChange(of: conversation.messages.count) { position.scrollTo(edge: .bottom) }
+                .onChange(of: conversation.messages.count) {
+                    atBottom = true
+                    position.scrollTo(edge: .bottom)
+                }
+                .onChange(of: conversation.messages.last.map { $0.text.count + $0.reasoning.count }) {
+                    if atBottom && !scrolling { position.scrollTo(edge: .bottom) }
+                }
                 .onChange(of: conversation.id) {
                     atBottom = true
                     position.scrollTo(edge: .bottom)
