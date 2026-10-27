@@ -153,8 +153,8 @@ Set `SPLASH_API_KEY` in the server and agent shells to require authentication;
 `serve --api-key KEY` overrides the server's environment value. Every request
 then needs `Authorization: Bearer KEY` or `x-api-key: KEY` (one that sends both
 needs the key in both), `/status` and `/metrics` included; only the chat page,
-`/health`, `/ready` and browsers' `OPTIONS` preflights stay public. Enter the
-key in the chat page to send requests; the page does not persist it. Use
+`/health`, `/ready` and browsers' `OPTIONS` preflights stay public. The chat
+page asks for the key once the server answers 401 and does not persist it. Use
 `serve --no-webui` to disable the page. Authentication is off by default, and
 the server then ignores any key a client sends, so a client that insists on
 one can send any value.
