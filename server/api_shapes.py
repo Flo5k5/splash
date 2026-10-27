@@ -1003,11 +1003,11 @@ def responses_response(model, job, status, output, result=None, error=None):
             "input_tokens": result.prompt_tokens,
             "input_tokens_details": {
                 "cached_tokens": cache.matched_tokens,
-                # Tokens written to the cache at a price of their own, as
-                # OpenAI defines the field. The prefix cache stores a prompt
-                # as it prefills it at no extra cost, as OpenAI's automatic
-                # caching does, which reports 0: uncached input is
-                # input_tokens less cached_tokens.
+                # Clients price these tokens apart from the rest of the
+                # uncached input. The prefix cache keeps a prompt as prefill
+                # computes it, at no cost of its own, so uncached input is
+                # input_tokens less cached_tokens, as in Messages, which
+                # reports no cache_creation_input_tokens.
                 "cache_write_tokens": 0,
             },
             "output_tokens": result.completion_tokens,

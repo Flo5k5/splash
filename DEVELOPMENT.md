@@ -828,9 +828,10 @@ API's own fields: Chat `prompt_tokens_details.cached_tokens` and
 `input_tokens_details.cached_tokens` and `output_tokens_details.reasoning_tokens`,
 and Messages `cache_read_input_tokens` (with `input_tokens` the uncached rest)
 and `output_tokens_details.thinking_tokens`, in a stream's `message_delta`.
-Responses `cache_write_tokens` is 0: the prefix cache stores a prompt as it
-prefills it at no cost of its own, as OpenAI reports its automatic caching, so
-uncached input is `input_tokens` less `cached_tokens`.
+Responses `cache_write_tokens` is 0: clients price cache writes apart from the
+rest of the uncached input, and the prefix cache keeps a prompt as prefill
+computes it, at no cost of its own. So uncached input is `input_tokens` less
+`cached_tokens`, as in Messages, which reports no `cache_creation_input_tokens`.
 
 Chat and text completions include a llama-server-style `timings` object, both in
 non-streaming responses and in the final finish-reason chunk of a stream,
