@@ -32,13 +32,13 @@ INSTALL_FILES = (
     "local.py",
     "gguf.py",
     "requirements.txt",
+    "suggested-models.tsv",
 )
 COMPLETION_FILES = (
     "models",
     "_splash",
     "splash.bash",
     "splash.fish",
-    "suggested-models.txt",
 )
 SERVER_FILES = (
     "__init__.py",

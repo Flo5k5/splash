@@ -70,9 +70,9 @@ completions finds them. In a source checkout, source
 `install/completions/splash.bash` for Bash, `install/completions/_splash` for
 Zsh after `compinit`, or `install/completions/splash.fish` for fish.
 
-Completion suggests commands, the upstream models the README starts with and
-installed models, a GGUF's `OWNER/REPO:VARIANT` included, without network
-access.
+Completion suggests commands, the models in `install/suggested-models.tsv`
+(the list the Mac app offers too) and installed models, a GGUF's
+`OWNER/REPO:VARIANT` included, without network access.
 
 ## Server configuration
 

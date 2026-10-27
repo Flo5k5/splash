@@ -95,7 +95,6 @@ class PackageTests(unittest.TestCase):
                 "_splash",
                 "splash.bash",
                 "splash.fish",
-                "suggested-models.txt",
             }
             for name in completion_names:
                 (completions / name).write_text(f"fixture {name}\n")
@@ -316,12 +315,7 @@ puts SplashMacOSRequirement.check
             source = root / "source"
             assets = source / "install/completions"
             assets.mkdir(parents=True)
-            for name in (
-                "_splash",
-                "splash.bash",
-                "splash.fish",
-                "suggested-models.txt",
-            ):
+            for name in ("_splash", "splash.bash", "splash.fish"):
                 (assets / name).write_text(f"fixture {name}\n")
             (assets / "models").write_text("#!/bin/sh\nprintf '%s\\n' new/model\n")
             (assets / "models").chmod(0o755)
@@ -454,7 +448,6 @@ class InstallerTests(unittest.TestCase):
             helper = assets / "models"
             helper.write_text("#!/bin/sh\nprintf '%s\\n' fixture/model\n")
             helper.chmod(0o755)
-            (assets / "suggested-models.txt").write_text("fixture/model\n")
         archive = self.releases / f"{name}.tar.gz"
         subprocess.run(
             ["tar", "-czf", str(archive), "-C", str(staging), name], check=True
