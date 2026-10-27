@@ -156,10 +156,10 @@ final class Popup {
                             backing: .buffered, defer: false)
         panel.isOpaque = false
         panel.backgroundColor = .clear
-        panel.hasShadow = true
+        // A hairline sets it off, no shadow.
+        panel.hasShadow = false
         panel.contentView = host
         window.addChildWindow(panel, ordered: .above)
-        panel.invalidateShadow()
         self.panel = panel
         isOpen = true
         Self.open = self
