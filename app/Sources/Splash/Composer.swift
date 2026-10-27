@@ -72,15 +72,8 @@ struct Composer: View {
                     .disabled(!images)
                     .help(images ? "Attach Images" : "Images need a model that can see them")
                     .accessibilityLabel("Attach Images")
-                EffortMenu()
                 Spacer()
-                if state.server.phase == .ready, let model = state.server.model {
-                    Text(state.displayName(of: model))
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .help("The model that answers. Models change on the Server screen.")
-                }
+                ModelMenu()
                 if streaming {
                     Button { state.chats.stop() } label: { Image(systemName: "stop.fill").font(.system(size: 10, weight: .bold)) }
                         .keyboardShortcut(".", modifiers: .command)
@@ -150,55 +143,61 @@ private struct InkCircle: ButtonStyle {
     }
 }
 
-/// How much the model thinks, as its template tells efforts apart: its levels and Off, or On and
-/// Off, its default marked. A model that decides itself has none.
-private struct EffortMenu: View {
+/// The model that answers and how much it thinks, as Claude's composer shows them: its name, then
+/// its effort, which a click changes, as its template tells efforts apart (its levels, or thinking
+/// on or off), its default marked. A model that decides itself shows its name alone. Models
+/// themselves change on the Server screen.
+private struct ModelMenu: View {
     @Environment(AppState.self) private var state
 
     var body: some View {
-        if let reasoning = state.server.reasoning, let thinks = reasoning.thinks {
-            let levels = !reasoning.efforts.isEmpty
-            // The choice that leaves the effort to the model: its default, by name where it has one.
-            let initial = !thinks ? "none" : levels ? reasoning.default ?? "" : "on"
-            let choices = (levels ? reasoning.efforts.reversed() : ["on"])
-                + (levels && reasoning.default == nil && thinks ? [""] : []) + ["none"]
-            let chosen = state.effort.isEmpty ? initial : !levels && state.effort != "none" ? "on" : state.effort
-            Menu {
-                Picker("Thinking", selection: Binding(get: { chosen }, set: { choice in
-                    // On, for a model whose thinking is only on or off, is any effort but none.
-                    state.effort = choice == initial ? "" : choice == "on" ? "medium" : choice
-                })) {
-                    ForEach(choices, id: \.self) { choice in
-                        Text(choice == initial ? "\(Self.title(choice)) (Default)" : Self.title(choice)).tag(choice)
+        if state.server.phase == .ready, let model = state.server.model {
+            let name = Text(state.displayName(of: model)).foregroundStyle(.secondary)
+            if let reasoning = state.server.reasoning, let thinks = reasoning.thinks {
+                let levels = !reasoning.efforts.isEmpty
+                // The choice that leaves the effort to the model: its default, by name where it has one.
+                let initial = !thinks ? "none" : levels ? reasoning.default ?? "" : "on"
+                let choices = (levels ? reasoning.efforts.reversed() : ["on"])
+                    + (levels && reasoning.default == nil && thinks ? [""] : []) + ["none"]
+                let chosen = state.effort.isEmpty ? initial : !levels && state.effort != "none" ? "on" : state.effort
+                Menu {
+                    Picker("Thinking", selection: Binding(get: { chosen }, set: { choice in
+                        // On, for a model whose thinking is only on or off, is any effort but none.
+                        state.effort = choice == initial ? "" : choice == "on" ? "medium" : choice
+                    })) {
+                        ForEach(choices, id: \.self) { choice in
+                            Text(choice == initial ? "\(Self.title(choice)) (Default)" : Self.title(choice)).tag(choice)
+                        }
                     }
+                    .pickerStyle(.inline)
+                } label: {
+                    HStack(spacing: 6) {
+                        name
+                        Text(Self.title(chosen)).foregroundStyle(.tertiary)
+                    }
+                    .font(.callout)
+                    .lineLimit(1)
+                    .contentShape(.rect)
                 }
-                .pickerStyle(.inline)
-            } label: {
-                HStack(spacing: 4) {
-                    Image(systemName: "brain").imageScale(.small)
-                    Text(Self.title(chosen))
-                    Image(systemName: "chevron.down").imageScale(.small)
-                }
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .contentShape(.rect)
+                .menuStyle(.button)
+                .buttonStyle(.plain)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .help("How much the model thinks before it answers")
+                .accessibilityLabel(state.displayName(of: model))
+                .accessibilityValue(Self.title(chosen))
+            } else {
+                name.font(.callout).lineLimit(1)
             }
-            .menuStyle(.button)
-            .buttonStyle(.plain)
-            .menuIndicator(.hidden)
-            .fixedSize()
-            .help("Thinking: how much the model thinks before it answers")
-            .accessibilityLabel("Thinking")
-            .accessibilityValue(Self.title(chosen))
         }
     }
 
-    /// An effort's name in the menu.
+    /// An effort's name.
     private static func title(_ effort: String) -> String {
         switch effort {
         case "": "Default"
-        case "on": "On"
-        case "none": "Off"
+        case "on": "Thinking"
+        case "none": "No Thinking"
         case "xhigh": "Extra High"
         default: effort.capitalized
         }
