@@ -1,12 +1,11 @@
 import AppKit
 import SwiftUI
 
-/// Splash's mark, as the app icon draws it (app/AppIcon.icon/Assets/mark.svg): a circle cut by two
-/// lines at 45°, its pieces slid along them, up and to the right. `gap` is the width of the cuts in
-/// radii, which a small mark widens to keep them in sight; `spread` how far the pieces are slid,
-/// from 0, lined up as one circle, to 1, the icon's pose. The mark keeps its size at every spread.
+/// Splash's mark, as the app icon draws it (app/AppIcon.icon/Assets/mark.svg): three arcs of water
+/// springing from one point of a rippled surface, two thrown to the right and one to the left, each
+/// throwing a drop. `spread` is how far the splash has risen, from 0, the surface alone, to 1, the
+/// icon's pose; the mark keeps its place and size at every spread.
 struct SplashMark: Shape {
-    var gap = 24.0 / 272
     var spread = 1.0
 
     var animatableData: Double {
@@ -14,48 +13,60 @@ struct SplashMark: Shape {
         set { spread = newValue }
     }
 
+    // On the icon's 1024-point canvas, drawn in strokes 76 points wide with round ends.
+    private static let surface = Path { path in
+        path.move(to: CGPoint(x: 200, y: 717.2))
+        path.addCurve(to: CGPoint(x: 398, y: 717.2), control1: CGPoint(x: 270, y: 699.2), control2: CGPoint(x: 340, y: 699.2))
+        path.addCurve(to: CGPoint(x: 606, y: 717.2), control1: CGPoint(x: 444, y: 733.2), control2: CGPoint(x: 560, y: 733.2))
+        path.addCurve(to: CGPoint(x: 824, y: 717.2), control1: CGPoint(x: 670, y: 699.2), control2: CGPoint(x: 744, y: 699.2))
+    }
+
+    /// Each arc, from its root in the surface, and the drop it throws.
+    private static let arcs: [(arc: Path, drop: CGPoint, radius: CGFloat)] = [
+        (arc(CGPoint(x: 502, y: 711.2), CGPoint(x: 500, y: 593.2), CGPoint(x: 534, y: 471.2), CGPoint(x: 604, y: 399.2)),
+         CGPoint(x: 684.3, y: 312.8), 36),
+        (arc(CGPoint(x: 516, y: 711.2), CGPoint(x: 544, y: 633.2), CGPoint(x: 606, y: 567.2), CGPoint(x: 700, y: 547.2)),
+         CGPoint(x: 805.2, y: 522.6), 30),
+        (arc(CGPoint(x: 490, y: 711.2), CGPoint(x: 466, y: 653.2), CGPoint(x: 424, y: 621.2), CGPoint(x: 364, y: 609.2)),
+         CGPoint(x: 267.2, y: 588.4), 25),
+    ]
+
+    /// The icon's pose, by which the mark is placed.
+    private static let bounds = CGRect(x: 162, y: 276.8, width: 700, height: 490.4)
+
+    private static func arc(_ root: CGPoint, _ control1: CGPoint, _ control2: CGPoint, _ end: CGPoint) -> Path {
+        Path { path in
+            path.move(to: root)
+            path.addCurve(to: end, control1: control1, control2: control2)
+        }
+    }
+
     func path(in rect: CGRect) -> Path {
-        let mark = pieces(spread: spread)
+        let stroke = StrokeStyle(lineWidth: 76, lineCap: .round)
+        var mark = Self.surface.strokedPath(stroke)
+        // The drops come as the arcs reach their full height.
+        let drop = min(max((spread - 0.75) / 0.25, 0), 1)
+        for (arc, center, radius) in Self.arcs {
+            mark = mark.union(arc.trimmedPath(from: 0, to: spread).strokedPath(stroke))
+            if drop > 0 {
+                let r = radius * drop
+                mark = mark.union(Path(ellipseIn: CGRect(x: center.x - r, y: center.y - r, width: 2 * r, height: 2 * r)))
+            }
+        }
         // Placed as the icon's pose fits rect, centred.
-        let bounds = pieces(spread: 1).boundingRect
+        let bounds = Self.bounds
         let scale = min(rect.width / bounds.width, rect.height / bounds.height)
         return mark.applying(CGAffineTransform(translationX: -bounds.midX, y: -bounds.midY)
             .concatenating(CGAffineTransform(scaleX: scale, y: scale))
             .concatenating(CGAffineTransform(translationX: rect.midX, y: rect.midY)))
     }
 
-    /// The pieces of a circle of radius 1 about the origin.
-    private func pieces(spread: Double) -> Path {
-        // Where each piece starts and ends across the cuts, and how far along them it slides in the
-        // icon's pose; in radii, as the icon's 272-point circle has them. The middle one slides
-        // alike at every spread.
-        let pieces: [(low: Double, high: Double, slide: Double)] = [
-            (-2, -100.0 / 272, -22.0 / 272), (-100.0 / 272, 70.0 / 272, 14.0 / 272), (70.0 / 272, 2, 50.0 / 272),
-        ]
-        let middle = pieces[1].slide
-        let along = CGPoint(x: sqrt(0.5), y: -sqrt(0.5)), across = CGPoint(x: sqrt(0.5), y: sqrt(0.5))
-        let point = { (s: Double, t: Double) in CGPoint(x: across.x * s + along.x * t, y: across.y * s + along.y * t) }
-        let circle = Path(ellipseIn: CGRect(x: -1, y: -1, width: 2, height: 2))
-        var mark = Path()
-        for piece in pieces {
-            let low = piece.low > -1 ? piece.low + gap / 2 : piece.low
-            let high = piece.high < 1 ? piece.high - gap / 2 : piece.high
-            let band = Path { band in
-                band.addLines([point(low, -2), point(high, -2), point(high, 2), point(low, 2)])
-                band.closeSubpath()
-            }
-            let slide = middle + spread * (piece.slide - middle)
-            mark.addPath(circle.intersection(band), transform: CGAffineTransform(translationX: along.x * slide, y: along.y * slide))
-        }
-        return mark
-    }
-
-    /// The mark as the menu bar shows the app: in the menu bar's own color, lined up and faint
-    /// until a model serves.
+    /// The mark as the menu bar shows the app: in the menu bar's own color, faint until a model
+    /// serves.
     static func menuBarImage(serving: Bool) -> NSImage {
-        let image = NSImage(size: NSSize(width: 18, height: 18), flipped: true) { rect in
+        let image = NSImage(size: NSSize(width: 20, height: 16), flipped: true) { rect in
             NSColor.black.withAlphaComponent(serving ? 1 : 0.45).setFill()
-            NSBezierPath(cgPath: SplashMark(gap: 0.18, spread: serving ? 1 : 0).path(in: rect.insetBy(dx: 1, dy: 1)).cgPath).fill()
+            NSBezierPath(cgPath: SplashMark().path(in: rect.insetBy(dx: 1, dy: 1)).cgPath).fill()
             return true
         }
         image.isTemplate = true
@@ -63,12 +74,14 @@ struct SplashMark: Shape {
     }
 }
 
-extension ShapeStyle where Self == LinearGradient {
-    /// The mark's colors, as the app icon has them; the mark's alone.
-    static var splash: LinearGradient {
-        LinearGradient(colors: [Color(.displayP3, red: 0.180, green: 0.788, blue: 1),
-                                Color(.displayP3, red: 0.231, green: 0.357, blue: 1)],
-                       startPoint: .top, endPoint: .bottom)
+extension ShapeStyle where Self == Color {
+    /// The mark's color: the icon's aqua, deepened on a light ground so that it stands out there.
+    static var splash: Color {
+        Color(nsColor: NSColor(name: nil) { appearance in
+            appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+                ? NSColor(displayP3Red: 0.345, green: 0.902, blue: 0.878, alpha: 1)
+                : NSColor(displayP3Red: 0.055, green: 0.604, blue: 0.588, alpha: 1)
+        })
     }
 }
 
@@ -77,11 +90,10 @@ enum MarkLook: Equatable {
     case off, loading, on, asleep, failed
 }
 
-/// The server's state in the mark, in a slot of its own size: lined up and grey while nothing runs,
-/// its pieces sliding apart and back along the cuts while a model loads into memory, in the icon's
-/// pose and colors while one serves, faint while it sleeps; a warning sign when it failed. It
-/// moves only while weights load, never while the model answers. The words beside it say what it
-/// shows.
+/// The server's state in the mark, in a slot of its own size: the surface alone, grey, while nothing
+/// runs; the splash rising and falling back while a model loads into memory; risen, in the icon's
+/// color, while one serves; faint while it sleeps; a warning sign when it failed. It moves only
+/// while weights load, never while the model answers. The words beside it say what it shows.
 struct StatusMark: View {
     let look: MarkLook
     /// When the load began, where the slide starts lined up.
@@ -97,12 +109,11 @@ struct StatusMark: View {
             } else {
                 TimelineView(.animation(minimumInterval: 1.0 / 30, paused: look != .loading || Motion.reduced)) { context in
                     let spread = spread(at: context.date)
-                    let gap = size < 24 ? 0.18 : 24.0 / 272
                     ZStack {
-                        SplashMark(gap: gap, spread: spread)
+                        SplashMark(spread: spread)
                             .fill(look == .off ? HierarchicalShapeStyle.tertiary : .secondary)
                             .opacity(look == .on || look == .asleep ? 0 : 1)
-                        SplashMark(gap: gap, spread: spread)
+                        SplashMark(spread: spread)
                             .fill(.splash)
                             .opacity(look == .on ? 1 : look == .asleep ? 0.4 : 0)
                     }
@@ -115,14 +126,14 @@ struct StatusMark: View {
         .accessibilityHidden(true)
     }
 
-    /// How far apart the pieces are at `date`: out and back every 1.6 s while loading, in the
-    /// icon's pose while serving, lined up otherwise; in the pose throughout with Reduce Motion.
+    /// How far the splash has risen at `date`: up and back every 1.6 s while loading, risen while
+    /// serving, the surface alone otherwise; risen throughout with Reduce Motion.
     private func spread(at date: Date) -> Double {
         if Motion.reduced { return 1 }
         switch look {
         case .loading:
             let wave = sin(Double.pi * date.timeIntervalSince(since) / 1.6)
-            return 0.85 * wave * wave
+            return wave * wave
         case .on, .asleep: return 1
         case .off, .failed: return 0
         }
