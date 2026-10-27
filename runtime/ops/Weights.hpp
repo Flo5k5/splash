@@ -25,10 +25,15 @@ struct ProjectionShape final {
   // (quant_four_bits); Apple10 runs the register tile on narrower grids of
   // fewer (Linear::decodeStorageRows).
   bool fourBits = true;
-  // Its quantized segments, together, store fewer than four and a half bits
-  // per weight, its float ones aside; Apple10 may decode a lane of it on the
-  // staged 16-row tile (Linear::decodeStorageRows).
-  bool underFourAndHalfBits = false;
+  // The bits per weight its quantized segments store together, its float
+  // ones aside, in sixteenths, rounded down; 0 where it has none or they are
+  // unknown, which plans take for the most a format stores. Apple10's staged
+  // split law weighs a split's partials against the weights (LinearGguf.cpp).
+  uint32_t weightBits16 = 0;
+  // Whether its quantized segments, together, store fewer than four and a
+  // half bits per weight; Apple10 may decode a lane of it on the staged
+  // 16-row tile (Linear::decodeStorageRows).
+  [[nodiscard]] constexpr bool underFourAndHalfBits() const noexcept { return weightBits16 && weightBits16 < 72; }
   auto operator<=>(const ProjectionShape &) const = default;
 };
 
@@ -141,7 +146,7 @@ public:
       bytes += n * s.format().block_bytes / s.format().block_elements;
     }
     return {outputSize, inputSize, static_cast<bool>(rotation), registerFormats, fourBits,
-            weights && 16 * bytes < 9 * weights};
+            weights ? uint32_t(128 * bytes / weights) : 0};
   }
 
   // Views of a projection of one unrotated quantized tensor (Linear.cpp):

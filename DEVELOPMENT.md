@@ -2610,25 +2610,90 @@ its meta unit when it enters a new one, load while the previous step's matmul ru
 column tile of a decode projection starts its walk over its K partition at its own step
 (`staged_first_step`, `LinearConfig::spread`), so the tiles do not all wait on the same freshly
 written slice of the input at once; the MoE experts, prefill, Apple9 and fewer cores walk in
-lockstep. There a dense gate/up pair whose tensors share their format also decodes in one
-dispatch (`LinearConfig::oneGateUpPass`), each simdgroup staging both tensors' columns, so a
-chain's serial steps serve both. Its output is bitwise the two passes' at the same K split; it
-splits K as one projection of the pair's columns, and where that split differs from theirs, its
-sums are reassociated. A step of three request lanes runs the 32-row tile over four lanes of
-storage. On Apple10 one lane runs the 16-row tile over two lanes of storage
-(`LinearConfig::sixteenRows`), its padding lane computed and discarded, where its staged plan is
-unsplit and the projection's quantized segments store fewer than four and a half bits per weight
-together (`ProjectionShape::underFourAndHalfBits`), a gate/up pair where both its tensors' own
-plans do: the lane's rows are bitwise the 8-row tile's, in less time (the 27B UD-IQ3_XXS decodes
-one lane 3.3-3.6% faster on a 12-core M6). Split plans take more time on it, as does Q4_K's
-4.5 bits on the M6. Prefill runs the staged kernels on both families: the 128-row prefill tile
-(`LinearTile::GgufPrefill`), and the staged tile for chunks of up to 32 rows. Every projection
-splits its K across threadgroups by one rule (`decodeSplits`: each tile's tiers of threadgroups
-per core, inputs per partition and partitions, from measured occupancy, Apple9's staged tile taking
-the register tile's of eight partitions) that does not depend on the batch width. Partitions stop
-at eight, but the register tile splits a grid that eight leave below three threadgroups per core
-into sixteen while partitions keep 512 inputs (Qwen3.8-Flash-Next's hyper-connection down
-projection, 320 columns over 10240 inputs; measured on Apple10). The MoE experts
+lockstep. There a dense gate/up pair whose tensors share their format may also decode in one
+dispatch (`LinearConfig::oneGateUpPass`), each simdgroup staging both tensors' columns, where
+the staged split law below takes it. Its output is bitwise the two passes' at the same K split;
+where its split differs from the two passes', its sums are reassociated. A step of three request
+lanes runs the 32-row tile over four lanes of storage. On Apple10 one lane runs the 16-row tile
+over two lanes of storage (`LinearConfig::sixteenRows`), its padding lane computed and
+discarded, where its staged plan is unsplit and the projection's quantized segments store fewer
+than four and a half bits per weight together (`ProjectionShape::underFourAndHalfBits()`), an
+unsplit gate/up pair where both its tensors' own plans do: the lane's rows are bitwise the 8-row
+tile's, in less time (the 27B UD-IQ3_XXS decodes one lane 3.3-3.6% faster on a 12-core M6).
+Split, the padding lane's partials double the split's traffic: on the narrow grids where the law
+splits K most (the 35B's, the 122B's and Flash-Next's output projections, 1 to 1.5 threadgroups
+per core unsplit, in four or eight partitions) the 16-row tile takes 4-36% more time than the
+8-row tile at the same split on a 32-core M5 Max (IQ3_XXS, IQ2_XS and Q2_K, and IQ4_XS where it
+stages), against 2-8% less at 4 to 20 threadgroups per core on the M6 and 7% less to 2% more on
+the 27B's 5120-column projections in four on the M5 Max. Q4_K's 4.5 bits take more time on it on
+the M6. Prefill runs the staged kernels on both families: the 128-row prefill tile
+(`LinearTile::GgufPrefill`), and the staged tile for chunks of up to 32 rows.
+
+Apple10's staged tile splits K across threadgroups, and runs a gate/up pair in one pass or two,
+by one wave law (`apple10Staged` in `runtime/ops/LinearGguf.cpp`), for decode steps and short
+prefill chunks alike: it takes the split (of at most eight partitions keeping 512 inputs each)
+and passes of least predicted time, ties to fewer partitions, then one pass. Each tile kernel
+has an occupancy (`StagedOccupancy`): a core runs `resident` of its threadgroups at once, so a
+grid runs in waves of that many per core (10 for the two-simdgroup tile, 16 for the
+one-simdgroup pair, both measured); a grid of one wave takes at least `saturating` threadgroups'
+time per step (with fewer a core waits on its chains' latency), and a last wave after others at
+least `following`'s, since it starts as the one before drains. Each threadgroup streams 64
+columns of a K step of the projection's bits per weight (`ProjectionShape::weightBits16`, the
+most a format stores where the formats are unknown, which bounds the scratch), and a split
+grid's threadgroups each also store their fp32 partials of the tile's rows, which the last
+partition reads back. The constants come from sweeps of 2 to 40 threadgroups per core on the
+32-core M5 Max, the 20-core M5 Pro and the 12-core M6 (`gguf-projection-benchmark`, which times
+a gate/up pair in both pass modes; MLX 4-bit and six GGUF formats at 2048 and 5120 inputs,
+gate/up pairs in MLX 4-bit): time per byte steps up past 10 and 16 threadgroups per core at one
+and two lanes (past 8 or 9 of the two-simdgroup tile on the M5 Pro), and the 32-row tile of
+three and four lanes steps past 9 on the M5 Max, 8 on the M5 Pro and 11 on the M6, which the law
+leaves out. The floors are fitted, not measured: a grid search over every measured case's
+fastest split gave 6 and 10 for `saturating` (a lone chain measures 5.4 and 9 threadgroups'
+bytes) and 2 and 3 for `following` (one threadgroup per core past a full wave measures 2.7-3.5
+of the tile's and 6-8.5 of the pair's); they stand in for what the law leaves out. Floors at the
+measured trailing waves take as much time in total on the sweeps but leave more cases slower.
+The law's totals on the sweeps (1.1%, 1.6% and 0.05% less time than the earlier rules on the M5
+Max, the M5 Pro and the M6) are in-sample, the fit's own records; the ABBA decode runs and a
+16-core emulation are the only out-of-sample checks, and the down projections' 17408 inputs,
+pairs in other formats and low-bit pairs take the law unmeasured. On the 12-core M6 the 35B draft's
+fc projection (2048 columns over 16384 inputs) runs two partitions instead of four at three and
+four lanes, 1.0-1.2% (2 us a cycle) more, within the 1.2-1.4% the benchmark varies between
+repeats; the law keeps it. The benchmark times the 27B's IQ4_XS gate/up pair 6.5% slower in two
+passes than in one at three and four lanes on the M5 Max (318.0 against 298.5 us), yet in the 27B
+UD-Q4_K_M's decode cycles at a 1024-token prompt the law's two passes took 0.8-1.2% less time there
+than a build running IQ4_XS pairs in one pass (1.2-1.8% at one and two lanes, six runs each), so the
+law keeps them.
+
+The law tells a gate/up pair's pass modes apart only where a last wave falls below its floor. On
+the M5 Max the 27B gate/up pair runs two passes (one pass would put 17 threadgroups on each
+core, the 17th a second wave alone: 333 us against 245 at one lane). Where both modes' last
+waves clear their floors the law predicts the same time for both, and the tie takes one pass,
+which the sweeps measure faster in 133 of 152 tied cases (by up to 22%) and slower at 20 and 36
+one-pass threadgroups per core (by up to 20%, most at one lane): a 20-core M5 Pro (27.2 per
+core) and a 40-core M5 Max (13.6) run one. A 16-core M5 Pro puts 34 one-pass threadgroups on
+each core (16, 16 and 2), where the law takes two passes at every lane count; emulated by width
+on the M5 Max, two passes take 9-12% less time than one unsplit pass, the earlier rule's plan,
+at one and two lanes but 7% more at three and four (the 32-row tile's lower residency), so there
+the 27B gate/up pair's three- and four-lane steps lose about 7%. The law keeps that loss: a 32-row
+residency of 8, which gives those steps back, sends the 32-core M5 Max's 27B pair to one pass at
+three and four lanes, 19-26% slower than its two passes, and a pair efficiency factor (0.92-0.97)
+fits the sweeps worse; no 16-core Mac has measured the case. Fewer than 16 cores run two
+passes whatever the law (`spreadsStagedDecode`): a 12-core M6 took 2-11% more in one. The law's
+plans depend on the batch width, since partials grow with the rows, so a request's greedy output
+may change with the requests batched with it (the 27B MLX's decode cycles of three and four
+lanes and the 35B MLX's of two to four, and of one at other prompt lengths, yield other tokens per
+cycle than before), and with it a step's time: on the 32-core M5 Max's 35B MLX at two lanes, where
+only the draft's gate/up pair changes (one partition to two), cycles took 0.5-1.1% more at a
+1024-token prompt but 0.9% less to 0.7% more at 640, 896, 1280 and 1536 tokens, tokens per cycle
+moving both ways, so that step follows the text rather than the kernel. The
+register tile and Apple9's staged tile, whose matrix operations share the FP32 pipe or run exact in
+registers without a residency step in their time, split by tiers (`decodeSplits`: threadgroups per
+core, inputs per partition and partitions, measured on a 40-core M3 Max, Apple9's staged tile taking
+the register tile's of eight partitions) that do not depend on the batch width.
+Partitions stop at eight, but the register tile splits a grid that eight leave below three
+threadgroups per core into sixteen while partitions keep 512 inputs (Qwen3.8-Flash-Next's
+hyper-connection down projection, 320 columns over 10240 inputs; measured on Apple10). The MoE
+experts
 (`runtime/ops/MoE.cpp`) run the same numerics per family over the grouped rows: the register
 form in `linear_gguf_sgmatrix.metal`, the staged one in `kernels/shared/moe_gguf.metal`, which
 Apple9 takes on GPUs of 10 cores or fewer (the base M3 and M4), and on larger ones for experts
@@ -2747,15 +2812,17 @@ shared slices. The goldens and how to regenerate them are
 in `dev/tests/fixtures/weight-goldens/`; with `SPLASH_GGML_ORACLE=<libggml-base.dylib>`,
 `gguf-reference` also compares the reference with GGML directly and prints GGML's hashes.
 
-Two benchmark tools repeat the measurements behind the GGUF split tiers and MoE plans, with the
-weights DRAM-cold (each command of the projection benchmark reads a ring of weight copies of at
-least 384 MiB, however small the tensor). `make benchmark-gguf-projection
+Two benchmark tools repeat the measurements behind the GGUF split law and tiers and the MoE plans,
+with the weights DRAM-cold (each command of the projection benchmark reads a ring of weight copies
+of at least 384 MiB, however small the tensor). `make benchmark-gguf-projection
 GGUF_PROJECTION_ARGS='q4k 5120 8192'` times one projection (up to three fused formats and widths,
-then `K` and an optional epilogue) on both decode tiles at one to four lanes (one lane also on the staged 16-row tile, `staged16`) and
-every K split, and marks the device policy's pick, or, with a trailing `prefill=R[,R...]`
-after the epilogue and the round count, one format's 128-row prefill tile at each chunk of `R`
-rows (more than 32); the formats `float-bf16` and `float-f32`, and `float-<format>` for a
-quantized format's native rows (such as `float-af8g64`), time the float projection
+then `K` and an optional epilogue) on both decode tiles at one to four lanes (one lane also on the
+staged 16-row tile, `staged16`; a gate/up pair on the staged tile in two passes, `staged`, and where
+the walks spread also in one, `pair` and `pair16`) and every K split, and marks the device policy's
+pick; widths emulate core counts, since the policy counts threadgroups per core. Or, with a trailing
+`prefill=R[,R...]` after the epilogue and the round count, one format's 128-row prefill tile at each
+chunk of `R` rows (more than 32); the formats `float-bf16` and `float-f32`, and `float-<format>` for
+a quantized format's native rows (such as `float-af8g64`), time the float projection
 (`ops::addGgufFloat`, widths of any multiple of 8) on both float tiles instead, marking
 `Linear::ggufFloatTile`'s pick; `make benchmark-gguf-moe` times one MoE layer at the 35B shape,
 or at Qwen3.8-Flash-Next's or Flint's (`GGUF_MOE_ARGS='flash-next'` or `'flint'`), on the
