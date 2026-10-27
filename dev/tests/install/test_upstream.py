@@ -1630,13 +1630,14 @@ class UpstreamTest(unittest.TestCase):
                 assembly.verify(chosen.link)["sources"]["target"]["revision"],
                 "a" * 40,
             )
-            # A new selection needs the Hub once for its draft's default branch,
-            # which no installation of it records.
-            with self.assertRaisesRegex(
-                models.ModelError,
-                f"cannot resolve {DENSE.draft_repo}: HF_HUB_OFFLINE is set",
-            ):
-                self.prepare(selection(self.root, revision="a" * 40))
+            # A new selection takes its draft's default branch from the
+            # snapshot the other installation pinned.
+            pinned = selection(self.root, revision="a" * 40)
+            self.prepare(pinned)
+            self.assertEqual(
+                assembly.verify(pinned.link)["sources"]["draft"],
+                {"repo": DENSE.draft_repo, "revision": DRAFT_COMMIT},
+            )
             with self.assertRaisesRegex(
                 models.ModelError,
                 f"cannot resolve {MODEL}: HF_HUB_OFFLINE is set; neither this "
@@ -1644,6 +1645,34 @@ class UpstreamTest(unittest.TestCase):
             ):
                 self.prepare(selection(self.root, revision="v2"))
         self.assertEqual(fake.requests, [])
+
+    def test_offline_install_takes_a_snapshot_another_installation_pinned(self):
+        """The Hub cache another Splash filled, such as a source checkout's,
+        installs here without the Hub for the default branch, from the
+        snapshots that installation pinned; a branch named is still left to
+        the Hub."""
+        fake = fake_hub(self, self.cache)
+        self.prepare(selection(self.root / "checkout"))
+        fake.requests.clear(), fake.downloads.clear()
+        here = selection(self.root / "app")
+        with mock.patch("huggingface_hub.constants.HF_HUB_OFFLINE", True):
+            output, _ = self.prepare(here)
+            self.assertIn(
+                "Could not reach the Hub (HF_HUB_OFFLINE is set); installing "
+                f"{MODEL}@{'a' * 12} from the Hub cache.",
+                output,
+            )
+            self.assertEqual(
+                assembly.verify(here.link)["sources"]["draft"],
+                {"repo": DENSE.draft_repo, "revision": DRAFT_COMMIT},
+            )
+            with self.assertRaisesRegex(
+                models.ModelError,
+                f"cannot resolve {MODEL}: HF_HUB_OFFLINE is set; neither this "
+                "installation nor the Hub cache records a commit for v2",
+            ):
+                self.prepare(selection(self.root / "other", revision="v2"))
+        self.assertEqual((fake.requests, fake.downloads), ([], []))
 
     def test_a_gguf_taken_by_its_ending_is_named_before_it_is_checked(self):
         def repository(root):

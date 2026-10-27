@@ -149,6 +149,48 @@ class LauncherTests(unittest.TestCase):
                 self.assertEqual(served.host, expected)
                 self.assertEqual(served.allowed_host, ["proxy.example"])
 
+    def test_serve_prepares_local_files_and_names_them_for_the_api(self):
+        def prepared(command, *, cwd, stdout):
+            stdout.write("/prepared/model\n")
+            return 0
+
+        target = "/models/My Model-UD-Q4_K_M.gguf"
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.object(launcher, "RUNTIME_DIR", Path(temporary)),
+            mock.patch.object(launcher.socket, "socket"),
+            mock.patch.object(launcher, "_ensure_built"),
+            mock.patch.object(launcher, "_run_held", side_effect=prepared) as run,
+            mock.patch.object(launcher.os, "execve") as execute,
+        ):
+            launcher.main(["serve", "--model", target, "--language-only"])
+            self.assertEqual(
+                run.call_args.args[0][1:],
+                [str(launcher.ROOT / "install/local.py"), target, "--language-only"],
+            )
+            served = api.parse_args(server_arguments(execute.call_args.args[1]))
+            self.assertEqual(
+                (served.model_root, served.model),
+                ("/prepared/model", "local/My-Model-UD-Q4_K_M"),
+            )
+        for options, message in (
+            (["--revision", "v2"], "names a commit of a Hub model"),
+            (["--draft-model", "owner/draft"], "takes a draft directory"),
+        ):
+            with (
+                self.subTest(options=options),
+                tempfile.TemporaryDirectory() as temporary,
+                mock.patch.object(launcher, "RUNTIME_DIR", Path(temporary)),
+                mock.patch.object(launcher.socket, "socket"),
+                mock.patch.object(launcher, "_ensure_built") as built,
+                mock.patch("sys.stderr", io.StringIO()) as error,
+            ):
+                self.assertEqual(
+                    launcher.main(["serve", "--model", target, *options]), 1
+                )
+                self.assertIn(message, error.getvalue())
+                built.assert_not_called()
+
     def test_invalid_bind_address_fails_before_model_work(self):
         with (
             tempfile.TemporaryDirectory() as temporary,

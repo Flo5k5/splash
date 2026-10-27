@@ -30,6 +30,7 @@ INSTALL_FILES = (
     "assembly.py",
     "upstream.py",
     "local.py",
+    "cached.py",
     "gguf.py",
     "requirements.txt",
     "suggested-models.tsv",

@@ -82,7 +82,7 @@ Completion suggests commands, the models in `install/suggested-models.tsv`
 
 | Option | Default | Purpose |
 | --- | --- | --- |
-| `--model` | Required | The upstream model, `OWNER/REPO`, or a GGUF's `OWNER/REPO:VARIANT`. See [upstream model loading](#upstream-model-loading). |
+| `--model` | Required | The upstream model, `OWNER/REPO`, or a GGUF's `OWNER/REPO:VARIANT`; or the absolute path of model files on this Mac. See [upstream model loading](#upstream-model-loading) and [local model files](#local-model-files). |
 | `--revision` | Default branch | Select an upstream target branch, tag, or commit. See [revisions](#revisions). |
 | `--draft-model` | The family's released DFlash2 draft | A compatible repository or local directory in its place; required for a family without a released draft. See [drafts](#drafts). |
 | `--language-only` | Off | Skip vision loading; image and PDF input is rejected. See [vision](#vision). |
@@ -763,6 +763,16 @@ reasoning, and any other reply is all answer
 splash serve --model mlx-community/Qwen3.8-27B-4bit --default-reasoning-effort none
 ```
 
+`/v1/models` reports, as `reasoning`, what efforts do to the model's default
+template, rendered as at startup: `thinks`, whether a request without an effort
+reasons; `efforts`, the efforts besides `none` that render differently, each
+named by the one of those rendering alike that no alias stands in for (`low`,
+`medium` and `xhigh` for Qwen3.8; none for Qwen3.6, whose template switches
+reasoning on and off alike at every effort); and `default`, the one of them a
+request without an effort renders like, `--default-reasoning-effort` in place
+of the template's. For Flint, whose model decides, `thinks` is `null` and
+`efforts` empty.
+
 `/apply-template` uses the same default. Anthropic `thinking` keeps its protocol
 semantics (off when omitted) unless the request's `chat_template_kwargs` set
 `enable_thinking`; judgment endpoints always disable thinking. The
@@ -910,7 +920,7 @@ Messages requires it.
 | `GET`, `DELETE /v1/responses/{id}` | A stored response ([Responses state](#responses-state)) |
 | `POST /v1/messages` | Anthropic Messages |
 | `POST /v1/messages/count_tokens` | A Messages request's prompt tokens, images included, as `{"input_tokens": N}`, without inference |
-| `GET /v1/models`, `/v1/models/{id}` | The served model and its aliases, with the context limit |
+| `GET /v1/models`, `/v1/models/{id}` | The served model and its aliases, with the context limit and what reasoning efforts do ([default reasoning effort](#default-reasoning-effort)) |
 | `POST /tokenize`, `/apply-template` | A text's tokens, or a conversation's rendered prompt, without inference |
 | `POST /v1/judgments`, `/v1/systemone` | Scores over fixed answers ([judgment contracts](#judgment-contracts)) |
 | `POST /v1/memory/release` | Gives the weights back now, as the idle release does, when no request is in service; the next request restores them ([explicit release](#explicit-weights-release)). It takes no body (or `{}`); `200` with `{"released": true, "weights": …}`, `409 engine_busy` while the engine serves a request or restores its weights, `503 engine_busy` when the engine does not answer within 5 s, and `503 engine_recovering` or `server_shutdown` while the engine restarts or the server stops |
@@ -2186,14 +2196,19 @@ server takes the [server options](#server-options) of `splash serve`; the
 model's source options (`--revision`, `--draft-model`, `--language-only`,
 `--offline`) are `prepare_local_model`'s arguments instead, or have no use.
 
+`splash serve --model PATH` does both for the files at the absolute PATH, with
+`--draft-model` a draft directory and `--language-only` as given: it prepares
+them with `python install/local.py PATH`, which prints the directory, and
+serves it as `local/NAME`, NAME being the file's or folder's name.
+
 - `target`: a GGUF file, any part of a split GGUF naming all its parts,
   which lie beside it; or a directory whose root holds an MLX model or else
   a single GGUF target, whole or split, beside any projectors named `mmproj`.
 - `draft`: the directory of a DFlash2 draft ([Drafts](#drafts)). Without
   one, the family's released draft is taken from the Hugging Face cache, at
   the commit a download of its default branch last recorded there, as
-  `hf download incoai/Qwen3.8-27B-DFlash2` does; `splash serve` downloads by
-  commit, which records none.
+  `hf download incoai/Qwen3.8-27B-DFlash2` does, or else, as `splash serve`
+  downloads by commit, which records none, the one an installation pinned.
 - `mmproj`: a GGUF target's vision projector ([Vision](#vision)); without
   one, a GGUF target serves text only, and a target of a family without a
   vision tower refuses one. An MLX target serves images with the tower in
@@ -2371,10 +2386,14 @@ never gains `__pycache__`.
 A missing assembly, or one that no longer verifies, is built again. Without the
 Hub it is built from a cached snapshot, of the commit the `--revision` names,
 or else the one the installation recorded or pinned, or one the Hub cache
-records for the branch, never of another revision. Only files downloaded before
-are available, which is enough to rebuild a damaged or deleted assembly; a new
-selection needs the Hub once for its draft's default branch. The installer
-never rewrites upstream files.
+records for the branch, never of another revision; for a default branch the
+cache records no commit of, one another installation pinned, newest first, so
+that a model another Splash, such as a source checkout, downloaded installs
+here too. Only files downloaded
+before are available, which is enough to rebuild a damaged or deleted assembly.
+`install/cached.py` installs this way every model the Hub cache holds whole
+that Splash serves, leaving out what the installer refuses, for the Mac app to
+offer. The installer never rewrites upstream files.
 
 ### Weight loading
 

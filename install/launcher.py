@@ -7,10 +7,12 @@ import fcntl
 import http.client
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -97,7 +99,8 @@ def _request_json(path, timeout=2, *, port=serve_options.DEFAULT_PORT):
         return None
 
 
-def _ensure_installed(selection):
+def _ensure_built():
+    """In a source checkout, build it; refuse a Mac the engine cannot run."""
     if not paths.PACKAGED:
         # Serialize builds across ports; make keeps the lock if the launcher exits.
         with (RUNTIME_DIR / "build.lock").open("a+") as lock:
@@ -120,6 +123,10 @@ def _ensure_installed(selection):
         model_artifacts.run_engine(["device-check"], "device check")
     except model_artifacts.ModelError as error:
         raise LauncherError(str(error)) from None
+
+
+def _ensure_installed(selection):
+    _ensure_built()
     command = [
         str(paths.PYTHON),
         str(ROOT / "install/models.py"),
@@ -139,6 +146,38 @@ def _ensure_installed(selection):
         command.insert(-1, "--language-only")
     if _run_held(command, cwd=ROOT):
         raise LauncherError("model download or verification failed")
+
+
+def _prepare_local(args):
+    """The directory the server loads for the files on this Mac args.model
+    names (install/local.py), and the name the API reports for it: local/
+    and the file's or folder's name."""
+    if args.revision is not None:
+        raise LauncherError("--revision names a commit of a Hub model, not local files")
+    if args.draft_model is not None and not Path(args.draft_model).is_absolute():
+        raise LauncherError("a model from local files takes a draft directory")
+    _ensure_built()
+    command = [str(paths.PYTHON), str(ROOT / "install/local.py"), args.model]
+    if args.draft_model is not None:
+        command += ["--draft", args.draft_model]
+    if args.language_only:
+        command.append("--language-only")
+    with tempfile.TemporaryFile("w+") as output:
+        if _run_held(command, cwd=ROOT, stdout=output):
+            raise LauncherError("the files of the model could not be prepared")
+        output.seek(0)
+        directory = output.read().strip()
+    stem = Path(args.model).name.removesuffix(".gguf")
+    name = re.sub(r"[^A-Za-z0-9._-]+", "-", stem).strip("-._") or "model"
+    return directory, f"local/{name}"
+
+
+def parse_model(value):
+    """--model: a Hub model ID, or the absolute path of model files on this
+    Mac, which install/local.py prepares."""
+    if value.startswith(("/", "~")):
+        return str(Path(value).expanduser())
+    return serve_options.parse_model_id(value)
 
 
 def _serve_lock_owner(lock):
@@ -232,14 +271,18 @@ def serve(args):
             raise LauncherError(
                 f"cannot bind {args.host}:{args.port}: {error}"
             ) from None
-        selection = model_artifacts.Selection.of(
-            paths.MODELS,
-            args.model,
-            revision=args.revision,
-            language_only=args.language_only,
-            draft_model=args.draft_model,
-        )
-        _ensure_installed(selection)
+        if Path(args.model).is_absolute():
+            model_root, name = _prepare_local(args)
+        else:
+            selection = model_artifacts.Selection.of(
+                paths.MODELS,
+                args.model,
+                revision=args.revision,
+                language_only=args.language_only,
+                draft_model=args.draft_model,
+            )
+            _ensure_installed(selection)
+            model_root, name = selection.link, args.model
         # The server package of this installation, from any working
         # directory: -P keeps the directory, which may hold a package of the
         # same name, off sys.path, and PYTHONPATH names the root. The server
@@ -252,9 +295,9 @@ def serve(args):
             "-P",
             "-m",
             "server.server",
-            str(selection.link),
+            str(model_root),
             "--model",
-            args.model,
+            name,
             "--binary",
             str(paths.BINARY),
             "--port",
@@ -402,10 +445,12 @@ def parse_args(argv=None):
     model = groups["model"]
     model.add_argument(
         "--model",
-        type=serve_options.parse_model_id,
+        type=parse_model,
         required=True,
-        metavar="OWNER/REPO[:VARIANT]",
-        help="upstream Hugging Face model, with a GGUF variant after ':' (e.g. :UD-Q4_K_M)",
+        metavar="OWNER/REPO[:VARIANT] | PATH",
+        help="upstream Hugging Face model, with a GGUF variant after ':' (e.g. "
+        ":UD-Q4_K_M), or the absolute path of a GGUF file or a model folder on "
+        "this Mac",
     )
     model.add_argument(
         "--revision",

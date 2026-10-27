@@ -14,7 +14,8 @@ with Splash's own Python and this checkout or release on PYTHONPATH:
 
 and then `python -m server.server MODEL --model OWNER/REPO --binary ENGINE`,
 ENGINE being the engine of the same checkout or release (build/splash, or
-engine/splash in a release). It checks the files with the rules the
+engine/splash in a release). `splash serve --model PATH` does both, preparing
+with `python install/local.py PATH`, which prints the directory. It checks the files with the rules the
 installer and the engine hold a download to, and it makes no network
 request.
 
@@ -29,10 +30,20 @@ every start, at little cost.
 
 from __future__ import annotations
 
+import argparse
+import contextlib
 import functools
 import os
+import signal
+import sys
 import tempfile
 from pathlib import Path
+
+if __name__ == "__main__" and not __package__:
+    # Run as a script, from the installation's install/ folder: import its
+    # siblings as the install package.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    __package__ = "install"
 
 from . import hub, models, paths, upstream
 from .models import ModelError
@@ -54,8 +65,8 @@ def prepare_local_model(
     weights) trained for the target's family. Without one, the draft
     released for the family is taken from the Hugging Face cache
     (HF_HUB_CACHE), at the commit a download of its default branch, such as
-    `hf download REPO`, last recorded there; `splash serve` downloads by
-    commit, which records none.
+    `hf download REPO`, last recorded there, or else, where none is, the one
+    `splash serve` last installed, which downloads by commit.
     mmproj: a GGUF target's vision projector, a GGUF file, with which it
     serves images; a GGUF target serves text only without one, as one of a
     family without a vision tower (Flint) always does. An MLX target's
@@ -259,3 +270,37 @@ def _draft(family, draft):
             f"{error}; download {family.draft_repo}, or pass the directory of a "
             f"{family.name} DFlash2 draft as draft"
         ) from None
+
+
+def main(argv=None):
+    """prepare_local_model's command line: the directory on stdout, all
+    else on stderr."""
+    parser = argparse.ArgumentParser(
+        description="Prepare a model for the server from files on this Mac"
+    )
+    parser.add_argument("target", type=Path)
+    parser.add_argument("--draft", type=Path)
+    parser.add_argument("--mmproj", type=Path)
+    parser.add_argument("--language-only", action="store_true")
+    parser.add_argument("--models", type=Path, default=paths.MODELS)
+    args = parser.parse_args(argv)
+    # The launcher starts this with the stop signals blocked; they arrive here.
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGINT, signal.SIGTERM))
+    try:
+        with contextlib.redirect_stdout(sys.stderr):
+            directory = prepare_local_model(
+                args.target,
+                args.draft,
+                mmproj=args.mmproj,
+                language_only=args.language_only,
+                models_dir=args.models,
+            )
+    except (ModelError, OSError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    print(directory)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

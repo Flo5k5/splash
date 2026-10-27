@@ -423,7 +423,10 @@ def _cached_commits(name, revision, installation):
     """The commits of name whose cached snapshots may stand in for revision
     without the Hub, most specific first: revision itself when it is a
     commit; the commit installation recorded, then the ones it pinned
-    (refs/splash); then the commit the cache recorded for the branch or tag.
+    (refs/splash); then the commit the cache recorded for the branch or tag;
+    for a default branch the cache records none of, the ones other
+    installations pinned, newest first, as another Splash, such as a source
+    checkout, installed them.
     Splash downloads by commit, which never records a branch. The record is
     read as it is: this is how a damaged installation is rebuilt."""
     if models.is_hex_digest(revision, 40):
@@ -453,7 +456,14 @@ def _cached_commits(name, revision, installation):
             (folder(name) / "refs" / (revision or "main")).read_text().strip()
         )
     except OSError:
-        pass
+        if revision is None:
+            pinned = (folder(name) / "refs" / "splash").glob("*/*")
+            commits += [
+                ref.name
+                for ref in sorted(
+                    pinned, key=lambda ref: ref.stat().st_mtime_ns, reverse=True
+                )
+            ]
     return list(dict.fromkeys(c for c in commits if models.is_hex_digest(c, 40)))
 
 
