@@ -101,6 +101,20 @@ struct AppFlowTests {
         #expect(state.server.requestLog.contains { $0.contains("Done · ") })
         #expect(state.server.activity.generated > 0)
         await Snapshot.save("server-activity", size: CGSize(width: 1120, height: 1100), ServerView(advanced: true).environment(state))
+        await Snapshot.save("menu-bar", size: CGSize(width: 300, height: 400), MenuBarPanel().environment(state))
+        await Snapshot.save("popup-thinking", size: CGSize(width: 300, height: 260), PopupList(
+            header: "Thinking",
+            items: [PopupItem(id: "xhigh", title: "Extra High", detail: "Thinks thoroughly", badge: "Default"),
+                    PopupItem(id: "medium", title: "Medium", detail: "Thinks a while"),
+                    PopupItem(id: "low", title: "Low", detail: "Thinks briefly"),
+                    PopupItem(id: "none", title: "No Thinking", detail: "Answers at once")],
+            chosen: "xhigh") { _ in })
+        await Snapshot.save("popup-context", size: CGSize(width: 260, height: 320), PopupList(
+            header: "Context length",
+            items: [PopupItem(id: "", title: "Auto", badge: "Default")]
+                + ContextLength.lengths.map { PopupItem(id: String($0), title: ContextLength.title($0)) }
+                + [PopupItem(id: "custom", title: "Custom…", separated: true)],
+            chosen: "") { _ in })
         // Changed options ask for a restart, which starts the model with them.
         state.options["--max-context"] = "32768"
         #expect(state.optionsChanged)

@@ -220,11 +220,7 @@ private struct ControlBar: View {
                 Button("Switch to \(state.displayName(of: selection))") { state.start(selection) }
                     .buttonStyle(.borderedProminent)
             } else {
-                Menu("Coding Agents") { AgentMenuItems() }
-                    .menuStyle(.button)
-                    .buttonStyle(.borderless)
-                    .fixedSize()
-                    .help("Open a coding agent in Terminal, connected to this model")
+                AgentsPopup()
                 Button("Stop") { state.stop() }
                 if state.optionsChanged, let model = server.model {
                     Button("Restart to Apply") { state.start(model) }.buttonStyle(.borderedProminent)
@@ -325,9 +321,45 @@ private struct RequestLog: View {
                 .padding(10)
             }
             .frame(height: 180)
-            .defaultScrollAnchor(.bottom)
+            // From the top down, following the latest once the box is full.
+            .defaultScrollAnchor(.top, for: .alignment)
+            .defaultScrollAnchor(.bottom, for: .initialOffset)
+            .defaultScrollAnchor(.bottom, for: .sizeChanges)
             .background(.quaternary.opacity(0.5), in: .rect(cornerRadius: 8))
         }
+    }
+}
+
+/// The coding agents to open in Terminal on the model that runs, and its API address to copy.
+private struct AgentsPopup: View {
+    @Environment(AppState.self) private var state
+    @State private var hovering = false
+    private static let copy = "copy"
+
+    var body: some View {
+        PopupMenu(header: "Open in Terminal",
+                  items: Agent.allCases.map { PopupItem(id: $0.rawValue, title: $0.title) }
+                      + [PopupItem(id: Self.copy, title: "Copy API Address", separated: true)],
+                  chosen: nil, above: true) { choice in
+            if let agent = Agent(rawValue: choice) {
+                NSApp.activate()
+                agent.open(runtime: state.runtime, settings: state.server.settings)
+            } else {
+                state.copyAPIAddress()
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Text("Coding Agents")
+                Image(systemName: "chevron.up.chevron.down").font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(.quaternary.opacity(hovering ? 1 : 0), in: .rect(cornerRadius: 7))
+            .contentShape(.rect)
+        }
+        .fixedSize()
+        .onHover { hovering = $0 }
+        .help("Open a coding agent in Terminal, connected to this model")
     }
 }
 

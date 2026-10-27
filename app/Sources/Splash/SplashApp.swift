@@ -42,11 +42,12 @@ struct SplashApp: App {
         }
 
         MenuBarExtra {
-            MenuBarMenu()
+            MenuBarPanel()
                 .environment(state)
         } label: {
             Image(systemName: state.server.phase == .ready ? "bolt.fill" : "bolt")
         }
+        .menuBarExtraStyle(.window)
     }
 }
 

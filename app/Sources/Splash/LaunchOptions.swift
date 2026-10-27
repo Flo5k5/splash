@@ -98,23 +98,34 @@ private struct ChoicePicker: View {
     let custom: LaunchOption.Value?
     @Binding var value: String?
     @State private var typing = false
+    @State private var hovering = false
 
-    /// The tag of Custom…, which is no value.
-    private static let other = "\u{0}custom"
+    /// The items' IDs of the default and of Custom…, which are no values.
+    private static let none = "\u{0}default", other = "\u{0}custom"
 
     var body: some View {
-        Picker(title, selection: Binding(get: { value }, set: { choice in
-            if choice == Self.other { typing = true } else { value = choice }
-        })) {
-            Text(standard).tag(String?.none)
-            ForEach(choices, id: \.value) { Text($0.title).tag(Optional($0.value)) }
-            if let value, let custom, !choices.contains(where: { $0.value == value }) {
-                Text(custom.title(value)).tag(Optional(value))
+        // A value typed in before, which the choices don't hold.
+        let typed = value.flatMap { value in
+            choices.contains { $0.value == value } ? nil : custom.map { PopupItem(id: value, title: $0.title(value)) }
+        }
+        let items = [PopupItem(id: Self.none, title: standard, badge: "Default")]
+            + choices.map { PopupItem(id: $0.value, title: $0.title) }
+            + [typed].compactMap { $0 }
+            + (custom == nil ? [] : [PopupItem(id: Self.other, title: "Custom…", separated: true)])
+        LabeledContent(title) {
+            PopupMenu(header: title, items: items, chosen: value ?? Self.none) { choice in
+                if choice == Self.other { typing = true } else { value = choice == Self.none ? nil : choice }
+            } label: {
+                HStack(spacing: 5) {
+                    Text(items.first { $0.id == (value ?? Self.none) }?.title ?? standard)
+                    Image(systemName: "chevron.up.chevron.down").font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .background(.quaternary.opacity(hovering ? 1 : 0.6), in: .rect(cornerRadius: 6))
+                .contentShape(.rect)
             }
-            if custom != nil {
-                Divider()
-                Text("Custom…").tag(Optional(Self.other))
-            }
+            .onHover { hovering = $0 }
         }
         .sheet(isPresented: $typing) {
             if let custom {

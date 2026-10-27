@@ -163,16 +163,12 @@ private struct ModelMenu: View {
                 let choices = (levels ? reasoning.efforts.reversed() : ["on"])
                     + (levels && reasoning.default == nil && thinks ? [""] : []) + ["none"]
                 let chosen = state.effort.isEmpty ? initial : !levels && state.effort != "none" ? "on" : state.effort
-                Menu {
-                    Picker("Thinking", selection: Binding(get: { chosen }, set: { choice in
-                        // On, for a model whose thinking is only on or off, is any effort but none.
-                        state.effort = choice == initial ? "" : choice == "on" ? "medium" : choice
-                    })) {
-                        ForEach(choices, id: \.self) { choice in
-                            Text(choice == initial ? "\(Self.title(choice)) (Default)" : Self.title(choice)).tag(choice)
-                        }
-                    }
-                    .pickerStyle(.inline)
+                PopupMenu(header: "Thinking", items: choices.map { choice in
+                    PopupItem(id: choice, title: Self.title(choice), detail: Self.detail(choice),
+                              badge: choice == initial ? "Default" : nil)
+                }, chosen: chosen, above: true) { choice in
+                    // On, for a model whose thinking is only on or off, is any effort but none.
+                    state.effort = choice == initial ? "" : choice == "on" ? "medium" : choice
                 } label: {
                     HStack(spacing: 6) {
                         name
@@ -185,9 +181,6 @@ private struct ModelMenu: View {
                     .background(.quaternary.opacity(hovering ? 1 : 0), in: .rect(cornerRadius: 7))
                     .contentShape(.rect)
                 }
-                .menuStyle(.button)
-                .buttonStyle(.plain)
-                .menuIndicator(.hidden)
                 .fixedSize()
                 .onHover { hovering = $0 }
                 .animation(.easeOut(duration: 0.12), value: hovering)
@@ -197,6 +190,19 @@ private struct ModelMenu: View {
             } else {
                 name.font(.callout).lineLimit(1)
             }
+        }
+    }
+
+    /// What an effort does, in a few words.
+    private static func detail(_ effort: String) -> String {
+        switch effort {
+        case "none": "Answers at once"
+        case "on": "Thinks before it answers"
+        case "minimal", "low": "Thinks briefly"
+        case "medium": "Thinks a while"
+        case "high", "xhigh": "Thinks thoroughly"
+        case "max": "Thinks as long as it needs"
+        default: "As the model chooses"
         }
     }
 

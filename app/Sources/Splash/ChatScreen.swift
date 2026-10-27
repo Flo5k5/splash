@@ -17,7 +17,8 @@ struct ChatScreen: View {
         HStack(spacing: 0) {
             ChatList()
                 .frame(width: 260)
-            Divider()
+            // Up through the toolbar, as far as the sidebar's background goes.
+            Divider().ignoresSafeArea(edges: .top)
             ConversationView()
         }
         .onAppear { state.draft.focus() }
