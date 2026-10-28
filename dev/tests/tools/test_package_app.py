@@ -13,7 +13,7 @@ from dev.tools import package_app
 
 THIN_ARM64 = bytes.fromhex("cffaedfe0c000001")
 # The release key's public half, SPARKLE_PUBLIC_KEY, as generate_keys printed
-# it once (DEVELOPMENT.md, Updates).
+# it once (docs/package.md, Updates).
 RELEASE_KEY = "QAOqAR9iWlOPmkqq0XgbaAPjP8Y/X0lJwfd+W4a9kSc="
 SPARKLE = "APP/Contents/Frameworks/Sparkle.framework"
 
@@ -125,7 +125,7 @@ class PackageAppTests(unittest.TestCase):
         # Every app shipped holds it and takes only updates its private half
         # signed; Sparkle replaces it only from a disk image the app's own
         # team signed, so a new key strands every app of an earlier team
-        # (DEVELOPMENT.md, Moving to the organization account). RELEASE_KEY
+        # (docs/package.md, Moving to the organization account). RELEASE_KEY
         # pins it, to be changed on purpose only.
         self.assertEqual(package_app.SPARKLE_PUBLIC_KEY, RELEASE_KEY)
         # As generate_keys prints it: 32 bytes in base64. Sparkle refuses to

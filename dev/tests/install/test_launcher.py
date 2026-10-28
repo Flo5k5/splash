@@ -506,8 +506,9 @@ class LauncherTests(unittest.TestCase):
                         launcher.parse_args([*arguments, "--port", value])
 
     def test_serve_refuses_abbreviated_options(self):
-        # serve takes its options by their full names, as the Mac app passes
-        # every one: an abbreviation would change meaning as options are added.
+        # serve takes its options by their full names, as the desktop app
+        # passes every one: an abbreviation would change meaning as options are
+        # added.
         for arguments in (
             ["--po", "9000"],
             ["--po=9000"],

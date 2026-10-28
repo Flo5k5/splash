@@ -1,7 +1,7 @@
 """Install, without the Hub, the models the Hugging Face cache holds whole
 that Splash serves: what other tools, or another Splash such as a source
-checkout, downloaded there. The Mac app runs it so that it offers those models
-beside the ones it downloaded:
+checkout, downloaded there. The desktop app runs it so that it offers those
+models beside the ones it downloaded:
 
     python install/cached.py [--models DIR]
 

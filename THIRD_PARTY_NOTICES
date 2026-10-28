@@ -239,8 +239,8 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 Sparkle 2.10.1 (https://github.com/sparkle-project/Sparkle)
 
-Splash for Mac updates itself with Sparkle.framework, which it carries in
-Splash.app/Contents/Frameworks.
+The Splash desktop app updates itself with Sparkle.framework, which it carries
+in Splash.app/Contents/Frameworks.
 
 Copyright (c) 2006-2013 Andy Matuschak.
 Copyright (c) 2009-2013 Elgato Systems GmbH.

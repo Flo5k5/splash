@@ -1,4 +1,4 @@
-"""install/suggested-models.tsv, the models the Mac app offers and shell
+"""install/suggested-models.tsv, the models the desktop app offers and shell
 completion completes: its rows' format, and README.md's Models table, which
 must list only its IDs."""
 

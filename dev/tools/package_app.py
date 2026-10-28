@@ -17,13 +17,13 @@ from dev.tools import package  # noqa: E402
 
 BUNDLE_ID = "ai.inco.splash"
 # Where Splash is released: each release carries the app's disk image and the
-# appcast that offers it (DEVELOPMENT.md, Updates).
+# appcast that offers it (docs/package.md, Updates).
 RELEASES = f"https://github.com/{package.REPOSITORY}/releases"
 # The appcast the app checks for updates, the latest release's. Every app
 # shipped keeps this URL, so it never changes.
 APPCAST_URL = f"{RELEASES}/latest/download/appcast.xml"
 # The release key's public half, as Sparkle's generate_keys prints it
-# (DEVELOPMENT.md, Updates): the app takes an update whose disk image the
+# (docs/package.md, Updates): the app takes an update whose disk image the
 # private half signed or, to replace a lost key, one signed with the app's
 # Developer ID. Without it, the app checks for no update.
 SPARKLE_PUBLIC_KEY = "QAOqAR9iWlOPmkqq0XgbaAPjP8Y/X0lJwfd+W4a9kSc="
@@ -341,7 +341,7 @@ def main(argv=None):
         "allowed with Open Anyway in System Settings › Privacy & Security, or "
         "its quarantine is removed with "
         "xattr -dr com.apple.quarantine /Applications/Splash.app. make "
-        "release-app makes a release (DEVELOPMENT.md, Releases)."
+        "release-app makes a release (docs/package.md, Releases)."
     )
 
 
