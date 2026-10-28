@@ -158,8 +158,7 @@ private struct EngineSlot: View {
         let name = server.model.map(state.displayName(of:)) ?? ""
         let words = switch server.phase {
         case .ready: name
-        case .starting: "Loading \(name)…"
-        case .stopping: state.status
+        case .starting, .stopping: state.status
         case .failed: "\(name) ran into a problem"
         case .stopped: state.installed.isEmpty ? "No model on this Mac" : "No model running"
         }

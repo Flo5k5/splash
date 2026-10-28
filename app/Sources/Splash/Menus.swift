@@ -95,7 +95,7 @@ struct MenuBarPanel: View {
     private var phase: String {
         let server = state.server
         switch server.phase {
-        case .starting: return "Loading into memory…"
+        case .starting: return "\(server.step.rawValue)…"
         case .stopping:
             guard let next = server.next else { return "Stopping…" }
             return next == server.model ? "Restarting…" : "Switching to \(state.displayName(of: next))…"

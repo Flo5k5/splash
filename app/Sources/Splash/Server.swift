@@ -11,7 +11,31 @@ final class Server {
         case failed(String)
     }
 
+    /// What a start does, as the server's log tells it: the server starts, reads the model's
+    /// weights into memory, then runs the model once at full size so that its first answer comes
+    /// quickly; the first start after an update also prepares the GPU's programs then, which can
+    /// take a minute.
+    enum Step: String {
+        case starting = "Starting"
+        case loading = "Loading weights"
+        case warming = "Warming up"
+
+        /// The step `line` of the server's log begins, if it begins one.
+        init?(_ line: String) {
+            if line.contains("Loading · ") {
+                self = .loading
+            } else if line.contains("Weights loaded") {
+                self = .warming
+            } else {
+                return nil
+            }
+        }
+    }
+
     private(set) var phase = Phase.stopped
+    /// While starting: what the start does, and since when.
+    private(set) var step = Step.starting
+    private(set) var stepSince = Date.now
     /// The model starting, served or last failed.
     private(set) var model: String?
     /// The start to make once the model stopping has stopped.
@@ -141,6 +165,8 @@ final class Server {
             return refuse("Port \(settings.port) is in use by another app. Quit that app, or choose another port in Launch Options › Advanced.")
         }
         since = .now
+        step = .starting
+        stepSince = .now
         phase = .starting
         do {
             child = try ChildProcess(
@@ -169,6 +195,10 @@ final class Server {
     private func received(_ line: String) {
         // Why a start fails; once serving, error lines are about requests.
         if phase == .starting, firstError == nil { firstError = errorMessage(line) }
+        if phase == .starting, let next = Step(line) {
+            step = next
+            stepSince = .now
+        }
         if phase == .ready, let entry = RequestEntry(line) {
             requestLog.append(entry)
             if requestLog.count > 1000 { requestLog.removeFirst(requestLog.count - 1000) }

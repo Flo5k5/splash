@@ -87,12 +87,12 @@ final class AppState {
     var findingCachedModels: Bool { cachedInstaller != nil }
 
     /// What runs, in a sentence: VoiceOver announces it, and the Chat's composer says it while a
-    /// model stops.
+    /// model starts or stops.
     var status: String {
         let name = server.model.map(displayName(of:)) ?? ""
         switch server.phase {
         case .stopped: return "No model running"
-        case .starting: return "Loading \(name) into memory…"
+        case .starting: return "\(name) · \(server.step.rawValue)…"
         case .stopping:
             guard let next = server.next else { return "Stopping \(name)…" }
             return next == server.model ? "Restarting \(name)…" : "Switching to \(displayName(of: next))…"

@@ -87,6 +87,9 @@ struct AppFlowTests {
         #expect(state.selection == model)
         try await waitFor(state.server.phase == .starting, "starting")
         await Snapshot.save("server-starting", MainView().environment(state))
+        // It says what it does, as the log tells it: it reads the weights, then warms up.
+        try await waitFor(state.server.step == .warming, "warming up")
+        await Snapshot.save("server-warming", MainView().environment(state))
         try await ready()
         await Snapshot.save("server-ready", MainView().environment(state))
         let reply = try await chat("Reply with one word: hello")

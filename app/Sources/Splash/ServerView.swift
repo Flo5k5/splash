@@ -218,11 +218,13 @@ private struct ControlBar: View {
         let server = state.server
         switch server.phase {
         case .starting:
-            // Seconds, once a load takes long enough to wonder about.
-            TimelineView(.periodic(from: server.since, by: 1)) { context in
-                let seconds = Int(context.date.timeIntervalSince(server.since))
-                Text(seconds < 3 ? "Loading into memory…" : "Loading into memory · \(seconds)s").monospacedDigit()
+            // The step, with its seconds once it takes long enough to wonder about.
+            let step = server.step.rawValue
+            TimelineView(.periodic(from: server.stepSince, by: 1)) { context in
+                let seconds = Int(context.date.timeIntervalSince(server.stepSince))
+                Text(seconds < 3 ? "\(step)…" : "\(step) · \(seconds)s").monospacedDigit()
             }
+            .help(server.step == .warming ? "Running the model once so that its first answer comes quickly. The first start after an update also prepares its GPU programs, which can take a minute." : "")
         case .stopping:
             if let next = server.next {
                 Text(next == server.model ? "Restarting…" : "Switching to \(state.displayName(of: next))…")
@@ -561,7 +563,7 @@ private struct ModelRow: View {
         guard server.running, server.model == model.id else { return nil }
         switch server.phase {
         case .ready: return server.asleep ? "Sleeping" : "Running"
-        case .starting: return "Loading…"
+        case .starting: return "\(server.step.rawValue)…"
         case .stopping: return server.next == model.id ? "Restarting…" : "Stopping…"
         case .failed: return "Not responding"
         case .stopped: return nil

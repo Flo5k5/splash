@@ -249,6 +249,14 @@ struct ServerTests {
         #expect(RequestEntry("12:01:02 Started · input 4,096 · cached 0 · thinking on") == nil)
         #expect(RequestEntry("12:00:58 Ready · http://127.0.0.1:8000") == nil)
     }
+
+    @Test func followsTheStepsOfAStart() {
+        // As server.py and the engine write them, in order.
+        #expect(Server.Step("16:14:43 Loading · mlx-community/Qwen3.6-35B-A3B-4bit") == .loading)
+        #expect(Server.Step("16:14:44 Chat template · patched to render later system messages in place") == nil)
+        #expect(Server.Step("16:14:50 Weights loaded in 6.52 s.") == .warming)
+        #expect(Server.Step("16:14:50 Kernel policy for GPU family 10 with 32 cores.") == nil)
+    }
 }
 
 struct AgentTests {
