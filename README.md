@@ -14,7 +14,7 @@ It reuses cached prefixes and batches concurrent requests automatically.
 
 ## Quick start
 
-[Download Splash for Mac](https://github.com/incoai/splash/releases/latest/download/Splash.dmg)
+[Download the Splash desktop app](https://github.com/incoai/splash/releases/latest/download/Splash.dmg)
 for an Apple M3 or newer on macOS 26.4 or later, open the disk image and drag
 Splash into Applications.
 

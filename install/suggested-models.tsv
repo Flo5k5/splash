@@ -1,4 +1,4 @@
-# The models Splash suggests, best first: the Mac app offers them and shell
+# The models Splash suggests, best first: the desktop app offers them and shell
 # completion completes them. MODEL<TAB>NAME<TAB>MEMORY<TAB>SIZE<TAB>ABOUT: the
 # ID splash serve --model takes, the model's name, the smallest Mac memory in
 # GB the variant is meant for, its download in whole GB (the model, its vision

@@ -153,7 +153,7 @@ class ReleaseAppTests(unittest.TestCase):
                     [f"there is no annotated tag {version}"],
                 )
             # Release notes kept in the checkout are a change too, by name.
-            (checkout / "README.md").write_text("Splash for Mac\n")
+            (checkout / "README.md").write_text("The Splash desktop app\n")
             (checkout / "notes.md").write_text("Notes\n")
             self.assertEqual(
                 release_app.checkout_problems("1.5.0"),

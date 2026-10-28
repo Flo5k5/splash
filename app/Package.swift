@@ -1,5 +1,5 @@
 // swift-tools-version: 6.2
-// The Splash Mac app: a window and a menu bar item around `splash serve`.
+// The Splash desktop app: a window and a menu bar item around `splash serve`.
 // `make app` builds it and assembles Splash.app around the packaged runtime.
 
 import PackageDescription

@@ -71,7 +71,7 @@ completions finds them. In a source checkout, source
 Zsh after `compinit`, or `install/completions/splash.fish` for fish.
 
 Completion suggests commands, the models in `install/suggested-models.tsv`
-(the list the Mac app offers too) and installed models, a GGUF's
+(the list the desktop app offers too) and installed models, a GGUF's
 `OWNER/REPO:VARIANT` included, without network access. It also completes local
 paths for `--model-dir`, `--draft-model` and `--mmproj`.
 
@@ -2391,13 +2391,13 @@ so pruning can free what no installation links any more.
 `hub.Repository.download` first removes the partial files
 (`<blob>.<random>.incomplete`) killed downloads left in the repository's blobs
 folder, of any blob, each under huggingface_hub's lock on its blob. Front ends
-such as the Mac app run `install/models.py --model ID prepare --json-progress`,
-with which each download also reports its progress as JSON lines on stdout,
-`{"event": "download", "repo": REPO, "done": BYTES, "total": BYTES}`: done 0
-first, at most four a second as the bytes received grow (what the network has
-brought or what the Hub cache holds, whichever is more), and done equal to
-total once it succeeds. It is an interface between Splash's front ends and its
-installer, not a public one.
+such as the desktop app run `install/models.py --model ID prepare
+--json-progress`, with which each download also reports its progress as JSON
+lines on stdout, `{"event": "download", "repo": REPO, "done": BYTES, "total":
+BYTES}`: done 0 first, at most four a second as the bytes received grow (what
+the network has brought or what the Hub cache holds, whichever is more), and
+done equal to total once it succeeds. It is an interface between Splash's front
+ends and its installer, not a public one.
 
 huggingface_hub downloads on threads it joins, which finish their files
 before an interrupt reaches the program, so the download runs on a thread of
@@ -2439,7 +2439,7 @@ in, as a pin does not say which revision it was installed for. Only files
 downloaded before are available, which is enough to rebuild a damaged or
 deleted assembly. `install/cached.py` installs this way every model the Hub
 cache holds whole that Splash serves, leaving out what the installer refuses,
-for the Mac app to offer: a GGUF by the ID `install/suggested-models.tsv`
+for the desktop app to offer: a GGUF by the ID `install/suggested-models.tsv`
 gives it, or else by its split parts' folder or by its name past the model's,
 `MODEL-VARIANT.gguf` as `OWNER/MODEL-GGUF:VARIANT`, an ID that selects it from
 the Hub's listing too. The installer never rewrites upstream files.
@@ -3944,27 +3944,27 @@ make install test-real test-http-real MODEL=mlx-community/Qwen3.8-27B-4bit
 `make check` needs no model weights, but it runs the Metal tests, so it needs a
 Mac that Splash supports: it runs the source checks, `check-native-cpu`,
 `check-native-metal`, `check-native-build`, the Python checks and `check-app`,
-the Mac app's tests (`swift test --package-path app`). `make check-native-cpu`
-builds production and runs native CPU tests without a GPU;
+the desktop app's tests (`swift test --package-path app`). `make
+check-native-cpu` builds production and runs native CPU tests without a GPU;
 `make check-native-metal` requires a supported Metal device and runs the kernel
 tests under shader validation, and the Linear pipeline resource check without
 it. They include loading small synthetic MLX, GGUF and vision sources and the
 GGUF kernels on synthetic tensors. `make check-native-build` builds every
 native test, benchmark and tool and runs none. Hosted CI runs the CPU checks,
-`check-native-build`, the sanitizers and `check-app`.
-`make test-sanitizers-metal` runs the Metal tests of the components whose host
-steps share their state with the engine thread and the SSD readers (the hot
-block cache of spilled KV and the history stream) under ThreadSanitizer, built
-with it in `build/metal-tsan`. `make architecture-check`, one of the source
-checks, also fails when a workflow under `.github/workflows` names a Hugging
-Face token (`HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN` or a `secrets.HF_*` secret):
-CI installs public models alone and never receives one.
+`check-native-build`, the sanitizers and `check-app`. `make
+test-sanitizers-metal` runs the Metal tests of the components whose host steps
+share their state with the engine thread and the SSD readers (the hot block
+cache of spilled KV and the history stream) under ThreadSanitizer, built with
+it in `build/metal-tsan`. `make architecture-check`, one of the source checks,
+also fails when a workflow under `.github/workflows` names a Hugging Face token
+(`HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN` or a `secrets.HF_*` secret): CI installs
+public models alone and never receives one.
 
-The native tests are in `dev/tests/engine` and the Mac app's in `app/Tests`;
-each Python test is in the directory of what it tests: `dev/tests/server`,
-`dev/tests/install` (launcher, client configuration and model installation) or
-`dev/tests/tools` (`dev/tools`, `dev/benchmarks`, the Makefiles and the
-real-model harnesses).
+The native tests are in `dev/tests/engine` and the desktop app's in
+`app/Tests`; each Python test is in the directory of what it tests:
+`dev/tests/server`, `dev/tests/install` (launcher, client configuration and
+model installation) or `dev/tests/tools` (`dev/tools`, `dev/benchmarks`, the
+Makefiles and the real-model harnesses).
 
 The real-model targets run against an installation in this checkout's
 `install/models`: run `make install` with the same options first, or in the
@@ -4283,14 +4283,14 @@ existing Splash installation. The install check requires a poured bottle and
 runs the bundled launcher without a compiler or separate Python installation.
 
 To publish, tag the verified release commit in `incoai/splash` with the version
-(no `v` prefix), preserving existing history and tags, and make the release with
-`make release-app` ([releases](#releases)). Its folder carries the runtime
-archive, its `.sha256` file and the bottle beside the Mac app's disk images and
-appcast, and `dist/splash.rb` as `Formula/splash.rb`, which the pull request in
-`incoai/homebrew-tap` takes beside the app's cask; the formula's URLs must point
-to the published release assets. After the tap update merges, verify a fresh
-install and an upgrade from the previous release through the public tap,
-including a real model request and preservation of user data. Run
+(no `v` prefix), preserving existing history and tags, and make the release
+with `make release-app` ([releases](#releases)). Its folder carries the runtime
+archive, its `.sha256` file and the bottle beside the desktop app's disk images
+and appcast, and `dist/splash.rb` as `Formula/splash.rb`, which the pull
+request in `incoai/homebrew-tap` takes beside the app's cask; the formula's
+URLs must point to the published release assets. After the tap update merges,
+verify a fresh install and an upgrade from the previous release through the
+public tap, including a real model request and preservation of user data. Run
 `brew audit --strict --online incoai/tap/splash`.
 
 Before publishing, verify that the models the README names and the draft
@@ -4302,9 +4302,10 @@ The runtime package allowlists engine, Python, server and launcher files; tests,
 benchmarks and developer documents are excluded. User model links survive
 upgrades; downloads remain in the Hugging Face cache.
 
-### Mac app
+### Desktop app
 
-`app/` is Splash for Mac, a SwiftUI app distributed as a disk image:
+`app/` is the Splash desktop app, a SwiftUI app for the Mac distributed as a
+disk image:
 
 ```sh
 make app RELEASE_VERSION=$VERSION   # dist/Splash.app, signed ad hoc

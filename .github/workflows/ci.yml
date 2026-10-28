@@ -47,7 +47,7 @@ jobs:
         run: make check-native-build
       - name: Run native sanitizers
         run: make test-sanitizers
-      - name: Test the Mac app
+      - name: Test the desktop app
         run: make check-app
 
   python-compatibility:

@@ -1,6 +1,6 @@
-"""The appcast a release of Splash for Mac carries (release_app.py): it offers
-the release's disk image as the update, with the release notes, signed with
-the release key."""
+"""The appcast a release of the Splash desktop app carries (release_app.py): it
+offers the release's disk image as the update, with the release notes, signed
+with the release key."""
 
 import base64
 import os
