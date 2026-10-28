@@ -396,7 +396,7 @@ class Repository:
                 f"from {self.name}@{self.revision[:12]}; cached files are reused.",
                 flush=True,
             )
-        with _download_progress(self.name, blobs, fetch):
+        with _download_progress(self.name, blobs, fetch) as counted:
             path = Path(
                 _interruptible(
                     snapshot_download,
@@ -404,6 +404,7 @@ class Repository:
                     revision=self.revision,
                     allow_patterns=sorted(names),
                     max_workers=4,
+                    tqdm_class=counted,
                 )
             )
         if self.default_branch:
@@ -560,22 +561,27 @@ def _interruptible(call, *args, **kwargs):
 @contextmanager
 def _download_progress(repo_id, blobs, fetch):
     """With json_progress, report the download in the block of fetch,
-    (bytes, blob ID) pairs in the blobs folder, as JSON lines on stdout:
-    done 0 first, then the bytes the folder holds of them, measured every
-    PROGRESS_INTERVAL, whenever that grew, and done == total once the block
-    succeeds. The folder is measured, not huggingface_hub's progress bars,
-    which are off without a terminal and count network bytes under Xet."""
+    (bytes, blob ID) pairs in the blobs folder, as JSON lines on stdout,
+    and yield the tqdm class the block's snapshot_download counts with (None
+    without json_progress): done 0 first, then, measured every
+    PROGRESS_INTERVAL, whenever it grew, the bytes received, and done == total
+    once the block succeeds. Received is what the network has brought or what
+    the folder holds of fetch, whichever is more, and at most the total: under
+    Xet a file is written in order from chunks that arrive out of order and
+    wait in memory, so the folder alone stood at 0 for minutes, then jumped."""
     if not (json_progress and fetch):
-        yield
+        yield None
         return
     total = sum(size for size, _ in fetch)
+    counted = _network_counter()
     stop = threading.Event()
 
     def measure():
         done = 0
         while not stop.wait(PROGRESS_INTERVAL):
             held = _blob_bytes(blobs)
-            now = sum(min(size, held.get(blob, 0)) for size, blob in fetch)
+            written = sum(min(size, held.get(blob, 0)) for size, blob in fetch)
+            now = min(max(written, counted.received), total)
             # A partial file renamed to its blob between the listing and its
             # size goes uncounted once, so only growth is reported.
             if now > done:
@@ -586,11 +592,40 @@ def _download_progress(repo_id, blobs, fetch):
     thread = threading.Thread(target=measure)
     thread.start()
     try:
-        yield
+        yield counted
     finally:
         stop.set()
         thread.join()
     _report_progress(repo_id, total, total)
+
+
+# The progress bar snapshot_download counts the bytes from the network on, as
+# huggingface_hub names it.
+NETWORK_BAR = "huggingface_hub.snapshot_download.transfer"
+
+
+def _network_counter():
+    """A tqdm class for snapshot_download that counts in `received` the bytes
+    its network bar is told have arrived; json_progress has its bars draw
+    nothing."""
+    from huggingface_hub.utils import tqdm
+
+    lock = threading.Lock()
+
+    class Counted(tqdm):
+        received = 0
+
+        def __init__(self, *args, **kwargs):
+            self.network = kwargs.get("name") == NETWORK_BAR
+            super().__init__(*args, **kwargs)
+
+        def update(self, n=1):
+            if self.network and n:
+                with lock:
+                    Counted.received += n
+            return super().update(n)
+
+    return Counted
 
 
 def _blob_bytes(blobs):

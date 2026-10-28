@@ -2,8 +2,10 @@ import _thread
 import contextlib
 import fcntl
 import hashlib
+import inspect
 import io
 import json
+import logging
 import os
 import signal
 import tempfile
@@ -67,6 +69,16 @@ class DownloadTest(unittest.TestCase):
         self.downloads = []
         # Called with the bytes downloaded so far after each chunk.
         self.after_chunk = lambda done: None
+        # Whether files come as Xet brings them: chunks counted on the network
+        # bar as they arrive, the file written whole once all have; and the
+        # bytes each chunk costs the network beyond its own.
+        self.xet = False
+        self.overhead = 0
+        # As report_json_progress has them, the bars draw nothing.
+        from huggingface_hub.utils import disable_progress_bars, enable_progress_bars
+
+        disable_progress_bars()
+        self.addCleanup(enable_progress_bars)
         for name, replacement in (
             ("huggingface_hub.constants.HF_HUB_CACHE", str(self.cache)),
             ("huggingface_hub.snapshot_download", self.snapshot_download),
@@ -76,10 +88,24 @@ class DownloadTest(unittest.TestCase):
             patch.start()
             self.addCleanup(patch.stop)
 
-    def snapshot_download(self, repo_id, *, revision, allow_patterns, max_workers):
+    def snapshot_download(
+        self, repo_id, *, revision, allow_patterns, max_workers, tqdm_class=None
+    ):
         """Each file's blob, appended to <blob>.<random>.incomplete a chunk at
-        a time, then renamed, and linked from the snapshot."""
+        a time, then renamed, and linked from the snapshot; or, with xet, its
+        chunks counted on the network bar, then the file written whole."""
+        from huggingface_hub.utils import tqdm
+        from huggingface_hub.utils.tqdm import _create_progress_bar
+
         self.downloads.append(sorted(allow_patterns))
+        # As huggingface_hub makes it, with the caller's class.
+        network = _create_progress_bar(
+            cls=tqdm_class or tqdm,
+            log_level=logging.WARNING,
+            name=hub.NETWORK_BAR,
+            total=0,
+            unit="B",
+        )
         done = 0
         for name in allow_patterns:
             target = self.blobs / blob(name)
@@ -87,10 +113,15 @@ class DownloadTest(unittest.TestCase):
                 partial = self.blobs / f"{blob(name)}.0123abcd.incomplete"
                 with partial.open("wb") as file:
                     for start in range(0, len(FILES[name]), CHUNK):
-                        file.write(FILES[name][start : start + CHUNK])
-                        file.flush()
+                        if self.xet:
+                            network.update(CHUNK + self.overhead)
+                        else:
+                            file.write(FILES[name][start : start + CHUNK])
+                            file.flush()
                         done += CHUNK
                         self.after_chunk(done)
+                    if self.xet:
+                        file.write(FILES[name])
                 partial.rename(target)
             self.snapshot.mkdir(parents=True, exist_ok=True)
             (self.snapshot / name).symlink_to(target)
@@ -155,6 +186,31 @@ class DownloadTest(unittest.TestCase):
             f"Fetching 2 file(s), 0.00 GB, from {REPO}@{'c' * 12}; "
             "cached files are reused.\n",
             self.stdout.getvalue(),
+        )
+
+    def test_a_xet_download_reports_the_bytes_the_network_brought(self):
+        # The folder holds nothing of a file until all its chunks have come.
+        self.xet = True
+        self.after_chunk = self.wait_for_report
+        self.download()
+        dones = [event["done"] for event in self.events()]
+        self.assertEqual(dones, sorted(dones))
+        self.assertEqual(set(dones), {0, 100, 200, 300, 400, 500})
+
+    def test_network_bytes_beyond_the_files_count_no_more_than_the_total(self):
+        self.xet, self.overhead = True, 60
+        self.after_chunk = lambda done: done < 500 or self.wait_for_report(500)
+        self.download()
+        dones = [event["done"] for event in self.events()]
+        self.assertEqual(dones, sorted(dones))
+        self.assertEqual(max(dones), 500)
+        self.assertEqual(dones[-2:], [500, 500])
+
+    def test_the_pinned_huggingface_hub_names_its_network_bar_so(self):
+        from huggingface_hub import _snapshot_download
+
+        self.assertIn(
+            f'name="{hub.NETWORK_BAR}"', inspect.getsource(_snapshot_download)
         )
 
     def test_a_successful_download_reports_its_completion(self):
