@@ -168,10 +168,13 @@ struct AppFlowTests {
     }
 
     @Test func modelFilesOnThisMacStartAndAnswer() async throws {
-        // The GGUF a download of the model left in the Hugging Face cache, added as files on this Mac.
+        // The GGUF a download of the model left in the Hugging Face cache, added as files on this Mac;
+        // they serve with the family's draft at the commit the download recorded for its branch.
         try await install(model)
         let file = try #require(Self.gguf(of: model), "no GGUF of \(model) in the Hugging Face cache")
         state.addLocal(file)
+        // The list outlives the run, so that a failed one leaves the next a Mac without the files.
+        defer { state.removeLocal(file.path) }
         #expect(state.selection == file.path && state.isInstalled(file.path))
         state.start(file.path)
         try await ready()
@@ -290,7 +293,7 @@ struct AppFlowTests {
         let help = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
         process.waitUntilExit()
         let flags = Set(help.matches(of: /(?m)^  (--[a-z-]+)/).map { String($0.1) })
-            .subtracting(["--help", "--model", "--offline", "--revision", "--draft-model"])
+            .subtracting(["--help", "--model", "--model-dir", "--offline", "--revision", "--draft-model", "--mmproj"])
         #expect(!flags.isEmpty)
         #expect(flags == Set(LaunchOption.all.map(\.flag)))
     }
