@@ -1,8 +1,8 @@
 import SwiftUI
 
 /// How a model starts: every `splash serve` option of `LaunchOption.all`, the main ones in a card
-/// and the others under Advanced, by their part. Each is on Auto or the server's own default until
-/// changed; a change applies the next time a model starts.
+/// and the others under Advanced, in the same card, by their part. Each is on Auto or the server's
+/// own default until changed; a change applies the next time a model starts.
 struct LaunchOptions: View {
     @Environment(AppState.self) private var state
     @State var advanced = false
@@ -14,6 +14,17 @@ struct LaunchOptions: View {
             ForEach(Self.options(.main)) { OptionRow(option: $0) }
             DisclosureRow(title: "Advanced", open: $advanced, opened: { row.scrollToTop() })
                 .background(ViewAnchor { row.view = $0 })
+            if advanced {
+                // Under the row that opens them, in line with its title.
+                ForEach(LaunchOption.Section.allCases.dropFirst(), id: \.self) { section in
+                    Text(section.rawValue)
+                        .font(.callout.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .padding(.top, 6)
+                        .padding(.leading, DisclosureRow.indent)
+                    ForEach(Self.options(section)) { OptionRow(option: $0).padding(.leading, DisclosureRow.indent) }
+                }
+            }
         } header: {
             HStack(alignment: .firstTextBaseline) {
                 SectionTitle(text: LaunchOption.Section.main.rawValue)
@@ -24,15 +35,6 @@ struct LaunchOptions: View {
                         .foregroundStyle(.tint)
                         .font(.callout)
                         .padding(.trailing, -6)
-                }
-            }
-        }
-        if advanced {
-            ForEach(LaunchOption.Section.allCases.dropFirst(), id: \.self) { section in
-                Section {
-                    ForEach(Self.options(section)) { OptionRow(option: $0) }
-                } header: {
-                    Text(section.rawValue).font(.callout.weight(.semibold)).foregroundStyle(.secondary).textCase(nil)
                 }
             }
         }

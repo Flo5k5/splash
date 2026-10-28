@@ -1,7 +1,7 @@
 import SwiftUI
 
 /// The main window: the Server or the Chat, as the switch at the toolbar's start picks. Its toolbar
-/// holds, besides, a download under way while the Chat shows.
+/// holds, besides, a download under way.
 struct MainView: View {
     @Environment(AppState.self) private var state
 
@@ -15,7 +15,9 @@ struct MainView: View {
                     ToolbarItem(placement: .navigation) { SectionSwitch() }
                         .sharedBackgroundVisibility(.hidden)
                 }
-                if state.installer.running && state.section == .chat {
+                // In both sections: an item that came and went with the switch left its glass
+                // behind, sliding under the switch.
+                if state.installer.running {
                     ToolbarItem { DownloadButton() }
                 }
                 if state.available && state.section == .chat {
@@ -92,15 +94,22 @@ struct SectionSwitch: View {
     }
 }
 
-/// A download under way while the Chat shows; opens the Server.
+/// A download under way; opens the Server, which shows it.
 struct DownloadButton: View {
     @Environment(AppState.self) private var state
 
     var body: some View {
         Button { state.section = .server } label: {
-            ProgressView(value: state.installer.progress?.fraction ?? 0)
-                .progressViewStyle(.circular)
-                .controlSize(.small)
+            // It spins until the download has told its size, rather than show an empty ring.
+            Group {
+                if let progress = state.installer.progress, progress.total > 0 {
+                    ProgressView(value: progress.fraction)
+                } else {
+                    ProgressView()
+                }
+            }
+            .progressViewStyle(.circular)
+            .controlSize(.small)
         }
         .help(state.downloadStatus ?? "")
         .accessibilityLabel("Download")
