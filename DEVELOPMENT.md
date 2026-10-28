@@ -2389,8 +2389,9 @@ folder, of any blob, each under huggingface_hub's lock on its blob. Front ends
 such as the Mac app run `install/models.py --model ID prepare --json-progress`,
 with which each download also reports its progress as JSON lines on stdout,
 `{"event": "download", "repo": REPO, "done": BYTES, "total": BYTES}`: done 0
-first, at most four a second as the Hub cache grows, and done equal to total
-once it succeeds. It is an interface between Splash's front ends and its
+first, at most four a second as the bytes received grow (what the network has
+brought or what the Hub cache holds, whichever is more), and done equal to
+total once it succeeds. It is an interface between Splash's front ends and its
 installer, not a public one.
 
 huggingface_hub downloads on threads it joins, which finish their files
@@ -3937,26 +3938,28 @@ make install test-real test-http-real MODEL=mlx-community/Qwen3.8-27B-4bit
 
 `make check` needs no model weights, but it runs the Metal tests, so it needs a
 Mac that Splash supports: it runs the source checks, `check-native-cpu`,
-`check-native-metal`, `check-native-build` and the Python checks.
-`make check-native-cpu` builds production and runs native CPU tests without a
-GPU; `make check-native-metal` requires a supported Metal device and runs the
-kernel tests under shader validation, and the Linear pipeline resource check
-without it. They include loading small synthetic MLX, GGUF and vision sources
-and the GGUF kernels on synthetic tensors. `make check-native-build` builds
-every native test, benchmark and tool and runs none. Hosted CI runs the CPU
-checks, `check-native-build` and the sanitizers. `make test-sanitizers-metal`
-runs the Metal tests of the components whose host steps share their state with
-the engine thread and the SSD readers (the hot block cache of spilled KV and
-the history stream) under ThreadSanitizer, built with it in `build/metal-tsan`.
-`make architecture-check`, one of the source checks, also fails when a workflow
-under `.github/workflows` names a Hugging Face token (`HF_TOKEN`,
-`HUGGING_FACE_HUB_TOKEN` or a `secrets.HF_*` secret): CI installs public models
-alone and never receives one.
+`check-native-metal`, `check-native-build`, the Python checks and `check-app`,
+the Mac app's tests (`swift test --package-path app`). `make check-native-cpu`
+builds production and runs native CPU tests without a GPU;
+`make check-native-metal` requires a supported Metal device and runs the kernel
+tests under shader validation, and the Linear pipeline resource check without
+it. They include loading small synthetic MLX, GGUF and vision sources and the
+GGUF kernels on synthetic tensors. `make check-native-build` builds every
+native test, benchmark and tool and runs none. Hosted CI runs the CPU checks,
+`check-native-build`, the sanitizers and `check-app`.
+`make test-sanitizers-metal` runs the Metal tests of the components whose host
+steps share their state with the engine thread and the SSD readers (the hot
+block cache of spilled KV and the history stream) under ThreadSanitizer, built
+with it in `build/metal-tsan`. `make architecture-check`, one of the source
+checks, also fails when a workflow under `.github/workflows` names a Hugging
+Face token (`HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN` or a `secrets.HF_*` secret):
+CI installs public models alone and never receives one.
 
-The native tests are in `dev/tests/engine`; each Python test is in the
-directory of what it tests: `dev/tests/server`, `dev/tests/install` (launcher,
-client configuration and model installation) or `dev/tests/tools`
-(`dev/tools`, `dev/benchmarks`, the Makefiles and the real-model harnesses).
+The native tests are in `dev/tests/engine` and the Mac app's in `app/Tests`;
+each Python test is in the directory of what it tests: `dev/tests/server`,
+`dev/tests/install` (launcher, client configuration and model installation) or
+`dev/tests/tools` (`dev/tools`, `dev/benchmarks`, the Makefiles and the
+real-model harnesses).
 
 The real-model targets run against an installation in this checkout's
 `install/models`: run `make install` with the same options first, or in the
@@ -4334,12 +4337,13 @@ serve` takes but the ones of one model (`--revision`, `--draft-model`) and the
 ones it sets itself, from one table (`LaunchOption.all`) the tests hold to
 `splash serve --help`; the API key reaches the server as `SPLASH_API_KEY`,
 from the Keychain, and nothing starts while the Keychain does not give it. It
-serves model files on this Mac the user adds with `splash serve --model PATH`,
-and at launch it runs `install/cached.py`. While a model runs,
-the Server shows its `/status`: requests, answering and prompt speed, time to
-first token, the tokens generated, read and taken from the cache, and the Metal
-memory it holds, with each request's line of the server's log, folded. Its chat
-is its own, not the chat page: it streams
+serves model files on this Mac the user adds with `splash serve --model
+local/NAME --model-dir PATH`, NAME being the file's or folder's name made a
+repository name, and at launch it runs `install/cached.py`. While a model runs, the Server shows
+its context limit, from `/v1/models`, and its `/status`: requests, answering
+and prompt speed, time to first token, the tokens generated, read and taken
+from the cache, and the Metal memory it holds, with each request's line of the
+server's log, folded. Its chat is its own, not the chat page: it streams
 `/v1/chat/completions` and keeps each conversation as a JSON file in
 `~/Library/Application Support/Splash/Chats`, so a conversation outlives a
 switch of models. Its icon is `app/AppIcon.icon`, an Icon Composer document
