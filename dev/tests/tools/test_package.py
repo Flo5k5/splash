@@ -25,6 +25,23 @@ def write_distribution(path, names):
             archive.addfile(tarfile.TarInfo(name), io.BytesIO())
 
 
+def write_source(root):
+    """A source tree holding the files stage_runtime copies, and none of the
+    optional engine files."""
+    for folder, names in (
+        ("install", package.INSTALL_FILES),
+        ("install/completions", package.COMPLETION_FILES),
+        ("server", package.SERVER_FILES),
+        ("server/chat-assets", package.CHAT_ASSET_FILES),
+        ("build", package.ENGINE_FILES),
+    ):
+        (root / folder).mkdir(parents=True, exist_ok=True)
+        for name in names:
+            (root / folder / name).write_text("fixture")
+    for name in package.LICENSE_FILES:
+        (root / name).write_text("license")
+
+
 class PackageTests(unittest.TestCase):
     def test_build_needs_no_hub_access_and_never_ships_credentials(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -169,18 +186,7 @@ class PackageTests(unittest.TestCase):
             root = Path(temporary) / "source"
             stage = Path(temporary) / "stage"
             stage.mkdir()
-            for folder, names in (
-                ("install", package.INSTALL_FILES),
-                ("install/completions", package.COMPLETION_FILES),
-                ("server", package.SERVER_FILES),
-                ("server/chat-assets", package.CHAT_ASSET_FILES),
-                ("build", package.ENGINE_FILES),
-            ):
-                (root / folder).mkdir(parents=True, exist_ok=True)
-                for name in names:
-                    (root / folder / name).write_text("fixture")
-            for name in package.LICENSE_FILES:
-                (root / name).write_text("license")
+            write_source(root)
             with mock.patch.object(package, "ROOT", root):
                 package.stage_runtime(stage, "test")
             self.assertEqual(
@@ -198,18 +204,7 @@ class PackageTests(unittest.TestCase):
             root = Path(temporary) / "source"
             stage = Path(temporary) / "stage"
             stage.mkdir()
-            for folder, names in (
-                ("install", package.INSTALL_FILES),
-                ("install/completions", package.COMPLETION_FILES),
-                ("server", package.SERVER_FILES),
-                ("server/chat-assets", package.CHAT_ASSET_FILES),
-                ("build", package.ENGINE_FILES),
-            ):
-                (root / folder).mkdir(parents=True, exist_ok=True)
-                for name in names:
-                    (root / folder / name).write_text("fixture")
-            for name in package.LICENSE_FILES:
-                (root / name).write_text("license")
+            write_source(root)
             cached = root / "build/release/python-runtime.tar.gz"
             cached.parent.mkdir()
             library = "python/lib/python3.13"

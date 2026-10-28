@@ -92,13 +92,10 @@ def candidates(name, files, suggested_models):
 def install_cached(models_root):
     """Install each model the Hub cache holds whole that is not installed in
     models_root, without the Hub; yield the IDs installed."""
-    from huggingface_hub import constants
-
     from . import hub, upstream
 
     suggested_models = suggested()
-    for folder in sorted(Path(constants.HF_HUB_CACHE).glob("models--*")):
-        name = folder.name.removeprefix("models--").replace("--", "/")
+    for name in hub.cached_repositories():
         try:
             repository = hub.Repository.resolve(name)
         except (models.ModelError, OSError):

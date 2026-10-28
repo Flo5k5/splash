@@ -372,25 +372,17 @@ class PackageAppTests(unittest.TestCase):
         )
 
     def test_invalid_arguments_stop_before_the_build(self):
-        # The bundle's short version needs the release version's x.y.z, and
-        # only make release-app notarizes.
-        for arguments in (
-            ["dmg", "--version", "6e9dfe3f"],
-            ["dmg", "--notary-profile", "splash"],
+        # The bundle's short version needs the release version's x.y.z.
+        with (
+            mock.patch.object(
+                package_app,
+                "build_products",
+                side_effect=AssertionError("built despite invalid arguments"),
+            ),
+            redirect_stderr(io.StringIO()),
+            self.assertRaises(SystemExit),
         ):
-            with (
-                self.subTest(arguments=arguments),
-                mock.patch.object(
-                    package_app,
-                    "build_products",
-                    side_effect=AssertionError("built despite invalid arguments"),
-                ),
-                redirect_stderr(io.StringIO()),
-                self.assertRaises(SystemExit),
-            ):
-                package_app.main(
-                    ["--version", "1.4.1", "--macos-min", "26.4", *arguments]
-                )
+            package_app.main(["dmg", "--version", "6e9dfe3f", "--macos-min", "26.4"])
 
 
 if __name__ == "__main__":

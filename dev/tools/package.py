@@ -83,12 +83,21 @@ CHAT_ASSET_FILES = (
 )
 # Splash's license and the notices of the third-party code it ships.
 LICENSE_FILES = ("LICENSE", "THIRD_PARTY_NOTICES")
+# The GitHub repository releases are published from.
+REPOSITORY = "incoai/splash"
 # The engine's files in build/, and the host-step spin's library beside them
 # when the build has one: a Metal compiler that refuses its kernel leaves none
 # (Makefile, HOST_STEP_LIB), and the engine then runs awake host steps without
 # the spin.
 ENGINE_FILES = ("splash", "splash.metallib")
 OPTIONAL_ENGINE_FILES = ("host-step.metallib",)
+# Imports that exercise the staged runtime's native libraries and Splash's own
+# entry modules, run from the runtime's directory.
+SMOKE_IMPORTS = (
+    "import sys; sys.path.insert(0, '.'); "
+    "import tokenizers, llguidance, numpy, PIL, transformers, huggingface_hub, pypdfium2; "
+    "import server.server, install.launcher"
+)
 
 
 def digest(path):
@@ -170,17 +179,7 @@ def build_runtime(destination, version):
     # runtime, not the developer's virtualenv or source PYTHONPATH, and, as
     # the runtime runs, without writing bytecode.
     subprocess.run(
-        [
-            str(python),
-            "-I",
-            "-B",
-            "-c",
-            "import sys; sys.path.insert(0, '.'); "
-            "import tokenizers, llguidance, numpy, PIL, transformers, huggingface_hub, pypdfium2; "
-            "import server.server, install.launcher",
-        ],
-        cwd=destination,
-        check=True,
+        [str(python), "-I", "-B", "-c", SMOKE_IMPORTS], cwd=destination, check=True
     )
     # The server's entry point as the launcher starts it, which the
     # import above does not run. Not isolated: -I would ignore PYTHONPATH.
@@ -226,7 +225,7 @@ end
 
 class Splash < Formula
   desc "Local inference engine for Apple silicon, built around the model"
-  homepage "https://github.com/incoai/splash"
+  homepage "https://github.com/{REPOSITORY}"
   url {quote(url)}
   sha256 {quote(checksum)}
   license "Apache-2.0"
@@ -291,7 +290,7 @@ def main(argv=None):
     archive.with_suffix(archive.suffix + ".sha256").write_text(checksum + "\n")
     url = (
         args.url
-        or f"https://github.com/incoai/splash/releases/download/{args.version}/{archive.name}"
+        or f"https://github.com/{REPOSITORY}/releases/download/{args.version}/{archive.name}"
     )
     (dist / "splash.rb").write_text(
         formula(args.version, url, checksum, args.macos_min)

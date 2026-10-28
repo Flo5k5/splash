@@ -649,7 +649,7 @@ end
         self.assertFalse(any("brew" in line for line in candidate))
 
     def release(
-        self, version, *arguments, problems=(), keychain=(SHA1, IDENTITY), checked=None
+        self, version, *arguments, problems=(), keychain=IDENTITY, checked=None
     ):
         """Run main for version, everything but its own steps mocked, in a
         checkout at self.root whose keychains hold keychain, or nothing for

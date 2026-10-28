@@ -26,7 +26,6 @@ sys.path.insert(0, str(ROOT))
 
 from dev.tools import appcast, package, package_app  # noqa: E402
 
-REPOSITORY = "incoai/splash"
 # The tap incoai/homebrew-tap: the command line's formula, splash, and the
 # app's cask, splash-app.
 TAP = "incoai/tap"
@@ -37,6 +36,9 @@ CASK = "splash-app"
 # apart, or by its certificate's SHA-1, which tells apart two of one name.
 IDENTITY = re.compile(r"Developer ID Application: .+ \(([A-Z0-9]{10})\)")
 SHA1 = re.compile(r"[0-9A-F]{40}")
+# A release's version, which its tag is: x.y.z, or x.y.z-rc.N for a release
+# candidate.
+RELEASE_VERSION = re.compile(r"\d+\.\d+\.\d+(-rc\.\d+)?")
 # What a dry run prints for an identity, notary credentials or a submission it
 # does not have, and commands print for the folder a disk image is attached at.
 UNSET_IDENTITY = "Developer ID Application: NAME (TEAMID)"
@@ -121,7 +123,7 @@ def parse_args(argv=None):
         "service (DRY_RUN=1)",
     )
     args = parser.parse_args(argv)
-    if not appcast.RELEASE_VERSION.fullmatch(args.version):
+    if not RELEASE_VERSION.fullmatch(args.version):
         parser.error(
             "RELEASE_VERSION (--version) must be x.y.z or x.y.z-rc.N, e.g. 1.5.0, "
             f"not {args.version}"
@@ -188,7 +190,7 @@ def checkout_problems(version):
 def keychain_identity(identity):
     """The identity valid for signing code that the keychains hold for
     identity, its name or its certificate's SHA-1, as security find-identity
-    lists it: (SHA-1, name). Raises LookupError when none does, or when two
+    lists it: its name. Raises LookupError when none does, or when two
     have its name, as while a renewed certificate and the one it renews are
     both valid, which codesign would refuse as ambiguous."""
     listed = subprocess.run(
@@ -210,7 +212,7 @@ def keychain_identity(identity):
             "SIGN_IDENTITY to the SHA-1 of the one to sign with, which "
             "security find-identity -v -p codesigning lists"
         )
-    return next(iter(found.items()))
+    return next(iter(found.values()))
 
 
 def signer(identity):
@@ -223,7 +225,7 @@ def signer(identity):
             "SIGN_IDENTITY (--sign), a Developer ID Application identity, is not set",
         )
     try:
-        _, name = keychain_identity(identity)
+        name = keychain_identity(identity)
         problem = None
     except LookupError as error:
         name, problem = identity, str(error)
@@ -434,7 +436,7 @@ def cask(version, checksum, macos_min):
   url "{package_app.RELEASES}/download/#{{version}}/Splash-#{{version}}.dmg"
   name "Splash"
   desc "Local inference engine for Apple silicon, built around the model"
-  homepage "https://github.com/{REPOSITORY}"
+  homepage "https://github.com/{package.REPOSITORY}"
 
   livecheck do
     url :url
@@ -530,10 +532,10 @@ def publishing(version, folder, assets):
     candidate, the tap's formula and cask. Paths are the folder's own, so that
     another Mac can publish a copy of it."""
     candidate = "-rc." in version
-    repository = ["--repo", REPOSITORY]
+    repository = ["--repo", package.REPOSITORY]
     lines = [
-        f"# With gh, signed in with write access to {REPOSITORY}. The tag, from "
-        "the checkout:",
+        f"# With gh, signed in with write access to {package.REPOSITORY}. "
+        "The tag, from the checkout:",
         shlex.join(["git", "push", "origin", f"refs/tags/{version}"]),
         "# A draft release of the folder's files, from the folder:",
         shlex.join(["cd", str(folder)]),

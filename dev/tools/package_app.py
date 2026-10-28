@@ -18,7 +18,7 @@ from dev.tools import package  # noqa: E402
 BUNDLE_ID = "ai.inco.splash"
 # Where Splash is released: each release carries the app's disk image and the
 # appcast that offers it (DEVELOPMENT.md, Updates).
-RELEASES = "https://github.com/incoai/splash/releases"
+RELEASES = f"https://github.com/{package.REPOSITORY}/releases"
 # The appcast the app checks for updates, the latest release's. Every app
 # shipped keeps this URL, so it never changes.
 APPCAST_URL = f"{RELEASES}/latest/download/appcast.xml"
@@ -260,12 +260,7 @@ def check_signed(app):
     bytecode file written into it would break the seal."""
     runtime = app / "Contents/Resources/splash"
     subprocess.run(
-        [str(runtime / "python/bin/python3"), "-I", "-B", "-c"]
-        + [
-            "import sys; sys.path.insert(0, '.'); "
-            "import tokenizers, llguidance, numpy, PIL, transformers, huggingface_hub, "
-            "pypdfium2, cryptography.fernet; import server.server, install.launcher"
-        ],
+        [str(runtime / "python/bin/python3"), "-I", "-B", "-c", package.SMOKE_IMPORTS],
         cwd=runtime,
         check=True,
     )

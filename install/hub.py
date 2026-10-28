@@ -103,6 +103,16 @@ def folder(repo_id: str) -> Path:
     return Path(constants.HF_HUB_CACHE) / folder_name(repo_id)
 
 
+def cached_repositories() -> list[str]:
+    """The IDs of the model repositories the Hub cache holds."""
+    from huggingface_hub import constants
+
+    return sorted(
+        path.name.removeprefix("models--").replace("--", "/")
+        for path in Path(constants.HF_HUB_CACHE).glob("models--*")
+    )
+
+
 def snapshot(repo_id: str, commit: str) -> Path:
     return folder(repo_id) / "snapshots" / commit
 
@@ -568,7 +578,7 @@ def _download_progress(repo_id, blobs, fetch):
     once the block succeeds. Received is what the network has brought or what
     the folder holds of fetch, whichever is more, and at most the total: under
     Xet a file is written in order from chunks that arrive out of order and
-    wait in memory, so the folder alone stood at 0 for minutes, then jumped."""
+    wait in memory, so the folder alone can stay at 0 for minutes, then jump."""
     if not (json_progress and fetch):
         yield None
         return

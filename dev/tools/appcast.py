@@ -4,7 +4,6 @@ the release key."""
 
 import base64
 import os
-import re
 import shutil
 import subprocess
 import tempfile
@@ -24,9 +23,6 @@ ACCOUNT = package_app.BUNDLE_ID
 # package app/Package.swift pins.
 TOOLS = ROOT / "app/.build/artifacts/sparkle/Sparkle/bin"
 SPARKLE = "{http://www.andymatuschak.org/xml-namespaces/sparkle}"
-# A release's version, which its tag is: x.y.z, or x.y.z-rc.N for a release
-# candidate.
-RELEASE_VERSION = re.compile(r"\d+\.\d+\.\d+(-rc\.\d+)?")
 
 
 def generate(image, notes, version, key_file):
