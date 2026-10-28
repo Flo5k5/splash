@@ -16,6 +16,20 @@ sys.path.insert(0, str(ROOT))
 from dev.tools import package  # noqa: E402
 
 BUNDLE_ID = "ai.inco.splash"
+# Where Splash is released: each release carries the app's disk image and the
+# appcast that offers it (DEVELOPMENT.md, Updates).
+RELEASES = "https://github.com/incoai/splash/releases"
+# The appcast the app checks for updates, the latest release's. Every app
+# shipped keeps this URL, so it never changes.
+APPCAST_URL = f"{RELEASES}/latest/download/appcast.xml"
+# The release key's public half, as Sparkle's generate_keys prints it
+# (DEVELOPMENT.md, Updates): the app takes an update whose disk image the
+# private half signed or, to replace a lost key, one signed with the app's
+# Developer ID. Without it, the app checks for no update.
+SPARKLE_PUBLIC_KEY = ""
+# The code Sparkle.framework holds besides its library, which installs an
+# update: the installer and the app that shows its progress.
+SPARKLE_HELPERS = ("Versions/B/Autoupdate", "Versions/B/Updater.app")
 # The first four bytes of a Mach-O file: a 64- or 32-bit image in either byte
 # order, or a universal one. The runtime's interpreter and engine have no
 # extension, so its Mach-O files are found by content, not by name.
@@ -65,6 +79,15 @@ def build_number():
 
 
 def info_plist(version, build, macos_min):
+    """The app's Info.plist. Sparkle reads its keys: the appcast; once there is
+    a release key, its public half and SUVerifyUpdateBeforeExtraction, for
+    Sparkle to check a download's signature before it mounts the disk image,
+    not after; and, left out, SUEnableAutomaticChecks, for Sparkle to ask on
+    the second launch whether to check by itself."""
+    sparkle = {"SUFeedURL": APPCAST_URL}
+    if SPARKLE_PUBLIC_KEY:
+        sparkle["SUPublicEDKey"] = SPARKLE_PUBLIC_KEY
+        sparkle["SUVerifyUpdateBeforeExtraction"] = True
     return {
         "CFBundleIdentifier": BUNDLE_ID,
         "CFBundleName": "Splash",
@@ -82,6 +105,7 @@ def info_plist(version, build, macos_min):
         # over plain HTTP on 127.0.0.1.
         "NSAppTransportSecurity": {"NSAllowsLocalNetworking": True},
         "NSHumanReadableCopyright": "Copyright © Inco AI",
+        **sparkle,
     }
 
 
@@ -96,9 +120,9 @@ def mach_o_files(root):
     return found
 
 
-def build_executable():
+def build_products():
     """Build the app's executable, arm64 in release configuration, and return
-    its path."""
+    the folder that holds it and the Sparkle.framework it links."""
     command = [
         "swift",
         "build",
@@ -115,7 +139,7 @@ def build_executable():
     products = subprocess.run(
         [*command, "--show-bin-path"], check=True, capture_output=True, text=True
     ).stdout.strip()
-    return Path(products) / "Splash"
+    return Path(products)
 
 
 def compile_icon(resources, macos_min):
@@ -145,26 +169,39 @@ def compile_icon(resources, macos_min):
             raise RuntimeError(f"actool wrote no {name} into {resources}")
 
 
-def copy_resources(executable, resources):
-    """Copy the app's resource bundle, which SwiftPM built beside executable,
-    into resources: a bundle at the .app's root would leave it unsealed."""
+def copy_resources(products, resources):
+    """Copy the app's resource bundle, which SwiftPM built into products, into
+    resources: a bundle at the .app's root would leave it unsealed."""
     shutil.copytree(
-        executable.parent / RESOURCE_BUNDLE, resources / RESOURCE_BUNDLE, symlinks=True
+        products / RESOURCE_BUNDLE, resources / RESOURCE_BUNDLE, symlinks=True
     )
 
 
-def assemble(app, executable, version, macos_min):
-    """Lay out app: the executable, Info.plist, the icon, the app's resource
-    bundle and, in Resources/splash, the runtime build_runtime builds, whose
-    layout install/paths.py resolves."""
+def add_sparkle(frameworks, framework):
+    """Copy Sparkle.framework into frameworks with ditto, which keeps the links
+    a framework's layout is made of, without its XPC services: only a
+    sandboxed app needs them, and Splash is not one."""
+    frameworks.mkdir()
+    copy = frameworks / framework.name
+    subprocess.run(["ditto", str(framework), str(copy)], check=True)
+    shutil.rmtree(copy / "Versions/B/XPCServices")
+    (copy / "XPCServices").unlink()
+
+
+def assemble(app, products, version, macos_min):
+    """Lay out app: the executable, Sparkle.framework in Frameworks, where the
+    executable's rpath finds it (app/Package.swift), Info.plist, the icon, the
+    app's resource bundle and, in Resources/splash, the runtime build_runtime
+    builds, whose layout install/paths.py resolves."""
     contents = app / "Contents"
     (contents / "MacOS").mkdir(parents=True)
-    shutil.copy2(executable, contents / "MacOS/Splash")
+    shutil.copy2(products / "Splash", contents / "MacOS/Splash")
+    add_sparkle(contents / "Frameworks", products / "Sparkle.framework")
     with (contents / "Info.plist").open("wb") as stream:
         plistlib.dump(info_plist(version, build_number(), macos_min), stream)
     runtime = contents / "Resources/splash"
     runtime.mkdir(parents=True)
-    copy_resources(executable, contents / "Resources")
+    copy_resources(products, contents / "Resources")
     compile_icon(contents / "Resources", macos_min)
     package.build_runtime(runtime, version)
 
@@ -180,8 +217,8 @@ def codesign(path, identity, *options):
 
 
 def sign(app, identity):
-    """Sign every Mach-O file of app's runtime, then app, and verify them;
-    return the number of runtime files signed.
+    """Sign every Mach-O file of app's runtime, Sparkle's code from the inside
+    out, then app, and verify them; return the number of runtime files signed.
 
     codesign --deep signs and checks only the code a bundle nests where code
     belongs, not the runtime's files in Resources, so each is signed on its
@@ -199,6 +236,10 @@ def sign(app, identity):
         identifier = identifiers.get(binary.resolve())
         named = ("--identifier", identifier) if identifier else ()
         codesign(binary, identity, *hardened, *named)
+    sparkle = app / "Contents/Frameworks/Sparkle.framework"
+    for helper in SPARKLE_HELPERS:
+        codesign(sparkle / helper, identity, *hardened)
+    codesign(sparkle, identity, *hardened)
     codesign(app, identity, *hardened)
     for binary in binaries:
         subprocess.run(["codesign", "--verify", "--strict", str(binary)], check=True)
@@ -300,10 +341,10 @@ def main(argv=None):
     image = dist / f"Splash-{args.version}.dmg"
     if args.target == "dmg" and image.exists():
         parser.error(f"release already exists: {image}")
-    executable = build_executable()
+    products = build_products()
     with tempfile.TemporaryDirectory(prefix=".package-app-", dir=dist) as temporary:
         bundle = Path(temporary) / app.name
-        assemble(bundle, executable, args.version, args.macos_min)
+        assemble(bundle, products, args.version, args.macos_min)
         signed = sign(bundle, args.sign)
         check_signed(bundle)
         if app.exists():

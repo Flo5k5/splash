@@ -7,9 +7,23 @@ import PackageDescription
 let package = Package(
     name: "Splash",
     platforms: [.macOS("26.4")],
+    dependencies: [
+        // Updates the app from the appcast of the GitHub releases (DEVELOPMENT.md, Updates). Pinned to
+        // one release: its tools sign the appcast the app checks, so a new one is taken on purpose.
+        .package(url: "https://github.com/sparkle-project/Sparkle", exact: "2.10.1"),
+    ],
     targets: [
-        // The Chat's transcript is a web page, in Transcript/.
-        .executableTarget(name: "Splash", path: "Sources/Splash", resources: [.copy("Transcript")]),
+        .executableTarget(
+            name: "Splash",
+            dependencies: [.product(name: "Sparkle", package: "Sparkle")],
+            path: "Sources/Splash",
+            // The Chat's transcript is a web page, in Transcript/.
+            resources: [.copy("Transcript")],
+            // Where the executable finds Sparkle.framework: in Contents/Frameworks of Splash.app, and
+            // beside it in .build, for a build run from there.
+            linkerSettings: [.unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks",
+                                           "-Xlinker", "-rpath", "-Xlinker", "@executable_path"])]
+        ),
         .testTarget(name: "SplashTests", dependencies: ["Splash"], path: "Tests/SplashTests"),
     ]
 )

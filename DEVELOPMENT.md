@@ -4245,7 +4245,8 @@ runs the bundled launcher without a compiler or separate Python installation.
 
 To publish, tag the verified release commit in `incoai/splash` with the version
 (no `v` prefix), preserving existing history and tags. Create a GitHub Release
-with the runtime archive, its `.sha256` file and the bottle. Open a pull request
+with the runtime archive, its `.sha256` file, the bottle and the Mac app's disk
+images and appcast ([updates](#updates)). Open a pull request
 in `incoai/homebrew-tap` replacing `Formula/splash.rb` with `dist/splash.rb`;
 its URLs must point to the published release assets. After the tap update
 merges, verify a fresh install and an upgrade from the previous release through
@@ -4317,6 +4318,61 @@ and slid apart, is the menu bar's too (`SplashMark`), and the chat page's
 `SPLASH_RUNTIME` naming a packaged runtime and `SPLASH_APP_MODELS` installed
 models, they also drive the app end to end and, with `SPLASH_APP_SNAPSHOTS`,
 render its windows to that folder.
+
+#### Updates
+
+The app updates itself with [Sparkle](https://sparkle-project.org), the
+release `app/Package.swift` pins. It checks the appcast of the latest GitHub
+release, `https://github.com/incoai/splash/releases/latest/download/appcast.xml`
+(`APPCAST_URL` in `dev/tools/package_app.py`), a URL every app shipped keeps,
+and opens a disk image it downloads only once it has checked who signed it:
+the release key, an EdDSA key whose public half is `SPARKLE_PUBLIC_KEY` there,
+or, to replace a lost release key, the app's Developer ID. An app built while
+`SPARKLE_PUBLIC_KEY` is empty checks for nothing. Sparkle asks on the second
+launch whether to check by itself, once a day, and installs an update by
+quitting the app as its Quit command does, which stops what runs first.
+`package_app.py` puts `Sparkle.framework` in `Contents/Frameworks` without its
+XPC services, which only a sandboxed app needs, and signs its installer, its
+progress app and the framework before the app.
+
+The release key is made once, on the Mac that publishes releases, with the
+tools `swift build` unpacks into `app/.build/artifacts/sparkle/Sparkle/bin`:
+
+```sh
+app/.build/artifacts/sparkle/Sparkle/bin/generate_keys --account ai.inco.splash
+app/.build/artifacts/sparkle/Sparkle/bin/generate_keys --account ai.inco.splash \
+    -x /Volumes/OFFLINE/splash-release-key
+```
+
+The first keeps the private key in the login keychain and prints the public
+one, which goes into `SPARKLE_PUBLIC_KEY`; the second exports the private key
+for a backup kept offline, such as on an encrypted drive, never in the
+checkout; `generate_keys --account ai.inco.splash -f FILE` imports it on
+another Mac. A lost key can be replaced with a new one: the apps shipped also
+take a disk image signed with the same Developer ID, as `make dmg` signs it,
+if its app carries the new key's public half and the new key signed it in the
+appcast (Sparkle's key rotation). With both the key and the Developer ID lost,
+they update no more.
+
+Each release then carries `appcast.xml` beside its disk images:
+
+```sh
+make dmg RELEASE_VERSION=$VERSION SIGN_IDENTITY="Developer ID Application: ..." \
+    NOTARY_PROFILE=splash-notary
+make appcast RELEASE_VERSION=$VERSION RELEASE_NOTES=notes.md
+```
+
+`make appcast` (`dev/tools/appcast.py`) has Sparkle's `generate_appcast` write
+`dist/appcast.xml`, offering `Splash-<version>.dmg` from the release tagged
+`<version>`, with `RELEASE_NOTES`, a Markdown file, and what it reads from the
+app in the disk image: the build number Sparkle compares (`CFBundleVersion`),
+the version it shows and `LSMinimumSystemVersion`. It signs the disk image
+with the release key from the login keychain, or the file `SPARKLE_KEY_FILE`
+names, and checks the signature with `SPARKLE_PUBLIC_KEY`. Upload
+`Splash-<version>.dmg`, a copy of it named `Splash.dmg` and `appcast.xml`, then
+publish the release: the apps check whichever release is the latest, and
+cannot while it carries no appcast. A release candidate, `x.y.z-rc.N`, is a
+prerelease, never the latest.
 
 ### Private test releases
 

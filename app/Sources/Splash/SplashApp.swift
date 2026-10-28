@@ -7,12 +7,17 @@ struct SplashApp: App {
 
     var body: some Scene {
         let state = delegate.state
+        let updates = delegate.updates
         Window("Splash", id: "main") {
             MainView()
                 .environment(state)
         }
         .defaultSize(width: 1120, height: 780)
         .commands {
+            CommandGroup(after: .appInfo) {
+                Button("Check for Updates…") { updates.check() }
+                    .disabled(!updates.canCheck)
+            }
             CommandGroup(replacing: .newItem) {
                 Button("New Chat") {
                     state.section = .chat
@@ -52,10 +57,12 @@ struct SplashApp: App {
     }
 }
 
-/// Owns the app's state, starts it on launch, and stops what runs before the app quits.
+/// Owns the app's state and its updates, starts them on launch, and stops what runs before the app
+/// quits, for the Quit command, the system, `kill` and an update alike.
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let state: AppState
+    let updates = Updates()
 
     override init() {
         guard let runtime = Runtime.locate() else {
@@ -99,6 +106,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSApp.perform(#selector(NSApplication.terminate(_:)), with: nil, afterDelay: 0)
         }
         termination?.resume()
+        updates.start()
         Task { await state.launch() }
     }
 
