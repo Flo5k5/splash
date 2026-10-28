@@ -41,6 +41,8 @@ struct ChatTarget {
     let model: String
     let acceptsImages: Bool
     let effort: String
+    /// The tokens the model's context holds, if the server said.
+    var context: Int?
     /// The key the server asks for, if any.
     var apiKey: String?
 }
@@ -152,7 +154,8 @@ final class ChatStore {
                     answer.tokensPerSecond = delta.tokensPerSecond ?? answer.tokensPerSecond
                     answer.reasoningTokens = delta.reasoningTokens ?? answer.reasoningTokens
                     read = delta.read ?? read
-                    if delta.cut { answer.error = "The reply reached its length limit." }
+                    // Asked for no limit, a reply runs to the end of the context.
+                    if delta.cut { answer.error = "The reply reached the end of the model’s context." }
                     // A redraw of the whole reply per token would be wasted work.
                     if ContinuousClock.now - shown > .milliseconds(50) {
                         shown = .now
@@ -251,7 +254,8 @@ enum ChatClient {
                     if let status = (response as? HTTPURLResponse)?.statusCode, status != 200 {
                         var data = Data()
                         for try await byte in bytes { data.append(byte) }
-                        throw Failure(errorDescription: message(of: data) ?? HTTPURLResponse.localizedString(forStatusCode: status))
+                        throw Failure(errorDescription: message(of: data, for: messages, server: server)
+                            ?? HTTPURLResponse.localizedString(forStatusCode: status))
                     }
                     for try await line in bytes.lines {
                         switch try parse(line) {
@@ -336,9 +340,16 @@ enum ChatClient {
                             reasoningTokens: chunk.usage?.completion_tokens_details?.reasoning_tokens))
     }
 
-    private static func message(of data: Data) -> String? {
-        struct Body: Decodable { struct Problem: Decodable { let message: String }; let error: Problem }
-        return (try? JSONDecoder().decode(Body.self, from: data))?.error.message
+    /// What the error in a response's body to `messages` says: a prompt too long for the model's
+    /// context, in the app's words; any other, in the server's.
+    static func message(of data: Data, for messages: [ChatMessage], server: ChatTarget) -> String? {
+        struct Body: Decodable { struct Problem: Decodable { let message: String; let code: String? }; let error: Problem }
+        guard let problem = try? JSONDecoder().decode(Body.self, from: data).error else { return nil }
+        guard problem.code == "context_length_exceeded" else { return problem.message }
+        let context = server.context.map { "the model’s \(ContextLength.figure($0))-token context" } ?? "the model’s context"
+        // A new chat leaves the earlier messages behind; a first message has none to leave.
+        return messages.count == 1 ? "This message is longer than \(context)."
+            : "This chat is longer than \(context). Start a new chat to continue."
     }
 
     /// The type of an image the app keeps, PNG or JPEG.

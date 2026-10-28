@@ -377,7 +377,7 @@ enum Showcase {
         ChatMessage(role: .user, text: "What’s in this picture?", images: [picture]),
         ChatMessage(role: .assistant, text: "A gradient from teal to blue, square, with nothing else in it.",
                     model: "mlx-community/Qwen3-30B-A3B-4bit", tokensPerSecond: 41,
-                    error: "The reply reached its length limit."),
+                    error: "The reply reached the end of the model’s context."),
         ChatMessage(role: .user, text: "Thanks!\nOne more line, to see a message of two."),
         ChatMessage(role: .assistant, text: "You’re welcome. Ask again whenever you like.",
                     model: "mlx-community/Qwen3-30B-A3B-4bit", tokensPerSecond: 39.6, stopped: true),

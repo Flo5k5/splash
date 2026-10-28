@@ -234,6 +234,8 @@ struct ServerTests {
         let busy = Server.report(Data(#"{"requests": {"completed": 5}, "metrics": {"decode_tokens_per_second": 71.5, "prefill_tokens_per_second": 900, "ttft_ms": {"p50": 120}}, "weights": {"released": true}, "transport": {"stopped": true, "error": "the engine failed"}}"#.utf8))
         #expect(busy == Server.Report(activity: Server.Activity(served: 5, generation: 71.5, reading: 900, firstToken: .milliseconds(120)),
                                       asleep: true, stopped: "the engine failed"))
+        // While the server starts a failed engine again.
+        #expect(Server.report(Data(#"{"transport": {"ready": false, "recovering": true, "stopped": false}}"#.utf8))?.recovering == true)
         #expect(Server.report(Data("not json".utf8)) == nil)
     }
 
@@ -330,6 +332,25 @@ struct ChatTests {
         #expect(throws: ChatClient.Failure.self) {
             try ChatClient.parse(#"data: {"error":{"message":"engine is recovering; retry shortly"}}"#)
         }
+    }
+
+    @Test func saysWhenAChatOutgrowsTheContext() {
+        // As the server refuses a prompt longer than the context, before it streams anything.
+        let overflow = Data(#"{"error":{"message":"prompt exceeds the context window","type":"invalid_request_error","code":"context_length_exceeded"}}"#.utf8)
+        let chat = [ChatMessage(role: .user, text: "Hi"), ChatMessage(role: .assistant, text: "Hello"),
+                    ChatMessage(role: .user, text: "And then?")]
+        var target = ChatTarget(url: URL(string: "http://127.0.0.1:8000")!, model: "a/b", acceptsImages: false, effort: "", context: 262_144)
+        #expect(ChatClient.message(of: overflow, for: chat, server: target)
+            == "This chat is longer than the model’s 256K-token context. Start a new chat to continue.")
+        // A first message too long has no earlier ones a new chat would leave behind.
+        #expect(ChatClient.message(of: overflow, for: [chat[0]], server: target) == "This message is longer than the model’s 256K-token context.")
+        target.context = 57_337
+        #expect(ChatClient.message(of: overflow, for: [chat[0]], server: target) == "This message is longer than the model’s 57,337-token context.")
+        target.context = nil
+        #expect(ChatClient.message(of: overflow, for: chat, server: target) == "This chat is longer than the model’s context. Start a new chat to continue.")
+        let other = Data(#"{"error":{"message":"engine is recovering; retry shortly","code":"engine_recovering"}}"#.utf8)
+        #expect(ChatClient.message(of: other, for: chat, server: target) == "engine is recovering; retry shortly")
+        #expect(ChatClient.message(of: Data("Bad Gateway".utf8), for: chat, server: target) == nil)
     }
 
     @Test func asksWithImagesEarlierThoughtsAndTheEffort() throws {

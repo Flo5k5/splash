@@ -75,7 +75,7 @@ struct ServerView: View {
         .formStyle(.grouped)
         // The screen changes its shape as one: rows and sections fade in and out as the server,
         // downloads and options change, the rows after them moving along.
-        .animation(Motion.settle, value: Layout(phase: state.server.phase, next: state.server.next, asleep: state.server.asleep,
+        .animation(Motion.settle, value: Layout(phase: state.server.phase, next: state.server.next, serving: state.server.serving,
                                                 installed: state.installed.map(\.id), downloading: state.installer.running,
                                                 failure: state.installer.failure?.message, keyProblem: state.keyProblem,
                                                 finding: state.findingCachedModels, options: state.options))
@@ -99,7 +99,7 @@ struct ServerView: View {
     private struct Layout: Equatable {
         var phase: Server.Phase
         var next: String?
-        var asleep: Bool
+        var serving: Server.Serving
         var installed: [String]
         var downloading: Bool
         var failure: String?
@@ -170,7 +170,7 @@ private struct ControlBar: View {
         var phase: Server.Phase
         var next: String?
         var model: String?
-        var asleep: Bool
+        var serving: Server.Serving
         var selection: String?
         var changed: Bool
     }
@@ -178,7 +178,7 @@ private struct ControlBar: View {
     var body: some View {
         let server = state.server
         let model = server.running ? server.model : state.selection
-        let stage = Stage(phase: server.phase, next: server.next, model: server.model, asleep: server.asleep,
+        let stage = Stage(phase: server.phase, next: server.next, model: server.model, serving: server.serving,
                           selection: state.selection, changed: state.optionsChanged)
         HStack(spacing: 12) {
             StatusMark(look: look, since: server.since)
@@ -231,9 +231,11 @@ private struct ControlBar: View {
             } else {
                 Text("Stopping…")
             }
+        case .ready where server.recovering:
+            Text(server.serving.rawValue)
         case .ready:
             HStack(spacing: 4) {
-                Text(verbatim: "\(server.asleep ? "Sleeping" : "Running") · Port \(server.settings.port)")
+                Text(verbatim: "\(server.serving.rawValue) · Port \(server.settings.port)")
                     .help(server.asleep ? "It freed its memory while idle and loads again with the next message." : "")
                 CopyButton(copy: state.copyAPIAddress)
                     .buttonStyle(.hover)
@@ -293,7 +295,7 @@ private struct ActivitySection: View {
 
     var body: some View {
         Section {
-            ActivityFigures(activity: state.server.activity)
+            ActivityFigures(activity: state.server.activity, context: state.server.context)
             RequestLog(entries: state.server.requestLog, totals: RequestLog.totals(state.server.activity), open: advanced)
         } header: {
             SectionTitle(text: "Activity")
@@ -302,9 +304,10 @@ private struct ActivitySection: View {
 }
 
 /// How the model that runs does since it started: how fast it answers and reads prompts on average,
-/// how soon an answer starts, and the memory it holds.
+/// how soon an answer starts; and the context and memory it holds.
 private struct ActivityFigures: View {
     let activity: Server.Activity
+    let context: Int?
 
     var body: some View {
         let latency = activity.firstToken.map(Format.latency)
@@ -315,6 +318,7 @@ private struct ActivityFigures: View {
             Figure(value: activity.reading.map(Format.whole), unit: "tok/s", caption: "Reading prompts",
                    help: "Average since the model started")
             Figure(value: latency?.0, unit: latency?.1, caption: "To first token", help: "Median since the model started")
+            Figure(value: context.map(ContextLength.figure), caption: "Context", help: "The tokens a conversation can hold")
             Figure(value: memory?.0, unit: memory?.1, caption: "Memory", help: "What the engine holds in memory now")
         }
         .padding(.vertical, 6)
@@ -562,7 +566,7 @@ private struct ModelRow: View {
         if server.next == model.id && server.model != model.id { return "Up next" }
         guard server.running, server.model == model.id else { return nil }
         switch server.phase {
-        case .ready: return server.asleep ? "Sleeping" : "Running"
+        case .ready: return server.serving.rawValue
         case .starting: return "\(server.step.rawValue)…"
         case .stopping: return server.next == model.id ? "Restarting…" : "Stopping…"
         case .failed: return "Not responding"

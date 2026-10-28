@@ -32,6 +32,14 @@ final class Server {
         }
     }
 
+    /// What a ready server does: runs the model, sleeps with its weights given back, or recovers
+    /// while the engine, having failed, starts again.
+    enum Serving: String {
+        case running = "Running"
+        case sleeping = "Sleeping"
+        case recovering = "Recovering…"
+    }
+
     private(set) var phase = Phase.stopped
     /// While starting: what the start does, and since when.
     private(set) var step = Step.starting
@@ -46,12 +54,20 @@ final class Server {
     private(set) var since = Date.now
     /// Once ready: whether the engine has given the weights back while idle.
     private(set) var asleep = false
+    /// Once ready: whether the engine failed and the server is starting it again.
+    private(set) var recovering = false
+    /// Once ready: the tokens the model's context holds, as the option set it or Auto fitted it.
+    private(set) var context: Int?
     /// Once ready: whether the model takes images.
     private(set) var acceptsImages = false
     /// Once ready: what a reasoning effort does to the model.
     private(set) var reasoning: Reasoning?
     /// Once ready: the work the server reports, as its status gives it.
     private(set) var activity = Activity()
+    /// Once ready: what the server does.
+    var serving: Serving { recovering ? .recovering : asleep ? .sleeping : .running }
+    /// Whether the model answers a request now: ready, and not recovering.
+    var answers: Bool { phase == .ready && !recovering }
 
     /// Once ready: each request the server finished, as its log line gives it, the latest last.
     private(set) var requestLog: [RequestEntry] = []
@@ -154,6 +170,8 @@ final class Server {
         self.model = model
         self.settings = settings
         asleep = false
+        recovering = false
+        context = nil
         activity = Activity()
         requestLog = []
         acceptsImages = false
@@ -259,10 +277,13 @@ final class Server {
                let (_, response) = try? await URLSession.shared.data(from: health),
                (response as? HTTPURLResponse)?.statusCode == 200,
                !Task.isCancelled, phase == .starting {
-                phase = .ready
+                // What the model takes and holds, known as it shows as ready.
                 let served = await servedModel()
+                guard !Task.isCancelled, phase == .starting else { break }
                 acceptsImages = served?.input_modalities?.contains("image") ?? false
                 reasoning = served?.reasoning
+                context = served?.context_length
+                phase = .ready
                 break
             }
             try? await Task.sleep(for: .milliseconds(500))
@@ -271,6 +292,7 @@ final class Server {
         while !Task.isCancelled, phase == .ready {
             if let report = await status(), phase == .ready {
                 asleep = report.asleep
+                recovering = report.recovering
                 activity = report.activity
                 if let stopped = report.stopped { phase = .failed(stopped) }
             }
@@ -279,10 +301,12 @@ final class Server {
     }
 
     /// What the server's status says: the work it has done, whether it has given the weights back
-    /// while idle, and, once it serves nothing more, why.
+    /// while idle, whether it is starting a failed engine again, and, once it serves nothing more,
+    /// why.
     struct Report: Equatable {
         var activity: Activity
         var asleep: Bool
+        var recovering = false
         var stopped: String?
     }
 
@@ -303,6 +327,7 @@ final class Server {
                 memory: status.memory_actual?.current_bytes
             ),
             asleep: status.weights?.released ?? false,
+            recovering: status.transport?.recovering ?? false,
             // The engine failed again and again; the server stays up but serves nothing.
             stopped: status.transport?.stopped == true ? status.transport?.error ?? "It stopped after failing repeatedly." : nil
         )
@@ -310,7 +335,7 @@ final class Server {
 
     private struct Status: Decodable {
         struct Weights: Decodable { let released: Bool? }
-        struct Transport: Decodable { let stopped: Bool?; let error: String? }
+        struct Transport: Decodable { let recovering: Bool?; let stopped: Bool?; let error: String? }
         struct Requests: Decodable { let completed: Int? }
         struct Request: Decodable {}
         struct Metrics: Decodable {
@@ -336,6 +361,7 @@ final class Server {
         /// Text, and images and PDFs with vision.
         let input_modalities: [String]?
         let reasoning: Reasoning?
+        let context_length: Int?
     }
 
     private func servedModel() async -> ServedModel? {

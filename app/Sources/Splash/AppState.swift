@@ -96,7 +96,7 @@ final class AppState {
         case .stopping:
             guard let next = server.next else { return "Stopping \(name)…" }
             return next == server.model ? "Restarting \(name)…" : "Switching to \(displayName(of: next))…"
-        case .ready: return "\(name) · \(server.asleep ? "Sleeping" : "Running")"
+        case .ready: return "\(name) · \(server.serving.rawValue)"
         case .failed: return "\(name) ran into a problem"
         }
     }
@@ -105,7 +105,12 @@ final class AppState {
     var markLook: MarkLook {
         switch server.phase {
         case .starting: .loading
-        case .ready: server.asleep ? .asleep : .on
+        case .ready:
+            switch server.serving {
+            case .running: .on
+            case .sleeping: .asleep
+            case .recovering: .loading
+            }
         case .failed: .failed
         case .stopped, .stopping: .off
         }
@@ -245,7 +250,7 @@ final class AppState {
     private var target: ChatTarget? {
         guard server.phase == .ready, let model = server.model else { return nil }
         return ChatTarget(url: server.settings.url, model: model, acceptsImages: server.acceptsImages, effort: effort,
-                          apiKey: server.settings.apiKey)
+                          context: server.context, apiKey: server.settings.apiKey)
     }
 
     /// The reasoning effort messages to the model that runs ask for, as chosen for it; empty for

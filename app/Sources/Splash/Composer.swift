@@ -109,12 +109,12 @@ struct Composer: View {
     }
 
     private var sendable: Bool {
-        !draft.isEmpty && state.server.phase == .ready && state.chats.streaming == nil
+        !draft.isEmpty && state.server.answers && state.chats.streaming == nil
             && (draft.images.isEmpty || state.server.acceptsImages)
     }
 
     private var help: String {
-        if state.server.phase != .ready { return "Available once a model is running" }
+        if !state.server.answers { return "Available once a model is running" }
         if !draft.images.isEmpty && !state.server.acceptsImages { return "This model can’t see images" }
         return "Send"
     }
@@ -157,6 +157,7 @@ private struct EngineSlot: View {
         let server = state.server
         let name = server.model.map(state.displayName(of:)) ?? ""
         let words = switch server.phase {
+        case .ready where server.recovering: state.status
         case .ready: name
         case .starting, .stopping: state.status
         case .failed: "\(name) ran into a problem"

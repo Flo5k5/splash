@@ -389,7 +389,12 @@ enum ContextLength {
 
     /// A length as the menu names it: 32K tokens, 1M tokens, 100,000 tokens.
     static func title(_ tokens: Int) -> String {
-        tokens % 1024 == 0 || tokens % 1_000_000 == 0 ? "\(text(tokens)) tokens" : "\(tokens.formatted()) tokens"
+        "\(figure(tokens)) tokens"
+    }
+
+    /// A length in short: 32K, 1M, 100,000.
+    static func figure(_ tokens: Int) -> String {
+        tokens % 1024 == 0 || tokens % 1_000_000 == 0 ? text(tokens) : tokens.formatted()
     }
 
     /// A length as it is typed, which `parse` reads back: 32K, 1M, 100000.

@@ -99,7 +99,7 @@ struct MenuBarPanel: View {
         case .stopping:
             guard let next = server.next else { return "Stopping…" }
             return next == server.model ? "Restarting…" : "Switching to \(state.displayName(of: next))…"
-        case .ready: return server.asleep ? "Sleeping" : "Running"
+        case .ready: return server.serving.rawValue
         case .failed: return server.running ? "Not responding" : "Ran into a problem"
         case .stopped: return "Not running"
         }

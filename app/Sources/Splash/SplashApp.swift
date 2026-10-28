@@ -50,7 +50,7 @@ struct SplashApp: App {
             MenuBarPanel()
                 .environment(state)
         } label: {
-            Image(nsImage: SplashMark.menuBarImage(serving: state.server.phase == .ready))
+            Image(nsImage: SplashMark.menuBarImage(serving: state.server.answers))
                 .accessibilityLabel("Splash")
         }
         .menuBarExtraStyle(.window)

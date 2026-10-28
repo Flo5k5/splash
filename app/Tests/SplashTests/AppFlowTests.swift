@@ -91,6 +91,7 @@ struct AppFlowTests {
         try await waitFor(state.server.step == .warming, "warming up")
         await Snapshot.save("server-warming", MainView().environment(state))
         try await ready()
+        #expect((state.server.context ?? 0) > 0)
         await Snapshot.save("server-ready", MainView().environment(state))
         let reply = try await chat("Reply with one word: hello")
         #expect(!reply.isEmpty)
