@@ -16,10 +16,9 @@ package-check:
 
 # dist/Splash.app, app/ around the runtime make package ships, signed ad hoc
 # or, with SIGN_IDENTITY, a Developer ID Application identity, for the
-# hardened runtime. dmg also wraps it in dist/Splash-RELEASE_VERSION.dmg, which
-# NOTARY_PROFILE, a notarytool keychain profile, notarizes.
+# hardened runtime. dmg also wraps it in dist/Splash-RELEASE_VERSION.dmg, for
+# testing: only release-app notarizes.
 SIGN_IDENTITY ?=
-NOTARY_PROFILE ?=
 APP_ARGS = --version "$(RELEASE_VERSION)" --macos-min "$(MACOS_MIN_VERSION)" \
 	$(if $(SIGN_IDENTITY),--sign "$(SIGN_IDENTITY)")
 .PHONY: app dmg check-app
@@ -27,21 +26,38 @@ app: install-environment all
 	$(PYTHON) dev/tools/package_app.py app $(APP_ARGS)
 
 dmg: install-environment all
-	$(PYTHON) dev/tools/package_app.py dmg $(APP_ARGS) \
-		$(if $(NOTARY_PROFILE),--notary-profile "$(NOTARY_PROFILE)")
+	$(PYTHON) dev/tools/package_app.py dmg $(APP_ARGS)
 
-# dist/appcast.xml, which offers dist/Splash-RELEASE_VERSION.dmg as the update
-# to the apps shipped, with RELEASE_NOTES, a Markdown file, signed with the
-# release key from the login keychain or SPARKLE_KEY_FILE (DEVELOPMENT.md,
-# Updates).
+# dist/release/RELEASE_VERSION, release RELEASE_VERSION of Splash, made from
+# its annotated tag and ready to publish by hand (DEVELOPMENT.md, Releases):
+# the app and its disk image signed with SIGN_IDENTITY, notarized with
+# NOTARY_PROFILE, a notarytool keychain profile, or NOTARY_KEY, an App Store
+# Connect API key's file, with NOTARY_KEY_ID and NOTARY_ISSUER, and stapled;
+# the command line's files package and package-bottle leave in dist/; the
+# appcast, with RELEASE_NOTES, a Markdown file outside the checkout, signed
+# with the release key from the login keychain or SPARKLE_KEY_FILE; and the
+# tap's formula and cask. DRY_RUN=1 signs ad hoc, prints what needs the
+# Developer ID or the notary service instead of running it, and writes
+# dist/release/RELEASE_VERSION-dry-run.
+NOTARY_PROFILE ?=
+NOTARY_KEY ?=
+NOTARY_KEY_ID ?=
+NOTARY_ISSUER ?=
 RELEASE_NOTES ?=
 SPARKLE_KEY_FILE ?=
-.PHONY: appcast
-appcast: install-environment
+DRY_RUN ?=
+RELEASE_ARGS = $(APP_ARGS) --notes "$(RELEASE_NOTES)" \
+	$(if $(NOTARY_PROFILE),--notary-profile "$(NOTARY_PROFILE)") \
+	$(if $(NOTARY_KEY),--notary-key "$(NOTARY_KEY)") \
+	$(if $(NOTARY_KEY_ID),--notary-key-id "$(NOTARY_KEY_ID)") \
+	$(if $(NOTARY_ISSUER),--notary-issuer "$(NOTARY_ISSUER)") \
+	$(if $(SPARKLE_KEY_FILE),--sparkle-key-file "$(SPARKLE_KEY_FILE)") \
+	$(if $(filter 1,$(DRY_RUN)),--dry-run)
+.PHONY: release-app
+release-app: install-environment all
 	@test -n "$(RELEASE_NOTES)" || { echo "set RELEASE_NOTES to the release notes, a Markdown file"; exit 1; }
-	$(PYTHON) dev/tools/appcast.py --version "$(RELEASE_VERSION)" \
-		--macos-min "$(MACOS_MIN_VERSION)" --notes "$(RELEASE_NOTES)" \
-		$(if $(SPARKLE_KEY_FILE),--key-file "$(SPARKLE_KEY_FILE)")
+	@test -z "$(filter-out 0 1,$(DRY_RUN))" || { echo "set DRY_RUN to 1 for a dry run, or leave it out"; exit 1; }
+	$(PYTHON) dev/tools/release_app.py $(RELEASE_ARGS)
 
 # The app's own tests; the Python ones cover what packages it.
 check-app:

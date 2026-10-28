@@ -54,6 +54,9 @@ IDENTIFIERS = {
     "python/bin/python3": f"{BUNDLE_ID}.python",
     "engine/splash": f"{BUNDLE_ID}.engine",
 }
+# The disk image's signing identifier; codesign would name it after its file,
+# which carries the version.
+IMAGE_IDENTIFIER = f"{BUNDLE_ID}.dmg"
 
 
 def short_version(version):
@@ -206,14 +209,15 @@ def assemble(app, products, version, macos_min):
     package.build_runtime(runtime, version)
 
 
-def codesign(path, identity, *options):
-    """Sign path ad hoc ("-") or with identity and the secure timestamp
-    notarization requires."""
+def codesign_command(path, identity, *options):
+    """The command that signs path ad hoc ("-") or with identity and the secure
+    timestamp notarization requires."""
     timestamp = "--timestamp=none" if identity == "-" else "--timestamp"
-    subprocess.run(
-        ["codesign", "--force", "--sign", identity, timestamp, *options, str(path)],
-        check=True,
-    )
+    return ["codesign", "--force", "--sign", identity, timestamp, *options, str(path)]
+
+
+def codesign(path, identity, *options):
+    subprocess.run(codesign_command(path, identity, *options), check=True)
 
 
 def sign(app, identity):
@@ -271,10 +275,10 @@ def check_signed(app):
     subprocess.run(["codesign", "--verify", "--deep", "--strict", str(app)], check=True)
 
 
-def build_image(app, image, identity, notary_profile):
-    """Write image, a DMG of app beside a link to /Applications, signed with
-    identity unless that is ad hoc, and notarized and stapled with
-    notary_profile when one is given."""
+def build_image(app, image, identity):
+    """Write image, a DMG of app beside a link to /Applications, compressed
+    with LZFSE (ULFO), as Sparkle recommends, rather than LZMA (ULMO), which
+    is slower to open, and signed with identity unless that is ad hoc."""
     with tempfile.TemporaryDirectory(
         prefix=".package-app-", dir=image.parent
     ) as temporary:
@@ -285,29 +289,28 @@ def build_image(app, image, identity, notary_profile):
         temporary_image = Path(temporary) / image.name
         subprocess.run(
             ["hdiutil", "create", "-volname", "Splash", "-srcfolder", str(folder)]
-            + ["-format", "ULMO", str(temporary_image)],
+            + ["-format", "ULFO", str(temporary_image)],
             check=True,
         )
         if identity != "-":
-            codesign(temporary_image, identity)
-        if notary_profile:
-            subprocess.run(
-                ["xcrun", "notarytool", "submit", str(temporary_image)]
-                + ["--keychain-profile", notary_profile, "--wait"],
-                check=True,
-            )
-            subprocess.run(
-                ["xcrun", "stapler", "staple", str(temporary_image)], check=True
-            )
-            subprocess.run(
-                ["spctl", "-a", "-t", "open", "--context", "context:primary-signature"]
-                + ["-v", str(temporary_image)],
-                check=True,
-            )
-            subprocess.run(
-                ["xcrun", "stapler", "validate", str(temporary_image)], check=True
-            )
+            codesign(temporary_image, identity, "--identifier", IMAGE_IDENTIFIER)
         temporary_image.replace(image)
+
+
+def build_app(dist, version, macos_min, identity):
+    """Build dist/Splash.app, signed with identity, and return it."""
+    products = build_products()
+    app = dist / "Splash.app"
+    with tempfile.TemporaryDirectory(prefix=".package-app-", dir=dist) as temporary:
+        bundle = Path(temporary) / app.name
+        assemble(bundle, products, version, macos_min)
+        signed = sign(bundle, identity)
+        check_signed(bundle)
+        if app.exists():
+            shutil.rmtree(app)
+        bundle.replace(app)
+    print(f"Built {app}; signed it and the {signed} Mach-O files of its runtime.")
+    return app
 
 
 def main(argv=None):
@@ -325,44 +328,26 @@ def main(argv=None):
         metavar="IDENTITY",
         help="codesign identity, a Developer ID Application; ad hoc (-) by default",
     )
-    parser.add_argument(
-        "--notary-profile",
-        metavar="NAME",
-        help="notarytool keychain profile to notarize the DMG with",
-    )
     args = parser.parse_args(argv)
     if not short_version(args.version):
         parser.error("release version must start with x.y.z, e.g. 1.4.1-36-g6e9dfe3f")
-    if args.notary_profile and (args.target != "dmg" or args.sign == "-"):
-        parser.error("--notary-profile notarizes a dmg signed with a --sign identity")
     dist = ROOT / "dist"
     dist.mkdir(exist_ok=True)
-    app = dist / "Splash.app"
     image = dist / f"Splash-{args.version}.dmg"
     if args.target == "dmg" and image.exists():
         parser.error(f"release already exists: {image}")
-    products = build_products()
-    with tempfile.TemporaryDirectory(prefix=".package-app-", dir=dist) as temporary:
-        bundle = Path(temporary) / app.name
-        assemble(bundle, products, args.version, args.macos_min)
-        signed = sign(bundle, args.sign)
-        check_signed(bundle)
-        if app.exists():
-            shutil.rmtree(app)
-        bundle.replace(app)
-    print(f"Built {app}; signed it and the {signed} Mach-O files of its runtime.")
+    app = build_app(dist, args.version, args.macos_min, args.sign)
     if args.target == "app":
         return
-    build_image(app, image, args.sign, args.notary_profile)
-    print(f"Built {image}.")
-    if not args.notary_profile:
-        print(
-            f"{image.name} is not notarized and is for local testing only: on another "
-            "Mac, Gatekeeper blocks the Splash.app copied from it until it is "
-            "allowed with Open Anyway in System Settings › Privacy & Security, or "
-            "its quarantine is removed with "
-            "xattr -dr com.apple.quarantine /Applications/Splash.app."
-        )
+    build_image(app, image, args.sign)
+    print(
+        f"Built {image}. It is not notarized and is for local testing only: on "
+        "another Mac, Gatekeeper blocks the Splash.app copied from it until it is "
+        "allowed with Open Anyway in System Settings › Privacy & Security, or "
+        "its quarantine is removed with "
+        "xattr -dr com.apple.quarantine /Applications/Splash.app. make "
+        "release-app makes a release (DEVELOPMENT.md, Releases)."
+    )
 
 
 if __name__ == "__main__":

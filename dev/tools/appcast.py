@@ -1,15 +1,12 @@
-#!/usr/bin/env python3
-"""Write dist/appcast.xml, the appcast a release of Splash for Mac carries: it
-offers the release's disk image as the update, with the release notes, signed
-with the release key."""
+"""The appcast a release of Splash for Mac carries (release_app.py): it offers
+the release's disk image as the update, with the release notes, signed with
+the release key."""
 
-import argparse
 import base64
 import os
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 from pathlib import Path
 from xml.etree import ElementTree
@@ -17,15 +14,14 @@ from xml.etree import ElementTree
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
+from dev.tools import package_app
+
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT))
-
-from dev.tools import package_app  # noqa: E402
-
 # The release key's item in the login keychain, apart from any other key
 # Sparkle's tools keep there.
 ACCOUNT = package_app.BUNDLE_ID
-# Sparkle's tools, which SwiftPM unpacks with the package app/Package.swift pins.
+# Sparkle's tools, which SwiftPM unpacks, as the app's build does, with the
+# package app/Package.swift pins.
 TOOLS = ROOT / "app/.build/artifacts/sparkle/Sparkle/bin"
 SPARKLE = "{http://www.andymatuschak.org/xml-namespaces/sparkle}"
 # A release's version, which its tag is: x.y.z, or x.y.z-rc.N for a release
@@ -89,48 +85,3 @@ def check(appcast, image, version, macos_min):
             f"{image.name} is not signed with the release key whose public half "
             "is SPARKLE_PUBLIC_KEY in dev/tools/package_app.py"
         ) from None
-
-
-def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--version", required=True, help="the release's version, x.y.z or x.y.z-rc.N"
-    )
-    parser.add_argument("--macos-min", required=True, help="minimum macOS, e.g. 26.4")
-    parser.add_argument(
-        "--notes", required=True, type=Path, help="the release notes, in Markdown"
-    )
-    parser.add_argument(
-        "--key-file",
-        type=Path,
-        help="the release key's private half, as generate_keys -x exports it; "
-        "the login keychain's by default",
-    )
-    args = parser.parse_args(argv)
-    if not RELEASE_VERSION.fullmatch(args.version):
-        parser.error("release version must be x.y.z or x.y.z-rc.N, e.g. 1.5.0")
-    if not package_app.SPARKLE_PUBLIC_KEY:
-        parser.error(
-            "SPARKLE_PUBLIC_KEY in dev/tools/package_app.py is empty: "
-            "apps built without it check for no update"
-        )
-    image = ROOT / "dist" / f"Splash-{args.version}.dmg"
-    if not image.is_file():
-        parser.error(f"no disk image to offer: {image}; make dmg builds it")
-    # Unpacks Sparkle's tools, unless a build has already.
-    subprocess.run(
-        ["swift", "package", "resolve", "--package-path", str(ROOT / "app")],
-        check=True,
-    )
-    appcast = generate(image, args.notes, args.version, args.key_file)
-    check(appcast, image, args.version, args.macos_min)
-    output = ROOT / "dist/appcast.xml"
-    output.write_bytes(appcast)
-    print(
-        f"Wrote {output}. Release {args.version} carries it beside {image.name} "
-        "and a copy of it named Splash.dmg."
-    )
-
-
-if __name__ == "__main__":
-    main()

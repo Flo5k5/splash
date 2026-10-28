@@ -12,6 +12,9 @@ from unittest import mock
 from dev.tools import package_app
 
 THIN_ARM64 = bytes.fromhex("cffaedfe0c000001")
+# The release key's public half, SPARKLE_PUBLIC_KEY, as generate_keys printed
+# it once (DEVELOPMENT.md, Updates); empty until then.
+RELEASE_KEY = ""
 SPARKLE = "APP/Contents/Frameworks/Sparkle.framework"
 
 
@@ -118,12 +121,17 @@ class PackageAppTests(unittest.TestCase):
         # Sparkle asks on the second launch whether to check by itself.
         self.assertNotIn("SUEnableAutomaticChecks", info)
 
-    def test_the_sparkle_public_key_is_empty_or_an_eddsa_public_key(self):
+    def test_the_sparkle_public_key_is_the_release_keys(self):
+        # Every app shipped holds it and takes only updates its private half
+        # signed; Sparkle replaces it only from a disk image the app's own
+        # team signed, so a new key strands every app of an earlier team
+        # (DEVELOPMENT.md, Moving to the organization account). RELEASE_KEY
+        # pins it, to be changed on purpose only.
+        self.assertEqual(package_app.SPARKLE_PUBLIC_KEY, RELEASE_KEY)
         # As generate_keys prints it: 32 bytes in base64. Sparkle refuses to
         # start with any other.
-        key = package_app.SPARKLE_PUBLIC_KEY
-        if key:
-            self.assertEqual(len(base64.b64decode(key, validate=True)), 32)
+        if RELEASE_KEY:
+            self.assertEqual(len(base64.b64decode(RELEASE_KEY, validate=True)), 32)
 
     def test_mach_o_files_are_found_by_content_not_by_name(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -319,19 +327,56 @@ class PackageAppTests(unittest.TestCase):
             ],
         )
 
-    def test_invalid_arguments_stop_before_the_build(self):
-        # Notarization takes a DMG signed with an identity, and the bundle's
-        # short version needs the release version's x.y.z.
-        for arguments in (
-            ["dmg", "--notary-profile", "splash"],
+    def image_commands(self, identity):
+        """The commands build_image runs for identity, the app as APP and the
+        disk image's temporary folder as FOLDER."""
+        with tempfile.TemporaryDirectory() as temporary:
+            app = Path(temporary) / "Splash.app"
+            app.mkdir()
+            image = Path(temporary) / "Splash-1.5.0.dmg"
+            commands = []
+
+            def run(command, check):
+                if command[0] == "hdiutil":
+                    Path(command[-1]).write_bytes(b"disk image")
+                commands.append(command)
+                return subprocess.CompletedProcess(command, 0)
+
+            with mock.patch.object(package_app.subprocess, "run", side_effect=run):
+                package_app.build_image(app, image, identity)
+            self.assertEqual(image.read_bytes(), b"disk image")
+            folder = str(Path(commands[0][-1]).parents[1])
+            return [
+                [
+                    argument.replace(str(app), "APP").replace(folder, "FOLDER")
+                    for argument in command
+                ]
+                for command in commands
+            ]
+
+    def test_the_disk_image_is_lzfse_and_signed_with_its_own_identifier(self):
+        built = [
+            ["ditto", "APP", "FOLDER/Splash/Splash.app"],
+            ["hdiutil", "create", "-volname", "Splash", "-srcfolder", "FOLDER/Splash"]
+            + ["-format", "ULFO", "FOLDER/Splash-1.5.0.dmg"],
+        ]
+        self.assertEqual(self.image_commands("-"), built)
+        identity = "Developer ID Application: Test (ABCDE12345)"
+        self.assertEqual(
+            self.image_commands(identity),
             [
-                "app",
-                "--sign",
-                "Developer ID Application: Test",
-                "--notary-profile",
-                "splash",
+                *built,
+                ["codesign", "--force", "--sign", identity, "--timestamp"]
+                + ["--identifier", "ai.inco.splash.dmg", "FOLDER/Splash-1.5.0.dmg"],
             ],
+        )
+
+    def test_invalid_arguments_stop_before_the_build(self):
+        # The bundle's short version needs the release version's x.y.z, and
+        # only make release-app notarizes.
+        for arguments in (
             ["dmg", "--version", "6e9dfe3f"],
+            ["dmg", "--notary-profile", "splash"],
         ):
             with (
                 self.subTest(arguments=arguments),

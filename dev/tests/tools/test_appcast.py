@@ -1,9 +1,7 @@
 import base64
-import io
 import subprocess
 import tempfile
 import unittest
-from contextlib import redirect_stderr
 from pathlib import Path
 from unittest import mock
 
@@ -150,35 +148,6 @@ class AppcastTests(unittest.TestCase):
             self.generate_command(Path("/keys/release")),
             [f"{tool}/generate_appcast", "--ed-key-file", "/keys/release", *options],
         )
-
-    def test_invalid_arguments_stop_before_the_appcast_is_made(self):
-        # The download is a release's asset, named after its tag, and the
-        # disk image make dmg built; the apps shipped hold the public key it is
-        # checked with.
-        for version, key in (
-            ("1.4.1-36-g6e9dfe3f", "key"),
-            ("1.5", "key"),
-            ("v1.5.0", "key"),
-            ("1.5.0-beta.1", "key"),
-            ("1.5.0", ""),
-            ("1.5.0-rc.1", ""),
-            ("1.5.0", "key"),
-        ):
-            with (
-                self.subTest(version=version, key=key),
-                mock.patch.object(package_app, "SPARKLE_PUBLIC_KEY", key),
-                mock.patch.object(appcast, "ROOT", self.image.parent),
-                mock.patch.object(
-                    appcast.subprocess,
-                    "run",
-                    side_effect=AssertionError("ran despite invalid arguments"),
-                ),
-                redirect_stderr(io.StringIO()),
-                self.assertRaises(SystemExit),
-            ):
-                appcast.main(
-                    ["--version", version, "--macos-min", "26.4", "--notes", "notes.md"]
-                )
 
 
 if __name__ == "__main__":
