@@ -60,6 +60,17 @@ struct ServeSettingsTests {
             == ["serve", "--model", "a/b:Q4", "--port", "8000", "--offline"])
     }
 
+    @Test func servesFilesOnThisMacUnderANameTheServerTakes() {
+        #expect(ServeSettings().serveArguments(model: "/models/My Model-UD-Q4_K_M.gguf")
+            == ["serve", "--model", "local/My-Model-UD-Q4_K_M", "--model-dir", "/models/My Model-UD-Q4_K_M.gguf",
+                "--port", "8000", "--offline"])
+        for (path, name) in [("/models/Qwen3.8 27B - Q4_K_M.gguf", "Qwen3.8-27B-Q4_K_M"), ("/models/model..v2", "model-v2"),
+                             ("/models/" + String(repeating: "x", count: 95) + "-y.gguf", String(repeating: "x", count: 95)),
+                             ("/models/repo.git", "repo"), ("/models/repo.git.git", "repo"), ("/models/ - .gguf", "model")] {
+            #expect(ServeSettings.localID(path) == "local/" + name)
+        }
+    }
+
     @Test func passesTheOptionsSetInTheTablesOrder() {
         let settings = ServeSettings(values: [
             "--port": "8100", "--max-context": "131072", "--max-memory": "48G", "--idle-release": "off",

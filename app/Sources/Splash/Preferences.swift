@@ -52,12 +52,29 @@ struct ServeSettings: Equatable {
         defaults.set(values, forKey: Preference.launchOptions)
     }
 
+    /// What `splash serve` takes to serve `model`, a Hugging Face ID or the path of model files on
+    /// this Mac, with these options.
     func serveArguments(model: String) -> [String] {
-        var arguments = ["serve", "--model", model, "--port", String(port), "--offline"]
+        let source = model.hasPrefix("/") ? ["--model", Self.localID(model), "--model-dir", model] : ["--model", model]
+        var arguments = ["serve"] + source + ["--port", String(port), "--offline"]
         for option in LaunchOption.all where option.flag != "--port" && option.applies(self) {
             arguments += option.arguments(values[option.flag])
         }
         return arguments
+    }
+
+    /// The ID the API reports for the model files at `path`: local/ and the file's or folder's name,
+    /// made a repository name as the server takes one: each run of other characters than letters,
+    /// digits and _ becomes one -, unless it is a single . or -; neither begins or ends the name, of
+    /// at most 96 characters, nor does .git end it.
+    static func localID(_ path: String) -> String {
+        var name = URL(filePath: path).lastPathComponent
+        if name.hasSuffix(".gguf") { name.removeLast(5) }
+        name = name.replacing(/[^A-Za-z0-9_]{2,}|[^A-Za-z0-9_.\-]/, with: "-")
+        let edges = CharacterSet(charactersIn: "-.")
+        name = String(name.trimmingCharacters(in: edges).prefix(96)).trimmingCharacters(in: edges)
+        name = name.replacing(/(\.git)+$/, with: "")
+        return "local/" + (name.isEmpty ? "model" : name)
     }
 
     /// What the server's environment adds: the API key it asks for.
