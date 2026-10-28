@@ -233,7 +233,7 @@ def serve(args):
     if args.offline:
         # The installer and the server both read it.
         os.environ["HF_HUB_OFFLINE"] = "1"
-    if sys.flags.dont_write_bytecode:
+    if sys.dont_write_bytecode:
         # A child inherits the environment, not -B: every Python program
         # serve starts, down to the server's PDF workers, writes no bytecode
         # either, so a runtime inside a signed app never gains __pycache__

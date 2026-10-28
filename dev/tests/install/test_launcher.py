@@ -13,7 +13,6 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
 from dev.tests.server_fixtures import keep_stop_signals, server_arguments
@@ -1271,7 +1270,7 @@ class LauncherTests(unittest.TestCase):
         # launcher run with -B or PYTHONDONTWRITEBYTECODE gives the installer
         # and the server PYTHONDONTWRITEBYTECODE, which the server's PDF
         # workers inherit from it.
-        for flag in (0, 1):
+        for flag in (False, True):
             with (
                 self.subTest(dont_write_bytecode=flag),
                 tempfile.TemporaryDirectory() as temporary,
@@ -1284,11 +1283,7 @@ class LauncherTests(unittest.TestCase):
                     seen["installer"] = os.environ.get("PYTHONDONTWRITEBYTECODE")
 
                 with (
-                    mock.patch.object(
-                        launcher.sys,
-                        "flags",
-                        SimpleNamespace(dont_write_bytecode=flag),
-                    ),
+                    mock.patch.object(launcher.sys, "dont_write_bytecode", flag),
                     mock.patch.object(launcher, "RUNTIME_DIR", runtime),
                     mock.patch.object(launcher.socket, "socket"),
                     mock.patch.object(
