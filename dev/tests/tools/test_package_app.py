@@ -1,3 +1,4 @@
+import base64
 import io
 import plistlib
 import re
@@ -11,6 +12,7 @@ from unittest import mock
 from dev.tools import package_app
 
 THIN_ARM64 = bytes.fromhex("cffaedfe0c000001")
+SPARKLE = "APP/Contents/Frameworks/Sparkle.framework"
 
 
 class PackageAppTests(unittest.TestCase):
@@ -39,9 +41,10 @@ class PackageAppTests(unittest.TestCase):
                 self.assertEqual(package_app.short_version(version), short)
 
     def test_info_plist_describes_the_bundle_assemble_lays_out(self):
-        info = plistlib.loads(
-            plistlib.dumps(package_app.info_plist("1.4.1-36-g6e9dfe3f", "1505", "26.4"))
-        )
+        # Without a release key; the next test adds the keys that come with one.
+        with mock.patch.object(package_app, "SPARKLE_PUBLIC_KEY", ""):
+            info = package_app.info_plist("1.4.1-36-g6e9dfe3f", "1505", "26.4")
+        info = plistlib.loads(plistlib.dumps(info))
         self.assertEqual(
             info,
             {
@@ -59,8 +62,32 @@ class PackageAppTests(unittest.TestCase):
                 "NSHighResolutionCapable": True,
                 "NSAppTransportSecurity": {"NSAllowsLocalNetworking": True},
                 "NSHumanReadableCopyright": "Copyright © Inco AI",
+                "SUFeedURL": "https://github.com/incoai/splash/releases/latest/"
+                "download/appcast.xml",
             },
         )
+
+    def test_the_updater_checks_only_with_the_release_keys_public_half(self):
+        # Without SUPublicEDKey the app leaves Sparkle off (Updates.swift);
+        # with it, Sparkle checks a download's signature before it opens it.
+        with mock.patch.object(package_app, "SPARKLE_PUBLIC_KEY", ""):
+            info = package_app.info_plist("1.5.0", "1600", "26.4")
+        self.assertNotIn("SUPublicEDKey", info)
+        self.assertNotIn("SUVerifyUpdateBeforeExtraction", info)
+        key = base64.b64encode(bytes(range(32))).decode()
+        with mock.patch.object(package_app, "SPARKLE_PUBLIC_KEY", key):
+            info = package_app.info_plist("1.5.0", "1600", "26.4")
+        self.assertEqual(info["SUPublicEDKey"], key)
+        self.assertIs(info["SUVerifyUpdateBeforeExtraction"], True)
+        # Sparkle asks on the second launch whether to check by itself.
+        self.assertNotIn("SUEnableAutomaticChecks", info)
+
+    def test_the_sparkle_public_key_is_empty_or_an_eddsa_public_key(self):
+        # As generate_keys prints it: 32 bytes in base64. Sparkle refuses to
+        # start with any other.
+        key = package_app.SPARKLE_PUBLIC_KEY
+        if key:
+            self.assertEqual(len(base64.b64decode(key, validate=True)), 32)
 
     def test_mach_o_files_are_found_by_content_not_by_name(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -86,6 +113,50 @@ class PackageAppTests(unittest.TestCase):
             (root / "lib/empty").write_bytes(b"")
             (root / "lib/folder.so").mkdir()
             self.assertEqual(package_app.mach_o_files(root), sorted(binaries))
+
+    def test_sparkle_is_copied_with_its_links_and_without_its_xpc_services(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            framework = Path(temporary) / "products/Sparkle.framework"
+            version = framework / "Versions/B"
+            for folder in ("Resources", "Updater.app/Contents/MacOS"):
+                (version / folder).mkdir(parents=True)
+            for folder in ("Installer.xpc", "Downloader.xpc"):
+                (version / "XPCServices" / folder / "Contents").mkdir(parents=True)
+            for name in ("Sparkle", "Autoupdate", "Updater.app/Contents/MacOS/Updater"):
+                (version / name).write_bytes(THIN_ARM64)
+            (framework / "Versions/Current").symlink_to("B")
+            for name in ("Sparkle", "Autoupdate", "Updater.app", "Resources"):
+                (framework / name).symlink_to(f"Versions/Current/{name}")
+            (framework / "XPCServices").symlink_to("Versions/Current/XPCServices")
+            frameworks = Path(temporary) / "Splash.app/Contents/Frameworks"
+            frameworks.parent.mkdir(parents=True)
+
+            package_app.add_sparkle(frameworks, framework)
+
+            copy = frameworks / "Sparkle.framework"
+            self.assertEqual(
+                sorted(
+                    str(path.relative_to(copy))
+                    + (" -> " + str(path.readlink()) if path.is_symlink() else "")
+                    for path in copy.rglob("*")
+                ),
+                [
+                    "Autoupdate -> Versions/Current/Autoupdate",
+                    "Resources -> Versions/Current/Resources",
+                    "Sparkle -> Versions/Current/Sparkle",
+                    "Updater.app -> Versions/Current/Updater.app",
+                    "Versions",
+                    "Versions/B",
+                    "Versions/B/Autoupdate",
+                    "Versions/B/Resources",
+                    "Versions/B/Sparkle",
+                    "Versions/B/Updater.app",
+                    "Versions/B/Updater.app/Contents",
+                    "Versions/B/Updater.app/Contents/MacOS",
+                    "Versions/B/Updater.app/Contents/MacOS/Updater",
+                    "Versions/Current -> B",
+                ],
+            )
 
     def compile_icon(self, stdout, written=(), returncode=0):
         """Run compile_icon with actool printing stdout, writing the files
@@ -137,10 +208,14 @@ class PackageAppTests(unittest.TestCase):
 
     def signing_commands(self, identity):
         """The commands sign runs for a runtime of three Mach-O files, a link
-        to one and a script: runtime paths relative to the runtime, the app
-        as APP."""
+        to one and a script, beside Sparkle.framework: runtime paths relative
+        to the runtime, the app as APP."""
         with tempfile.TemporaryDirectory() as temporary:
             app = Path(temporary) / "Splash.app"
+            sparkle = app / "Contents/Frameworks/Sparkle.framework/Versions/B"
+            (sparkle / "Updater.app/Contents/MacOS").mkdir(parents=True)
+            for name in ("Sparkle", "Autoupdate", "Updater.app/Contents/MacOS/Updater"):
+                (sparkle / name).write_bytes(THIN_ARM64)
             runtime = app / "Contents/Resources/splash"
             for folder in ("python/bin", "python/lib", "engine", "install"):
                 (runtime / folder).mkdir(parents=True)
@@ -175,6 +250,9 @@ class PackageAppTests(unittest.TestCase):
                     "python/bin/python3.13",
                 ],
                 [*adhoc, "python/lib/x.so"],
+                [*adhoc, f"{SPARKLE}/Versions/B/Autoupdate"],
+                [*adhoc, f"{SPARKLE}/Versions/B/Updater.app"],
+                [*adhoc, SPARKLE],
                 [*adhoc, "APP"],
                 ["codesign", "--verify", "--strict", "engine/splash"],
                 ["codesign", "--verify", "--strict", "python/bin/python3.13"],
@@ -188,7 +266,7 @@ class PackageAppTests(unittest.TestCase):
         signed = ["codesign", "--force", "--sign", identity, "--timestamp"]
         signed += ["--options", "runtime"]
         self.assertEqual(
-            self.signing_commands(identity)[:4],
+            self.signing_commands(identity)[:7],
             [
                 [*signed, "--identifier", "ai.inco.splash.engine", "engine/splash"],
                 [
@@ -198,6 +276,9 @@ class PackageAppTests(unittest.TestCase):
                     "python/bin/python3.13",
                 ],
                 [*signed, "python/lib/x.so"],
+                [*signed, f"{SPARKLE}/Versions/B/Autoupdate"],
+                [*signed, f"{SPARKLE}/Versions/B/Updater.app"],
+                [*signed, SPARKLE],
                 [*signed, "APP"],
             ],
         )
@@ -220,7 +301,7 @@ class PackageAppTests(unittest.TestCase):
                 self.subTest(arguments=arguments),
                 mock.patch.object(
                     package_app,
-                    "build_executable",
+                    "build_products",
                     side_effect=AssertionError("built despite invalid arguments"),
                 ),
                 redirect_stderr(io.StringIO()),

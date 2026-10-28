@@ -30,6 +30,19 @@ dmg: install-environment all
 	$(PYTHON) dev/tools/package_app.py dmg $(APP_ARGS) \
 		$(if $(NOTARY_PROFILE),--notary-profile "$(NOTARY_PROFILE)")
 
+# dist/appcast.xml, which offers dist/Splash-RELEASE_VERSION.dmg as the update
+# to the apps shipped, with RELEASE_NOTES, a Markdown file, signed with the
+# release key from the login keychain or SPARKLE_KEY_FILE (DEVELOPMENT.md,
+# Updates).
+RELEASE_NOTES ?=
+SPARKLE_KEY_FILE ?=
+.PHONY: appcast
+appcast: install-environment
+	@test -n "$(RELEASE_NOTES)" || { echo "set RELEASE_NOTES to the release notes, a Markdown file"; exit 1; }
+	$(PYTHON) dev/tools/appcast.py --version "$(RELEASE_VERSION)" \
+		--macos-min "$(MACOS_MIN_VERSION)" --notes "$(RELEASE_NOTES)" \
+		$(if $(SPARKLE_KEY_FILE),--key-file "$(SPARKLE_KEY_FILE)")
+
 # The app's own tests; the Python ones cover what packages it.
 check-app:
 	swift test --package-path app
