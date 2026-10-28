@@ -270,6 +270,34 @@ class RequestFailureTests(HarnessTestCase):
         status, _, _ = harness.request("POST", "/v1/chat/completions", chat_body())
         self.assertEqual(status, 200)
 
+    def test_capacity_failure_of_a_closed_ssd_cache_does_not_blame_memory(self):
+        native = (
+            "requests past 147449 tokens keep their KV on the SSD cache, "
+            "which takes no writes"
+        )
+        records = []
+        runtime = FakeRuntime(
+            Plan(
+                exception=api.engine_runtime.RequestFailed(
+                    1, b"capacity_exhausted", native.encode(), retryable=False
+                )
+            ),
+            Plan([[4]]),
+        )
+        harness = self.harness(runtime, request_logger=records.append)
+        status, _, payload = harness.request(
+            "POST", "/v1/chat/completions", chat_body()
+        )
+        error = json.loads(payload)["error"]
+        self.assertEqual(status, 400)
+        self.assertEqual(error["code"], "capacity_exhausted")
+        self.assertEqual(error["message"], native)
+        self.assertNotIn("--max-memory", error["message"])
+        # The console line names the engine's reason.
+        failed = [record for record in records if record["outcome"] == "error"]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]["engine_reason"], native)
+
     def test_disk_quota_failure_is_a_bad_request_naming_the_ssd_cache(self):
         native = (
             "this request's KV needs needed_bytes=1703936 of the SSD cache, which may "
