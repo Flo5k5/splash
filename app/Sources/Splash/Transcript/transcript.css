@@ -1,8 +1,7 @@
-/* The Chat's transcript, as the app's native views drew it: a 680 pt column of messages, the
-   system's reading font and colors, following the app's appearance. Lines are as tall as SwiftUI
-   sets the system font, which is no fixed share of its size: 19 pt at 15, 15 at 12, 24 at 20; text
-   with room between its lines, as a native view's lineSpacing gave it, has that room between lines
-   alone, none over the first or under the last. */
+/* The Chat's transcript: a 680 pt column of messages, the system's reading font and colors,
+   following the app's appearance. Lines are as tall as SwiftUI sets the system font, which is no
+   fixed share of its size: 19 pt at 15, 15 at 12, 24 at 20; text with room between its lines has
+   that room between lines alone, none over the first or under the last. */
 
 :root {
   color-scheme: light dark;
@@ -11,8 +10,8 @@
   --tertiary: -apple-system-tertiary-label;
   --quaternary: -apple-system-quaternary-label;
   --separator: -apple-system-separator;
-  /* The fills the native views drew, which WebKit doesn't name, as shares of the quaternary label
-     color: the user's messages, inline code (the tertiary system fill), a button under the pointer. */
+  /* Fills WebKit doesn't name, as shares of the quaternary label color: the user's messages,
+     inline code (the tertiary system fill), a button under the pointer. */
   --bubble: color-mix(in srgb, var(--quaternary) 70%, transparent);
   --fill: color-mix(in srgb, var(--quaternary) 48%, transparent);
   --hover: color-mix(in srgb, var(--quaternary) 75%, transparent);
@@ -281,7 +280,7 @@ a {
   text-decoration: none;
 }
 
-/* Filled as high as the line's text reaches, as the native fill was. */
+/* Filled as high as the line's text reaches. */
 code {
   padding-top: 1.5px;
   font: 13.5px ui-monospace, monospace;
@@ -342,7 +341,7 @@ hr {
 }
 
 /* Code, outlined, apart from what is said, which the user's messages show filled; the outline is
-   inside its edge, as the native one was, so that it takes no room. */
+   inside its edge, so that it takes no room. */
 figure.code {
   overflow: hidden;
   outline: 1px solid var(--separator);

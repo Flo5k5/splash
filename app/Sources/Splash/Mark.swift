@@ -91,12 +91,13 @@ enum MarkLook: Equatable {
 }
 
 /// The server's state in the mark, in a slot of its own size: the surface alone, grey, while nothing
-/// runs; the splash rising and falling back while a model loads into memory; risen, in the icon's
-/// color, while one serves; faint while it sleeps; a warning sign when it failed. It moves only
-/// while weights load, never while the model answers. The words beside it say what it shows.
+/// runs; the splash rising and falling back while a model starts, or while the engine starts again
+/// after failing; risen, in the icon's color, while one serves; faint while it sleeps; a warning
+/// sign when it failed. It moves only then, never while the model answers. The words beside it say
+/// what it shows.
 struct StatusMark: View {
     let look: MarkLook
-    /// When the load began, where the slide starts lined up.
+    /// When the model began to start, where the slide starts lined up.
     let since: Date
     var size: CGFloat = 14
 

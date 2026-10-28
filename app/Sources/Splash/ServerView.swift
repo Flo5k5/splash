@@ -304,7 +304,7 @@ private struct ActivitySection: View {
 }
 
 /// How the model that runs does since it started: how fast it answers and reads prompts on average,
-/// how soon an answer starts; and the context and memory it holds.
+/// how soon an answer starts; the context limit it serves, and the memory it holds now.
 private struct ActivityFigures: View {
     let activity: Server.Activity
     let context: Int?

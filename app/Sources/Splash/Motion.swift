@@ -2,9 +2,10 @@ import AppKit
 import SwiftUI
 
 /// The app's motion, in three meanings, and the one place SwiftUI's durations and curves are named
-/// (AppKit's twins, a popup's fade and the scroll to options opened, keep the same values):
+/// (their twins keep the same values: AppKit's, in a popup's fade and the scroll to options opened,
+/// and the transcript page's `--quick`, `--settle` and glide to the latest message):
 /// - `quick`, touch and feedback: a field's ring, a check, the mark's color, a reply's actions
-///   coming into view; a hover highlight comes at once;
+///   coming into view; a SwiftUI hover highlight comes at once, the page's within `quick`;
 /// - `settle`, a change of state or shape: a disclosure, rows and sections coming and going, the
 ///   control bar's stage, the switch between the Server and the Chat, figures that change;
 /// - `glide`, travel: a scroll to the latest message or to options opened, the mark taking its

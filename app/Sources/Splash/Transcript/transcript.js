@@ -1,7 +1,6 @@
-// The Chat's transcript: the open conversation as the app sends it (Transcript.swift), drawn as the
-// app's native views drew it. The app calls setup once the page has loaded, show with the whole
-// conversation when it changes, and update with the reply that streams; the page sends back what
-// to copy, and Ask Again.
+// The Chat's transcript: the open conversation as the app sends it (Transcript.swift). The app
+// calls setup once the page has loaded, show with the whole conversation when it changes, and
+// update with the reply that streams; the page sends back what to copy, and Ask Again.
 'use strict';
 
 const transcript = (() => {
@@ -18,8 +17,8 @@ const transcript = (() => {
   const copyGlyphs = '<span class="glyph copy"></span><span class="glyph check"></span>';
   const bullets = ['•', '◦', '▪'];
 
-  // A reply's Markdown as the native renderer read it: no raw HTML, its line breaks kept, only web
-  // and mail links, and an image as a link to it, so that a reply never loads anything by itself.
+  // A reply's Markdown: no raw HTML, its line breaks kept, only web and mail links, and an image as
+  // a link to it, so that a reply never loads anything by itself.
   const markdown = window.markdownit ? configured(window.markdownit({html: false, breaks: true})) : null;
 
   function configured(markdown) {
@@ -28,7 +27,7 @@ const transcript = (() => {
     markdown.core.ruler.push('splash', state => {
       let cell = false;
       for (const token of state.tokens) {
-        // A list item's text is a paragraph, tight list or loose, as the native views drew both.
+        // A list item's text is a paragraph, in a tight list or a loose one.
         if (token.type === 'paragraph_open' || token.type === 'paragraph_close') token.hidden = false;
         if (token.type === 'th_open' || token.type === 'td_open') cell = true;
         if (token.type === 'th_close' || token.type === 'td_close') cell = false;
@@ -60,7 +59,7 @@ const transcript = (() => {
     };
     rules.list_item_close = () => '</div></li>';
     // A table scrolls sideways when it is wider than the reply; its cells wrap at a width of their
-    // own and line up at their start, as the native grid's did.
+    // own and line up at their start.
     rules.table_open = (tokens, index, options, env, self) => '<div class="table">' + self.renderToken(tokens, index, options);
     rules.table_close = (tokens, index, options, env, self) => self.renderToken(tokens, index, options) + '</div>';
     for (const cell of ['th', 'td']) {
@@ -213,9 +212,9 @@ const transcript = (() => {
     element.querySelector('.actions').setAttribute('aria-hidden', message.live);
   }
 
-  // The line over a reply: Reading or Thinking while it waits, which shows half a second into the
-  // wait, so that a quick answer doesn't flash it; what the thinking took after. It opens to the
-  // thinking, of which it shows the latest lines while the model thinks.
+  // The line over a reply: its verb while it waits, which shows half a second into the wait, so
+  // that a quick answer doesn't flash it; what the thinking took after. It opens to the thinking,
+  // of which it shows the latest lines while the model thinks.
   function drawLine(element, message) {
     const line = element.querySelector('.line');
     line.hidden = message.line === null;

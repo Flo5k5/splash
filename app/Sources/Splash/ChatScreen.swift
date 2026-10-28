@@ -1,11 +1,7 @@
 import SwiftUI
 
-extension Font {
-    /// What answers, messages and the composer are written in.
-    static let reading = Font.system(size: 15)
-}
-
-/// The width of the conversation and of the composer under it.
+/// The width of the composer: the transcript's column (`main`'s max-width in
+/// Transcript/transcript.css), so that the two line up.
 private let column: CGFloat = 680
 
 /// The conversations at the side of the open one. The window's toolbar is the Server's, so the

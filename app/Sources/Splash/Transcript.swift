@@ -2,13 +2,12 @@ import AppKit
 import SwiftUI
 import WebKit
 
-/// The open conversation, shown as a web page in the system's WebKit, as Claude's and Codex's
-/// desktop apps show theirs: one page, its text selectable across messages and scrolled by WebKit
-/// off the main thread, where every message's text was an AppKit text view of its own. The page
-/// (Transcript/transcript.html, with the runtime's markdown-it and highlight.js) loads once; after
-/// that only data goes to it, as JSON: the whole conversation when it changes, and while a reply
-/// streams, that reply alone. The page outlives the Chat it shows in, so that showing the Chat
-/// again, or another conversation, never loads it again.
+/// The open conversation, shown as a web page in the system's WebKit: one page, its text selectable
+/// across messages and scrolled by WebKit off the main thread. The page (Transcript/transcript.html,
+/// with the runtime's markdown-it and highlight.js) loads once; after that only data goes to it, as
+/// JSON: the whole conversation when it changes, and while a reply streams, that reply alone. The
+/// page outlives the Chat it shows in, so that showing the Chat again, or another conversation,
+/// never loads it again.
 @MainActor
 final class Transcript: NSObject {
     /// What Ask Again asks of the app.
@@ -270,9 +269,10 @@ struct TranscriptMessage: Encodable, Equatable {
     }
 }
 
-/// The line over a reply, of what comes before its answer: Reading while the prompt is read, then
-/// Thinking while the model thinks, and once it answers, what the thinking took. While it waits,
-/// the page counts the seconds since `since` itself, once a second, from the first.
+/// The line over a reply, of what comes before its answer: Loading into memory while a model the
+/// idle release put to sleep loads again, Reading while the prompt is read, then Thinking while the
+/// model thinks, and once it answers, what the thinking took. While it waits, the page counts the
+/// seconds since `since` itself, once a second, from the first.
 struct ReplyLine: Encodable, Equatable {
     let verb: String
     /// Its figures, in a fainter tone.

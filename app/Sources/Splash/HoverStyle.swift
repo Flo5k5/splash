@@ -50,7 +50,7 @@ extension View {
 }
 
 /// A button that copies, and says so: its label shows a check for 1.5 s, which another copy holds
-/// longer. The app's one confirmation of a copy.
+/// longer, as the transcript page's copy buttons do.
 struct CopyButton<Label: View>: View {
     let copy: () -> Void
     @ViewBuilder let label: (_ copied: Bool) -> Label

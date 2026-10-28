@@ -97,7 +97,7 @@ struct TranscriptTests {
         }
     }
 
-    @Test func thePageDrawsRepliesAsTheNativeViewsDid() async throws {
+    @Test func thePageDrawsRepliesSafelyAndAsksAgain() async throws {
         try Showcase.requireScripts()
         let transcript = Transcript(runtime: Showcase.runtime)
         var askedAgain = 0
