@@ -318,7 +318,7 @@ private struct ActivityFigures: View {
             Figure(value: activity.reading.map(Format.whole), unit: "tok/s", caption: "Reading prompts",
                    help: "Average since the model started")
             Figure(value: latency?.0, unit: latency?.1, caption: "To first token", help: "Median since the model started")
-            Figure(value: context.map(ContextLength.figure), caption: "Context", help: "The tokens a conversation can hold")
+            Figure(value: context.map(ContextLength.figure), caption: "Context limit", help: "The tokens a conversation can hold")
             Figure(value: memory?.0, unit: memory?.1, caption: "Memory", help: "What the engine holds in memory now")
         }
         .padding(.vertical, 6)
