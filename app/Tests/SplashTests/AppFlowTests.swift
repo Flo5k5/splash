@@ -167,6 +167,25 @@ struct AppFlowTests {
         try await stop()
     }
 
+    @Test func modelFilesOnThisMacStartAndAnswer() async throws {
+        // The GGUF a download of the model left in the Hugging Face cache, added as files on this Mac.
+        try await install(model)
+        let file = try #require(Self.gguf(of: model), "no GGUF of \(model) in the Hugging Face cache")
+        state.addLocal(file)
+        #expect(state.selection == file.path && state.isInstalled(file.path))
+        state.start(file.path)
+        try await ready()
+        await Snapshot.save("server-local", MainView().environment(state))
+        // The API names it by the files' name, and the app's chat answers with it.
+        let (data, _) = try await URLSession.shared.data(from: state.server.settings.url.appending(path: "v1/models"))
+        struct Models: Decodable { struct Model: Decodable { let id: String }; let data: [Model] }
+        #expect(try JSONDecoder().decode(Models.self, from: data).data.first?.id == ServeSettings.localID(file.path))
+        try await converse("Say hi.")
+        try await stop()
+        state.removeLocal(file.path)
+        #expect(!state.isInstalled(file.path))
+    }
+
     @Test func aStartThatFailsSaysWhy() async throws {
         state.options["--max-memory"] = "1G"
         defer { state.options = Self.defaults }
@@ -299,6 +318,18 @@ struct AppFlowTests {
     private func stop() async throws {
         state.server.stop()
         try await waitFor(!state.server.running, "stopped", seconds: 60)
+    }
+
+    /// The file of `model`, a GGUF's `OWNER/REPO:VARIANT`, that a download left in the Hugging Face
+    /// cache.
+    private static func gguf(of model: String) -> URL? {
+        let parts = model.split(separator: ":")
+        guard parts.count == 2 else { return nil }
+        let cache = environment["HF_HUB_CACHE"].map { URL(filePath: $0) }
+            ?? FileManager.default.homeDirectoryForCurrentUser.appending(path: ".cache/huggingface/hub")
+        let snapshots = cache.appending(path: "models--\(parts[0].replacing("/", with: "--"))/snapshots")
+        let files = FileManager.default.enumerator(at: snapshots, includingPropertiesForKeys: nil)?.allObjects as? [URL] ?? []
+        return files.first { $0.lastPathComponent.hasSuffix("\(parts[1]).gguf") }
     }
 
     /// Sends `prompt` as the app's composer does and waits for the reply to end.
