@@ -72,7 +72,8 @@ Zsh after `compinit`, or `install/completions/splash.fish` for fish.
 
 Completion suggests commands, the models in `install/suggested-models.tsv`
 (the list the Mac app offers too) and installed models, a GGUF's
-`OWNER/REPO:VARIANT` included, without network access.
+`OWNER/REPO:VARIANT` included, without network access. It also completes local
+paths for `--model-dir`, `--draft-model` and `--mmproj`.
 
 ## Server configuration
 
@@ -82,7 +83,9 @@ Completion suggests commands, the models in `install/suggested-models.tsv`
 
 | Option | Default | Purpose |
 | --- | --- | --- |
-| `--model` | Required | The upstream model, `OWNER/REPO`, or a GGUF's `OWNER/REPO:VARIANT`; or the absolute path of model files on this Mac. See [upstream model loading](#upstream-model-loading) and [local model files](#local-model-files). |
+| `--model` | Required | The upstream model, `OWNER/REPO`, or a GGUF's `OWNER/REPO:VARIANT`; with `--model-dir`, the name the API reports. See [upstream model loading](#upstream-model-loading). |
+| `--model-dir` | None | Prepare a local GGUF file or GGUF/MLX model directory without the Hub. See [local model files](#local-model-files). |
+| `--mmproj` | None | A local GGUF target's vision projector; requires `--model-dir`. |
 | `--revision` | Default branch | Select an upstream target branch, tag, or commit. See [revisions](#revisions). |
 | `--draft-model` | The family's released DFlash2 draft | A compatible repository or local directory in its place; required for a family without a released draft. See [drafts](#drafts). |
 | `--language-only` | Off | Skip vision loading; image and PDF input is rejected. See [vision](#vision). |
@@ -994,14 +997,23 @@ below, `seed`, `stop`, `priority`, `timeout` and `stream` with
 `echo`, `logprobs`, `best_of` and `n` other than 1 are rejected.
 
 Responses takes `input` and `instructions`, function `tools` and `namespace`
-groups of them, `tool_choice`, `parallel_tool_calls`, `reasoning.effort`,
-`thinking_token_budget`, `text.format` for structured output,
-`max_output_tokens`, the sampling fields, Chat's `ignore_eos`,
-`chat_template_kwargs` and `preserve_thinking`, and `store` and
-`previous_response_id` ([Responses state](#responses-state)). Reasoning comes
-back as `reasoning` output items. `conversation`, `background: true` and
+groups of them, custom (freeform) `tools`, `tool_choice`,
+`parallel_tool_calls`, `reasoning.effort`, `thinking_token_budget`,
+`text.format` for structured output, `max_output_tokens`, the sampling fields,
+Chat's `ignore_eos`, `chat_template_kwargs` and `preserve_thinking`, and `store`
+and `previous_response_id` ([Responses state](#responses-state)). Reasoning
+comes back as `reasoning` output items. `conversation`, `background: true` and
 `truncation` other than `disabled` return 400; Splash compacts nothing, so
 `context_management` leaves the input as sent.
+
+A custom tool, such as Codex's `apply_patch`, reaches the model as a function
+of one string parameter, `input`, whose description carries the tool's
+`format` (its grammar, or plain text); the grammar describes the input and
+does not constrain it. A call comes back as a `custom_tool_call` item with the
+input as the model wrote it, streamed as one
+`response.custom_tool_call_input.delta` and `.done` when the call closes;
+`custom_tool_call` and `custom_tool_call_output` items are taken as input, and
+`tool_choice` `{"type": "custom", "name": ...}` names one.
 
 Messages takes `max_tokens`, `system`, `messages`, custom `tools` (every one
 declared in the prompt, `defer_loading` ones too, so a `tool_result`'s
@@ -2170,6 +2182,35 @@ message for every family, so a developer message renders as `<|system|>`.
 
 ### Local model files
 
+`splash serve --model-dir PATH` prepares the target at `PATH` with
+`install.local.prepare_local_model` and starts the server on the directory it
+returns. `PATH` names a GGUF file, any part of a split GGUF, a directory
+holding one GGUF target, or an MLX model directory. It names the target
+directly, rather than a library to search by repository ID:
+
+```sh
+splash serve --model local/qwen \
+  --model-dir /models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf \
+  --draft-model /models/Qwen3.8-27B-DFlash2 \
+  --mmproj /models/Qwen3.8-27B-GGUF/mmproj-BF16.gguf
+```
+
+`--model` remains required in `OWNER/REPO[:VARIANT]` form as the API's model
+name; it selects no files and makes no Hub request in this mode. Preparation
+never contacts the Hub, whether or not `--offline` is set. `--draft-model`
+must name a local compatible DFlash2 draft directory; without one, the
+family's released draft must already be in the Hub cache at the commit its
+default branch records, as `hf download REPO` or `splash serve` leaves it. A
+missing draft is refused with its download instruction; it is never downloaded
+implicitly.
+
+`--mmproj` supplies a local BF16, F32 or F16 GGUF vision projector. Without
+one, a GGUF serves text only. An MLX target uses its own vision tower unless
+`--language-only` is set. `--revision` cannot be combined with `--model-dir`,
+and `--mmproj` requires `--model-dir` and cannot be combined with
+`--language-only`. Files are linked, and each start prepares them again under
+the same validation, publication and lifetime rules described below.
+
 An application that downloads models itself prepares them for the server
 with `install.local.prepare_local_model`, the installer's one public
 interface, and starts the server on the directory it returns. It runs in
@@ -2197,16 +2238,6 @@ engine of the same checkout or release (`build/splash` in a checkout). The
 server takes the [server options](#server-options) of `splash serve`; the
 model's source options (`--revision`, `--draft-model`, `--language-only`,
 `--offline`) are `prepare_local_model`'s arguments instead, or have no use.
-
-`splash serve --model PATH` does both for the files at the absolute PATH, with
-`--draft-model` a draft directory and `--language-only` as given: it prepares
-them with `python install/local.py PATH`, which prints the directory, and
-serves it as `local/NAME`, NAME being the file's or folder's name without
-`.gguf`, made a repository name: each run of other characters than letters,
-digits and `_` becomes one `-`, unless it is a single `.` or `-`; neither
-begins or ends the name, of at most 96 characters, nor does `.git` end it
-(`model` when nothing is left). A relative path to files is refused rather
-than taken for a Hub ID.
 
 - `target`: a GGUF file, any part of a split GGUF naming all its parts,
   which lie beside it; or a directory whose root holds an MLX model or else

@@ -14,8 +14,7 @@ with Splash's own Python and this checkout or release on PYTHONPATH:
 
 and then `python -m server.server MODEL --model OWNER/REPO --binary ENGINE`,
 ENGINE being the engine of the same checkout or release (build/splash, or
-engine/splash in a release). `splash serve --model PATH` does both, preparing
-with `python install/local.py PATH`, which prints the directory. It checks the files with the rules the
+engine/splash in a release). It checks the files with the rules the
 installer and the engine hold a download to, and it makes no network
 request.
 
@@ -30,20 +29,13 @@ every start, at little cost.
 
 from __future__ import annotations
 
-import argparse
-import contextlib
 import functools
 import os
 import signal
 import sys
 import tempfile
+from contextlib import redirect_stdout
 from pathlib import Path
-
-if __name__ == "__main__" and not __package__:
-    # Run as a script, from the installation's install/ folder: import its
-    # siblings as the install package.
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    __package__ = "install"
 
 from . import hub, models, paths, upstream
 from .models import ModelError
@@ -271,38 +263,36 @@ def _draft(family, draft):
         ) from None
 
 
-def main(argv=None):
-    """prepare_local_model's command line: the directory on stdout, all
-    else on stderr."""
-    parser = argparse.ArgumentParser(
-        description="Prepare a model for the server from files on this Mac"
-    )
-    parser.add_argument("target", type=Path)
-    parser.add_argument("--draft", type=Path)
-    parser.add_argument("--mmproj", type=Path)
-    parser.add_argument("--language-only", action="store_true")
+def _main(argv=None):
+    """The launcher's helper, run by Splash's Python after setup. Its stdout
+    is only prepare_local_model's result; preparation messages use stderr."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Prepare local Splash model files")
+    parser.add_argument("target")
     parser.add_argument("--models", type=Path, default=paths.MODELS)
+    parser.add_argument("--draft-model")
+    parser.add_argument("--mmproj")
+    parser.add_argument("--language-only", action="store_true")
     args = parser.parse_args(argv)
     try:
-        # The launcher starts this with the stop signals blocked, so that one
-        # sent while it starts is not lost; it arrives here.
         signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGINT, signal.SIGTERM))
-        with contextlib.redirect_stdout(sys.stderr):
-            directory = prepare_local_model(
+        with redirect_stdout(sys.stderr):
+            prepared = prepare_local_model(
                 args.target,
-                args.draft,
+                args.draft_model,
                 mmproj=args.mmproj,
                 language_only=args.language_only,
                 models_dir=args.models,
             )
+        print(prepared)
     except (ModelError, OSError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         return 130
-    print(directory)
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(_main())
