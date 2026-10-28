@@ -70,10 +70,10 @@ completions finds them. In a source checkout, source
 `install/completions/splash.bash` for Bash, `install/completions/_splash` for
 Zsh after `compinit`, or `install/completions/splash.fish` for fish.
 
-Completion suggests commands, the upstream models the README starts with and
-installed models, a GGUF's `OWNER/REPO:VARIANT` included, without network
-access. It also completes local paths for `--model-dir`, `--draft-model` and
-`--mmproj`.
+Completion suggests commands, the models in `install/suggested-models.tsv`
+(the list the Mac app offers too) and installed models, a GGUF's
+`OWNER/REPO:VARIANT` included, without network access. It also completes local
+paths for `--model-dir`, `--draft-model` and `--mmproj`.
 
 ## Server configuration
 
@@ -156,8 +156,8 @@ Set `SPLASH_API_KEY` in the server and agent shells to require authentication;
 `serve --api-key KEY` overrides the server's environment value. Every request
 then needs `Authorization: Bearer KEY` or `x-api-key: KEY` (one that sends both
 needs the key in both), `/status` and `/metrics` included; only the chat page,
-`/health`, `/ready` and browsers' `OPTIONS` preflights stay public. Enter the
-key in the chat page to send requests; the page does not persist it. Use
+`/health`, `/ready` and browsers' `OPTIONS` preflights stay public. The chat
+page asks for the key once the server answers 401 and does not persist it. Use
 `serve --no-webui` to disable the page. Authentication is off by default, and
 the server then ignores any key a client sends, so a client that insists on
 one can send any value.
@@ -690,7 +690,8 @@ installed model starts, with a line naming the reason. Without the Hub, Splash
 rebuilds a missing or damaged installation from the files it downloaded
 before, for the same revision. It pins the commits it installs in the Hugging
 Face cache (`refs/splash`), so pruning the cache keeps an installed model's
-files. [Installation](#installation) gives the mechanics.
+files, and records there the commit of a default branch, as `hf download`
+does (`refs/main`). [Installation](#installation) gives the mechanics.
 
 ### Model cache
 
@@ -710,7 +711,7 @@ are not moved.
 | Path | Holds |
 | --- | --- |
 | `~/Library/Application Support/Splash` | The data directory of a packaged install: `models/`, the installed models' links into the Hugging Face cache and the metadata derived from GGUFs; `runtime/`, the locks of running servers; and `thinking.key`, which encrypts the Messages reasoning a response hides. A source checkout keeps the first two in `install/models` and `build/runtime`. |
-| Hugging Face cache (`HF_HUB_CACHE`, by default `~/.cache/huggingface/hub`) | Model and draft downloads, with Splash's pins under `refs/splash` ([revisions](#revisions)). |
+| Hugging Face cache (`HF_HUB_CACHE`, by default `~/.cache/huggingface/hub`) | Model and draft downloads, with Splash's pins under `refs/splash` and the commit of a default branch as `refs/main` ([revisions](#revisions)). |
 | `~/Library/Caches/Splash/prefix-cache` (`--cache-dir`) | The [persistent cache](#persistent-cache), with `--persistent-cache` only, within the [SSD cache](#ssd-cache)'s limit. Every start removes the caches there that nobody used for 14 days. |
 | `$TMPDIR/splash-cache-*` | The [SSD cache](#ssd-cache)'s files, on by default, without `--persistent-cache`, or when another process holds the persistent cache's directory or it cannot be used: one of KV pages and one of states, together at most about the SSD cache's limit: under `auto` a quarter of the volume's free space beyond its floor, up to 32 GiB, or the size `--max-cache-disk` sets while the volume keeps its floor. Each is unlinked as it is created, so no directory lists it and macOS's storage settings count it as System Data, and its space returns when the engine exits, even after a crash. `--cache-dir` does not move them; they follow `TMPDIR`. |
 | `~/Library/Logs/Splash/crash` | [Crash traces](#failures-and-crash-traces), with `SPLASH_CRASH_TRACE=1` only. |
@@ -765,6 +766,17 @@ reasoning, and any other reply is all answer
 ```sh
 splash serve --model mlx-community/Qwen3.8-27B-4bit --default-reasoning-effort none
 ```
+
+`/v1/models` reports, as `reasoning`, what efforts do to the model's default
+template, rendered as at startup: `thinks`, whether a request without an effort
+reasons; `efforts`, the efforts besides `none` that the template renders, and
+differently, each named by the one of those rendering alike that no alias
+stands in for (`low`, `medium` and `xhigh` for Qwen3.8; none for Qwen3.6, whose
+template switches reasoning on and off alike at every effort); and `default`,
+the one of them a request without an effort renders like,
+`--default-reasoning-effort` in place of the template's (`xhigh` for `high` on
+Qwen3.8). For Flint, whose model decides, `thinks` is `null` and `efforts`
+empty.
 
 `/apply-template` uses the same default. Anthropic `thinking` keeps its protocol
 semantics (off when omitted) unless the request's `chat_template_kwargs` set
@@ -918,7 +930,7 @@ Messages requires it.
 | `GET`, `DELETE /v1/responses/{id}` | A stored response ([Responses state](#responses-state)) |
 | `POST /v1/messages` | Anthropic Messages |
 | `POST /v1/messages/count_tokens` | A Messages request's prompt tokens, images included, as `{"input_tokens": N}`, without inference |
-| `GET /v1/models`, `/v1/models/{id}` | The served model and its aliases, with the context limit |
+| `GET /v1/models`, `/v1/models/{id}` | The served model and its aliases, with the context limit and what reasoning efforts do ([default reasoning effort](#default-reasoning-effort)) |
 | `POST /tokenize`, `/apply-template` | A text's tokens, or a conversation's rendered prompt, without inference |
 | `POST /v1/judgments`, `/v1/systemone` | Scores over fixed answers ([judgment contracts](#judgment-contracts)) |
 | `POST /v1/memory/release` | Gives the weights back now, as the idle release does, when no request is in service; the next request restores them ([explicit release](#explicit-weights-release)). It takes no body (or `{}`); `200` with `{"released": true, "weights": …}`, `409 engine_busy` while the engine serves a request or restores its weights, `503 engine_busy` when the engine does not answer within 5 s, and `503 engine_recovering` or `server_shutdown` while the engine restarts or the server stops |
@@ -2193,8 +2205,9 @@ name; it selects no files and makes no Hub request in this mode. Preparation
 never contacts the Hub, whether or not `--offline` is set. `--draft-model`
 must name a local compatible DFlash2 draft directory; without one, the
 family's released draft must already be in the Hub cache at the commit its
-default branch records, as `hf download REPO` leaves it. A missing draft is
-refused with its download instruction; it is never downloaded implicitly.
+default branch records, as `hf download REPO` or `splash serve` leaves it. A
+missing draft is refused with its download instruction; it is never downloaded
+implicitly.
 
 `--mmproj` supplies a local BF16, F32 or F16 GGUF vision projector. Without
 one, a GGUF serves text only. An MLX target uses its own vision tower unless
@@ -2236,9 +2249,8 @@ model's source options (`--revision`, `--draft-model`, `--language-only`,
   a single GGUF target, whole or split, beside any projectors named `mmproj`.
 - `draft`: the directory of a DFlash2 draft ([Drafts](#drafts)). Without
   one, the family's released draft is taken from the Hugging Face cache, at
-  the commit a download of its default branch last recorded there, as
-  `hf download incoai/Qwen3.8-27B-DFlash2` does; `splash serve` downloads by
-  commit, which records none.
+  the commit last recorded there for its default branch, as `hf download
+  incoai/Qwen3.8-27B-DFlash2` and `splash serve` record it.
 - `mmproj`: a GGUF target's vision projector ([Vision](#vision)); without
   one, a GGUF target serves text only, and a target of a family without a
   vision tower refuses one. An MLX target serves images with the tower in
@@ -2376,6 +2388,28 @@ an installed model links. Publishing a new assembly retires the installation's
 other pins, in the repositories it links and in those its predecessor linked,
 so pruning can free what no installation links any more.
 
+`hub.Repository.download` first removes the partial files
+(`<blob>.<random>.incomplete`) killed downloads left in the repository's blobs
+folder, of any blob, each under huggingface_hub's lock on its blob. Front ends
+such as the Mac app run `install/models.py --model ID prepare --json-progress`,
+with which each download also reports its progress as JSON lines on stdout,
+`{"event": "download", "repo": REPO, "done": BYTES, "total": BYTES}`: done 0
+first, at most four a second as the bytes received grow (what the network has
+brought or what the Hub cache holds, whichever is more), and done equal to
+total once it succeeds. It is an interface between Splash's front ends and its
+installer, not a public one.
+
+huggingface_hub downloads on threads it joins, which finish their files
+before an interrupt reaches the program, so the download runs on a thread of
+its own (`hub._interruptible`) and Ctrl+C stops the installer within a
+fraction of a second: it unwinds its temporary files and ends without waiting
+for those threads, and the repository's next download removes the partial
+files they leave. A launcher run without writing bytecode (`-B` or
+`PYTHONDONTWRITEBYTECODE`) sets `PYTHONDONTWRITEBYTECODE=1` in its environment
+before `serve` starts anything, so the installer, the server and the server's
+PDF workers write none either, and a packaged runtime inside a signed app
+never gains `__pycache__`.
+
 `hub.Repository.resolve` alone decides whether a start asks the Hub
 ([Revisions](#revisions)), each request within `hub.HUB_TIMEOUT`:
 
@@ -2395,10 +2429,20 @@ so pruning can free what no installation links any more.
 A missing assembly, or one that no longer verifies, is built again. Without the
 Hub it is built from a cached snapshot, of the commit the `--revision` names,
 or else the one the installation recorded or pinned, or one the Hub cache
-records for the branch, never of another revision. Only files downloaded before
-are available, which is enough to rebuild a damaged or deleted assembly; a new
-selection needs the Hub once for its draft's default branch. The installer
-never rewrites upstream files.
+records for the branch, never of another revision. Splash downloads by
+commit, which records no branch, so when the Hub names the commit of a
+default branch, Splash records it as `refs/main`, as a download of the branch
+does, once the cache holds that commit, when the Hub names it or a download of
+it ends: a model another Splash, such as a source checkout, installed from the
+default branch installs here too. Another installation's pins never stand
+in, as a pin does not say which revision it was installed for. Only files
+downloaded before are available, which is enough to rebuild a damaged or
+deleted assembly. `install/cached.py` installs this way every model the Hub
+cache holds whole that Splash serves, leaving out what the installer refuses,
+for the Mac app to offer: a GGUF by the ID `install/suggested-models.tsv`
+gives it, or else by its split parts' folder or by its name past the model's,
+`MODEL-VARIANT.gguf` as `OWNER/MODEL-GGUF:VARIANT`, an ID that selects it from
+the Hub's listing too. The installer never rewrites upstream files.
 
 ### Weight loading
 
@@ -3899,26 +3943,28 @@ make install test-real test-http-real MODEL=mlx-community/Qwen3.8-27B-4bit
 
 `make check` needs no model weights, but it runs the Metal tests, so it needs a
 Mac that Splash supports: it runs the source checks, `check-native-cpu`,
-`check-native-metal`, `check-native-build` and the Python checks.
-`make check-native-cpu` builds production and runs native CPU tests without a
-GPU; `make check-native-metal` requires a supported Metal device and runs the
-kernel tests under shader validation, and the Linear pipeline resource check
-without it. They include loading small synthetic MLX, GGUF and vision sources
-and the GGUF kernels on synthetic tensors. `make check-native-build` builds
-every native test, benchmark and tool and runs none. Hosted CI runs the CPU
-checks, `check-native-build` and the sanitizers. `make test-sanitizers-metal`
-runs the Metal tests of the components whose host steps share their state with
-the engine thread and the SSD readers (the hot block cache of spilled KV and
-the history stream) under ThreadSanitizer, built with it in `build/metal-tsan`.
-`make architecture-check`, one of the source checks, also fails when a workflow
-under `.github/workflows` names a Hugging Face token (`HF_TOKEN`,
-`HUGGING_FACE_HUB_TOKEN` or a `secrets.HF_*` secret): CI installs public models
-alone and never receives one.
+`check-native-metal`, `check-native-build`, the Python checks and `check-app`,
+the Mac app's tests (`swift test --package-path app`). `make check-native-cpu`
+builds production and runs native CPU tests without a GPU;
+`make check-native-metal` requires a supported Metal device and runs the kernel
+tests under shader validation, and the Linear pipeline resource check without
+it. They include loading small synthetic MLX, GGUF and vision sources and the
+GGUF kernels on synthetic tensors. `make check-native-build` builds every
+native test, benchmark and tool and runs none. Hosted CI runs the CPU checks,
+`check-native-build`, the sanitizers and `check-app`.
+`make test-sanitizers-metal` runs the Metal tests of the components whose host
+steps share their state with the engine thread and the SSD readers (the hot
+block cache of spilled KV and the history stream) under ThreadSanitizer, built
+with it in `build/metal-tsan`. `make architecture-check`, one of the source
+checks, also fails when a workflow under `.github/workflows` names a Hugging
+Face token (`HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN` or a `secrets.HF_*` secret):
+CI installs public models alone and never receives one.
 
-The native tests are in `dev/tests/engine`; each Python test is in the
-directory of what it tests: `dev/tests/server`, `dev/tests/install` (launcher,
-client configuration and model installation) or `dev/tests/tools`
-(`dev/tools`, `dev/benchmarks`, the Makefiles and the real-model harnesses).
+The native tests are in `dev/tests/engine` and the Mac app's in `app/Tests`;
+each Python test is in the directory of what it tests: `dev/tests/server`,
+`dev/tests/install` (launcher, client configuration and model installation) or
+`dev/tests/tools` (`dev/tools`, `dev/benchmarks`, the Makefiles and the
+real-model harnesses).
 
 The real-model targets run against an installation in this checkout's
 `install/models`: run `make install` with the same options first, or in the
@@ -4237,13 +4283,15 @@ existing Splash installation. The install check requires a poured bottle and
 runs the bundled launcher without a compiler or separate Python installation.
 
 To publish, tag the verified release commit in `incoai/splash` with the version
-(no `v` prefix), preserving existing history and tags. Create a GitHub Release
-with the runtime archive, its `.sha256` file and the bottle. Open a pull request
-in `incoai/homebrew-tap` replacing `Formula/splash.rb` with `dist/splash.rb`;
-its URLs must point to the published release assets. After the tap update
-merges, verify a fresh install and an upgrade from the previous release through
-the public tap, including a real model request and preservation of user data.
-Run `brew audit --strict --online incoai/tap/splash`.
+(no `v` prefix), preserving existing history and tags, and make the release with
+`make release-app` ([releases](#releases)). Its folder carries the runtime
+archive, its `.sha256` file and the bottle beside the Mac app's disk images and
+appcast, and `dist/splash.rb` as `Formula/splash.rb`, which the pull request in
+`incoai/homebrew-tap` takes beside the app's cask; the formula's URLs must point
+to the published release assets. After the tap update merges, verify a fresh
+install and an upgrade from the previous release through the public tap,
+including a real model request and preservation of user data. Run
+`brew audit --strict --online incoai/tap/splash`.
 
 Before publishing, verify that the models the README names and the draft
 repositories of `families.FAMILIES` are publicly accessible. Check the installed
@@ -4253,6 +4301,252 @@ is not an installation check.
 The runtime package allowlists engine, Python, server and launcher files; tests,
 benchmarks and developer documents are excluded. User model links survive
 upgrades; downloads remain in the Hugging Face cache.
+
+### Mac app
+
+`app/` is Splash for Mac, a SwiftUI app distributed as a disk image:
+
+```sh
+make app RELEASE_VERSION=$VERSION   # dist/Splash.app, signed ad hoc
+make dmg RELEASE_VERSION=$VERSION   # and dist/Splash-<version>.dmg
+```
+
+`dev/tools/package_app.py` builds the app with `swift build`, puts the runtime
+`make package` ships, staged by the same function, under
+`Contents/Resources/splash`, signs each of its Mach-O files and then the app,
+and verifies them. Without `SIGN_IDENTITY` the signature is ad hoc, without the
+hardened runtime, which cannot load the wheels' libraries under an ad hoc
+signature: such a disk image is for local testing, opened with Open Anyway in
+System Settings › Privacy & Security. `SIGN_IDENTITY`, a Developer ID
+Application identity, adds the hardened runtime, which needs no entitlements;
+only a release is notarized ([releases](#releases)).
+
+The app adds no second way to serve. It runs the packaged runtime's own
+commands, each in a process group of its own, as a terminal runs a foreground
+job, with its output appended to a log in `~/Library/Logs/Splash`:
+`install/models.py --model ID prepare --json-progress` downloads a model, and
+`splash serve --model ID --port PORT --offline` serves an installed one, with
+the launch options picked in the app that differ from the server's defaults,
+ready once the port's lock names that process and `/health` answers; stopping
+is Ctrl+C's SIGINT to the group. Switching models stops one server and starts
+the next. The app starts nothing by itself: its window opens on the Server,
+where models download, start and switch, beside the Chat. Models, locks and
+downloads are the ones a packaged `splash` uses, in `~/Library/Application
+Support/Splash` and the Hugging Face cache. The app offers
+`install/suggested-models.tsv`, per model the variant meant for the Mac's
+memory with its download size and a few words about the model, and starts
+coding agents with `splash AGENT --port PORT` in Terminal, in a folder the user
+picks, from a script that holds the running server's API key and removes itself
+as it starts. Its launch options are every option `splash serve` takes but the
+ones of one model (`--revision`, `--draft-model`, `--mmproj`) and the ones it
+sets itself, from one table (`LaunchOption.all`) the tests hold to `splash
+serve --help`; the API key reaches the server as `SPLASH_API_KEY`, from the
+Keychain, and nothing starts while the Keychain does not give it. It serves
+model files on this Mac the user adds with `splash serve --model local/NAME
+--model-dir PATH`, NAME being the file's or folder's name made a repository
+name, and at launch it runs `install/cached.py`. While a model runs, the Server
+shows its context limit, from `/v1/models`, and its `/status`: requests,
+answering and prompt speed, time to first token, the tokens generated, read and
+taken from the cache, and the Metal memory it holds, with each request's line
+of the server's log, folded. Its chat is its own, not the chat page: it streams
+`/v1/chat/completions` and keeps each conversation as a JSON file in
+`~/Library/Application Support/Splash/Chats`, so a conversation outlives a
+switch of models. Its icon is `app/AppIcon.icon`, an Icon Composer document
+`actool` compiles, which needs the full Xcode; its mark, three arcs of water
+springing from a rippled surface, is the menu bar's too (`SplashMark`), and the
+chat page's (`server/favicon.svg`). `swift test --package-path app` runs its
+tests; with `SPLASH_RUNTIME` naming a packaged runtime and `SPLASH_APP_MODELS`
+installed models, they also drive the app end to end and, with
+`SPLASH_APP_SNAPSHOTS`, render its windows to that folder.
+
+#### Updates
+
+The app updates itself with [Sparkle](https://sparkle-project.org), the
+release `app/Package.swift` pins. It checks the appcast of the latest GitHub
+release, `https://github.com/incoai/splash/releases/latest/download/appcast.xml`
+(`APPCAST_URL` in `dev/tools/package_app.py`), a URL every app shipped keeps,
+and opens a disk image it downloads only once it has checked who signed it:
+the release key, an EdDSA key whose public half is `SPARKLE_PUBLIC_KEY` there,
+or, to replace a lost release key, the app's Developer ID. An app built while
+`SPARKLE_PUBLIC_KEY` is empty checks for nothing. Sparkle asks on the second
+launch whether to check by itself, once a day, and installs an update by
+quitting the app as its Quit command does, which stops what runs first.
+`package_app.py` puts `Sparkle.framework` in `Contents/Frameworks` without its
+XPC services, which only a sandboxed app needs, and signs its installer, its
+progress app and the framework before the app.
+
+The release key is made once, on the Mac that publishes releases, with the
+tools `swift build` unpacks into `app/.build/artifacts/sparkle/Sparkle/bin`:
+
+```sh
+app/.build/artifacts/sparkle/Sparkle/bin/generate_keys --account ai.inco.splash
+app/.build/artifacts/sparkle/Sparkle/bin/generate_keys --account ai.inco.splash \
+    -x /Volumes/OFFLINE/splash-release-key
+```
+
+The first keeps the private key in the login keychain and prints the public
+one, which goes into `SPARKLE_PUBLIC_KEY`, and into `RELEASE_KEY` in
+`dev/tests/tools/test_package_app.py`, which holds it to that value, as every
+app shipped keeps it; the second exports the private key for a backup kept
+offline, such as on an encrypted drive, never in the checkout;
+`generate_keys --account ai.inco.splash -f FILE` imports it on another Mac. A
+lost key can be replaced with a new one: the apps shipped also take a disk
+image the same team signed, if its app carries the new key's public half and
+the new key signed it in the appcast (Sparkle's key rotation). With both the
+key and that team's Developer ID lost, they update no more.
+
+Each release carries `appcast.xml` beside its disk images, which
+`make release-app` writes ([releases](#releases)) with `dev/tools/appcast.py`:
+Sparkle's `generate_appcast` offers `Splash-<version>.dmg` from the release
+tagged `<version>`, with `RELEASE_NOTES`, a Markdown file, and what it reads
+from the app in the disk image: the build number Sparkle compares
+(`CFBundleVersion`), the version it shows and `LSMinimumSystemVersion`. It
+signs the disk image with the release key from the login keychain, or the
+file `SPARKLE_KEY_FILE` names, and checks the signature with
+`SPARKLE_PUBLIC_KEY`. The apps check whichever release is the latest, and
+cannot while it carries no appcast. A release candidate, `x.y.z-rc.N`, is a
+prerelease, never the latest.
+
+#### Releases
+
+A release is made from its annotated tag, on the Mac that holds the Developer
+ID and the release key, once `make package` and `make package-bottle`
+([package](#package)) have left the command line's files of its version in
+`dist/`, and published by hand:
+
+```sh
+git tag -a $VERSION -m $VERSION    # on the release commit
+make release-app RELEASE_VERSION=$VERSION \
+    RELEASE_NOTES=$HOME/splash-releases/$VERSION.md \
+    SIGN_IDENTITY="Developer ID Application: NAME (TEAMID)" \
+    NOTARY_PROFILE=splash-notary
+```
+
+`make release-app` (`dev/tools/release_app.py`) first lists what keeps the
+release from being whole, and stops on any of it: a change in the checkout,
+untracked files included, which is why the notes live outside it; a HEAD that
+is not the tag's commit, as the app shows the tag's `x.y.z`; an identity no
+keychain holds; no notary credentials; an empty `SPARKLE_PUBLIC_KEY`; a
+`dist/release/<version>` already made; and, unless it is a release candidate,
+`x.y.z-rc.N`, which carries the app alone, a `dist/` without the version's
+runtime archive, its `.sha256` file, its bottle and the formula naming them.
+While a renewed certificate and the one it renews are both valid, their
+identities share a name, and `SIGN_IDENTITY` is the SHA-1 that
+`security find-identity -v -p codesigning` lists for the one to sign with.
+
+It signs `dist/Splash.app` with the hardened runtime and a secure timestamp,
+runs the notary service's checks on it (`syspolicy_check notary-submission`),
+which warn of each Mach-O file in `Resources` and stop the release on anything
+worse, notarizes it and staples its ticket, builds the disk image from it, then
+signs, notarizes and staples the disk image too, keeping each submission's
+log. An App Store Connect Team API key, `NOTARY_KEY` with `NOTARY_KEY_ID` and
+`NOTARY_ISSUER`, can stand in for `NOTARY_PROFILE`. It checks the app in the
+disk image as a downloaded copy (`codesign`, `spctl`, `stapler validate`,
+`syspolicy_check distribution`, its versions and update keys) and prints the
+team its signature names, stopping unless it is `SIGN_IDENTITY`'s. A run that
+stops once it has begun keeps what it made, the notary logs among it, in a
+folder it names.
+
+It writes `dist/release/<version>` and uploads nothing: `Splash-<version>.dmg`
+and the same file as `Splash.dmg`, which
+`https://github.com/incoai/splash/releases/latest/download/Splash.dmg` names,
+the command line's archive, `.sha256` file and bottle, `SHA256SUMS` of the disk
+images and archives, `appcast.xml`, `notes.md`, the notary logs and, unless it
+is a release candidate, `Formula/splash.rb` and `Casks/splash-app.rb` for
+`incoai/homebrew-tap`. The cask's `zap` removes the app's chats, logs, caches
+and settings, not the models, locks and runtime the command line keeps in
+`~/Library/Application Support/Splash`, nor the Hugging Face cache. It prints
+what publishing takes, from the folder, so that a copy of it can be published
+from another Mac, one with `gh` signed in with write access to `incoai/splash`
+and `incoai/homebrew-tap`, and Homebrew with `incoai/tap` tapped: the tag, a
+draft release of the folder's files, published once its `Splash.dmg` opens on
+a clean Mac, and the tap's pull request.
+
+`DRY_RUN=1` rehearses a release without a tag, Developer ID, notary
+credentials or release key. It lists what would stop the release, at its start
+and its end, replaces `dist/Splash.app` with an ad hoc build, runs the notary
+service's checks on it, prints the commands it leaves out, the signature of the
+app's 70-odd files as one, and writes `dist/release/<version>-dry-run`,
+replacing an earlier one, which a release never reads. That folder has no
+notary logs, and no `appcast.xml` while `SPARKLE_PUBLIC_KEY` is empty.
+
+The setup, once, on a personal Apple Developer account:
+
+1. Create a Developer ID Application certificate, in Xcode › Settings ›
+   Accounts › Manage Certificates or on developer.apple.com with the G2
+   Sub-CA. `security find-identity -v -p codesigning` then lists it,
+   `Developer ID Application: NAME (TEAMID)`, `TEAMID` being the team's
+   10-character ID: that is `SIGN_IDENTITY`. Export it with its private key to
+   a `.p12` kept offline. The first release asks for the login keychain's
+   password to sign with that key: Always Allow, or it asks again for each of
+   the 70-odd files a release signs.
+2. Keep the notary service's credentials in the login keychain, with an
+   app-specific password from account.apple.com:
+
+   ```sh
+   xcrun notarytool store-credentials splash-notary --apple-id EMAIL --team-id TEAMID
+   ```
+
+   `--key AuthKey_ID.p8 --key-id ID --issuer UUID` in place of `--apple-id`
+   and `--team-id` stores an App Store Connect Team API key instead; an
+   individual key, which has no issuer, is not taken.
+3. Make the release key and set `SPARKLE_PUBLIC_KEY` ([updates](#updates)).
+   Then dry-run a release on this Mac: with the key set, though not yet
+   committed, a dry run also writes the appcast, signs it with the key from the
+   login keychain and checks the signature, as a release does.
+
+#### Moving to the organization account
+
+A release of the Inco AI organization's account differs from a personal one
+only in who signs it. `SIGN_IDENTITY` becomes the organization's Developer ID
+Application identity, as `security find-identity -v -p codesigning` lists it,
+under the legal name the organization enrolled with. Its Account Holder
+creates it from a certificate signing request made on the Mac that signs, not
+as a cloud-managed certificate, whose private key stays with Apple, and
+exports its `.p12`. The notary credentials are stored for the organization's
+team under a profile of their own, such as `splash-notary-inco`, which keeps
+the personal one. The bundle ID, `ai.inco.splash`, the release key, which
+moves with its backup to the Mac that publishes, and `APPCAST_URL` must not
+change: the apps shipped know the app by them.
+
+The first organization release reaches the apps the personal account signed
+through Sparkle, which takes a disk image the release key signed whatever team
+signed it. Only key rotation needs the same team, so after the move the
+release key is all that links the two: a new key would strand every app still
+on a personal release. Sparkle installs that first update without its atomic
+swap and Gatekeeper pre-scan, as its installer is still the personal team's,
+so the first launch may show Verifying; later updates are the organization's
+alone. Some of what macOS grants the app is tied to its team and is asked for
+once more. Anyone who saved an API key is asked, at the first launch of the
+organization's app, to let Splash read it: Always Allow ends it, Allow asks
+again at each launch, and Deny keeps models from starting until Try Again or
+until the Splash item is removed in Keychain Access. So is access to model
+files in Desktop, Documents, Downloads or on other disks and, with the
+firewall on and Listen on All Networks, to accept connections. The first
+organization release's notes say so.
+
+Rehearse the move before it reaches anyone. Make the first organization
+release `x.y.z-rc.1`, a prerelease, which the apps don't check, and on a Mac
+with the last personal release, an API key saved and a model added from
+Downloads or another disk, point Sparkle at its appcast:
+
+```sh
+defaults write ai.inco.splash SUFeedURL \
+    https://github.com/incoai/splash/releases/download/x.y.z-rc.1/appcast.xml
+```
+
+Check for Updates… then installs it and relaunches; each prompt comes once, and
+the model serves. `defaults delete ai.inco.splash SUFeedURL` ends the
+rehearsal, and `x.y.z` follows once it passes.
+
+Before publishing, check that a release carries the intended team:
+`make release-app` prints it, and `codesign -dv dist/Splash.app` shows it as
+`TeamIdentifier`. Do not revoke the personal certificate: every app it signed
+would stop opening; left to expire, its releases keep opening by their secure
+timestamp. Keep its `.p12` offline until then, as a disk image it signs is the
+only way to rotate the release key for apps still on a personal release, and
+remove its identity from the keychain of the Mac that publishes, so that
+`make release-app` refuses to sign with it.
 
 ### Private test releases
 
