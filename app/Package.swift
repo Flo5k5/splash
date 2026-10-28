@@ -8,7 +8,8 @@ let package = Package(
     name: "Splash",
     platforms: [.macOS("26.4")],
     targets: [
-        .executableTarget(name: "Splash", path: "Sources/Splash"),
+        // The Chat's transcript is a web page, in Transcript/.
+        .executableTarget(name: "Splash", path: "Sources/Splash", resources: [.copy("Transcript")]),
         .testTarget(name: "SplashTests", dependencies: ["Splash"], path: "Tests/SplashTests"),
     ]
 )

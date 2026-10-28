@@ -6,7 +6,9 @@ struct MainView: View {
     @Environment(AppState.self) private var state
 
     var body: some View {
-        content
+        // The window works out its least size from its content: the frame's minimum alone, without
+        // laying either screen out for it on every change.
+        Offered { content }
             .frame(minWidth: 800, minHeight: 560)
             .navigationTitle("Splash")
             .toolbar(removing: .title)
@@ -37,6 +39,8 @@ struct MainView: View {
             .onChange(of: state.status) { _, status in
                 AccessibilityNotification.Announcement(status).post()
             }
+            // The Chat's page loads with the window, so that the Chat shows at once.
+            .onAppear { state.transcript.load() }
     }
 
     @ViewBuilder private var content: some View {
@@ -51,6 +55,26 @@ struct MainView: View {
             }
         }
     }
+}
+
+/// Takes the space it's offered without asking its content, as a shape does.
+struct Offered: Layout {
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        proposal.replacingUnspecifiedDimensions()
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        for subview in subviews {
+            subview.place(at: bounds.origin, proposal: ProposedViewSize(bounds.size))
+        }
+    }
+
+    // No alignment guides of its own either, which would otherwise be looked for in its content.
+    func explicitAlignment(of guide: HorizontalAlignment, in bounds: CGRect, proposal: ProposedViewSize,
+                           subviews: Subviews, cache: inout ()) -> CGFloat? { nil }
+
+    func explicitAlignment(of guide: VerticalAlignment, in bounds: CGRect, proposal: ProposedViewSize,
+                           subviews: Subviews, cache: inout ()) -> CGFloat? { nil }
 }
 
 /// The switch between the Server and the Chat.
@@ -118,7 +142,7 @@ struct DownloadButton: View {
 }
 
 /// A figure of the engine's: its value large, its unit beside it, what it is under it; a dash
-/// before there is one. The value rolls as it changes (`Motion.number`).
+/// before there is one. The value changes in place.
 struct Figure: View {
     let value: String?
     var unit: String?
@@ -133,7 +157,9 @@ struct Figure: View {
                     .font(.system(size: compact ? 15 : 22, weight: .medium))
                     .foregroundStyle(value == nil ? .tertiary : .primary)
                     .monospacedDigit()
-                    .contentTransition(Motion.number)
+                    // In place: a rolling or fading figure is redrawn on the CPU in every frame
+                    // of its animation, some 35 frames a poll.
+                    .contentTransition(.identity)
                 if let unit, value != nil {
                     Text(unit).font(compact ? .subheadline : .callout).foregroundStyle(.secondary)
                 }

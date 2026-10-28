@@ -22,12 +22,7 @@ struct ServerView: View {
         let failed = if case .failed = state.server.phase { true } else { false }
         Form {
             if state.server.phase == .ready {
-                Section {
-                    ActivityFigures(activity: state.server.activity)
-                    RequestLog(entries: state.server.requestLog, totals: RequestLog.totals(state.server.activity), open: advanced)
-                } header: {
-                    SectionTitle(text: "Activity")
-                }
+                ActivitySection(advanced: advanced)
             }
             if first || failed || state.installer.failure != nil || state.installer.running || state.keyProblem != nil {
                 Section {
@@ -284,6 +279,22 @@ private struct ControlBar: View {
                     Button("Open Chat") { state.section = .chat }.buttonStyle(.borderedProminent)
                 }
             }
+        }
+    }
+}
+
+/// What the model that runs has done: its figures and its requests. It reads them itself, so that a
+/// poll or a request finishing redraws this section alone, not the whole screen.
+private struct ActivitySection: View {
+    @Environment(AppState.self) private var state
+    let advanced: Bool
+
+    var body: some View {
+        Section {
+            ActivityFigures(activity: state.server.activity)
+            RequestLog(entries: state.server.requestLog, totals: RequestLog.totals(state.server.activity), open: advanced)
+        } header: {
+            SectionTitle(text: "Activity")
         }
     }
 }

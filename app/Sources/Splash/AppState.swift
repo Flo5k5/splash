@@ -26,6 +26,9 @@ final class AppState {
     let chats: ChatStore
     /// The message being written, kept while the window shows something else.
     let draft = Draft()
+    /// The open conversation's page, kept while the window shows something else, so that the Chat
+    /// shows again at once.
+    let transcript: Transcript
     private(set) var installed: [InstalledModel] = []
     private(set) var blocker: Blocker?
     /// Whether the checks of `launch` are done; nothing starts before.
@@ -59,7 +62,13 @@ final class AppState {
         server = Server(runtime: runtime)
         installer = Installer(runtime: runtime)
         catalog = Catalog(contentsOf: runtime.suggestedModels)
+        transcript = Transcript(runtime: runtime)
         installer.installed = { [weak self] in self?.didInstall($0) }
+        // Asked from the page, which then has the keyboard: the composer takes it back.
+        transcript.askAgain = { [weak self] in
+            self?.retry()
+            self?.draft.focus()
+        }
         readKey()
         refresh()
     }

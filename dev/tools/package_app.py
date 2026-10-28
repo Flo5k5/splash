@@ -30,6 +30,10 @@ MACH_O_MAGICS = frozenset(
         "cafebabf",
     )
 )
+# The app's own resources, the Chat's transcript page among them: the bundle
+# SwiftPM builds beside the executable, which the app reads from
+# Contents/Resources (Bundle.resources, app/Sources/Splash/Transcript.swift).
+RESOURCE_BUNDLE = "Splash_Splash.bundle"
 # Signing identifiers of the runtime's two programs, by their paths in the
 # runtime; codesign names every other file after itself.
 IDENTIFIERS = {
@@ -141,10 +145,18 @@ def compile_icon(resources, macos_min):
             raise RuntimeError(f"actool wrote no {name} into {resources}")
 
 
+def copy_resources(executable, resources):
+    """Copy the app's resource bundle, which SwiftPM built beside executable,
+    into resources: a bundle at the .app's root would leave it unsealed."""
+    shutil.copytree(
+        executable.parent / RESOURCE_BUNDLE, resources / RESOURCE_BUNDLE, symlinks=True
+    )
+
+
 def assemble(app, executable, version, macos_min):
-    """Lay out app: the executable, Info.plist, the icon and, in
-    Resources/splash, the runtime build_runtime builds, whose layout
-    install/paths.py resolves."""
+    """Lay out app: the executable, Info.plist, the icon, the app's resource
+    bundle and, in Resources/splash, the runtime build_runtime builds, whose
+    layout install/paths.py resolves."""
     contents = app / "Contents"
     (contents / "MacOS").mkdir(parents=True)
     shutil.copy2(executable, contents / "MacOS/Splash")
@@ -152,6 +164,7 @@ def assemble(app, executable, version, macos_min):
         plistlib.dump(info_plist(version, build_number(), macos_min), stream)
     runtime = contents / "Resources/splash"
     runtime.mkdir(parents=True)
+    copy_resources(executable, contents / "Resources")
     compile_icon(contents / "Resources", macos_min)
     package.build_runtime(runtime, version)
 

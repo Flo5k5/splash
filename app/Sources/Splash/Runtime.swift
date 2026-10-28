@@ -22,6 +22,10 @@ struct Runtime: Sendable {
     var python: URL { root.appending(path: packaged ? "python/bin/python3" : ".venv/bin/python") }
     var engine: URL { root.appending(path: packaged ? "engine/splash" : "build/splash") }
     var suggestedModels: URL { root.appending(path: "install/suggested-models.tsv") }
+    /// The web chat's Markdown and code highlighting, which the Chat's transcript uses too.
+    var markdownScripts: [URL] {
+        ["markdown-it-15.0.2.min.js", "highlight-11.12.0.min.js"].map { root.appending(path: "server/chat-assets/\($0)") }
+    }
 
     private var data: URL { packaged ? URL.applicationSupportDirectory.appending(path: "Splash") : root }
     /// Where installed models' selection links live.

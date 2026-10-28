@@ -341,7 +341,8 @@ enum ChatClient {
         return (try? JSONDecoder().decode(Body.self, from: data))?.error.message
     }
 
-    private static func mediaType(_ image: Data) -> String {
+    /// The type of an image the app keeps, PNG or JPEG.
+    static func mediaType(_ image: Data) -> String {
         image.starts(with: [0x89, 0x50, 0x4E, 0x47]) ? "image/png" : "image/jpeg"
     }
 }

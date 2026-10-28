@@ -62,6 +62,42 @@ class PackageAppTests(unittest.TestCase):
             },
         )
 
+    def test_the_resource_bundle_is_the_one_the_app_reads(self):
+        # SwiftPM names it after the package and its target, and the app looks
+        # for it by that name in Contents/Resources.
+        source = (package_app.ROOT / "app/Sources/Splash/Transcript.swift").read_text()
+        name, extension = package_app.RESOURCE_BUNDLE.rsplit(".", 1)
+        self.assertIn(
+            f'Bundle.main.url(forResource: "{name}", withExtension: "{extension}")',
+            source,
+        )
+
+    def test_the_resource_bundle_goes_into_resources(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            products = root / "products"
+            page = (
+                products / package_app.RESOURCE_BUNDLE / "Contents/Resources/Transcript"
+            )
+            page.mkdir(parents=True)
+            (page / "transcript.html").write_text("<!doctype html>\n")
+            (products / "Splash").write_bytes(THIN_ARM64)
+            resources = root / "Splash.app/Contents/Resources"
+            resources.mkdir(parents=True)
+            package_app.copy_resources(products / "Splash", resources)
+            self.assertEqual(
+                (
+                    resources
+                    / package_app.RESOURCE_BUNDLE
+                    / "Contents/Resources/Transcript/transcript.html"
+                ).read_text(),
+                "<!doctype html>\n",
+            )
+            self.assertEqual(
+                sorted(path.name for path in (root / "Splash.app").iterdir()),
+                ["Contents"],
+            )
+
     def test_mach_o_files_are_found_by_content_not_by_name(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
