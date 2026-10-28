@@ -13,8 +13,8 @@ from dev.tools import package_app
 
 THIN_ARM64 = bytes.fromhex("cffaedfe0c000001")
 # The release key's public half, SPARKLE_PUBLIC_KEY, as generate_keys printed
-# it once (DEVELOPMENT.md, Updates); empty until then.
-RELEASE_KEY = ""
+# it once (DEVELOPMENT.md, Updates).
+RELEASE_KEY = "QAOqAR9iWlOPmkqq0XgbaAPjP8Y/X0lJwfd+W4a9kSc="
 SPARKLE = "APP/Contents/Frameworks/Sparkle.framework"
 
 
