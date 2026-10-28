@@ -859,6 +859,11 @@ connects to the running server. Arguments pass through, for example
 
 `splash pi` adds a `splash` provider to Pi's `models.json` (`splash-<port>` for
 a server on another port), preserving other providers, settings and sessions.
+Where every chat template of the server renders a later system message in
+place (`/status` `chat_template.later_system`, [tokenizer and chat
+templates](#tokenizer-and-chat-templates)), the provider's model says so to
+Pi, which otherwise folds the system messages it adds as a session goes on
+into the first: the prompt then keeps its start, and the server its cache.
 The chat page names no model, and the launchers configure each client with the
 model ID the running server reports, so a client need not list a model in its
 own catalog for Splash to serve it under its full repository ID.
