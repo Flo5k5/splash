@@ -1,17 +1,35 @@
 import SwiftUI
 
-/// How a model starts: every `splash serve` option of `LaunchOption.all`, the main ones in a card,
-/// and under Advanced, a heading of its own, the others in a card for each part. Each is on Auto or
-/// the server's own default until changed; a change applies the next time a model starts.
+/// How a model starts: every `splash serve` option of `LaunchOption.all` in one card, the main ones
+/// first and the others under Advanced, which opens them below it in the same card, each part
+/// under a band of its own. Each is on Auto or the server's own default until changed; a change
+/// applies the next time a model starts.
 struct LaunchOptions: View {
     @Environment(AppState.self) private var state
     @State var advanced = false
-    /// The Advanced heading, which opening it scrolls to the top, the parts under it in view.
-    @State private var heading = ScrollTarget()
+    /// The Advanced row, which opening it scrolls to the top, the options under it in view.
+    @State private var row = ScrollTarget()
 
     var body: some View {
         Section {
             ForEach(Self.options(.main)) { OptionRow(option: $0) }
+            DisclosureRow(title: "Advanced", open: $advanced)
+                .background(ViewAnchor { row.view = $0 })
+                .onChange(of: advanced) { if advanced { row.scrollToTop() } }
+            if advanced {
+                ForEach(LaunchOption.Section.allCases.dropFirst(), id: \.self) { section in
+                    // A band across the card, as a list groups its rows, so that each part reads
+                    // as one.
+                    Text(section.rawValue)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(.quaternary.opacity(0.6), in: .rect(cornerRadius: 6))
+                    ForEach(Self.options(section)) { OptionRow(option: $0) }
+                }
+            }
         } header: {
             HStack(alignment: .firstTextBaseline) {
                 SectionTitle(text: LaunchOption.Section.main.rawValue)
@@ -22,34 +40,6 @@ struct LaunchOptions: View {
                         .foregroundStyle(.tint)
                         .font(.callout)
                         .padding(.trailing, -6)
-                }
-            }
-        }
-        Section {} header: {
-            Button {
-                withAnimation(Motion.settle) { advanced.toggle() }
-                if advanced { heading.scrollToTop() }
-            } label: {
-                HStack(spacing: 6) {
-                    SectionTitle(text: "Advanced")
-                    Image(systemName: "chevron.right")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                        .rotationEffect(.degrees(advanced ? 90 : 0))
-                        .accessibilityHidden(true)
-                }
-            }
-            .buttonStyle(.hoverFlush)
-            .background(ViewAnchor { heading.view = $0 })
-            .accessibilityValue(advanced ? "Expanded" : "Collapsed")
-        }
-        if advanced {
-            // Each part a card of its own, its title a step below Advanced's.
-            ForEach(LaunchOption.Section.allCases.dropFirst(), id: \.self) { section in
-                Section {
-                    ForEach(Self.options(section)) { OptionRow(option: $0) }
-                } header: {
-                    Text(section.rawValue).font(.callout.weight(.semibold)).foregroundStyle(.secondary).textCase(nil)
                 }
             }
         }
