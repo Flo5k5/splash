@@ -69,28 +69,31 @@ private struct ChatList: View {
     /// gets a message moves to the top, and one deleted closes its gap.
     private func list(_ shown: [Conversation]) -> some View {
         let chats = state.chats
-        return List {
-            ForEach(shown) { conversation in
-                ChatRow(conversation: conversation, open: chats.selection == conversation.id) {
-                    chats.selection = conversation.id
-                }
-                .contextMenu {
-                    Button("Rename…") {
-                        title = conversation.title
-                        renaming = conversation
+        // A stack, not a sidebar list, whose source-list rows AppKit insets further.
+        return ScrollView {
+            LazyVStack(spacing: 2) {
+                ForEach(shown) { conversation in
+                    ChatRow(conversation: conversation, open: chats.selection == conversation.id) {
+                        chats.selection = conversation.id
                     }
-                    Button("Delete…", role: .destructive) { deleting = conversation }
+                    .contextMenu {
+                        Button("Rename…") {
+                            title = conversation.title
+                            renaming = conversation
+                        }
+                        Button("Delete…", role: .destructive) { deleting = conversation }
+                    }
                 }
             }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 4)
         }
-        .listStyle(.sidebar)
-        .scrollContentBackground(.hidden)
         .animation(Motion.settle, value: shown.map(\.id))
     }
 }
 
 /// A conversation in the list: its title, highlighted as the app's buttons are, held while open;
-/// its text in line with the search field's.
+/// the highlight in line with the search field.
 private struct ChatRow: View {
     let conversation: Conversation
     let open: Bool
@@ -104,8 +107,6 @@ private struct ChatRow: View {
                 .contentShape(.rect)
         }
         .buttonStyle(HoverStyle(padding: EdgeInsets(top: 6, leading: 8, bottom: 6, trailing: 8), held: open))
-        .listRowInsets(EdgeInsets(top: 0, leading: 10, bottom: 0, trailing: 10))
-        .listRowBackground(Color.clear)
         .accessibilityAddTraits(open ? .isSelected : [])
     }
 }
