@@ -1861,7 +1861,7 @@ def main():
             if effective_context % 1024 == 0
             else f"{effective_context:,}"
         )
-        mode = "" if readiness.vision else " · language only"
+        mode = "" if readiness.vision else " · text only"
         print_status(f"Ready · {args.model} · context {context}{mode} · {address}")
         server.serve_forever()
     except (
