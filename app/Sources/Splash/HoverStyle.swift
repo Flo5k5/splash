@@ -102,27 +102,21 @@ struct CopyGlyph: View {
 }
 
 /// A row of a form that folds and unfolds the rows after it, its chevron turned while they show,
-/// any detail after its title; `opened` runs as they start to unfold.
+/// any detail after its title.
 struct DisclosureRow: View {
     let title: String
     @Binding var open: Bool
     var detail: String?
-    var opened: (() -> Void)?
-
-    /// How far its title stands in from the row's start, for the rows it opens to line up with.
-    static let indent: CGFloat = 18
 
     var body: some View {
         Button {
             withAnimation(Motion.settle) { open.toggle() }
-            if open { opened?() }
         } label: {
             HStack(spacing: 6) {
                 Image(systemName: "chevron.right")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
                     .rotationEffect(.degrees(open ? 90 : 0))
-                    .frame(width: Self.indent - 6)
                     .accessibilityHidden(true)
                 Text(title)
                 if let detail {

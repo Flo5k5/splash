@@ -1,30 +1,17 @@
 import SwiftUI
 
-/// How a model starts: every `splash serve` option of `LaunchOption.all`, the main ones in a card
-/// and the others under Advanced, in the same card, by their part. Each is on Auto or the server's
-/// own default until changed; a change applies the next time a model starts.
+/// How a model starts: every `splash serve` option of `LaunchOption.all`, the main ones in a card,
+/// and under Advanced, a heading of its own, the others in a card for each part. Each is on Auto or
+/// the server's own default until changed; a change applies the next time a model starts.
 struct LaunchOptions: View {
     @Environment(AppState.self) private var state
     @State var advanced = false
-    /// The Advanced row, which opening it scrolls to the top, the options under it in view.
-    @State private var row = ScrollTarget()
+    /// The Advanced heading, which opening it scrolls to the top, the parts under it in view.
+    @State private var heading = ScrollTarget()
 
     var body: some View {
         Section {
             ForEach(Self.options(.main)) { OptionRow(option: $0) }
-            DisclosureRow(title: "Advanced", open: $advanced, opened: { row.scrollToTop() })
-                .background(ViewAnchor { row.view = $0 })
-            if advanced {
-                // Under the row that opens them, in line with its title.
-                ForEach(LaunchOption.Section.allCases.dropFirst(), id: \.self) { section in
-                    Text(section.rawValue)
-                        .font(.callout.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                        .padding(.top, 6)
-                        .padding(.leading, DisclosureRow.indent)
-                    ForEach(Self.options(section)) { OptionRow(option: $0).padding(.leading, DisclosureRow.indent) }
-                }
-            }
         } header: {
             HStack(alignment: .firstTextBaseline) {
                 SectionTitle(text: LaunchOption.Section.main.rawValue)
@@ -35,6 +22,34 @@ struct LaunchOptions: View {
                         .foregroundStyle(.tint)
                         .font(.callout)
                         .padding(.trailing, -6)
+                }
+            }
+        }
+        Section {} header: {
+            Button {
+                withAnimation(Motion.settle) { advanced.toggle() }
+                if advanced { heading.scrollToTop() }
+            } label: {
+                HStack(spacing: 6) {
+                    SectionTitle(text: "Advanced")
+                    Image(systemName: "chevron.right")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .rotationEffect(.degrees(advanced ? 90 : 0))
+                        .accessibilityHidden(true)
+                }
+            }
+            .buttonStyle(.hoverFlush)
+            .background(ViewAnchor { heading.view = $0 })
+            .accessibilityValue(advanced ? "Expanded" : "Collapsed")
+        }
+        if advanced {
+            // Each part a card of its own, its title a step below Advanced's.
+            ForEach(LaunchOption.Section.allCases.dropFirst(), id: \.self) { section in
+                Section {
+                    ForEach(Self.options(section)) { OptionRow(option: $0) }
+                } header: {
+                    Text(section.rawValue).font(.callout.weight(.semibold)).foregroundStyle(.secondary).textCase(nil)
                 }
             }
         }
