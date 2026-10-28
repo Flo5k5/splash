@@ -8,8 +8,9 @@ let package = Package(
     name: "Splash",
     platforms: [.macOS("26.4")],
     dependencies: [
-        // Updates the app from the appcast of the GitHub releases (DEVELOPMENT.md, Updates). Pinned to
-        // one release: its tools sign the appcast the app checks, so a new one is taken on purpose.
+        // Updates the app from the appcast of the GitHub releases (docs/package.md, Updates).
+        // Pinned to one release: its tools sign the appcast the app checks, so a new one is taken
+        // on purpose.
         .package(url: "https://github.com/sparkle-project/Sparkle", exact: "2.10.1"),
     ],
     targets: [
