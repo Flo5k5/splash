@@ -2899,6 +2899,11 @@ void testEngineLimitBindsThroughTheHostPause() {
   require(events.failures == std::vector<std::string>{"capacity_exhausted"} &&
               executor.suspensions == 0 && pool.snapshot().pagesAllocated == 8,
           "a lone request at the engine's limit waited for the host instead of failing");
+  const std::string &message = events.failureDetails.front().first;
+  require(message.starts_with("could not allocate ") &&
+              message.find("--max-memory") != std::string::npos &&
+              message.find("--max-context") != std::string::npos,
+          "a lone request at the engine's limit did not name the limits that would fit it");
 }
 
 // While the host refuses growth, a lane in service short of a page takes
@@ -8372,35 +8377,46 @@ void testIncompleteConfigIsRefused() {
 
 // On a target that can spill, a request that would spill starts Resident
 // while the SSD cache takes no writes and its projection fits in memory
-// alone; it is counted as a Resident start.
+// alone; it is counted as a Resident start. One whose projection does not fit
+// fails naming the SSD cache, not the memory limits.
 void testUnwritableTierKeepsRequestsResident() {
-  test::TestKvStorage storage(64, 4096, 4);
-  KvPool pool(storage, 0);
-  test::TestKvTier tier;
-  tier.writableFile = false;
-  engine::Cache cache(pool, &tier, nullptr);
-  Executor model;
-  Events events;
-  EngineConfig config = test::engineConfig();
-  config.spill = {.capable = true,
-                  .always = true,
-                  .denseTokens = 2048,
-                  .geometry = {.fullPageBytes = 423'936,
-                               .indexPageBytes = 24'576,
-                               .slotBytes = 425'984,
-                               .residentKvBytes = uint64_t{1} << 40,
-                               .residentTokens = 262'144,
-                               .densePages = 64,
-                               .windowPages = 64,
-                               .groupPages = 256}};
-  engine::Engine engine(config, cache, model, events);
-  guardReleases(storage, engine);
-  engine.submit(request(1, std::vector<uint32_t>(100, 3)));
-  runUntilIdle(engine);
-  const SpillRequestsSnapshot spill = engine.snapshot().spill;
-  require(events.completedCount == 1 && events.failedCount == 0 && spill.resident == 1 &&
-              spill.spill == 0 && spill.refusedClosed == 0,
-          "a request did not start Resident while the SSD cache took no writes");
+  for (const uint32_t residentTokens : {262'144U, 64U}) {
+    test::TestKvStorage storage(64, 4096, 4);
+    KvPool pool(storage, 0);
+    test::TestKvTier tier;
+    tier.writableFile = false;
+    engine::Cache cache(pool, &tier, nullptr);
+    Executor model;
+    Events events;
+    EngineConfig config = test::engineConfig();
+    config.spill = {.capable = true,
+                    .always = true,
+                    .denseTokens = 2048,
+                    .geometry = {.fullPageBytes = 423'936,
+                                 .indexPageBytes = 24'576,
+                                 .slotBytes = 425'984,
+                                 .residentKvBytes = uint64_t{1} << 40,
+                                 .residentTokens = residentTokens,
+                                 .densePages = 64,
+                                 .windowPages = 64,
+                                 .groupPages = 256}};
+    engine::Engine engine(config, cache, model, events);
+    guardReleases(storage, engine);
+    engine.submit(request(1, std::vector<uint32_t>(100, 3)));
+    runUntilIdle(engine);
+    const SpillRequestsSnapshot spill = engine.snapshot().spill;
+    if (residentTokens == 64) {
+      require(events.failures == std::vector<std::string>{"capacity_exhausted"} &&
+                  spill.refusedClosed == 1 &&
+                  events.failureDetails.front().first.find("SSD cache") != std::string::npos &&
+                  events.failureDetails.front().first.find("--max-memory") == std::string::npos,
+              "a request past the resident line did not fail naming the closed SSD cache");
+      continue;
+    }
+    require(events.completedCount == 1 && events.failedCount == 0 && spill.resident == 1 &&
+                spill.spill == 0 && spill.refusedClosed == 0,
+            "a request did not start Resident while the SSD cache took no writes");
+  }
 }
 
 // A target whose requests may spill (EngineConfig::spill), on a cache with a

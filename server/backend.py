@@ -34,7 +34,8 @@ RESTART_BACKOFF_SECONDS = 5.0
 STATUS_REFRESH_TIMEOUT_SECONDS = 0.05
 
 # Engine outcomes whose message the engine words from its own limits and
-# counts, never from a request: the console names their reason.
+# counts, never from a request: the client gets it as it is, and the console
+# prints it beside the code.
 _ENGINE_RESOURCE_CODES = frozenset(
     {"capacity_exhausted", "kv_disk_quota", "kv_write_budget", "resource_timeout"}
 )
@@ -1000,12 +1001,24 @@ class NativeBackend:
             message = error.message_bytes.decode("utf-8", "replace")
             if code == "deadline_exceeded":
                 return APIError(504, message, "request_timeout")
-            api_error = NativeBackend._request_failure(code, message, error)
-            # The engine words a resource failure itself, from its limits and
-            # counts, never from the request: the console may show it.
-            if code in _ENGINE_RESOURCE_CODES:
-                api_error.engine_reason = message
-            return api_error
+            # A request that does not fit even alone, in memory or in the SSD
+            # cache, fails the same way on a retry; the engine's message names
+            # what it lacked and the limits that would fit it.
+            if code in ("capacity_exhausted", "kv_disk_quota"):
+                return APIError(400, message, code)
+            request_codes = {
+                "invalid_constraint",
+                "invalid_count",
+                "invalid_deadline",
+                "invalid_enum_value",
+                "invalid_request",
+                "invalid_sampling",
+                "limit_exceeded",
+            }
+            status = 503 if error.retryable else 400 if code in request_codes else 500
+            # The engine says when a retry may succeed where that is not at
+            # once, as when the SSD cache's write budget refills.
+            return APIError(status, message, code, error.retry_after_seconds or 1)
         if isinstance(error, engine_runtime.MaskComputationFailed):
             if error.retryable:
                 return APIError(503, str(error), "runtime_busy")
@@ -1029,38 +1042,6 @@ class NativeBackend:
             return APIError(504, "request timed out", "request_timeout")
         return APIError(500, str(error), "runtime_error")
 
-    @staticmethod
-    def _request_failure(code, message, error):
-        if code == "capacity_exhausted":
-            # Memory the engine could not allocate; any other reason, as an
-            # SSD cache that takes no writes, speaks for itself.
-            if not message.startswith("could not allocate"):
-                return APIError(400, message, code)
-            return APIError(
-                400,
-                "the request does not fit in the memory this server may use, even "
-                "after every cached prefix was evicted; restart the server with a "
-                f"larger --max-memory or a smaller --max-context ({message})",
-                code,
-            )
-        # The SSD cache cannot hold even the prompt's KV of a request that
-        # does not fit in memory; the message names its quota.
-        if code == "kv_disk_quota":
-            return APIError(400, message, code)
-        request_codes = {
-            "invalid_constraint",
-            "invalid_count",
-            "invalid_deadline",
-            "invalid_enum_value",
-            "invalid_request",
-            "invalid_sampling",
-            "limit_exceeded",
-        }
-        status = 503 if error.retryable else 400 if code in request_codes else 500
-        # The engine says when a retry may succeed where that is not at
-        # once, as when the SSD cache's write budget refills.
-        return APIError(status, message, code, error.retry_after_seconds or 1)
-
     def _record(self, job, result=None, error=None):
         record = {
             "outcome": result.reason if result else "error",
@@ -1076,9 +1057,8 @@ class NativeBackend:
             }
         if error:
             record["error_code"] = error.code
-            reason = getattr(error, "engine_reason", None)
-            if reason:
-                record["engine_reason"] = reason
+            if error.code in _ENGINE_RESOURCE_CODES:
+                record["engine_reason"] = error.message
         self._log(record)
 
     def _log(self, record):

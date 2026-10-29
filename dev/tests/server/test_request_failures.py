@@ -235,8 +235,12 @@ class RequestFailureTests(HarnessTestCase):
     def test_capacity_failure_is_a_bad_request_naming_the_limits(self):
         native = (
             "could not allocate KV target: engine memory budget exceeded "
-            "(additional_pages=12, free_pages=0)"
+            "(additional_pages=12, free_pages=0); the request does not fit in the "
+            "memory this server may use, even after every cached prefix was "
+            "evicted: restart the server with a larger --max-memory or a smaller "
+            "--max-context"
         )
+        records = []
         capacity = [
             Plan(
                 exception=api.engine_runtime.RequestFailed(
@@ -245,7 +249,9 @@ class RequestFailureTests(HarnessTestCase):
             )
             for _ in range(2)
         ]
-        harness = self.harness(FakeRuntime(*capacity, Plan([[4]])))
+        harness = self.harness(
+            FakeRuntime(*capacity, Plan([[4]])), request_logger=records.append
+        )
         # Retrying fails the same way, so no response invites a retry.
         for path, body in (
             ("/v1/chat/completions", chat_body()),
@@ -263,40 +269,14 @@ class RequestFailureTests(HarnessTestCase):
             self.assertEqual(response.status, 400)
             self.assertIsNone(response.getheader("Retry-After"))
             self.assertEqual(error["type"], "invalid_request_error")
-            for text in ("--max-memory", "--max-context", native):
-                self.assertIn(text, error["message"])
+            self.assertEqual(error["message"], native)
             if path == "/v1/chat/completions":
                 self.assertEqual(error["code"], "capacity_exhausted")
         status, _, _ = harness.request("POST", "/v1/chat/completions", chat_body())
         self.assertEqual(status, 200)
-
-    def test_capacity_failure_of_a_closed_ssd_cache_does_not_blame_memory(self):
-        native = (
-            "requests past 147449 tokens keep their KV on the SSD cache, "
-            "which takes no writes"
-        )
-        records = []
-        runtime = FakeRuntime(
-            Plan(
-                exception=api.engine_runtime.RequestFailed(
-                    1, b"capacity_exhausted", native.encode(), retryable=False
-                )
-            ),
-            Plan([[4]]),
-        )
-        harness = self.harness(runtime, request_logger=records.append)
-        status, _, payload = harness.request(
-            "POST", "/v1/chat/completions", chat_body()
-        )
-        error = json.loads(payload)["error"]
-        self.assertEqual(status, 400)
-        self.assertEqual(error["code"], "capacity_exhausted")
-        self.assertEqual(error["message"], native)
-        self.assertNotIn("--max-memory", error["message"])
         # The console line names the engine's reason.
         failed = [record for record in records if record["outcome"] == "error"]
-        self.assertEqual(len(failed), 1)
-        self.assertEqual(failed[0]["engine_reason"], native)
+        self.assertEqual([record["engine_reason"] for record in failed], [native] * 2)
 
     def test_disk_quota_failure_is_a_bad_request_naming_the_ssd_cache(self):
         native = (
