@@ -9339,6 +9339,142 @@ void testALoneLaneWaitsForTheChainANeighbourLeft() {
   }
 }
 
+// A lone Spill lane's pages spill as its own copies land, which its
+// write-through writes a few at a time, fewer than an extent holds. Refused
+// its floor of the hot block cache once its first pages spilled, it waits
+// for the copies it still owes rather than fail: written, they free its
+// Full pages an extent at a time, and no lane grows into them. So it does
+// when the memory governor's pass, between commands, collects the copies
+// that landed, as the next ones start when it is refused again; while the
+// copies being written are its dense history's, whose pages stay Full, as
+// the owed ones that follow them free theirs; and at a wall that leaves no
+// room for another Index extent, as the Full extents the spill empties fund
+// it.
+void testALoneSpillLaneWaitsForItsOwnCopies() {
+  struct Case final {
+    uint32_t writes;
+    bool governorCollects;
+    bool wall;
+    const char *message;
+  };
+  for (const Case &each :
+       {Case{4, false, false, "a lone Spill lane failed while its own copies were freeing its memory"},
+        Case{4, true, false, "a lone Spill lane failed once the governor's pass collected its copies"},
+        Case{1, false, false, "a lone Spill lane failed while its dense history's copy was written"},
+        Case{4, false, true, "a lone Spill lane failed at a wall the Index runway could not refill at"}}) {
+    // Extents of 16 pages. Every state goes straight to the SSD.
+    Spilling spill(1024, true, 100'000, 0, Spilling::Extent{16});
+    spill.model.deniedReservations = std::numeric_limits<uint32_t>::max();
+    spill.model.stateTier = std::make_shared<OffloadControl>();
+    spill.model.stateTier->ready = true;
+    spill.model.restoreControl->ready = true;
+    // The tier writes a few of the lane's pages at a time, and lands none of
+    // them before the lane decodes.
+    spill.tier.writeLimits[static_cast<size_t>(WriteClass::Spill)] = each.writes;
+    bool land = false;
+    const auto run = [&](const std::function<bool()> &done, const char *message) {
+      for (uint32_t step = 0; step < 4000 && !done(); ++step) {
+        static_cast<void>(spill.engine.tick(spill.now++));
+        if (!land)
+          continue;
+        spill.tier.complete();
+        if (each.governorCollects && !spill.engine.commandInFlight())
+          static_cast<void>(spill.engine.reclaimMemory({.targetBytes = 1'000'000'000}));
+      }
+      require(done(), message);
+    };
+    // Its floor fits once two extents have left memory since it first asked
+    // for it.
+    std::optional<uint64_t> limit;
+    spill.model.spilledReadsRoom = [&](uint64_t) {
+      if (!limit)
+        limit = spill.storage.allocatedBytes() - 2 * 16 * 100;
+      return spill.storage.allocatedBytes() <= *limit;
+    };
+    spill.engine.submit(Spilling::prompt(1, 1, 60, 64));
+    run([&] { return spill.events.outputs.contains(1); }, "the lane did not decode");
+    require(!limit && !spill.cache.holdsIndexPages(1), "a page spilled before its copy landed");
+    // At the wall, the memory left beside its Full extents and the Index
+    // runway holds less than another Index extent.
+    if (each.wall)
+      spill.storage.budgetPages =
+          static_cast<uint32_t>((spill.storage.allocatedBytes() + 16 * 10 / 2) / 100);
+    land = true;
+    run([&] { return idle(spill.engine); }, "the lane did not end");
+    require(limit.has_value() && spill.events.failedCount == 0 &&
+                spill.events.usage.at(1).second == 64,
+            each.message);
+  }
+}
+
+// A turn that restores a Spill chain without all its copies, as the retry of
+// a turn the memory wall ended does, has no copy being written before its
+// first command. Alone, refused its prefill history's staging there, it
+// starts writing that chain and waits for those copies rather than fail.
+void testALaneRefusedBeforeItsFirstCommandWritesItsChain() {
+  // Extents of 16 pages. Every state goes straight to the SSD.
+  Spilling spill(1024, true, 100'000, 0, Spilling::Extent{16});
+  spill.model.deniedReservations = std::numeric_limits<uint32_t>::max();
+  spill.model.stateTier = std::make_shared<OffloadControl>();
+  spill.model.stateTier->ready = true;
+  spill.model.restoreControl->ready = true;
+  spill.tier.writeLimits[static_cast<size_t>(WriteClass::Spill)] = 4;
+  // The first turn ends after its first token, its copies owed no more, and
+  // the writes it started land.
+  spill.engine.submit(Spilling::prompt(1, 1, 60, 1));
+  spill.runUntilIdle();
+  for (uint32_t step = 0; step < 5; ++step) {
+    static_cast<void>(spill.engine.tick(spill.now++));
+    spill.tier.complete();
+  }
+  require(spill.cache.spillSnapshot().writeThroughInFlight == 0,
+          "the first turn's writes were still in flight");
+  // The next turn's staging fits once an extent has left memory.
+  const uint64_t limit = spill.storage.allocatedBytes() - 16 * 100;
+  spill.model.refusedStaging = {2};
+  spill.engine.submit(Spilling::prompt(2, 1, 60, 64));
+  for (uint32_t step = 0; step < 4000 && !idle(spill.engine); ++step) {
+    static_cast<void>(spill.engine.tick(spill.now++));
+    spill.tier.complete();
+    if (spill.storage.allocatedBytes() <= limit)
+      spill.model.refusedStaging.clear();
+  }
+  require(idle(spill.engine), "the requests did not end");
+  require(spill.events.failedCount == 0 && spill.events.usage.at(2).second == 64,
+          "a lone lane refused its staging failed while the chain it restored was written");
+}
+
+// A Spill lane's page spills once its own copy lands, whatever the pages
+// before it: one whose write is still in flight holds back none past it.
+void testAPageWaitingForItsCopyHoldsBackNoneAfterIt() {
+  Spilling spill(1024);
+  spill.engine.submit(Spilling::prompt(1, 1, 12, 64));
+  // Every write lands but that of the lane's first page past its dense
+  // history.
+  std::optional<uint32_t> held;
+  for (uint32_t step = 0; step < 2000; ++step) {
+    static_cast<void>(spill.engine.tick(spill.now++));
+    const auto lane = spill.model.requests.find(1);
+    if (!held && lane != spill.model.requests.end() && lane->second.resident &&
+        spill.cache.pageTable(1).pages.size() > 1)
+      held = spill.cache.pageTable(1).pages[1];
+    for (size_t index = 0; index < spill.tier.writes.size(); ++index)
+      if (spill.tier.transfers.at(index)->submitted && spill.tier.writes[index].page != held)
+        spill.tier.transfers.at(index)->ready = true;
+    if (spill.events.outputs.contains(1) && spill.cache.spillSnapshot().spilledPages >= 9)
+      break;
+  }
+  require(held && spill.pool.form(*held) == kv::PageForm::Full &&
+              spill.cache.spillSnapshot().spilledPages >= 9,
+          "a page whose copy had not landed held back the pages after it");
+  spill.engine.cancel(1);
+  for (uint32_t step = 0; step < 2000 && !idle(spill.engine); ++step) {
+    static_cast<void>(spill.engine.tick(spill.now++));
+    spill.tier.complete();
+  }
+  require(idle(spill.engine), "the lane did not end");
+}
+
 // A lane's memory for its reads of spilled KV is reserved once every lane of
 // the command has its KV: a lane that converts to Spill moves the landed
 // pages of the blocks it shares with Spill lanes to the index form, those
@@ -12284,6 +12420,9 @@ int main() {
     testARefusedDecodeTakesThePrefillLanesMemory();
     testRefusedModelMemoryTakesWhatGivesMemoryBack();
     testALoneLaneWaitsForTheChainANeighbourLeft();
+    testALoneSpillLaneWaitsForItsOwnCopies();
+    testALaneRefusedBeforeItsFirstCommandWritesItsChain();
+    testAPageWaitingForItsCopyHoldsBackNoneAfterIt();
     testAConversionLeavesNoLaneWithoutItsFloor();
     testLoneSpillLaneEndsAtTheWall();
     testHotCacheGrowthTakesNoModelCache();
