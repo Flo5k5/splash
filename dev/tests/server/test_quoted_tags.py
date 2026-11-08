@@ -85,9 +85,11 @@ def frontend(tokenizer):
     app = object.__new__(request_frontend.Frontend)
     app.tokenizer = tokenizer
     app.latencies = LatencyMetrics()
-    app.max_context = 4096
+    app.backend = SimpleNamespace(
+        runtime=SimpleNamespace(capabilities=SimpleNamespace(max_context_tokens=4096))
+    )
     app.chat_format = QWEN
-    app.prompt_tokenizer = PromptTokenizer(tokenizer, QWEN.message_boundary)
+    app.prompt_tokenizer = PromptTokenizer(tokenizer, QWEN.message_boundary, 4096)
     app.quoted_tag_tokens = {tag: plain_tokens(tokenizer, tag) for tag in QUOTED}
     # Text prompts prepare no image.
     app.images = SimpleNamespace(request_batch=list)
