@@ -14,7 +14,7 @@ from tokenizers import (
 )
 from transformers import PreTrainedTokenizerFast
 
-from server import api_shapes
+from server import chat_format
 from server import frontend as request_frontend
 from server.chat_format import QWEN
 from server.latency import LatencyMetrics
@@ -73,7 +73,7 @@ def tokenizer():
             AddedToken(
                 text, normalized=False, special=False, lstrip=False, rstrip=False
             )
-            for text in QUOTED + (api_shapes.IMAGE_PAD_TOKEN,)
+            for text in QUOTED + (chat_format.QWEN.image_pad,)
         ]
     )
     result = PreTrainedTokenizerFast(tokenizer_object=backend)
@@ -236,7 +236,7 @@ class QuotedTagTests(unittest.TestCase):
         )
 
     def test_quoted_tags_and_image_pads_keep_their_positions(self):
-        pad = api_shapes.IMAGE_PAD_TOKEN
+        pad = chat_format.QWEN.image_pad
         template = TEMPLATE.replace(
             "{{ part.text }}",
             "{% if part.type == 'image_url' %}{{ '" + pad + "' }}"
