@@ -455,6 +455,7 @@ SERVE_OPTIONS = (
             "Qwen3.8-Flash-Next, Qwen3.8-27B and Qwen3.6-35B-A3B only "
             "(default: none)",
         ),
+        engine=EngineArgument("--control-vector"),
     ),
     ServeOption(
         "--control-vector-scale",
@@ -465,6 +466,7 @@ SERVE_OPTIONS = (
             metavar="SCALE",
             help="scale of the control vector's directions (default: 1.0)",
         ),
+        engine=EngineArgument("--control-vector-scale"),
     ),
     ServeOption(
         "--control-vector-layer-range",
@@ -477,6 +479,9 @@ SERVE_OPTIONS = (
             "4-44 (default: every layer the file holds)",
         ),
         text=control_vector_layer_range_text,
+        engine=EngineArgument(
+            "--control-vector-layer-range", text=control_vector_layer_range_text
+        ),
     ),
     ServeOption(
         "--control-vector-mode",
@@ -488,6 +493,7 @@ SERVE_OPTIONS = (
             "does; project removes the scaled component of the residual along "
             "the direction (default: add)",
         ),
+        engine=EngineArgument("--control-vector-mode"),
     ),
     ServeOption(
         "--host",
