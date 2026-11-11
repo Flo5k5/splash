@@ -1,10 +1,10 @@
 #!/bin/sh
-# Le Splash du checkout (lai/main-20261108 : 1.6.0, PR #530 et #532, control vector par requête),
+# Le Splash du checkout (lai/main-20261111 : 1.6.1, PR #530 et #532, control vector par requête),
 # annoncé à oMLX sous la version de sa base : le lanceur d'un checkout répond « Splash (source checkout) », qu'oMLX
 # refuse (engine/splash.py inspect_splash_binary). Tout le reste passe au lanceur du checkout tel quel.
 set -eu
 case " $* " in
-  *" --version "*) echo "Splash 1.6.0"; exit 0 ;;
+  *" --version "*) echo "Splash 1.6.1"; exit 0 ;;
 esac
 root=$(CDPATH= cd -P -- "$(dirname -- "$0")" && pwd -P)
 exec "$root/splash" "$@"
